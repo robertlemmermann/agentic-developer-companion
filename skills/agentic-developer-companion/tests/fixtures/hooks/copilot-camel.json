@@ -390,7 +390,7 @@
         "modifiedResult.resultType": "success"
       },
       "match": {
-        "modifiedResult.textResultForLlm": "ADC_LIVE_TOKEN=\\[REDACTED\\]",
+        "modifiedResult.textResultForLlm": "ADC_LIVE_TOKEN\\s?=\\[REDACTED\\]\\nHOME",
         "additionalContext": "redacted"
       },
       "not_contains": [

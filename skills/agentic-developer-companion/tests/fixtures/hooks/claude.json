@@ -488,7 +488,7 @@
     }
   },
   {
-    "name": "SessionEnd records the reason",
+    "name": "SessionEnd records the reason; a resumed session is open again",
     "event": "post-edit",
     "dialect_arg": "claude",
     "payload": {
@@ -523,6 +523,29 @@
           "equals": {},
           "session": {
             "ended.reason": "prompt_input_exit"
+          }
+        }
+      },
+      {
+        "event": "post-edit",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "PostToolUse",
+          "prompt_id": "p-1",
+          "tool_name": "Edit",
+          "tool_input": {
+            "file_path": "<REPO>/src/x.js",
+            "new_string": "c"
+          }
+        },
+        "expect": {
+          "equals": {},
+          "session": {
+            "ended": false,
+            "edits.count": 2
           }
         }
       }

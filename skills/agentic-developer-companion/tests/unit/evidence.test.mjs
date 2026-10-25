@@ -109,6 +109,21 @@ test('normalizeCheck validates input strictly and degrades script output', () =>
   assert.equal(big.data.truncated, true);
 });
 
+test('createQaSnapshot sees same-tick edits (racy git) and works with an ignored .adc/', () => {
+  for (let i = 0; i < 8; i++) {
+    const { dir, g } = makeRepo({ 'a.js': 'x\n' });
+    fs.writeFileSync(path.join(dir, 'a.js'), 'y\n');
+    write(dir, { '.adc/.env.live': 'ADC_LIVE_TOKEN\n', 'u.txt': 'untracked\n' });
+    fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
+    core.sleepSync(40);
+    const before = g('status', '--porcelain');
+    const snap = ev.createQaSnapshot(dir, { exclude: ['.adc'] });
+    assert.equal(g('cat-file', 'blob', `${snap.tree}:a.js`), 'y\n', 'a same-size edit right after the commit is in the snapshot');
+    assert.deepEqual(g('ls-tree', '-r', '--name-only', snap.tree).trim().split('\n'), ['a.js', 'u.txt']);
+    assert.equal(g('status', '--porcelain'), before);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Verdict rules (pure)
 
@@ -593,6 +608,45 @@ test('verify --dry-run writes nothing; --finalize seals; bad options are usage e
 
 // ---------------------------------------------------------------------------
 // End to end through adc.mjs
+
+const LIB = path.join(core.SCRIPTS_DIR, 'lib');
+const hasModules = (...names) => names.every((n) => fs.existsSync(path.join(LIB, n)));
+
+test('e2e with the real step modules: planted skip fails, clean change passes, porcelain unchanged', { skip: !hasModules('diff-scope.mjs', 'clean-run.mjs') && 'diff-scope.mjs or clean-run.mjs not built yet' }, () => {
+  const testFile = (body) => `import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { add } from '../src/math.js';\n${body}`;
+  const { dir, g } = makeRepo({
+    'package.json': '{ "name": "demo", "version": "1.0.0", "type": "module", "scripts": { "test": "node --test" } }\n',
+    'package-lock.json': '{"name":"demo","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"demo","version":"1.0.0"}}}\n',
+    'src/math.js': 'export const add = (a, b) => a + b;\n',
+    'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest('negatives', () => { assert.equal(add(-1, -2), -3); });\n"),
+  });
+  write(dir, {
+    'src/math.js': 'export const add = (a, b) => a + b;\nexport const twice = (a) => add(a, a);\n',
+    'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest.skip('negatives', () => { assert.equal(add(-1, -2), -3); });\n"),
+  });
+  const before = g('status', '--porcelain');
+  const bad = adc(['verify', '--quick', '--offline', '--claims', '-'], { cwd: dir, input: 'All tests pass.\n' });
+  assert.ok(bad.json && bad.json.checks, bad.stderr);
+  assert.equal(g('status', '--porcelain'), before, 'byte-identical after real worktree runs');
+  const row = (res, id) => res.json.checks.find((c) => c.id === id && c.project === '.') || res.json.checks.find((c) => c.id === id);
+  if (row(bad, 'CK-SKIP').status !== 'unverified') {
+    assert.equal(row(bad, 'CK-SKIP').status, 'fail', 'diff-scope flags the added test.skip');
+    assert.equal(bad.json.verdict, 'FAIL');
+    assert.equal(bad.status, 1);
+  }
+  write(dir, { 'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest('negatives', () => { assert.equal(add(-1, -2), -3); });\n") });
+  const before2 = g('status', '--porcelain');
+  const good = adc(['verify', '--quick', '--offline', '--claims', '-', '--finalize'], { cwd: dir, input: 'All tests pass.\n' });
+  assert.ok(good.json && good.json.checks, good.stderr);
+  assert.equal(good.status, ev.verdictExit(good.json.verdict));
+  assert.equal(good.json.finalized, true);
+  const hard = good.json.checks.filter((c) => !['CK-COVERAGE', 'CK-MUTATION', 'CK-FLAKE', 'CK-TRACE', 'CK-REVIEW', 'CK-TYPES', 'CK-CLAIMS'].includes(c.id));
+  if (hard.every((c) => c.status === 'pass')) {
+    assert.equal(good.json.verdict, 'PASS', JSON.stringify(good.json.reasons));
+    assert.equal(good.json.claims[0].status, 'supported');
+  }
+  assert.equal(g('status', '--porcelain'), before2);
+});
 
 test('e2e: verify -> trace matrix -> claims -> score -> repro -> finalize -> render', () => {
   const { dir, g } = makeRepo({ 'src/limiter.js': 'export const limit = () => 200;\n', 'tests/limiter.test.js': "test('a', () => {});\n" });

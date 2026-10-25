@@ -7,8 +7,8 @@
 # {{project_name}}
 
 <!-- Canonical agent instructions: GitHub Copilot and Codex read this file, Claude Code reads it
-through the @AGENTS.md import in CLAUDE.md. Keep it short (well under 200 lines): one rule per
-line, commands and conventions over prose, no secrets, tokens or internal hostnames. -->
+through the import line at the top of CLAUDE.md. Keep it short (well under 200 lines): one rule
+per line, commands and conventions over prose, no secrets, tokens or internal hostnames. -->
 
 ## Commands
 
@@ -54,18 +54,29 @@ reads AGENTS.md, so keep this file to Copilot-only notes and under two pages. --
   suppressions, edits to CI workflows and new dependencies.
 @@@ file: .github/instructions/{{topic}}.instructions.md kind=instructions host=copilot @@@
 {{frontmatter}}
+
 # {{topic_title}}
 
-- (Rules that apply only to files matching {{apply_to_md}}. Copilot adds this file when such
-  files are in play; add `excludeAgent: "code-review"` or `"cloud-agent"` to hide it from one agent.)
+<!-- Copilot adds this file when files matching applyTo are in play. Add
+excludeAgent: "code-review" or "cloud-agent" to the frontmatter to hide it from one agent. -->
+
+Applies to {{apply_to_md}}.
+
+- (One rule per line for these files only.)
 @@@ file: .claude/rules/{{topic}}.md kind=instructions host=claude @@@
 {{frontmatter}}
+
 # {{topic_title}}
 
-- (Rules that apply only to files matching {{apply_to_md}}. Claude Code loads this rule when
-  such files are in play; Copilot CLI reads .claude/rules too.)
+<!-- Claude Code loads this rule when files matching paths are in play; Copilot CLI reads
+.claude/rules too. -->
+
+Applies to {{apply_to_md}}.
+
+- (One rule per line for these files only.)
 @@@ file: {{skill_dir}}/SKILL.md kind=skill @@@
 {{frontmatter}}
+
 # {{name}}
 
 {{summary}}
@@ -99,6 +110,7 @@ every path.
 - (Detail that only some invocations need.)
 @@@ file: .github/agents/{{agent_file}}.agent.md kind=agent host=copilot @@@
 {{frontmatter}}
+
 You are {{name}}. {{summary}}
 
 ## Inputs
@@ -119,6 +131,7 @@ Return exactly:
 - Say "unknown" instead of guessing.
 @@@ file: .claude/agents/{{name}}.md kind=agent host=claude @@@
 {{frontmatter}}
+
 You are {{name}}. {{summary}}
 
 ## Inputs
@@ -139,6 +152,7 @@ Return exactly:
 - Say "unknown" instead of guessing.
 @@@ file: {{skill_dir}}/SKILL.md kind=agent host=codex @@@
 {{frontmatter}}
+
 # {{name}}
 
 Codex has no custom agent files, so this role is a skill: invoke it with `${{name}}`.
@@ -158,16 +172,19 @@ Return exactly:
 - Say "unknown" instead of guessing.
 @@@ file: .github/prompts/{{name}}.prompt.md kind=prompt host=copilot @@@
 {{prompt_frontmatter}}
+
 {{summary}}
 
 - (The task, step by step. Prompt files run only in the VS Code Local harness and Visual
   Studio; the skill in {{prompt_skill_dir}} is the portable equivalent and the one to keep.)
 @@@ file: {{skill_dir}}/SKILL.md kind=prompt @@@
 {{frontmatter}}
+
 # {{name}}
 
-{{summary}} This skill runs only when the user invokes it by name; the words after the name
-are its input.
+{{summary}}
+
+This skill runs only when the user invokes it by name; the words after the name are its input.
 
 ## Steps
 

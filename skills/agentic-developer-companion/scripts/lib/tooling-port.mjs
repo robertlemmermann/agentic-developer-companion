@@ -387,13 +387,17 @@ function wrapWords(s, width) {
   return out;
 }
 
-/** Emit YAML for a plain object. `flowKeys` lists keys whose scalar arrays use `[a, b]`. */
-export function stringifyYaml(obj, { indent = 0, flowKeys = [] } = {}) {
+/**
+ * Emit YAML for a plain object. `flowKeys` lists keys whose scalar arrays use `[a, b]`;
+ * `quoteKeys` lists keys whose strings are always double-quoted (globs such as applyTo).
+ */
+export function stringifyYaml(obj, { indent = 0, flowKeys = [], quoteKeys = ['applyTo', 'paths', 'excludeAgent'] } = {}) {
   const pad = ' '.repeat(indent);
   const out = [];
   for (const [k, v] of Object.entries(obj || {})) {
     if (v === undefined) continue;
     const key = yamlKey(k);
+    const scalar = quoteKeys.includes(k) ? (x) => (typeof x === 'string' ? JSON.stringify(x) : yamlScalar(x)) : yamlScalar;
     if (Array.isArray(v)) {
       if (!v.length) { out.push(`${pad}${key}: []`); continue; }
       const scalars = v.every((x) => x === null || typeof x !== 'object');
@@ -401,15 +405,15 @@ export function stringifyYaml(obj, { indent = 0, flowKeys = [] } = {}) {
       out.push(`${pad}${key}:`);
       for (const item of v) {
         if (item && typeof item === 'object' && !Array.isArray(item)) {
-          const inner = stringifyYaml(item, { indent: indent + 4, flowKeys });
+          const inner = stringifyYaml(item, { indent: indent + 4, flowKeys, quoteKeys });
           if (!inner.length) { out.push(`${pad}  - {}`); continue; }
           out.push(`${pad}  - ${inner[0].slice(indent + 4)}`, ...inner.slice(1));
-        } else out.push(`${pad}  - ${yamlScalar(item)}`);
+        } else out.push(`${pad}  - ${scalar(item)}`);
       }
       continue;
     }
     if (v && typeof v === 'object') {
-      const inner = stringifyYaml(v, { indent: indent + 2, flowKeys });
+      const inner = stringifyYaml(v, { indent: indent + 2, flowKeys, quoteKeys });
       out.push(inner.length ? `${pad}${key}:` : `${pad}${key}: {}`, ...inner);
       continue;
     }
@@ -422,7 +426,7 @@ export function stringifyYaml(obj, { indent = 0, flowKeys = [] } = {}) {
       out.push(`${pad}${key}: >-`, ...wrapWords(v, Math.max(40, 80 - indent - 2)).map((l) => `${pad}  ${l}`));
       continue;
     }
-    out.push(`${pad}${key}: ${yamlScalar(v)}`);
+    out.push(`${pad}${key}: ${scalar(v)}`);
   }
   return out;
 }
@@ -863,10 +867,14 @@ export function renderHookConfig(entries, target, { file = 'hooks', guard = fals
     if (!events.includes(e.event)) { dropped.push({ file, field: `hooks.${e.event}`, reason: `${target === 'claude' ? 'Claude Code' : 'Codex'} has no ${e.event} event` }); continue; }
     const h = { type: 'command' };
     if (target === 'claude') {
-      if (e.exec) {
+      if (e.exec && pluginRoot) {
+        // Plugin hooks: exec form with ${CLAUDE_PLUGIN_ROOT} (Claude's own recommendation).
         h.command = e.exec.program;
-        h.args = rebaseArgs(e.exec.args, 'claude', notes);
-        if (pluginRoot) h.args = h.args.map((a) => a.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, '${CLAUDE_PLUGIN_ROOT}/').replace(/\$\{PLUGIN_ROOT\}/g, '${CLAUDE_PLUGIN_ROOT}'));
+        h.args = rebaseArgs(e.exec.args, 'claude', notes).map((a) => a.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, '${CLAUDE_PLUGIN_ROOT}/').replace(/\$\{PLUGIN_ROOT\}/g, '${CLAUDE_PLUGIN_ROOT}'));
+      } else if (e.exec) {
+        // Repository settings: Copilot CLI and VS Code run these hooks too, and their handling of
+        // exec form is undocumented, so one shell string (valid in sh, Git Bash and PowerShell).
+        h.command = joinPosix([e.exec.program, ...rebaseArgs(e.exec.args, 'claude', notes)]);
       } else if (e.posix) {
         h.command = e.posix;
         if (e.windows && e.windows !== e.posix) dropped.push({ file, field: 'powershell/commandWindows', value: e.windows, reason: 'Claude Code runs one command per hook (Git Bash on Windows when installed, else PowerShell)' });
@@ -1427,7 +1435,8 @@ export function parseAgent(text, host, rel) {
   const known = host === 'copilot' ? COPILOT_AGENT_FIELDS : CLAUDE_AGENT_FIELDS;
   if (host === 'copilot') {
     if (d.tools != null) { const t = toolsCopilotToCanonical(asList(d.tools)); ir.tools = t.tools; ir.toolsUnknown = t.unknown; }
-    ir.includeInstructions = asBool(d['include-custom-instructions']);
+    // Copilot subagents get no repository instructions unless this is true (default false).
+    ir.includeInstructions = asBool(d['include-custom-instructions']) === true;
     if (d.reasoningEffort != null) ir.effort = asText(d.reasoningEffort);
     if (d.infer != null && ir.disableModelInvocation == null) ir.disableModelInvocation = asBool(d.infer) === false ? true : null;
     for (const k of ['target', 'mcp-servers', 'metadata', 'argument-hint', 'handoffs', 'models', 'modelPolicy', 'hooks', 'infer']) if (d[k] != null) ir.extra[k] = d[k];
@@ -1481,7 +1490,10 @@ export function renderAgent(ir, host, { file = ir.name, pluginScoped = false } =
   if (ir.model) { data.model = ir.model; if (ir.source !== 'claude') manual.push(`Check that model "${ir.model}" is valid for Claude Code (sonnet, opus, haiku, inherit or a full model id).`); }
   if (ir.skills) data.skills = ir.skills;
   if (ir.effort) data.effort = ir.effort;
-  if (ir.includeInstructions === false) data.omitClaudeMd = true;
+  if (ir.includeInstructions === false) {
+    data.omitClaudeMd = true;
+    if (ir.source === 'copilot') manual.push(`${ir.name}: Copilot subagents get no repository instructions without include-custom-instructions: true, so the Claude Code agent sets omitClaudeMd: true; remove it to give the agent CLAUDE.md.`);
+  }
   if (ir.userInvocable != null) data['user-invocable'] = ir.userInvocable;
   if (ir.disableModelInvocation != null) data['disable-model-invocation'] = ir.disableModelInvocation;
   if (ir.toolsUnknown.length) manual.push(`${ir.name}: tool names ${ir.toolsUnknown.join(', ')} are not Copilot aliases; check them in Claude Code.`);
@@ -1521,7 +1533,7 @@ export function renderOpenAiYaml({ name, description, implicit = true, defaultPr
   const data = { interface: { display_name: name } };
   const sd = shortDescription(description);
   if (sd) data.interface.short_description = sd;
-  data.interface.default_prompt = defaultPrompt || `Use $${name} to ${firstSentence(description).replace(/^[A-Z]/, (c) => c.toLowerCase()).replace(/[.!?]$/, '') || 'help with this task'}.`;
+  data.interface.default_prompt = defaultPrompt || `Use $${name}: ${firstSentence(description) || 'help with this task.'}`;
   data.policy = { allow_implicit_invocation: Boolean(implicit) };
   return stringifyYaml(data).join('\n') + '\n';
 }
@@ -1536,7 +1548,7 @@ function skillFrontmatter({ name, description, extra = {}, host }) {
   return stringifyFrontmatter(data, { flowKeys: [] });
 }
 
-const PROMPT_VARS = /\$\{(input:[^}]+|selection|selectedText|file|fileBasename|fileDirname|fileBasenameNoExtension|workspaceFolder|workspaceFolderBasename)\}|#(file|tool):\S+/g;
+const PROMPT_VARS = /\$\{(input:[^}]+|selection|selectedText|file|fileBasename|fileDirname|fileBasenameNoExtension|workspaceFolder|workspaceFolderBasename)\}|#(file|tool):[^\s,;)]*[^\s,;).]/g;
 const CLAUDE_PLACEHOLDERS = /\$ARGUMENTS(\[\d+\])?|\$\d\b|\$\{CLAUDE_[A-Z_]+\}|(^|\s)!`[^`]+`/m;
 
 function convertPromptLike(src, cls, targets) {
@@ -1560,7 +1572,7 @@ function convertPromptLike(src, cls, targets) {
     description = firstSentence(body.replace(/^#.*$/m, '')) || `Runs the ${name} prompt.`;
     manual.push(`${src.rel} has no description; "${description}" was derived from the body. Rewrite it as what + when + boundary.`);
   }
-  const vars = [...new Set([...body.matchAll(PROMPT_VARS)].map((m) => m[0]))];
+  const vars = [...new Set([...`${description}\n${body}`.matchAll(PROMPT_VARS)].map((m) => m[0]))];
   for (const host of targets) {
     const dir = `${SKILL_DIRS[host]}/${name}`;
     const extra = {};

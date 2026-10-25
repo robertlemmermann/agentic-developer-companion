@@ -10,7 +10,7 @@ import {
 } from './core.mjs';
 import { git, emptyTree, showFile } from './git.mjs';
 
-// state.prepareTarget, through evidence.prepareQaTarget's fallback when that module is present.
+// The QA target (repo, state dir, base, snapshot) via evidence.prepareQaTarget, which carries the snapshot fixes.
 async function qaTarget(ctx, opts) {
   const ev = await import('./evidence.mjs');
   return ev.prepareQaTarget(ctx, opts);

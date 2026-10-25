@@ -2064,10 +2064,14 @@ export async function pluginCheck(ctx, dirArg) {
   validators.push({ name: 'copilot', ran: false, status: 'manual', reason: 'Copilot CLI has no validate command; load it with copilot --plugin-dir (see tooling plugin test)', errors: [], warnings: [] });
   validators.push({ name: 'codex', ran: false, status: 'manual', reason: 'Codex validation needs a model run (codex exec --strict-config) or a marketplace add; see tooling plugin test', errors: [], warnings: [] });
   const name = [...names][0] || path.basename(pdir);
+  const mktName = ['.claude-plugin/marketplace.json', '.agents/plugins/marketplace.json', '.github/plugin/marketplace.json'].map((f) => readMaybe(absOf(root, f)).doc?.name).find(Boolean) || null;
+  if (lint.status === 'ok' && lint.warnings.some((w) => /COLLISION/.test(String(w.rule)))) {
+    for (let k = findings.length - 1; k >= 0; k--) if (findings[k].rule === 'SKILL_SHADOWED') findings.splice(k, 1);
+  }
   return {
     plugin_dir: prel, name, hosts: [...new Set(hostsDetected)], files, skills: pluginSkills, findings, validators,
     errors: findings.filter((f) => f.severity === 'error').length, warnings: findings.filter((f) => f.severity === 'warning').length,
-    local_test_commands: pluginTestCommands(prel, name, null, pluginSkills[0], [...new Set(hostsDetected)]),
+    local_test_commands: pluginTestCommands(prel, name, mktName, pluginSkills[0], [...new Set(hostsDetected)]),
     release_steps: releaseSteps(name, versions[0]?.version || '0.1.0', prel),
   };
 }
@@ -2141,12 +2145,13 @@ export async function pluginRelease(ctx, dirArg, values) {
     if (entries.length) marketplaces.push({ file: f, abs: absOf(root, f), doc: r.doc, entries });
   }
   const write = Boolean(values.write) && !ctx.dryRun;
+  const dirty = (gitTry(root, ['status', '--porcelain', '--', prel === '.' ? '.' : prel]) || '').trim().length > 0;
   const updated = [];
   if (values.version) {
     for (const m of manifests) {
       if (!m.doc || m.doc.version === version) continue;
-      if (write) { m.doc.version = version; writeJsonAtomic(m.abs, m.doc); }
       updated.push({ file: m.file, from: m.doc.version ?? null, to: version });
+      if (write) { m.doc.version = version; writeJsonAtomic(m.abs, m.doc); }
     }
     for (const mk of marketplaces) {
       let changed = false;
@@ -2155,7 +2160,6 @@ export async function pluginRelease(ctx, dirArg, values) {
     }
   }
   const head = gitTry(root, ['rev-parse', 'HEAD']);
-  const dirty = (gitTry(root, ['status', '--porcelain', '--', prel === '.' ? '.' : prel]) || '').trim().length > 0;
   const tagList = (gitTry(root, ['tag', '-l', `v${version}`, `${name}--v${version}`]) || '').split(/\r?\n/).filter(Boolean);
   const remote = gitTry(root, ['config', '--get', 'remote.origin.url']) || '';
   const gh = /github\.com[:/]([^/]+)\/([^/.]+?)(?:\.git)?$/.exec(remote);
@@ -2170,7 +2174,8 @@ export async function pluginRelease(ctx, dirArg, values) {
   }
   const warnings = [];
   if (current.length > 1) warnings.push(`manifest versions differ: ${current.join(', ')}`);
-  if (dirty) warnings.push('the plugin directory has uncommitted changes; commit before tagging');
+  if (dirty) warnings.push('the plugin directory had uncommitted changes before this run; commit before tagging');
+  if (updated.length && write) warnings.push('versions were updated: commit the manifests before tagging');
   if (tagList.length) warnings.push(`tags already exist: ${tagList.join(', ')}`);
   if (!head) warnings.push('not a git repository with commits: no SHA to pin');
   return {

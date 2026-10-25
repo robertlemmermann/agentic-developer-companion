@@ -1052,6 +1052,8 @@ function frontmatterOf(text) {
 /** Links, references, footprint and body rules for a skill directory. */
 function skillStructure(fl, dir, body, offset) {
   const linked = new Set();
+  // A plain or backticked mention of the path also tells the model to read the file.
+  for (const m of body.matchAll(/(?:^|[\s`'"(\/{}])(references\/[\w./-]+\.\w+)/g)) linked.add(path.resolve(dir, m[1]));
   for (const { line, target } of markdownLinks(body)) {
     const n = line + offset;
     if (isExternalTarget(target)) continue;
@@ -1200,7 +1202,8 @@ async function lintSkillFile(fl) {
     const cv = /\$\{CLAUDE_(?:SKILL_DIR|PROJECT_DIR|SESSION_ID|EFFORT|PLUGIN_ROOT|PLUGIN_DATA)\}/.exec(line);
     if (cv) fl.emit('SK-SUBST', { line: n, message: `${cv[0]} is substituted only by Claude Code` });
     if (/(?:^|\s)!`[^`]+`/.test(line) || /^\s*(?:`{3,}|~{3,})!/.test(line)) fl.emit('SK-SUBST', { line: n, message: 'dynamic context (!`cmd`) runs only in Claude Code' });
-    const pos = /(?<![\\\w$])\$[0-9](?![0-9])/.exec(line);
+    // $N outside currency-like text ($1,845.00, $1k, $12.3M).
+    const pos = /(?<![\\\w$])\$[0-9](?![0-9]|[.,]\d|[kKmMbB]\b)/.exec(line);
     if (pos) fl.emit('SK-SUBST-POSITIONAL', { line: n, message: `${pos[0]} is replaced with an argument by Claude Code; escape it as \\${pos[0]}` });
   });
   skillStructure(fl, dir, body, offset);

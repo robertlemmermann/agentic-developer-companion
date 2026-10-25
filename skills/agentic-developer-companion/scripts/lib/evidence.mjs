@@ -10,7 +10,7 @@ import {
   writeJsonAtomic, withLock, sha256, nonce, nowIso, stamp, today, toPosix, relPosix, ensureDir, truncate,
   redactLiterals, runShell, generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, tmpRoot,
 } from './core.mjs';
-import { requireRepo, gitTry, git, gitRaw, headSha, gitPath, resolveBase, checkIgnore } from './git.mjs';
+import { requireRepo, repoRoot, gitTry, git, gitRaw, headSha, gitPath, resolveBase, checkIgnore } from './git.mjs';
 import { prepareStateDir, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes } from './state.mjs';
 import { citationChecker, evaluateMatrix, renderTraceMarkdown, readSpecInput } from './trace.mjs';
 
@@ -51,6 +51,8 @@ const DERIVED_KEYS = { checks: [], waivers: [], claims: ['status'] };
 const HASH_KEY_RE = /(?:sha256|^tree_digest$|^session_nonce$|^snapshot_commit$|^base$|^head$|^prev$|^tip$|^sha$|^tree$|^commit$)$/;
 
 const arr = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]);
+// Repository a ledger belongs to: explicit, else the one containing the ledger, else the cwd's.
+const rootFor = (file, root) => root || repoRoot(path.dirname(file)) || requireRepo(process.cwd());
 const posixRef = (root, file) => {
   const rel = root ? relPosix(root, file) : null;
   return rel && rel !== '.' ? rel : toPosix(file);
@@ -450,7 +452,7 @@ function observedRuns(stateInfo, sessionId) {
 }
 
 /**
- * Create a ledger for `target` (from state.prepareTarget). Returns { path, ledger }.
+ * Create a ledger for `target` (from prepareQaTarget). Returns { path, ledger }.
  * `mode` is 'verify' (written by the orchestrator) or 'manual' (`evidence init`).
  */
 export async function initLedger({
@@ -568,12 +570,12 @@ export async function addChecks(file, checks, { source = 'script', root = null, 
     if (inputTree && inputTree !== ledger.tree_digest) {
       throw new AdcError(EXIT.USAGE, 'STALE_INPUT', `the input was produced for snapshot ${String(inputTree).slice(0, 12)}, the ledger is for ${String(ledger.tree_digest).slice(0, 12)}; re-run the command or verify`);
     }
-    const repoRoot = root || requireRepo(process.cwd());
+    const repo = rootFor(file, root);
     const added = [];
     for (const raw0 of arr(checks)) {
       let raw = raw0;
       if (strict && raw && String(raw.id || '').toUpperCase() === 'CK-CLAIMS') throw usageError('CK-CLAIMS is derived at finalize; record claims with `evidence claims`');
-      if (strict && raw && String(raw.id || '').toUpperCase() === 'CK-TRACE') raw = await traceEntry(ledger, raw, { root: repoRoot, file, dryRun });
+      if (strict && raw && String(raw.id || '').toUpperCase() === 'CK-TRACE') raw = await traceEntry(ledger, raw, { root: repo, file, dryRun });
       const entry = normalizeCheck(raw, { strict });
       if (!entry) continue;
       if (source === 'input' || source === 'run') delete entry.pending;
@@ -583,7 +585,7 @@ export async function addChecks(file, checks, { source = 'script', root = null, 
       const placeholder = ledger.checks.find((c) => c.pending && c.id === entry.id && !entry.pending);
       if (placeholder) entry.supersedes = placeholder.seq;
       const artifactHashes = {};
-      for (const a of entry.artifacts) artifactHashes[a] = hashFile(path.resolve(repoRoot, a));
+      for (const a of entry.artifacts) artifactHashes[a] = hashFile(path.resolve(repo, a));
       entry.artifact_sha256 = artifactHashes;
       added.push(appendRecord(ledger, 'checks', redactDeep(entry, redact)));
     }
@@ -709,7 +711,7 @@ export async function addWaiver(file, { check, file: wfile = null, reason }, { r
     if (entries.every((c) => c.status === 'unverified')) throw usageError(`${id} is unverified; UNVERIFIED is resolved by running the step, not by a waiver`);
     const quotes = quotedSegments(text);
     let specText = null;
-    if (ledger.spec_copy && root) specText = readText(path.resolve(root, ledger.spec_copy));
+    if (ledger.spec_copy) specText = readText(path.resolve(rootFor(file, root), ledger.spec_copy));
     let verified = null;
     let by;
     if (specText != null) {
@@ -984,9 +986,11 @@ export function renderMarkdown(input, { short = false } = {}) {
   if (ledger.spec) out.push(`- Spec: ${cell(ledger.spec, 200)}`);
   if (d.needs_human_triage) out.push('- **Needs human triage**: the review reported a critical finding that no reproducing command confirmed.');
   if (ledger.mode === 'manual') out.push('- Created with `evidence init`: checks were recorded from command output, not by `verify`.');
+  if (d.effective.some((r) => r.id === 'CK-REVIEW' && r.entries.every((e) => e.pending))) out.push('- No adversarial review was recorded; this verdict carries no second opinion.');
   out.push('', '| Check | Project | Status | Summary |', '|---|---|---|---|');
   for (const r of d.effective) {
-    const st = r.effective === r.status ? r.effective : `${r.effective} (recorded ${r.status})`;
+    const pending = r.entries.some((e) => e.pending);
+    const st = pending ? `not recorded (${r.effective})` : r.effective === r.status ? r.effective : `${r.effective} (recorded ${r.status})`;
     const src = r.sources.includes('input') ? ' (input)' : '';
     out.push(`| ${r.id}${src} | ${cell(r.project, 40)} | ${st}${r.reason ? ` [${cell(r.reason, 40)}]` : ''} | ${cell(r.summary)}${r.notes.length ? ` - ${cell(r.notes.join('; '), 200)}` : ''} |`);
   }

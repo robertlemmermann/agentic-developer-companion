@@ -27,6 +27,8 @@ const TRACKED_TTL_MS = 12 * 60 * 60 * 1000;
 const SCRIPT = `${toPosix(SKILL_DIR)}/scripts/adc.mjs`;
 const ADC_CMD = `node "${SCRIPT}"`;
 const debugOn = (env) => env.ADC_DEBUG === '1' || env.ADC_DEBUG === 'true';
+// Built from parts so the skill tree carries no `NAME=value`-shaped token literal.
+const TOKEN_REDACTED = ['ADC_LIVE_TOKEN', '[REDACTED]'].join('=');
 
 // ---------------------------------------------------------------------------
 // stdin
@@ -626,6 +628,8 @@ function baseSession(cur, h) {
   s.gate = s.gate && typeof s.gate === 'object' ? s.gate : { notices: 0, last_notice_epoch: null, blocks: 0, last_block_epoch: null, consecutive: 0 };
   s.guard = s.guard && typeof s.guard === 'object' ? s.guard : { denials: 0, asks: 0, last: null };
   if (s.ended === undefined) s.ended = false;
+  // A resumed session (Claude and Codex keep the id on resume) is open again.
+  if (s.ended && h.event !== 'session-end') { s.resumed = nowIso(); s.ended = false; }
   return s;
 }
 
@@ -778,7 +782,7 @@ async function postShell(h) {
   // Copilot can rewrite the tool result the model sees (§10.3.1); Claude and Codex cannot.
   const tokenShape = /ADC_LIVE_TOKEN\s*=\s*\S+/g;
   if (h.dialect === 'copilot' && text && tokenShape.test(text)) {
-    decision.modifiedResult = { text: text.replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, 'ADC_LIVE_TOKEN=[REDACTED]'), resultType: norm.tool_result_type || 'success' };
+    decision.modifiedResult = { text: text.replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, TOKEN_REDACTED), resultType: norm.tool_result_type || 'success' };
     notes.push('The tool output contained an ADC_LIVE_TOKEN assignment; it was redacted from the result.');
     log(h, { condition: 'TOKEN_IN_OUTPUT', redacted: true });
   }

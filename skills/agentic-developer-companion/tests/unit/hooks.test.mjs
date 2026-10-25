@@ -67,7 +67,9 @@ function makeRepo() {
   }
   const dir = tmp();
   fs.cpSync(templateRepo, dir, { recursive: true });
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  cleanup.push(core.tmpRoot(real)); // the tracked-state cache the hooks keep in the OS temp dir
+  return real;
 }
 
 const get = (obj, dotted) => dotted.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -944,4 +946,23 @@ test('CLI: usage errors exit 2 with a JSON error; the host is guessed from the e
   assert.equal(r.code, 2);
   r = cli(['hooks', 'render', '--host', 'copilot', '--node-path', '--json', '--cwd', repo]);
   assert.equal(r.json.node, core.toPosix(process.execPath));
+});
+
+const CLAUDE = core.which('claude');
+
+test('rendered Claude hooks pass Claude Code\'s own hook validation (claude plugin validate, local and free)', { skip: CLAUDE ? false : 'claude not installed', timeout: 60_000 }, () => {
+  for (const [scope, level] of [['user', 'advise'], ['user', 'guard'], ['project', 'gate']]) {
+    const dir = path.join(tmp('adc-claude-validate-'), 'adc-hooks-probe');
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'adc-hooks-probe', version: '0.0.1', description: 'hook validation probe' }));
+    const r = hooksRender.renderHooks({ host: 'claude', scope, level, skillDir: SKILL, root: scope === 'project' ? makeRepo() : null, home: HOME, env: {} });
+    fs.writeFileSync(path.join(dir, 'hooks', 'hooks.json'), JSON.stringify({ description: 'probe', hooks: r.config.hooks }));
+    const res = spawnSync(CLAUDE, ['plugin', 'validate', dir, '--json'], { encoding: 'utf8', env: baseEnv(), timeout: 50_000 });
+    const out = JSON.parse(res.stdout);
+    const hooksReport = (out.contents || []).filter((c) => c.type === 'hooks');
+    const problems = hooksReport.flatMap((c) => [...(c.errors || []), ...(c.warnings || [])]);
+    assert.deepEqual(problems, [], `${scope}/${level}: ${JSON.stringify(problems)}`);
+    assert.equal(out.success, true, `${scope}/${level}: ${res.stdout.slice(0, 500)}`);
+  }
 });

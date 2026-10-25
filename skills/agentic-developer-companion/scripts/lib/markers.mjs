@@ -304,7 +304,7 @@ export const IN_SOURCE_RETRIES = [
   { id: 'retry.jest', langs: ['js'], code: true, re: /\bjest\.retryTimes\s*\(/ },
   { id: 'retry.mocha', langs: ['js'], code: true, re: /\bthis\.retries\s*\(\s*[1-9]/ },
   { id: 'retry.playwright', langs: ['js'], code: true, re: /\.describe\.configure\s*\(\s*\{[^}]*\bretries\s*:\s*[1-9]/ },
-  { id: 'retry.js-options', langs: ['js'], code: true, re: /\b(?:it|test|describe)(?:\.\w+)*\s*\([^{]*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/ },
+  { id: 'retry.js-options', langs: ['js'], code: true, re: /\b(?:it|test|describe)(?:\.(?:only|skip|concurrent|sequential))*\s*\(\s*(['"`])(?:(?!\1).)*\1\s*,\s*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/ },
   { id: 'retry.py', langs: ['py'], code: true, re: /@pytest\.mark\.flaky\b|@flaky\b|\bpytest\.mark\.flaky\b|@(?:pytest\.mark\.)?retry\b/ },
   { id: 'retry.jvm', langs: ['jvm'], code: true, re: /@(?:RetryingTest|Retry|RepeatedIfExceptionsTest|Flaky)\b|\bretryAnalyzer\s*=/ },
   { id: 'retry.cs', langs: ['cs'], code: true, re: /\[\s*(?:\w+\s*,\s*)*(?:Retry|RetryFact|RetryTheory)\b/ },
@@ -337,7 +337,9 @@ export const SECRET_PATTERNS = [
   { id: 'secret.private-key', severity: 'fail', re: /(-{5}BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY(?: BLOCK)?-{5})/ },
   { id: 'secret.jwt', severity: 'finding', re: /\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/ },
   { id: 'secret.url-credentials', severity: 'finding', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/([^/\s:@'"`]{2,64}:[^/\s:@'"`]{6,128})@([^\s/'"`]+)/ },
-  { id: 'secret.adc-live-token', severity: 'fail', re: /\bADC_LIVE_TOKEN\s*[:=]\s*["']?([^\s"'$<{]{6,})/ },
+  // The value must end at a quote, whitespace or end of line: code such as `X = token;` and
+  // placeholders such as `[REDACTED]`, `<token>`, `${VAR}` or `process.env.X` are not values.
+  { id: 'secret.adc-live-token', severity: 'fail', re: /\bADC_LIVE_TOKEN\s*[:=]\s*["']?(?![[<{$%]|process\.|os\.|env\.|getenv)([^\s"'`;,()]{6,})(?=["'`]|\s|$)/ },
   { id: 'secret.generic-assignment', severity: 'finding', generic: true,
     re: /\b(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?key|passw(?:or)?d|pwd)\b["']?\s*[:=]\s*["']([^"'\s]{12,200})["']/i },
 ];

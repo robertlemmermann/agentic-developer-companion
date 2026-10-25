@@ -122,6 +122,9 @@ skill, so registration is an explicit, confirmed step.
    means the registered entries differ from what this copy would render now; re-run step 2.
 5. Remove exactly what was added: `node <skill>/scripts/adc.mjs setup hooks --remove [--host h] [--scope s]`.
    Without a record it scans the host files for entries that run `adc.mjs hook-run`.
+   **Manual fallback:** in the target file, delete every entry (Copilot) or handler (Claude,
+   Codex) whose `bash`, `powershell`, `command`, `commandWindows` or `args` contain
+   `adc.mjs` and `hook-run`; delete `~/.copilot/hooks/agentic-developer-companion.json` outright.
 
 Options: `--node-path` renders the absolute path of the Node running the command (for Node
 from nvm, fnm, Volta or asdf that the hook launcher's PATH does not see); `--node <path>`

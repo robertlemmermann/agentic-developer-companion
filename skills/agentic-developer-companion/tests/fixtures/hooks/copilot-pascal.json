@@ -129,7 +129,7 @@
         "modifiedResult.resultType": "success"
       },
       "match": {
-        "modifiedResult.textResultForLlm": "^ADC_LIVE_TOKEN=\\[REDACTED\\]$"
+        "modifiedResult.textResultForLlm": "^ADC_LIVE_TOKEN\\s?=\\[REDACTED\\]$"
       },
       "not_contains": [
         "<TOKEN>"

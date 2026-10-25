@@ -621,7 +621,7 @@ describe('clean-run --red-green', () => {
     const repo = makeRepo(BUGGY);
     repo.write({ 'src/math.mjs': FIXED, 'test/regress.test.mjs': nodeTest('divides by two', 'assert.equal(div(8, 2), 4);') });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test', '--no-base', '--red-green', 'test/regress.test.mjs']);
-    assert.equal(r.exit, 0, r.stderr + r.stdout);
+    assert.equal(r.exit, 0, JSON.stringify(r.json && r.json.checks.map((c) => [c.status, c.summary, c.findings])));
     const rg = r.json.checks.find((c) => c.id === 'CK-REDGREEN');
     assert.equal(rg.status, 'pass');
     assert.equal(r.json.red_green.pairs.length, 1);
