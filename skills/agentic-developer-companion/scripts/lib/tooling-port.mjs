@@ -489,7 +489,7 @@ export function classifyArtifact(relPath) {
   if (/(^|\/)\.github\/prompts\/.+\.prompt\.md$/.test(p)) return { kind: 'prompt', host: 'copilot', hosts: ['copilot'] };
   if (/(^|\/)\.github\/chatmodes\/.+\.chatmode\.md$/.test(p)) return { kind: 'chatmode', host: 'copilot', hosts: ['copilot'] };
   if (/(^|\/)\.claude\/commands\/.+\.md$/.test(p)) return { kind: 'command', host: 'claude', hosts: ['claude', 'copilot'] };
-  if ((m = /^(?:(.*?)\/)?((?:\.github|\.agents|\.claude|\.codex)\/skills|skills)\/([^/]+)\/(.+)$/.exec(p))) {
+  if ((m = /^(?:(.*)\/)?((?:\.github|\.agents|\.claude|\.codex)\/skills)\/([^/]+)\/(.+)$/.exec(p)) || (m = /^(?:(.*)\/)?(skills)\/([^/]+)\/(.+)$/.exec(p))) {
     const loc = skillDirHosts(m[2]);
     if (m[4] === 'SKILL.md') return { kind: 'skill', ...loc, name: m[3], dir: [m[1], m[2], m[3]].filter(Boolean).join('/') };
     if (/\.md$/i.test(m[4])) return { kind: 'skill-file', ...loc, name: m[3], dir: [m[1], m[2], m[3]].filter(Boolean).join('/') };

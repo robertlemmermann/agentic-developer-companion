@@ -591,6 +591,7 @@ export function renderTraceMarkdown(m) {
 // ---------------------------------------------------------------------------
 // CLI
 
+/** `trace --spec <file|-|url>` (skeleton) or `trace --matrix <file>` (evaluation). */
 export const traceCommand = defineCommand({
   name: 'trace',
   usage: [

@@ -858,7 +858,7 @@ function goModuleOf(dir) {
  * Clean run of the snapshot (§9.1 step 11). Returns
  * `{ tree_digest, base, projects[], status, red_green?, checks[] }` with one CK-CLEANRUN check per project.
  */
-export async function cleanRun({ target, detectResult = null, noInstall = false, runner = null, allProjects = false, baseCountsFile = null, noBase = false, keep = false, redGreen = null, waivers, firedChecks, timeoutS = DEFAULT_TIMEOUT_S, dryRun = false } = {}) {
+export async function cleanRun({ target, detectResult = null, noInstall = false, runner = null, allProjects = false, baseCountsFile = null, noBase = false, keep = false, redGreen = null, waivers, firedChecks, timeoutS = DEFAULT_TIMEOUT_S, dryRun = false, detectFn = null } = {}) {
   const root = target.root;
   const tree = target.snapshot.tree;
   await loadMarkers();
@@ -885,7 +885,7 @@ export async function cleanRun({ target, detectResult = null, noInstall = false,
   }
   const targets = affected.length ? affected : projects.slice(0, 1);
   for (const project of targets) {
-    out.projects.push(await cleanRunProject({ target, project, runnerOpt: runner, noInstall, baseCountsFile, noBase, keep, timeoutMs, waived, fired, dryRun }));
+    out.projects.push(await cleanRunProject({ target, project, runnerOpt: runner, noInstall, baseCountsFile, noBase, keep, timeoutMs, waived, fired, dryRun, detectFn }));
   }
   out.status = worstStatus(out.projects.map((p) => p.status));
   out.checks = out.projects.map((p) => p.check);
@@ -900,11 +900,11 @@ export async function cleanRun({ target, detectResult = null, noInstall = false,
   return out;
 }
 
-async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCountsFile, noBase, keep, timeoutMs, waived, fired, dryRun }) {
+async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCountsFile, noBase, keep, timeoutMs, waived, fired, dryRun, detectFn }) {
   const root = target.root;
   const tree = target.snapshot.tree;
   const slug = projectSlug(project.root);
-  const prow = { root: toPosix(project.root || '.'), worktree: null, install: null, run: null, base_counts: null, delta: null, report_path: null, log_path: null, status: 'unverified', reason: null };
+  const prow = { root: toPosix(project.root || '.'), worktree: null, kept: Boolean(keep), install: null, run: null, base_counts: null, delta: null, report_path: null, log_path: null, status: 'unverified', reason: null };
   const runner = resolveRunner(project, runnerOpt);
   if (!runner) {
     prow.reason = 'NO_RUNNER';
@@ -938,7 +938,7 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
 
   // Base counts.
   let base = null;
-  if (!noBase) base = await baseCounts({ target, project, runner, slug, baseCountsFile, noInstall, timeoutMs, outRoot, keep });
+  if (!noBase) base = await baseCounts({ target, project, runner, slug, baseCountsFile, noInstall, timeoutMs, outRoot, keep, detectFn });
   prow.base_counts = base ? { ...pickCounts(base), source: base.source, ...(base.cmd ? { cmd: base.cmd } : {}), ...(base.status ? { status: base.status } : {}) } : (noBase ? { source: 'none', reason: '--no-base' } : null);
   const baseOk = base && Number.isFinite(base.executed) ? base : null;
   if (baseOk && runRec.counts) {
@@ -985,7 +985,7 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   return prow;
 }
 
-async function baseCounts({ target, project, runner, slug, baseCountsFile, noInstall, timeoutMs, outRoot, keep }) {
+async function baseCounts({ target, project, runner, slug, baseCountsFile, noInstall, timeoutMs, outRoot, keep, detectFn }) {
   const root = target.root;
   const sha = target.base.sha;
   if (baseCountsFile) {
@@ -1001,7 +1001,7 @@ async function baseCounts({ target, project, runner, slug, baseCountsFile, noIns
   // The base runs its own command (a narrowed test script in the snapshot must not narrow the base).
   let baseRunner = runner;
   try {
-    const bdet = await loadDetect(baseWt.dir, null);
+    const bdet = detectFn ? await detectFn(baseWt.dir) : await loadDetect(baseWt.dir, null);
     const bp = (bdet.projects || []).find((p) => toPosix(p.root || '.') === toPosix(project.root || '.'));
     const br = bp ? resolveRunner(bp, runner.source === '--runner' && runner.name === 'custom' ? runner.cmd : runner.name) : null;
     if (br) baseRunner = br;

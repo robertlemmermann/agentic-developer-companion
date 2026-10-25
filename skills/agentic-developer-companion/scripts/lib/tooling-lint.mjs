@@ -179,7 +179,7 @@ export const RULES = Object.freeze([
   R('HK-CP-PS-COMPAT', 'hooks', 'copilot=warning', 'The powershell string also runs under Windows PowerShell 5.1 (no && or ||)', 'cp-hooks-howto'),
   R('HK-CP-EXEC-MIX', 'hooks', 'copilot=error', '`exec` is not combined with bash, powershell or command', 'cp-hooks'),
   R('HK-CP-EXEC', 'hooks', 'copilot=warning', '`exec`/`args` run only in Copilot CLI (not the cloud agent or VS Code)', 'cp-hooks'),
-  R('HK-CP-TIMEOUT', 'hooks', 'copilot=warning', '`timeoutSec` is set and at most 30; not combined with `timeout`', 'cp-hooks'),
+  R('HK-CP-TIMEOUT', 'hooks', 'copilot=warning', '`timeoutSec` at most 30 and not combined with `timeout`; a missing one is a note (warning with --strict)', 'cp-hooks'),
   R('HK-CP-TIMEOUT-TYPE', 'hooks', 'copilot=error', '`timeoutSec` is a positive number', 'cp-hooks'),
   R('HK-CP-MATCHER', 'hooks', 'copilot=error', '`matcher` compiles as a regular expression (an invalid one skips the hook)', 'cp-hooks'),
   R('HK-CP-ASK', 'hooks', 'copilot=warning', 'No permissionDecision "ask" (it becomes deny in the cloud agent and autopilot)', 'cp-hooks'),
@@ -246,15 +246,15 @@ export const RULES = Object.freeze([
   R('MK-JSON', 'marketplace', 'copilot=error claude=error codex=error', 'The marketplace manifest is valid JSON', 'cl-mkt cp-plugins cx-plugins'),
   R('MK-SHAPE', 'marketplace', 'copilot=error claude=error codex=error', 'A marketplace has name, owner.name (Copilot, Claude) and plugins[]', 'cl-mkt cp-plugins cx-plugins'),
   R('MK-NAME-RESERVED', 'marketplace', 'claude=error', 'The marketplace name is not reserved', 'cl-mkt'),
-  R('MK-ENTRY', 'marketplace', 'copilot=error claude=error codex=error', 'Entries have name and source; relative sources start with ./ and never use ..', 'cl-mkt cp-plugins cx-plugins'),
-  R('MK-UNPINNED', 'marketplace', 'copilot=warning claude=warning codex=warning', 'Remote sources are pinned (40-character sha, npm version or archive sha256)', 'cp-plugins cl-mkt anti-patterns'),
+  R('MK-ENTRY', 'marketplace', 'copilot=error claude=error codex=error', 'Entries have name and source; relative sources never use .. (and start with ./ for Claude)', 'cl-mkt cp-plugins cx-plugins'),
+  R('MK-UNPINNED', 'marketplace', 'copilot=note claude=note codex=note', 'Remote sources are pinned (40-character sha, npm version or archive sha256); a warning with --strict', 'cp-plugins cl-mkt anti-patterns', { strict: Object.freeze({ copilot: 'warning', claude: 'warning', codex: 'warning' }) }),
   R('MK-HOOKS-PATH', 'marketplace', 'claude=error', 'Marketplace entries inline hooks as an object (paths are not supported)', 'cl-mkt'),
   R('MK-FIELD', 'marketplace', 'claude=warning copilot=warning', 'Marketplaces use only documented top-level keys', 'cl-mkt cp-plugins'),
   // MCP
   R('MC-JSON', 'mcp', 'copilot=error claude=error codex=error', 'The MCP config is valid JSON (JSONC only in .vscode/mcp.json)', 'cp-mcp vsc-mcp'),
   R('MC-TOPKEY', 'mcp', 'copilot=error claude=error', 'The top-level key matches the host: mcpServers (.mcp.json, Copilot CLI, Claude) or servers (.vscode/mcp.json)', 'cp-mcp vsc-mcp'),
   R('MC-SERVER', 'mcp', 'copilot=error claude=error codex=error', 'A local server has a command, a remote one a url, and the type is valid for the host', 'cp-mcp vsc-mcp ap-spec'),
-  R('MC-INPUT', 'mcp', 'copilot=warning claude=warning', '${input:...} prompts are VS Code-only (not forwarded to the Copilot harness, literal elsewhere)', 'vsc-mcp'),
+  R('MC-INPUT', 'mcp', 'copilot=warning claude=warning', '${input:...} is literal outside .vscode/mcp.json (a note there: not forwarded to the Copilot harness)', 'vsc-mcp'),
   R('MC-VSCODE-CLI', 'mcp', 'copilot=note', 'Copilot CLI does not read .vscode/mcp.json (use .mcp.json)', 'cp-mcp'),
   R('MC-HTTP', 'mcp', 'copilot=warning claude=warning', 'Remote servers use https unless they are on loopback', 'cl-validate'),
   R('MC-CLOUD', 'mcp', 'copilot=note', 'Cloud-agent MCP JSON needs `type` and `tools` on every server', 'cp-mcp'),
@@ -826,7 +826,7 @@ export function classifyToolingPath(absPath, { root = null, env = process.env, h
   const H = homeDirs(env, home);
   const userScope = under(abs, H.home) && (under(abs, H.copilot) || under(abs, H.claude) || under(abs, H.codex) ||
     under(abs, `${H.home}/.agents`));
-  const scope = userScope && !(root && under(abs, toPosix(path.resolve(root)))) ? 'user' : 'project';
+  const scope = userScope ? 'user' : 'project';
   const has = (re) => re.test(abs);
   const pluginRoot = (marker) => findUp(path.dirname(absPath), marker, root);
   const res = (kind, sub, reads, extra = {}) => ({ kind, sub, scope, reads, ...extra });
@@ -872,11 +872,12 @@ export function classifyToolingPath(absPath, { root = null, env = process.env, h
   }
   if (has(/(?:^|\/)\.claude-plugin\/plugin\.json$/)) return res('plugin', 'claude', ['claude', 'copilot']);
   if (has(/(?:^|\/)\.codex-plugin\/plugin\.json$/)) return res('plugin', 'codex', ['codex']);
-  if (b === 'plugin.json' && (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/plugin\.json$/) || sniff ||
-      fs.existsSync(path.join(path.dirname(absPath), 'skills')))) {
+  if (b === 'plugin.json') {
     const data = parseJson(readTextNormalized(absPath) || '').value;
     if (isObj(data) && typeof data.$schema === 'string' && /agent-plugins\.org/.test(data.$schema)) return res('plugin', 'agent-plugins', ['copilot', 'codex']);
-    return res('plugin', 'copilot', ['copilot']);
+    if (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/plugin\.json$/) || sniff || fs.existsSync(path.join(path.dirname(absPath), 'skills'))) {
+      return res('plugin', 'copilot', ['copilot']);
+    }
   }
   if (has(/(?:^|\/)\.claude-plugin\/marketplace\.json$/)) return res('marketplace', 'claude', ['claude', 'copilot', 'codex']);
   if (has(/(?:^|\/)\.agents\/plugins\/(?:api_)?marketplace\.json$/)) return res('marketplace', 'codex', ['codex']);
@@ -968,7 +969,7 @@ class FileLint {
   }
 
   /** Record a finding for every selected host the rule applies to (`only` narrows the hosts). */
-  emit(id, { line = null, message, field, evidence, only, severity } = {}) {
+  emit(id, { line = null, message, field, evidence, only, severity, strictSeverity } = {}) {
     const rule = RULE_INDEX.get(id);
     if (!rule) throw new Error(`unknown lint rule ${id}`);
     for (const [host, defSev] of Object.entries(rule.hosts)) {
@@ -977,6 +978,7 @@ class FileLint {
       if (!r) continue;
       let sev = severity && typeof severity === 'object' ? (severity[host] || defSev) : (severity || defSev);
       if (this.run.strict && rule.strict && rule.strict[host]) sev = rule.strict[host];
+      if (this.run.strict && strictSeverity) sev = typeof strictSeverity === 'object' ? (strictSeverity[host] || sev) : strictSeverity;
       const msg = typeof message === 'function' ? message(host) : (message || rule.title);
       const key = `${host}|${id}|${line}|${msg}`;
       if (this.seen.has(key)) continue;
@@ -1683,7 +1685,7 @@ function lintCopilotEntry(fl, event, e, line, cloudVisible, nested) {
   if (e.timeoutSec !== undefined && !(typeof e.timeoutSec === 'number' && e.timeoutSec > 0)) {
     fl.emit('HK-CP-TIMEOUT-TYPE', { line, message: `${event}: timeoutSec must be a positive number` });
   }
-  if (e.timeoutSec === undefined && e.timeout === undefined) fl.emit('HK-CP-TIMEOUT', { line, message: `${event}: no timeoutSec (Copilot waits up to 30 s; set it explicitly)` });
+  if (e.timeoutSec === undefined && e.timeout === undefined) fl.emit('HK-CP-TIMEOUT', { line, severity: 'note', strictSeverity: 'warning', message: `${event}: no timeoutSec (Copilot waits up to 30 s; set it explicitly)` });
   if (e.timeoutSec !== undefined && e.timeout !== undefined) fl.emit('HK-CP-TIMEOUT', { line, message: `${event}: both timeoutSec and timeout (VS Code Local reads them in the opposite order)` });
   const eff = typeof e.timeoutSec === 'number' ? e.timeoutSec : typeof e.timeout === 'number' ? e.timeout : null;
   if (eff !== null && eff > 30) fl.emit('HK-CP-TIMEOUT', { line, message: `${event}: timeout ${eff} s is above 30 s` });
@@ -2074,7 +2076,7 @@ async function lintMarketplace(fl) {
     if (!isObj(entry) || typeof entry.name !== 'string' || entry.source === undefined) { fl.emit('MK-ENTRY', { line, message: `plugins[${i}] needs "name" and "source"` }); return; }
     const src = entry.source;
     if (typeof src === 'string') {
-      if (!(src === '.' || src === './' || src.startsWith('./'))) fl.emit('MK-ENTRY', { line, message: `${entry.name}: relative source "${src}" must start with ./` });
+      if (sub === 'claude' && !(src === '.' || src === './' || src.startsWith('./'))) fl.emit('MK-ENTRY', { only: ['claude'], line, message: `${entry.name}: relative source "${src}" must start with ./` });
       if (src.split('/').includes('..')) fl.emit('MK-ENTRY', { line, message: `${entry.name}: source "${src}" must not use ..` });
     } else if (isObj(src)) {
       if (src.source === 'local' && typeof src.path === 'string' && src.path.split('/').includes('..')) fl.emit('MK-ENTRY', { line, message: `${entry.name}: source path must not use ..` });
@@ -2088,7 +2090,7 @@ const SECRET_KEY = /(?:token|secret|password|passwd|api[_-]?key|apikey|auth|cred
 
 function literalCredential(key, value) {
   if (typeof value !== 'string' || value.length < 8) return false;
-  if (/\$\{|\$[A-Z_]|\{\{|^\$/.test(value) || /^<[^>]+>$/.test(value)) return false;
+  if (/\$\{|\$[A-Z_]|\{\{|^\$/.test(value) || /^<[^>]+>$/.test(value) || /^[A-Z][A-Z0-9_]+$/.test(value)) return false;
   if (/^(?:Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{12,}$/i.test(value)) return true;
   return SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(value) && /\d/.test(value) && /[A-Za-z]/.test(value);
 }
@@ -2108,7 +2110,7 @@ async function mcpServerChecks(fl, name, s, text, { sub, hostTypes }) {
     } catch { fl.emit('MC-SERVER', { line, message: `server "${name}": invalid url "${s.url}"` }); }
   }
   if (JSON.stringify(s).includes('${input:')) {
-    fl.emit('MC-INPUT', { line, message: sub === 'vscode' ? `server "${name}" uses \${input:...}; VS Code does not forward it to the Copilot harness` : `server "${name}" uses \${input:...}, which only VS Code resolves` });
+    fl.emit('MC-INPUT', { line, severity: sub === 'vscode' ? 'note' : undefined, message: sub === 'vscode' ? `server "${name}" uses \${input:...}; VS Code does not forward it to the Copilot harness` : `server "${name}" uses \${input:...}, which only VS Code resolves` });
   }
   if (sub !== 'vscode' && sub !== 'agent-plugins' && s.tools === undefined) fl.emit('MC-CLOUD', { line, message: `server "${name}" has no "tools" list (required when this JSON is used for the cloud agent)` });
   for (const bag of ['env', 'headers']) {

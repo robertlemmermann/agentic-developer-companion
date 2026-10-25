@@ -272,7 +272,7 @@ test('ledger: secrets and the live token never reach the ledger or its Markdown'
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
   const token = ['hunter2', 'abcXYZ'].join('');
   const prev = process.env.ADC_LIVE_TOKEN;
-  process.env.ADC_LIVE_TOKEN = token;
+  process.env['ADC_LIVE_TOKEN'] = token;
   try {
     const { file } = await ledgerWith(dir, [ck('CK-SECRETS', 'fail', {
       summary: `found ${AWS_KEY()} and ${token}`, findings: [{ severity: 'fail', file: 'x.js', line: 1, message: 'key', evidence: `k=${AWS_KEY()}` }],

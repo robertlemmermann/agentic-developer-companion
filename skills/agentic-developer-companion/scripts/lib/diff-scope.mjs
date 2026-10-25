@@ -346,7 +346,10 @@ function checkAssertions(S) {
     for (const h of M.scanText(headL, M.TAUTOLOGIES, { file: f.path, lines: added })) {
       S.add('CK-ASSERT', 'finding', f.path, h.line, 'assertion that can never fail', h.text, { rule: h.id });
     }
+    const swallowLines = new Set();
     for (const h of newHits(S, f, [M.ASSERTION_SWALLOW, M.SWALLOW_PATTERNS])) {
+      if (swallowLines.has(h.line)) continue;
+      swallowLines.add(h.line);
       S.add('CK-ASSERT', 'finding', f.path, h.line, 'error handling in a test can swallow assertion failures', h.text, { rule: h.id });
     }
     if (f.status === 'A' || !oldTest) {
@@ -549,13 +552,14 @@ function relevantCfgKey(file, lines, idx) {
 
 function checkTestConfig(S) {
   let touched = 0;
+  let ciChanges = 0;
   for (const f of S.files) {
     const file = f.status === 'D' ? f.old_path : f.path;
     const base = path.posix.basename(file).toLowerCase();
     const isRunnerCfg = M.classifyPath(file).runnerConfig;
     const isCi = M.classifyPath(file).ci;
     if (!isRunnerCfg && !isCi) continue;
-    if (isCi) { ciTestCommands(S, f); continue; }
+    if (isCi) { ciChanges += ciTestCommands(S, f); continue; }
     if (base === 'package.json') { packageJsonTestConfig(S, f); continue; }
     const headL = f.status === 'D' ? [] : sideLines(S, f, 'head');
     const baseL = f.status === 'A' ? [] : sideLines(S, f, 'base');
@@ -602,7 +606,7 @@ function checkTestConfig(S) {
         first.text, { side: g.added[0] ? 'head' : 'base' });
     }
   }
-  S.summaries['CK-TEST-CFG'] = `${touched} runner configuration file(s) with discovery or failure-handling changes`;
+  S.summaries['CK-TEST-CFG'] = `${touched} runner configuration file(s) with discovery or failure-handling changes; ${ciChanges} CI test command change(s)`;
 }
 
 function packageJsonTestConfig(S, f) {
@@ -645,7 +649,8 @@ function packageJsonTestConfig(S, f) {
 
 /** CI files: changed test commands go to CK-TEST-CFG (CK-CI handles weakening and removals). */
 function ciTestCommands(S, f) {
-  if (f.status !== 'M' && f.status !== 'R') return;
+  if (f.status !== 'M' && f.status !== 'R') return 0;
+  let n = 0;
   const removed = f.removed.filter((x) => TEST_COMMAND.test(x.text));
   const added = f.added.filter((x) => TEST_COMMAND.test(x.text));
   const pairs = Math.min(removed.length, added.length);
@@ -654,10 +659,14 @@ function ciTestCommands(S, f) {
   for (let i = 0; i < Math.min(pairs, unmatchedRemoved.length, unmatchedAdded.length); i++) {
     const b = unmatchedRemoved[i].text;
     const a = unmatchedAdded[i].text;
+    // Failure-masking edits (|| true, --passWithNoTests, ...) are CK-CI's; report each edit once.
+    if (M.scanText([a], M.CI_WEAKENING).length) continue;
     const why = narrowsCommand(b, a);
+    n++;
     S.add('CK-TEST-CFG', why ? 'fail' : 'finding', f.path, unmatchedAdded[i].line,
       `CI test command changed: "${truncate(norm(b), 80)}" -> "${truncate(norm(a), 80)}"${why ? ` (${why})` : ''}`, a);
   }
+  return n;
 }
 
 // ---------------------------------------------------------------------------

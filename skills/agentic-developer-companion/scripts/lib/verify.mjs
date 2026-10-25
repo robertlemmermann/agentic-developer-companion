@@ -23,7 +23,9 @@ const DIFF_SCOPE_IDS = ['CK-SCOPE', 'CK-TEST-DEL', 'CK-SKIP', 'CK-ASSERT', 'CK-T
 /**
  * The scripted steps, in order. Each entry names the module (relative to this file) and export to
  * import, the check ids it must produce, and how to call it with the shared state `s`.
- * `needsDetect` steps are not called when detection failed; `when` false records them `skipped`.
+ * When detection fails the steps still run with `detectResult: null` (the QA modules fall back to
+ * their own detection); a step marked `needsDetect` is recorded `unverified` instead. A `when`
+ * that returns false records the step's checks as `skipped`.
  */
 export const DEFAULT_STEPS = Object.freeze([
   { name: 'detect', step: '1', module: './detect.mjs', export: 'detect', ids: [], kind: 'detect',
@@ -32,20 +34,22 @@ export const DEFAULT_STEPS = Object.freeze([
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, specPaths: s.specPaths, allow: s.opts.allow }) },
   { name: 'deps-check', step: '9', module: './deps.mjs', export: 'depsCheck', ids: ['CK-DEPS', 'CK-LOCK'],
     call: (fn, s) => fn({ target: s.target, offline: s.opts.offline }) },
-  { name: 'typecheck', step: '10', module: './clean-run.mjs', export: 'typecheck', ids: ['CK-TYPES'], needsDetect: true,
+  { name: 'typecheck', step: '10', module: './clean-run.mjs', export: 'typecheck', ids: ['CK-TYPES'],
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, strict: false, runner: s.opts.runner }) },
-  { name: 'clean-run', step: '11', module: './clean-run.mjs', export: 'cleanRun', ids: ['CK-CLEANRUN'], needsDetect: true,
+  { name: 'clean-run', step: '11', module: './clean-run.mjs', export: 'cleanRun', ids: ['CK-CLEANRUN'],
     call: (fn, s) => fn({
       target: s.target, detectResult: s.detectResult, noInstall: s.opts.noInstall, runner: s.opts.runner,
       allProjects: s.opts.allProjects, baseCountsFile: s.opts.baseCounts, noBase: s.opts.noBase, keep: s.opts.keep,
+      // §9.1.1: the skip-increase and shortfall rules depend on what diff-scope found; no waivers exist yet.
+      firedChecks: s.fired(), waivers: [],
     }) },
-  { name: 'coverage-delta', step: '12', module: './probes.mjs', export: 'coverageDelta', ids: ['CK-COVERAGE'], needsDetect: true,
+  { name: 'coverage-delta', step: '12', module: './probes.mjs', export: 'coverageDelta', ids: ['CK-COVERAGE'],
     when: (o) => !o.quick, skipReason: 'QUICK', skipSummary: 'skipped by --quick',
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, failUnder: s.opts.failUnder, report: null }) },
-  { name: 'mutation-scope', step: '13', module: './probes.mjs', export: 'mutationScope', ids: ['CK-MUTATION'], needsDetect: true,
+  { name: 'mutation-scope', step: '13', module: './probes.mjs', export: 'mutationScope', ids: ['CK-MUTATION'],
     when: (o) => o.deep, skipReason: 'NOT_REQUESTED', skipSummary: 'mutation testing runs with --deep',
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, budgetMin: s.opts.budgetMin }) },
-  { name: 'flake-probe', step: '14', module: './probes.mjs', export: 'flakeProbe', ids: ['CK-FLAKE'], needsDetect: true,
+  { name: 'flake-probe', step: '14', module: './probes.mjs', export: 'flakeProbe', ids: ['CK-FLAKE'],
     when: (o) => o.deep, skipReason: 'NOT_REQUESTED', skipSummary: 'the flake probe runs with --deep',
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, times: s.opts.times, tests: null }) },
   { name: 'trace', step: '15', module: './trace.mjs', export: 'trace', ids: ['CK-TRACE'], kind: 'trace',
@@ -275,6 +279,7 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
     detectError: null, ledgerFile, ledgerRef, traceMatrix: null,
   };
   const checks = [];
+  s.fired = () => [...new Set(checks.filter((c) => c.status === 'fail' || c.status === 'finding').map((c) => String(c.id).toUpperCase()))];
   const stepLog = [];
   for (const step0 of steps) {
     const step = step0.kind === 'trace' && !step0.after ? { ...step0, after: storeTrace } : step0;
@@ -340,6 +345,7 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
   return { result, exit: finalizeError ? EXIT.UNVERIFIABLE : verdictExit(derived.verdict), summary };
 }
 
+/** `verify`: every scripted step into one ledger (runVerify with the default steps). */
 export const verifyCommand = defineCommand({
   name: 'verify',
   usage: [

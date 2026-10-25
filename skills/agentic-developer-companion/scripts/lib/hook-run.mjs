@@ -593,7 +593,8 @@ export function newestLedger(evidenceDir) {
     const led = readJson(path.join(evidenceDir, s.name), null);
     if (!led || typeof led !== 'object' || Array.isArray(led)) continue;
     if (led.schema && !String(led.schema).startsWith('adc-evidence')) continue;
-    const ts = [led.finalized_at, led.updated_at, led.created_at].find((t) => typeof t === 'string' && !Number.isNaN(Date.parse(t)))
+    // created_at is when verify snapshotted the tree; later `evidence add` calls do not make it fresher.
+    const ts = [led.created_at, led.finalized_at, led.updated_at].find((t) => typeof t === 'string' && !Number.isNaN(Date.parse(t)))
       || new Date(s.mtimeMs).toISOString();
     return { file: s.name, verdict: typeof led.verdict === 'string' ? led.verdict : null, ts, finalized: Boolean(led.finalized_at) };
   }

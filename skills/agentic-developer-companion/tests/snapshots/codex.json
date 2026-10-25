@@ -158,7 +158,9 @@
     "target_file": "<REPO>/.codex/hooks.json",
     "skill_path": "/opt/skills/agentic-developer-companion",
     "node": "node",
-    "warnings": [],
+    "warnings": [
+      ".codex/hooks.json names this machine's skill path (/opt/skills/agentic-developer-companion); keep it uncommitted, since colleagues' copies live elsewhere"
+    ],
     "config": {
       "description": "agentic-developer-companion hooks",
       "hooks": {
@@ -230,7 +232,7 @@
     "skill_path": "/opt/skills/agentic-developer-companion",
     "node": "/opt/node js/bin/node",
     "warnings": [
-      "the Node path contains characters that need quoting (/opt/node js/bin/node); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+      "the Node path needs quoting (/opt/node js/bin/node); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
     ],
     "config": {
       "description": "agentic-developer-companion hooks",
@@ -241,7 +243,7 @@
               {
                 "type": "command",
                 "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
-                "commandWindows": "& \"\\opt\\node js\\bin\\node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
                 "timeout": 10
               }
             ]
@@ -254,7 +256,7 @@
               {
                 "type": "command",
                 "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
-                "commandWindows": "& \"\\opt\\node js\\bin\\node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
                 "timeout": 10
               }
             ]
@@ -265,7 +267,7 @@
               {
                 "type": "command",
                 "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
-                "commandWindows": "& \"\\opt\\node js\\bin\\node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
                 "timeout": 10
               }
             ]
@@ -277,7 +279,7 @@
               {
                 "type": "command",
                 "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
-                "commandWindows": "& \"\\opt\\node js\\bin\\node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
                 "timeout": 10
               }
             ]
@@ -289,7 +291,7 @@
               {
                 "type": "command",
                 "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
-                "commandWindows": "& \"\\opt\\node js\\bin\\node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
                 "timeout": 1
               }
             ]
@@ -303,7 +305,7 @@
     "skill_path": "C:/Users/Dev User/.copilot/skills/agentic-developer-companion",
     "node": "C:/Program Files/nodejs/node.exe",
     "warnings": [
-      "the Node path contains characters that need quoting (C:/Program Files/nodejs/node.exe); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+      "the Node path needs quoting (C:/Program Files/nodejs/node.exe); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
     ],
     "config": {
       "description": "agentic-developer-companion hooks",

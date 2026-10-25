@@ -10,10 +10,8 @@ import {
   writeJsonAtomic, withLock, sha256, nonce, nowIso, stamp, today, toPosix, relPosix, ensureDir, truncate,
   redactLiterals, runShell, generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, tmpRoot,
 } from './core.mjs';
-import { requireRepo, gitTry, git, gitRaw, headSha, gitPath, resolveBase, checkIgnore, createSnapshot } from './git.mjs';
-import {
-  prepareStateDir, prepareTarget, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes,
-} from './state.mjs';
+import { requireRepo, gitTry, git, gitRaw, headSha, gitPath, resolveBase, checkIgnore } from './git.mjs';
+import { prepareStateDir, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes } from './state.mjs';
 import { citationChecker, evaluateMatrix, renderTraceMarkdown, readSpecInput } from './trace.mjs';
 
 export const SCHEMA = 'adc-evidence/1';
@@ -59,29 +57,36 @@ const posixRef = (root, file) => {
 };
 
 // ---------------------------------------------------------------------------
-// Snapshot target (workaround for a foundation issue, reported upstream)
+// Snapshot target: git.createSnapshot / state.prepareTarget with two fixes (reported upstream)
 //
-// git.createSnapshot passes `:(top,exclude).adc` to `git add -A`; Git (2.43 here) exits 1 with
-// "paths are ignored" once `.adc/` is ignored, which prepareStateDir itself arranges. Ignored
-// paths are never added by `git add -A`, so the snapshot is rebuilt without exclude pathspecs
-// for the ignored ones (non-ignored state dirs keep theirs, so no state file is ever hashed),
-// and the state dirs are then removed from the temporary index. Same tree, same guarantees.
+// 1. git.createSnapshot passes `:(top,exclude).adc` to `git add -A`; Git (2.43 here) exits 1 with
+//    "paths are ignored" once `.adc/` is ignored, which prepareStateDir itself arranges. Ignored
+//    paths are never added by `git add -A`, so exclude pathspecs are kept only for state dirs that
+//    are not ignored (no state file is ever hashed) and every state dir is then removed from the
+//    temporary index.
+// 2. Copying the index gives the copy a new mtime. Git trusts the stat data of entries older than
+//    the index file, so a same-size edit made in the timestamp tick of the last index write is
+//    missed ("racy git"; about 4 in 100 snapshots in a tight loop). Backdating the copy keeps Git
+//    re-checking those entries by content.
 
-const IGNORED_PATHSPEC_RE = /paths are ignored by one of your \.gitignore files/i;
 const SNAPSHOT_IDENT = {
   GIT_AUTHOR_NAME: 'agentic-developer-companion', GIT_AUTHOR_EMAIL: 'adc@localhost',
   GIT_COMMITTER_NAME: 'agentic-developer-companion', GIT_COMMITTER_EMAIL: 'adc@localhost',
 };
 
-function snapshotWithIgnoredState(root, exclude) {
+/** Working-tree snapshot (§7.5) as `{ tree, commit, head }`; the user's index and working tree are untouched. */
+export function createQaSnapshot(root, { exclude = ['.adc'] } = {}) {
   const head = headSha(root);
   const tmpIndex = path.join(ensureDir(tmpRoot(root)), `index-${nonce()}`);
   const env = { GIT_INDEX_FILE: tmpIndex };
   const clean = exclude.filter(Boolean).map((p) => toPosix(p).replace(/\/+$/, ''));
   try {
     const realIndex = gitPath(root, 'index');
-    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tmpIndex);
-    else if (head) git(root, ['read-tree', 'HEAD'], { env });
+    if (fs.existsSync(realIndex)) {
+      fs.copyFileSync(realIndex, tmpIndex);
+      const back = new Date(fs.statSync(realIndex).mtimeMs - 2000);
+      fs.utimesSync(tmpIndex, back, back);
+    } else if (head) git(root, ['read-tree', 'HEAD'], { env });
     const keep = clean.filter((p) => !checkIgnore(root, p));
     git(root, ['add', '-A', '--', '.', ...keep.map((p) => `:(top,exclude)${p}`)], { env, timeoutMs: 600_000 });
     for (const p of clean) gitRaw(root, ['rm', '-r', '--cached', '--quiet', '--ignore-unmatch', '--', `:(top)${p}`], { env });
@@ -95,29 +100,12 @@ function snapshotWithIgnoredState(root, exclude) {
   }
 }
 
-const ignoredPathspecError = (err) => err instanceof AdcError && err.code === 'GIT_FAILED' && IGNORED_PATHSPEC_RE.test(err.message);
-
-/** git.createSnapshot, tolerating Git's refusal of an exclude pathspec that names an ignored path. */
-export function createQaSnapshot(root, { exclude = ['.adc'] } = {}) {
-  try {
-    return createSnapshot(root, { exclude });
-  } catch (err) {
-    if (!ignoredPathspecError(err)) throw err;
-    return snapshotWithIgnoredState(root, exclude);
-  }
-}
-
-/** state.prepareTarget with the createQaSnapshot fallback. Returns { root, state, base, snapshot }. */
-export async function prepareQaTarget(ctx, opts = {}) {
-  try {
-    return await prepareTarget(ctx, opts);
-  } catch (err) {
-    if (!ignoredPathspecError(err)) throw err;
-  }
+/** state.prepareTarget built on createQaSnapshot. Returns { root, state, base, snapshot }. */
+export async function prepareQaTarget(ctx, { base = null, snapshot = null, createState = true } = {}) {
   const root = requireRepo(ctx.cwd);
-  const state = prepareStateDir({ ...ctx, cwd: root }, { create: opts.createState !== false });
-  const base = resolveBase(root, opts.base || null);
-  return { root, state, base, snapshot: opts.snapshot || snapshotWithIgnoredState(root, snapshotExcludes(state)) };
+  const state = prepareStateDir({ ...ctx, cwd: root }, { create: createState });
+  const b = resolveBase(root, base);
+  return { root, state, base: b, snapshot: snapshot || createQaSnapshot(root, { exclude: snapshotExcludes(state) }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +139,7 @@ const FALLBACK_SECRET_PATTERNS = [
   { id: 'github-pat', re: new RegExp('\\bgithub' + '_pat_[A-Za-z0-9_]{22,}', 'g') },
   { id: 'slack-token', re: new RegExp('\\bxox[abposr]-[A-Za-z0-9-]{10,}', 'g') },
   { id: 'private-key', re: new RegExp('-----BEGIN [A-Z ]*' + 'PRIVATE KEY-----[\\s\\S]*?(?:-----END [A-Z ]*' + 'PRIVATE KEY-----|$)', 'g') },
-  { id: 'adc-live-token', re: /ADC_LIVE_TOKEN\s*[=:]\s*["']?[^\s"']+/g, replace: 'ADC_LIVE_TOKEN=[REDACTED]' },
+  { id: 'adc-live-token', re: /ADC_LIVE_TOKEN\s*[=:]\s*["']?[^\s"']+/g, replace: 'ADC_LIVE_TOKEN=<redacted>' },
 ];
 let patternCache = null;
 
@@ -368,6 +356,7 @@ export function normalizeCheck(raw, { strict = false } = {}) {
 // ---------------------------------------------------------------------------
 // Ledger files
 
+/** Read and minimally validate a ledger file; throws exit 2 when missing, exit 4 when not a ledger. */
 export function readLedgerFile(file) {
   const text = readText(file);
   if (text == null) throw usageError(`ledger not found: ${toPosix(file)}`);
@@ -379,6 +368,7 @@ export function readLedgerFile(file) {
   return ledger;
 }
 
+/** The generated Markdown next to a ledger. */
 export const markdownPath = (file) => file.replace(/\.json$/, '.md');
 /** Folder for a ledger's artifacts (trace matrix, spec copy, run logs). A subfolder keeps `evidence/*.json` ledger-only. */
 export const artifactsDir = (file) => file.replace(/\.json$/, '');
@@ -1412,6 +1402,7 @@ const scoreCmd = defineCommand({
   },
 });
 
+/** `evidence <init|add|claims|waive|finalize|render|status|score>`. */
 export const evidenceCommand = defineGroup({
   name: 'evidence',
   usage: [

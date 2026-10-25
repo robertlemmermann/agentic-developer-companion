@@ -35,7 +35,8 @@ const clone = (v) => JSON.parse(JSON.stringify(v));
 
 /** Per-host config homes, honoring COPILOT_HOME, CLAUDE_CONFIG_DIR and CODEX_HOME. */
 export function hostHomes({ env = process.env, home = null } = {}) {
-  const h = home || env.HOME || env.USERPROFILE || os.homedir();
+  // Windows hosts use the profile directory; HOME there may be an MSYS path from Git Bash.
+  const h = home || (IS_WINDOWS ? env.USERPROFILE : env.HOME) || os.homedir();
   return {
     copilot: env.COPILOT_HOME ? path.resolve(env.COPILOT_HOME) : path.join(h, '.copilot'),
     claude: env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : path.join(h, '.claude'),
@@ -100,11 +101,14 @@ function skillPathFor(host, scope, skillDir, root, warnings) {
     if (inRepo && inRepo !== '.') return { value: inRepo, relative: true };
     warnings.push(`the skill lives outside this repository (${abs}); this project hooks file references your machine's path, so do not commit it (vendor the skill or use --host copilot-cloud for a committable file)`);
   }
+  if (host === 'codex' && scope === 'project') {
+    warnings.push(`.codex/hooks.json names this machine's skill path (${abs}); keep it uncommitted, since colleagues' copies live elsewhere`);
+  }
   return { value: abs, relative: false };
 }
 
 /** Node invocations per field kind for the bare `node` or an absolute path. */
-function nodeForms(nodePath, warnings) {
+function nodeForms(nodePath, warnings, host, scope) {
   if (!nodePath) {
     return {
       bashTest: 'command -v node >/dev/null 2>&1', bash: 'node',
@@ -113,10 +117,12 @@ function nodeForms(nodePath, warnings) {
     };
   }
   const posix = toPosix(nodePath);
-  const win = posix.replace(/\//g, '\\');
+  const win = winAbs(posix) ? posix.replace(/\//g, '\\') : posix;
   const quoted = needsQuote(posix);
-  if (quoted) warnings.push(`the Node path contains characters that need quoting (${posix}); Codex commandWindows is rendered for a PowerShell launcher (\`& "<node>"\`), which cmd.exe cannot run`);
-  if (portableUnsafe(posix)) warnings.push('the Node path contains $, `, %, ! or a quote; shell-form commands cannot quote it for every shell');
+  const shellForm = host === 'codex' || (host === 'claude' && scope === 'project');
+  if (quoted && host === 'codex') warnings.push(`the Node path needs quoting (${posix}); Codex commandWindows is rendered for a PowerShell launcher (\`& "<node>"\`), which cmd.exe cannot run`);
+  if (quoted && host === 'claude' && scope === 'project') warnings.push(`the Node path needs quoting (${posix}); this shell-form command works in sh and Git Bash but not in PowerShell; prefer user scope (exec form) or a Node path without spaces`);
+  if (shellForm && portableUnsafe(posix)) warnings.push('the Node path contains $, `, %, ! or a quote; shell-form commands cannot quote it for every shell');
   return {
     bashTest: `command -v ${bashQuote(posix)} >/dev/null 2>&1`, bash: bashQuote(posix),
     psTest: `Get-Command ${psQuote(posix)} -ErrorAction SilentlyContinue`, ps: `& ${psQuote(posix)}`,
@@ -170,7 +176,12 @@ export function renderHooks({ host, scope = null, level = 'advise', nodePath = n
   if (sc === 'project' && !root) throw envError('NOT_A_REPO', 'project scope needs a Git repository (run inside it or pass --cwd)');
   const warnings = [];
   const skill = skillPathFor(host, sc, skillDir, root, warnings);
-  const node = nodeForms(nodePath, warnings);
+  let np = nodePath;
+  if (np && host === 'copilot-cloud') {
+    warnings.push('--node-path is ignored for copilot-cloud: a committed file must not name one machine\'s Node; the cloud agent and colleagues use the node on PATH');
+    np = null;
+  }
+  const node = nodeForms(np, warnings, host, sc);
   const script = `${skill.value}/scripts/adc.mjs`;
   if (/["$`%!]/.test(script) && (host === 'codex' || (host === 'claude' && sc === 'project'))) {
     warnings.push('the skill path contains $, `, %, ! or a quote; shell-form commands for this host cannot quote it for every shell');
@@ -496,20 +507,25 @@ export function listRegisteredHooks({ root = null, env = process.env, home = nul
     const stopSpec = found.find((f) => f.spec && f.spec.event === 'stop');
     const level = handlerEvents.includes('pre-guard') ? 'guard' : (stopSpec && stopSpec.spec.level) || 'advise';
     let matches = null;
+    const resolveSkill = (p) => (path.isAbsolute(p) || winAbs(p) || !root ? p : path.join(root, p));
     try {
+      // Compare with a fresh render for the same copy, level and Node: drift means the template
+      // or the entries changed since registration.
       const nodeGuess = nodeOf(found[0].entry);
       const scope = host === 'copilot-cloud' ? 'project' : cand.scope;
-      const fresh = renderHooks({ host, scope, level, nodePath: nodeGuess, skillDir, root, env, home });
+      const fresh = renderHooks({ host, scope, level, nodePath: nodeGuess, skillDir: skillPaths[0] ? resolveSkill(skillPaths[0]) : skillDir, root, env, home });
       const want = ourEntriesIn(fresh.config, cand.shape).map((f) => JSON.stringify([f.host_event, f.entry])).sort();
       const have = found.map((f) => JSON.stringify([f.host_event, f.entry])).sort();
       matches = want.length === have.length && want.every((w, i) => w === have[i]);
     } catch { matches = null; }
     const recorded = records.some((r) => r.file === toPosix(cand.file));
+    const here = toPosix(path.resolve(skillDir));
     out.push({
       host, scope: cand.scope, file: toPosix(cand.file),
       events: [...new Set(found.map((f) => f.host_event))],
       handlers: [...new Set(handlerEvents)],
       level, skill_paths: skillPaths, recorded, present: true, matches_current: matches,
+      this_copy: skillPaths.length > 0 && skillPaths.every((p) => toPosix(path.resolve(resolveSkill(p))) === here),
     });
   }
   for (const r of records) {

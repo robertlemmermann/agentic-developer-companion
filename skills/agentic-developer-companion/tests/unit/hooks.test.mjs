@@ -2,7 +2,7 @@
 // by the fixture files through `adc.mjs hook-run` (directly and through the rendered pwsh / sh /
 // exec-form launchers), fail-open behavior with missing, crashing and too-old Node, rendering
 // snapshots, and registration (merge, backup, record, list, remove) including the CLI.
-import { test, after } from 'node:test';
+import { describe, test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -426,10 +426,13 @@ const FIXTURE_FILES = ['copilot-camel', 'copilot-pascal', 'copilot-cloud', 'clau
 const NO_GIT_ROOT = hookRun.findRepo(os.tmpdir()) == null;
 
 for (const file of FIXTURE_FILES) {
-  for (const c of loadFixtures(file)) {
-    const skip = c.setup && c.setup.no_git && !NO_GIT_ROOT ? 'the OS temp dir is inside a git work tree' : false;
-    test(`fixture ${file}: ${c.name}`, { skip }, () => runCase(c, 'direct'));
-  }
+  // Cases are independent (one fresh repository each), so a file's cases run concurrently.
+  describe(`fixtures ${file}.json through adc.mjs hook-run`, { concurrency: POOL }, () => {
+    for (const c of loadFixtures(file)) {
+      const skip = c.setup && c.setup.no_git && !NO_GIT_ROOT ? 'the OS temp dir is inside a git work tree' : false;
+      test(c.name, { skip }, () => runCase(c, 'direct'));
+    }
+  });
 }
 
 /** Every case of a fixture file through a host launcher, in parallel; failures are reported together. */
@@ -836,6 +839,9 @@ test('listRegisteredHooks reports host, scope, level and drift; removeHooks dele
   assert.ok(by('codex').handlers.includes('pre-guard'));
   assert.equal(by('copilot-cloud').scope, 'project');
   assert.deepEqual(by('copilot-cloud').skill_paths, ['.github/skills/agentic-developer-companion']);
+  assert.equal(by('copilot-cloud').matches_current, true);
+  assert.equal(by('copilot-cloud').this_copy, false, 'the vendored copy is not the running one');
+  assert.equal(by('copilot').this_copy, true);
   assert.ok(list.every((x) => x.recorded && x.present));
   // Drift: an edited command no longer matches the current render.
   const cfile = path.join(home, '.copilot', 'hooks', 'agentic-developer-companion.json');

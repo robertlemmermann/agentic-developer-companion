@@ -165,9 +165,7 @@
     "target_file": "/home/dev/.copilot/hooks/agentic-developer-companion.json",
     "skill_path": "/opt/skills/agentic-developer-companion",
     "node": "/opt/node js/bin/node",
-    "warnings": [
-      "the Node path contains characters that need quoting (/opt/node js/bin/node); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
-    ],
+    "warnings": [],
     "config": {
       "version": 1,
       "hooks": {
@@ -218,9 +216,7 @@
     "target_file": "/home/dev/.copilot/hooks/agentic-developer-companion.json",
     "skill_path": "C:/Users/Dev User/.copilot/skills/agentic-developer-companion",
     "node": "C:/Program Files/nodejs/node.exe",
-    "warnings": [
-      "the Node path contains characters that need quoting (C:/Program Files/nodejs/node.exe); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
-    ],
+    "warnings": [],
     "config": {
       "version": 1,
       "hooks": {
