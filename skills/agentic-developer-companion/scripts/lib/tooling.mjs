@@ -1234,16 +1234,44 @@ function renderContext(root, rel, cls) {
   return text;
 }
 
+/** Replace machine-specific paths so snapshots from two runs diff cleanly. */
+function scrubPaths(text, root) {
+  let out = String(text || '');
+  const home = os.homedir();
+  const codexHome = process.env.CODEX_HOME || path.join(home, '.codex');
+  for (const [p, label] of [[root, '<repo>'], [codexHome, '<codex-home>'], [home, '~']]) {
+    for (const v of new Set([p, toPosix(p), realOrResolved(p), toPosix(realOrResolved(p))])) if (v && v.length > 1) out = out.split(v).join(label);
+  }
+  return out;
+}
+
+/**
+ * Rendered-context snapshots from the hosts' own free, sign-in-free commands (§11.6 step 1):
+ * `skills-ref to-prompt`, `copilot instruction list --json` / `copilot skill list --json`, and the
+ * skills and AGENTS.md parts of `codex debug prompt-input`. Run with --external.
+ */
 function externalSnapshots(root, rel, cls) {
   const out = [];
   const abs = absOf(root, rel);
+  const skillDir = fs.statSync(abs).isDirectory() ? abs : path.dirname(abs);
   if (cls.kind === 'skill' && which('skills-ref')) {
-    const r = run('skills-ref', ['to-prompt', fs.statSync(abs).isDirectory() ? abs : path.dirname(abs)], { timeoutMs: 30_000 });
-    out.push({ name: 'skills-ref to-prompt', exit: r.exit, output: truncate(r.stdout || r.stderr, 200_000) });
+    const r = run('skills-ref', ['to-prompt', skillDir], { timeoutMs: 30_000 });
+    out.push({ name: 'skills-ref to-prompt', exit: r.exit, output: truncate(scrubPaths(r.stdout || r.stderr, root), 200_000) });
   }
-  if (['instructions', 'scoped'].includes(cls.kind) && which('copilot')) {
-    const r = run('copilot', ['instruction', 'list', '--json'], { cwd: root, timeoutMs: 30_000, env: { ...process.env, COPILOT_AUTO_UPDATE: 'false' } });
-    out.push({ name: 'copilot instruction list --json', exit: r.exit, output: truncate(r.stdout || r.stderr, 200_000) });
+  const copilot = hostCli('copilot');
+  const sub = ['instructions', 'scoped'].includes(cls.kind) ? 'instruction' : cls.kind === 'skill' ? 'skill' : null;
+  if (copilot && sub) {
+    const r = runCli(copilot, [sub, 'list', '--json'], { cwd: root, timeoutMs: 60_000, env: { ...process.env, COPILOT_AUTO_UPDATE: 'false' } });
+    const rows = firstJson(r.stdout);
+    const kept = Array.isArray(rows) ? rows.filter((x) => x && x.source !== 'builtin') : null;
+    out.push({ name: `copilot ${sub} list --json`, exit: r.exit, output: kept ? scrubPaths(JSON.stringify(kept, null, 2), root) : truncate(r.stderr || r.stdout, 2000) });
+  }
+  const codex = hostCli('codex');
+  if (codex && ['skill', 'instructions', 'scoped'].includes(cls.kind)) {
+    const r = runCli(codex, ['debug', 'prompt-input', 'hello'], { cwd: root, timeoutMs: 60_000 });
+    const texts = [];
+    walkJson(firstJson(r.stdout), (o) => { if (typeof o.text === 'string' && (/^<skills_instructions>/.test(o.text) || /^# AGENTS\.md instructions/.test(o.text))) texts.push(o.text); });
+    out.push({ name: 'codex debug prompt-input (skills and AGENTS.md)', exit: r.exit, output: texts.length ? scrubPaths(texts.join('\n\n'), root) : truncate(r.stderr || r.stdout, 2000) });
   }
   return out;
 }
@@ -1384,6 +1412,13 @@ export function compareMeasurements(before, after, { note = null } = {}) {
   deltas.hosts = { before: before.hosts || [], after: after.hosts || [], lost, gained };
   if (lost.length) failing.push(`portability: no longer loads in ${lost.join(', ')}`);
   deltas.context = lineDiff(before.context ?? '', after.context ?? '');
+  // Host-rendered context (with --external): informational, like the golden transcripts.
+  const ext = {};
+  for (const a of after.external || []) {
+    const b = (before.external || []).find((x) => x.name === a.name);
+    if (b && typeof b.output === 'string') ext[a.name] = lineDiff(b.output, a.output || '');
+  }
+  if (Object.keys(ext).length) deltas.external = ext;
   const verdict = failing.length ? 'reject' : unverified.length ? 'unverified' : 'accept';
   return { verdict, failing, unverified, deltas };
 }
@@ -1547,6 +1582,7 @@ async function modifyRun(ctx, verb, values, p) {
   const base = latestBaseline(state.dir, rel);
   if (!base || !base.doc) throw usageError(`no baseline for ${rel}; run: tooling modify baseline ${rel}`);
   base.doc.context = readText(path.join(base.dir, 'context.txt'), '');
+  base.doc.external = (base.doc.external || []).map((e, k) => ({ ...e, output: readText(path.join(base.dir, `external-${k}.txt`), '') }));
   if (!common.triggerHost && base.doc.trigger?.host) common.triggerHost = base.doc.trigger.host;
   if (verb === 'restore') {
     const restored = [];
