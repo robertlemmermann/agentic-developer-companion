@@ -1,0 +1,611 @@
+[
+  {
+    "name": "SessionStart: nested additionalContext",
+    "event": "session-start",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "SessionStart",
+      "prompt_id": "p-1",
+      "source": "startup",
+      "model": "claude-opus"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.hookEventName": "SessionStart"
+      },
+      "match": {
+        "hookSpecificOutput.additionalContext": "agentic-developer-companion is installed"
+      }
+    }
+  },
+  {
+    "name": "SessionStart without cwd uses CLAUDE_PROJECT_DIR",
+    "event": "session-start",
+    "dialect_arg": "claude",
+    "spawn_cwd": "outside",
+    "env": {
+      "CLAUDE_PROJECT_DIR": "<REPO>"
+    },
+    "payload": {
+      "session_id": "cl-1",
+      "hook_event_name": "SessionStart",
+      "source": "compact"
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.hookEventName": "SessionStart"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse Write: focus marker",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/tests/a.test.ts",
+        "content": "test.only('x', () => {})\n"
+      },
+      "tool_response": {
+        "filePath": "<REPO>/tests/a.test.ts",
+        "success": true
+      },
+      "tool_use_id": "toolu_1"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.hookEventName": "PostToolUse"
+      },
+      "match": {
+        "hookSpecificOutput.additionalContext": "skip/focus marker"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse MultiEdit: eslint-disable",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "MultiEdit",
+      "tool_input": {
+        "file_path": "<REPO>/src/a.js",
+        "edits": [
+          {
+            "old_string": "a",
+            "new_string": "// eslint-disable-next-line no-console\nconsole.log(a)"
+          },
+          {
+            "old_string": "b",
+            "new_string": "c"
+          }
+        ]
+      }
+    },
+    "expect": {
+      "match": {
+        "hookSpecificOutput.additionalContext": "src/a\\.js: adds a lint/type suppression \\(\\S+\\) at line 1"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse NotebookEdit: pytest skip in a test notebook",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "NotebookEdit",
+      "tool_input": {
+        "notebook_path": "<REPO>/tests/test_nb.ipynb",
+        "new_source": "import os\nvalue = os.environ[\"X\"]  # type: ignore"
+      }
+    },
+    "expect": {
+      "match": {
+        "hookSpecificOutput.additionalContext": "tests/test_nb\\.ipynb[^\\n]*: adds a lint/type suppression \\(\\S+\\) at line 2"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse Edit: swallowed exception",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/app.py",
+        "old_string": "run()",
+        "new_string": "try:\n    run()\nexcept Exception:\n    pass"
+      }
+    },
+    "expect": {
+      "match": {
+        "hookSpecificOutput.additionalContext": "exception-swallowing"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse Bash: pytest summary becomes an observed run",
+    "event": "post-shell",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "uv run pytest -q",
+        "description": "tests"
+      },
+      "tool_response": {
+        "stdout": "..F\n=========== 1 failed, 2 passed in 0.31s ===========",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.class": "test",
+        "observed_runs.0.counts.failed": 1,
+        "observed_runs.0.counts.passed": 2,
+        "observed_runs.0.parse_source": "summary-line"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse Bash with a token: Claude cannot rewrite output",
+    "event": "post-shell",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "env"
+      },
+      "tool_response": {
+        "stdout": "ADC_LIVE_TOKEN=<TOKEN>",
+        "stderr": ""
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "PreToolUse Bash git push --force: nested deny",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "git push --force origin feature"
+      },
+      "tool_use_id": "toolu_2"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.hookEventName": "PreToolUse",
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Read .adc/.env.live: deny",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Read",
+      "tool_input": {
+        "file_path": "<REPO>/.adc/.env.live"
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Glob over .adc/: deny",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Glob",
+      "tool_input": {
+        "pattern": ".adc/**/*.json"
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Edit of source: allow (no decision)",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/x.js",
+        "old_string": "a",
+        "new_string": "b"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "PreToolUse Write of a workflow: ask",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/.github/workflows/test.yml",
+        "content": "on: push"
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "ask"
+      }
+    }
+  },
+  {
+    "name": "Stop (advise): nested Stop additionalContext once per epoch",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/x.js",
+        "new_string": "b"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "Stop",
+          "prompt_id": "p-1",
+          "stop_hook_active": false,
+          "last_assistant_message": "Implemented."
+        },
+        "expect": {
+          "values": {
+            "hookSpecificOutput.hookEventName": "Stop"
+          },
+          "match": {
+            "hookSpecificOutput.additionalContext": "newer than the verification evidence"
+          }
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "Stop",
+          "prompt_id": "p-1",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "Stop (gate) with a claim",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "level": "gate",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/src/y.js",
+        "content": "y"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "Stop",
+          "prompt_id": "p-1",
+          "stop_hook_active": false,
+          "last_assistant_message": "The tests are all green."
+        },
+        "expect": {
+          "keys": [
+            "decision",
+            "reason"
+          ],
+          "values": {
+            "decision": "block"
+          },
+          "match": {
+            "reason": "tests are all green"
+          }
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "Stop",
+          "prompt_id": "p-1",
+          "stop_hook_active": true
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "Stop (gate): a fresh FAIL ledger is current evidence, no block",
+    "event": "stop",
+    "dialect_arg": "claude",
+    "level": "gate",
+    "setup": {
+      "session": {
+        "id": "cl-1",
+        "edits": 1,
+        "last_offset_s": -60
+      },
+      "ledger": {
+        "verdict": "FAIL",
+        "offset_s": -1
+      }
+    },
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "Stop",
+      "prompt_id": "p-1",
+      "stop_hook_active": false
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "SessionEnd records the reason",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "PostToolUse",
+      "prompt_id": "p-1",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/x.js",
+        "new_string": "b"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "session-end",
+        "payload": {
+          "session_id": "cl-1",
+          "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+          "cwd": "<REPO>",
+          "permission_mode": "default",
+          "hook_event_name": "SessionEnd",
+          "prompt_id": "p-1",
+          "reason": "prompt_input_exit"
+        },
+        "expect": {
+          "equals": {},
+          "session": {
+            "ended.reason": "prompt_input_exit"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "--dialect auto resolves a Claude payload to claude",
+    "event": "session-start",
+    "dialect_arg": "auto",
+    "payload": {
+      "session_id": "cl-1",
+      "transcript_path": "/home/dev/.claude/projects/x/cl-1.jsonl",
+      "cwd": "<REPO>",
+      "permission_mode": "default",
+      "hook_event_name": "SessionStart",
+      "prompt_id": "p-1",
+      "source": "clear"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ]
+    }
+  },
+  {
+    "name": "session id from transcript_path when session_id is missing",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "transcript_path": "/home/dev/.claude/projects/x/abc.jsonl",
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/src/z.js",
+        "content": "z"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "edits.count": 1
+      }
+    }
+  },
+  {
+    "name": "malformed: not-json, empty, array, null",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": "not-json",
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "session-start",
+        "payload": "",
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "stop",
+        "payload": "[]",
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "pre-guard",
+        "level": "guard",
+        "payload": "null",
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "session-start",
+        "payload": "{}",
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  }
+]

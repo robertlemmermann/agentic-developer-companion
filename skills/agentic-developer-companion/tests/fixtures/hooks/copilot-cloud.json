@@ -1,0 +1,254 @@
+[
+  {
+    "name": "cloud sessionStart brief",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "new"
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ]
+    }
+  },
+  {
+    "name": "cloud str_replace_editor create of a focused test",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "create",
+        "path": "<REPO>/tests/a.test.js",
+        "file_text": "fit('focus', () => {})\n"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "skip/focus marker"
+      },
+      "session": {
+        "tool": "copilot-cloud",
+        "edits.count": 1
+      }
+    }
+  },
+  {
+    "name": "cloud str_replace_editor view is a read, not an edit",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "view",
+        "path": "<REPO>/src/a.py"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "no_state": true
+    }
+  },
+  {
+    "name": "cloud str_replace adds except: pass",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace",
+      "toolArgs": {
+        "path": "<REPO>/src/a.py",
+        "old_str": "raise",
+        "new_str": "try:\n    run()\nexcept:\n    pass"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "exception-swallowing pattern"
+      }
+    }
+  },
+  {
+    "name": "cloud guard denies str_replace_editor edits under .adc/",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "str_replace",
+        "path": "<REPO>/.adc/budget.json",
+        "old_str": "2500",
+        "new_str": "9999"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "cloud guard denies str_replace_editor view of .adc/.env.live",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "view",
+        "path": ".adc/.env.live"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "reading"
+      }
+    }
+  },
+  {
+    "name": "cloud guard denies force push",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git push --force-with-lease"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "cloud guard asks on CI edits (the cloud agent treats ask as deny)",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "str_replace",
+        "path": ".github/workflows/ci.yml",
+        "old_str": "a",
+        "new_str": "b"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "ask"
+      }
+    }
+  },
+  {
+    "name": "cloud agentStop gate after edits",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "str_replace",
+      "toolArgs": {
+        "path": "src/a.py",
+        "old_str": "a",
+        "new_str": "b"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cloud-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/root/t.jsonl",
+          "stopReason": "end_turn",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "values": {
+            "decision": "block"
+          }
+        }
+      },
+      {
+        "event": "session-end",
+        "payload": {
+          "sessionId": "cloud-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "reason": "complete"
+        },
+        "expect": {
+          "equals": {},
+          "session": {
+            "ended.reason": "complete",
+            "tool": "copilot-cloud"
+          }
+        }
+      }
+    ]
+  }
+]

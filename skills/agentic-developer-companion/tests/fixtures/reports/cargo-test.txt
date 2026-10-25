@@ -1,0 +1,49 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/demo-88d774561b498750)
+
+running 5 tests
+test tests::net ... ignored, needs network
+test tests::slow ... ignored
+test tests::adds_wrong ... FAILED
+test tests::unwraps ... FAILED
+test tests::adds ... ok
+
+failures:
+
+---- tests::adds_wrong stdout ----
+
+thread 'tests::adds_wrong' (5148) panicked at src/lib.rs:14:23:
+assertion `left == right` failed
+  left: 4
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::unwraps stdout ----
+
+thread 'tests::unwraps' (5149) panicked at src/lib.rs:22:71:
+called `Result::unwrap()` on an `Err` value: "boom"
+
+
+failures:
+    tests::adds_wrong
+    tests::unwraps
+
+test result: FAILED. 1 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+     Running tests/integration.rs (target/debug/deps/integration-d21da94bdfd918d3)
+
+running 1 test
+test it_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests demo
+
+running 1 test
+test src/lib.rs - add (line 3) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+error: 1 target failed:
+    `--lib`

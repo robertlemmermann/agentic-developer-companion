@@ -1,0 +1,527 @@
+{
+  "user-advise": {
+    "target_file": "/home/dev/.claude/settings.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [],
+    "config": {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "startup|resume|clear|compact|fork",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-start",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-edit",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-shell",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "stop",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "advise"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-end",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-guard": {
+    "target_file": "/home/dev/.claude/settings.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [],
+    "config": {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "startup|resume|clear|compact|fork",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-start",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "guard"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-edit",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-shell",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PreToolUse": [
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "pre-guard",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "guard"
+                ],
+                "timeout": 10,
+                "if": "Bash(git *)"
+              }
+            ]
+          },
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "pre-guard",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "guard"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "stop",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "guard"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-end",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "project-gate": {
+    "target_file": "<REPO>/.claude/settings.local.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [],
+    "config": {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "startup|resume|clear|compact|fork",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect auto --level gate",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect auto",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect auto",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect auto --level gate",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect auto",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-advise-node-path": {
+    "target_file": "/home/dev/.claude/settings.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "/opt/node js/bin/node",
+    "warnings": [
+      "the Node path contains characters that need quoting (/opt/node js/bin/node); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+    ],
+    "config": {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "startup|resume|clear|compact|fork",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/opt/node js/bin/node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-start",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/opt/node js/bin/node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-edit",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/opt/node js/bin/node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-shell",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/opt/node js/bin/node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "stop",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "advise"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/opt/node js/bin/node",
+                "args": [
+                  "/opt/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-end",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-advise-windows": {
+    "target_file": "/home/dev/.claude/settings.json",
+    "skill_path": "C:/Users/Dev User/.copilot/skills/agentic-developer-companion",
+    "node": "C:/Program Files/nodejs/node.exe",
+    "warnings": [
+      "the Node path contains characters that need quoting (C:/Program Files/nodejs/node.exe); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+    ],
+    "config": {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "startup|resume|clear|compact|fork",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "C:/Program Files/nodejs/node.exe",
+                "args": [
+                  "C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-start",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "C:/Program Files/nodejs/node.exe",
+                "args": [
+                  "C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-edit",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "C:/Program Files/nodejs/node.exe",
+                "args": [
+                  "C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "post-shell",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "C:/Program Files/nodejs/node.exe",
+                "args": [
+                  "C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "stop",
+                  "--dialect",
+                  "claude",
+                  "--level",
+                  "advise"
+                ],
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "C:/Program Files/nodejs/node.exe",
+                "args": [
+                  "C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs",
+                  "hook-run",
+                  "session-end",
+                  "--dialect",
+                  "claude"
+                ],
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

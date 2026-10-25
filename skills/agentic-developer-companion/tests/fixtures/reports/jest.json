@@ -1,0 +1,201 @@
+{
+ "numFailedTestSuites": 2,
+ "numFailedTests": 2,
+ "numPassedTestSuites": 1,
+ "numPassedTests": 3,
+ "numPendingTestSuites": 0,
+ "numPendingTests": 1,
+ "numRuntimeErrorTestSuites": 1,
+ "numTodoTests": 1,
+ "numTotalTestSuites": 3,
+ "numTotalTests": 7,
+ "openHandles": [],
+ "snapshot": {
+  "added": 0,
+  "didUpdate": false,
+  "failure": false,
+  "filesAdded": 0,
+  "filesRemoved": 0,
+  "filesRemovedList": [],
+  "filesUnmatched": 0,
+  "filesUpdated": 0,
+  "matched": 0,
+  "total": 0,
+  "unchecked": 0,
+  "uncheckedKeysByFile": [],
+  "unmatched": 0,
+  "updated": 0
+ },
+ "startTime": 1792951618244,
+ "success": false,
+ "testResults": [
+  {
+   "assertionResults": [
+    {
+     "ancestorTitles": [],
+     "duration": 1,
+     "failing": false,
+     "failureDetails": [],
+     "failureMessages": [],
+     "fullName": "flaky retried",
+     "invocations": 2,
+     "location": null,
+     "numPassingAsserts": 1,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "passed",
+     "title": "flaky retried",
+     "startAt": 1792951618845
+    }
+   ],
+   "endTime": 1792951618849,
+   "message": "",
+   "name": "/work/demo/jt/retry.test.js",
+   "startTime": 1792951618548,
+   "status": "passed",
+   "summary": ""
+  },
+  {
+   "assertionResults": [],
+   "endTime": 1792951619029,
+   "message": "  ● Test suite failed to run\n\n    Cannot find module './does-not-exist' from 'jt/broken.test.js'\n\n    > 1 | const x = require('./does-not-exist');\n        |           ^\n      2 | test('never', () => { expect(x).toBeTruthy(); });\n      3 |\n\n      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/index.js:1031:11)\n      at Object.require (jt/broken.test.js:1:11)\n",
+   "name": "/work/demo/jt/broken.test.js",
+   "startTime": 1792951619029,
+   "status": "failed",
+   "summary": ""
+  },
+  {
+   "assertionResults": [
+    {
+     "ancestorTitles": [
+      "math"
+     ],
+     "duration": 4,
+     "failing": false,
+     "failureDetails": [],
+     "failureMessages": [],
+     "fullName": "math adds",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 1,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "passed",
+     "title": "adds",
+     "startAt": 1792951618964
+    },
+    {
+     "ancestorTitles": [
+      "math"
+     ],
+     "duration": 2,
+     "failing": false,
+     "failureDetails": [
+      {
+       "matcherResult": {
+        "actual": 4,
+        "expected": 5,
+        "message": "expect(received).toBe(expected) // Object.is equality\n\nExpected: 5\nReceived: 4",
+        "name": "toBe",
+        "pass": false
+       }
+      }
+     ],
+     "failureMessages": [
+      "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: 5\nReceived: 4\n    at Object.toBe (/work/demo/jt/math.test.js:4:43)\n    at Promise.finally.completed (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)\n    at new Promise (<anonymous>)\n    at callAsyncCircusFn (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)\n    at _callCircusTest (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)\n    at processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at _runTestInContext (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)\n    at runTestWithContext (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:996:5)\n    at _runTestsForDescribeBlockOnce (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)\n    at _runTestsForDescribeBlock (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at _runTestsForDescribeBlockOnce (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1003:11)\n    at _runTestsForDescribeBlock (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at run (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:789:3)\n    at runAndTransformResultsToJestFormat (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)\n    at jestAdapter (/work/demo/node_modules/jest-circus/build/runner.js:111:19)\n    at runTestInternal (/work/demo/node_modules/jest-runner/build/testWorker.js:247:16)\n    at runTest (/work/demo/node_modules/jest-runner/build/testWorker.js:315:7)\n    at Object.worker (/work/demo/node_modules/jest-runner/build/testWorker.js:479:12)"
+     ],
+     "fullName": "math fails",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 0,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "failed",
+     "title": "fails",
+     "startAt": 1792951618969
+    },
+    {
+     "ancestorTitles": [
+      "math"
+     ],
+     "duration": null,
+     "failing": false,
+     "failureDetails": [],
+     "failureMessages": [],
+     "fullName": "math skipped",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 0,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "pending",
+     "title": "skipped",
+     "startAt": 1792951618972
+    },
+    {
+     "ancestorTitles": [
+      "math"
+     ],
+     "duration": null,
+     "failing": false,
+     "failureDetails": [],
+     "failureMessages": [],
+     "fullName": "math later",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 0,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "todo",
+     "title": "later",
+     "startAt": 1792951618972
+    },
+    {
+     "ancestorTitles": [
+      "math"
+     ],
+     "duration": 0,
+     "failing": false,
+     "failureDetails": [
+      {}
+     ],
+     "failureMessages": [
+      "ReferenceError: notDefined is not defined\n    at Object.notDefined (/work/demo/jt/math.test.js:7:26)\n    at Promise.finally.completed (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)\n    at new Promise (<anonymous>)\n    at callAsyncCircusFn (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)\n    at _callCircusTest (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)\n    at processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at _runTestInContext (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)\n    at runTestWithContext (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:996:5)\n    at _runTestsForDescribeBlockOnce (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)\n    at _runTestsForDescribeBlock (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at _runTestsForDescribeBlockOnce (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:1003:11)\n    at _runTestsForDescribeBlock (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:824:5)\n    at run (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:789:3)\n    at runAndTransformResultsToJestFormat (/work/demo/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)\n    at jestAdapter (/work/demo/node_modules/jest-circus/build/runner.js:111:19)\n    at runTestInternal (/work/demo/node_modules/jest-runner/build/testWorker.js:247:16)\n    at runTest (/work/demo/node_modules/jest-runner/build/testWorker.js:315:7)\n    at Object.worker (/work/demo/node_modules/jest-runner/build/testWorker.js:479:12)"
+     ],
+     "fullName": "math throws",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 0,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "failed",
+     "title": "throws",
+     "startAt": 1792951618972
+    },
+    {
+     "ancestorTitles": [],
+     "duration": 0,
+     "failing": false,
+     "failureDetails": [],
+     "failureMessages": [],
+     "fullName": "divides",
+     "invocations": 1,
+     "location": null,
+     "numPassingAsserts": 1,
+     "retryMessages": [],
+     "retryReasons": [],
+     "status": "passed",
+     "title": "divides",
+     "startAt": 1792951618973
+    }
+   ],
+   "endTime": 1792951618988,
+   "message": "  ● math › fails\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: 5\n    Received: 4\n\n      2 | describe('math', () => {\n      3 |   test('adds', () => { expect(add(1, 2)).toBe(3); });\n    > 4 |   test('fails', () => { expect(add(2, 2)).toBe(5); });\n        |                                           ^\n      5 |   test.skip('skipped', () => {});\n      6 |   test.todo('later');\n      7 |   test('throws', () => { notDefined(); });\n\n      at Object.toBe (jt/math.test.js:4:43)\n\n  ● math › throws\n\n    ReferenceError: notDefined is not defined\n\n       5 |   test.skip('skipped', () => {});\n       6 |   test.todo('later');\n    >  7 |   test('throws', () => { notDefined(); });\n         |                          ^\n       8 | });\n       9 | test('divides', () => { expect(div(4, 2)).toBe(2); });\n      10 |\n\n      at Object.notDefined (jt/math.test.js:7:26)\n",
+   "name": "/work/demo/jt/math.test.js",
+   "startTime": 1792951618574,
+   "status": "failed",
+   "summary": ""
+  }
+ ],
+ "wasInterrupted": false
+}

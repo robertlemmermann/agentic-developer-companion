@@ -1,0 +1,1278 @@
+[
+  {
+    "name": "session-start brief with cwd",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "startup",
+      "initialPrompt": "fix the bug"
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ],
+      "match": {
+        "additionalContext": "agentic-developer-companion is installed"
+      },
+      "no_state": true
+    }
+  },
+  {
+    "name": "session-start reads cached detect.json and the newest ledger",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "setup": {
+      "detect": {
+        "summary": "node(npm, node-test)",
+        "projects": [
+          {
+            "root": ".",
+            "test_globs": [
+              "**/*.test.js"
+            ]
+          }
+        ]
+      },
+      "ledger": {
+        "verdict": "PASS",
+        "offset_s": -30
+      }
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "resume"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "Detected stack \\(cached\\): node\\(npm, node-test\\)[\\s\\S]*verdict PASS"
+      }
+    }
+  },
+  {
+    "name": "session-start without cwd falls back to the process cwd",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "source": "new"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "No verification ledger"
+      }
+    }
+  },
+  {
+    "name": "session-start outside a git work tree emits {}",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "setup": {
+      "no_git": true
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "session-start states the gate level",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "Hook level gate"
+      }
+    }
+  },
+  {
+    "name": "post-edit: focus marker in a test file (toolArgs object)",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "tests/math.test.js",
+        "old_str": "it('adds'",
+        "new_str": "it.only('adds', () => {})"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "File edited"
+      }
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ],
+      "match": {
+        "additionalContext": "tests/math\\.test\\.js \\(test file\\): adds a skip/focus marker"
+      },
+      "session": {
+        "edits.count": 1,
+        "edits.classes.test": 1,
+        "edits.findings": 1
+      }
+    }
+  },
+  {
+    "name": "post-edit: string-encoded toolArgs are parsed a second time",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": "{\"path\":\"tests/math.test.js\",\"new_str\":\"describe.skip('suite', () => {})\"}"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "skip/focus marker"
+      }
+    }
+  },
+  {
+    "name": "post-edit: plain source edit is recorded silently",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "create",
+      "toolArgs": {
+        "path": "src/util.js",
+        "file_text": "export const add = (a, b) => a + b;\n"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "edits.count": 1,
+        "edits.files.0": "src/util.js"
+      }
+    }
+  },
+  {
+    "name": "post-edit: ts-ignore suppression in source",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/a.ts",
+        "new_str": "// @ts-ignore\nconst x: number = \"y\";"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "src/a\\.ts: adds a lint/type suppression \\(\\S+\\) at line 1"
+      }
+    }
+  },
+  {
+    "name": "post-edit: CI weakening in a workflow",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": ".github/workflows/ci.yml",
+        "new_str": "    - run: npm test\n      continue-on-error: true"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "\\(CI\\): weakens a CI step \\(\\S+\\) at line 2: continue-on-error: true"
+      }
+    }
+  },
+  {
+    "name": "post-edit: runner config change",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "jest.config.js",
+        "new_str": "testPathIgnorePatterns: ['/tests/']"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "CK-TEST-CFG"
+      }
+    }
+  },
+  {
+    "name": "post-edit: apply_patch body in a string toolArgs",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "apply_patch",
+      "toolArgs": "*** Begin Patch\n*** Add File: tests/new.test.js\n+it.skip('later', () => {})\n*** End Patch\n"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "tests/new\\.test\\.js \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 1"
+      }
+    }
+  },
+  {
+    "name": "post-edit: secret-shaped value is reported, never echoed",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/config.js",
+        "new_str": "const key = '<AWS_KEY>';"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "shaped like a secret"
+      },
+      "not_contains": [
+        "<AWS_KEY>"
+      ]
+    }
+  },
+  {
+    "name": "post-edit: a view call is not an edit",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "view",
+      "toolArgs": {
+        "path": "README.md"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "no_state": true
+    }
+  },
+  {
+    "name": "post-edit: edit under .adc/ is noted as companion state",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": ".adc/evidence/x.json",
+        "new_str": "{\"verdict\":\"PASS\"}"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "companion state under \\.adc/"
+      },
+      "session": {
+        "edits.count": 0,
+        "edits.state_dir_edits": 1
+      }
+    }
+  },
+  {
+    "name": "post-shell: observed test run with jest summary counts",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "npm test",
+        "description": "run tests"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "FAIL tests/a.test.js\nTest Suites: 1 failed, 1 total\nTests:       1 failed, 3 passed, 4 total\nSnapshots:   0 total\nTime:        1.2 s"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.class": "test",
+        "observed_runs.0.cmd_head": "npm test",
+        "observed_runs.0.counts.failed": 1,
+        "observed_runs.0.counts.passed": 3,
+        "observed_runs.0.exit": null
+      }
+    }
+  },
+  {
+    "name": "post-shell: narrowed test run is noted",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "cd app && npx jest tests/math.test.js"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "Tests: 1 passed, 1 total"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "narrowed test run \\(npx jest tests/math\\.test\\.js\\)"
+      }
+    }
+  },
+  {
+    "name": "post-shell: token assignment in the output is rewritten (modifiedResult)",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "printenv"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "PATH=/usr/bin\nADC_LIVE_TOKEN=<TOKEN>\nHOME=/root"
+      }
+    },
+    "expect": {
+      "values": {
+        "modifiedResult.resultType": "success"
+      },
+      "match": {
+        "modifiedResult.textResultForLlm": "ADC_LIVE_TOKEN=\\[REDACTED\\]",
+        "additionalContext": "redacted"
+      },
+      "not_contains": [
+        "<TOKEN>"
+      ]
+    }
+  },
+  {
+    "name": "post-shell: unrelated command records nothing",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "ls -la"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "total 0"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "no_state": true
+    }
+  },
+  {
+    "name": "stop (advise): notice once per edit epoch",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/a.js",
+        "new_str": "x"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stopReason": "end_turn",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "keys": [
+            "additionalContext"
+          ],
+          "match": {
+            "additionalContext": "1 edit event\\(s\\) in this session are newer than the verification evidence \\(no ledger yet\\)"
+          }
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "stop (gate): blocks once per epoch, honors stop_hook_active, re-arms on new edits",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/a.js",
+        "new_str": "x"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "keys": [
+            "decision",
+            "reason"
+          ],
+          "values": {
+            "decision": "block"
+          },
+          "match": {
+            "reason": "completion gate"
+          },
+          "session": {
+            "gate.blocks": 1,
+            "gate.last_block_epoch": 1
+          }
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stop_hook_active": true
+        },
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "post-edit",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "toolName": "edit",
+          "toolArgs": {
+            "path": "src/b.js",
+            "new_str": "y"
+          }
+        },
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "transcriptPath": "/tmp/t.jsonl",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "values": {
+            "decision": "block"
+          },
+          "match": {
+            "reason": "^agentic-developer-companion completion gate: 2 edit event"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "stop (gate): a ledger newer than the last edit passes",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "setup": {
+      "session": {
+        "id": "cc-1",
+        "edits": 2,
+        "last_offset_s": -120
+      },
+      "ledger": {
+        "verdict": "PASS",
+        "offset_s": -10
+      }
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "transcriptPath": "/tmp/t.jsonl",
+      "stop_hook_active": false
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "stop (gate): an UNVERIFIED ledger does not count",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "setup": {
+      "session": {
+        "id": "cc-1",
+        "edits": 1,
+        "last_offset_s": -120
+      },
+      "ledger": {
+        "verdict": "UNVERIFIED",
+        "offset_s": -10
+      }
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "transcriptPath": "/tmp/t.jsonl",
+      "stop_hook_active": false
+    },
+    "expect": {
+      "values": {
+        "decision": "block"
+      },
+      "match": {
+        "reason": "verdict UNVERIFIED"
+      }
+    }
+  },
+  {
+    "name": "stop (gate): an older ledger is stale",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "setup": {
+      "session": {
+        "id": "cc-1",
+        "edits": 3,
+        "last_offset_s": -5
+      },
+      "ledger": {
+        "verdict": "PASS",
+        "offset_s": -300
+      }
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "transcriptPath": "/tmp/t.jsonl",
+      "stop_hook_active": false
+    },
+    "expect": {
+      "values": {
+        "decision": "block"
+      }
+    }
+  },
+  {
+    "name": "stop: no edits this session means no decision",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "transcriptPath": "/tmp/t.jsonl",
+      "stop_hook_active": false
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "pre-guard: git push --force is denied (top-level permissionDecision)",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git push --force origin main"
+      }
+    },
+    "expect": {
+      "keys": [
+        "permissionDecision",
+        "permissionDecisionReason"
+      ],
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "force-push"
+      },
+      "session": {
+        "guard.denials": 1,
+        "guard.last.rule": "force-push"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: plain git push is allowed",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git push origin main"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "no_state": true
+    }
+  },
+  {
+    "name": "pre-guard: git -C . rebase -i is denied, --abort allowed",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git -C . rebase -i HEAD~3"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    },
+    "then": [
+      {
+        "event": "pre-guard",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "toolName": "bash",
+          "toolArgs": {
+            "command": "git rebase --abort"
+          }
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "pre-guard: reset --hard and commit --amend are denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git status && git reset --hard HEAD~1"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "reset --hard"
+      }
+    },
+    "then": [
+      {
+        "event": "pre-guard",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "toolName": "powershell",
+          "toolArgs": {
+            "command": "git commit --amend -m \"x\""
+          }
+        },
+        "expect": {
+          "values": {
+            "permissionDecision": "deny"
+          },
+          "match": {
+            "permissionDecisionReason": "amend"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "pre-guard: git add -f .adc/.env.live is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git add -f .adc/.env.live"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "git add -f"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: shell command naming .adc/.env.live is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "cat .adc/.env.live | head -1"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "live-test credential"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: git check-ignore of the credential file stays allowed",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git check-ignore -q .adc/.env.live"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "pre-guard: view of .adc/.env.live (absolute path) is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "view",
+      "toolArgs": {
+        "path": "<REPO>/.adc/.env.live"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "reading or searching"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: string-encoded toolArgs editing .adc/ is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": "{\"path\":\".adc/evidence/20261025T000000Z-abc.json\",\"old_str\":\"FAIL\",\"new_str\":\"PASS\"}"
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "written only by the companion"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: grep rooted in .adc is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "grep",
+      "toolArgs": {
+        "pattern": "TOKEN",
+        "path": ".adc"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: CI workflow edit asks",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": ".github/workflows/ci.yml",
+        "new_str": "x"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "ask"
+      },
+      "match": {
+        "permissionDecisionReason": "CI configuration"
+      },
+      "session": {
+        "guard.asks": 1
+      }
+    }
+  },
+  {
+    "name": "pre-guard: ordinary edit is allowed",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/a.js",
+        "new_str": "x"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "pre-guard: no determinable path fails open",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "description": "something"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "pre-guard: nested bash -c force push is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "bash -c \"git push -uf origin HEAD\""
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: + refspec push is a force push",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "powershell",
+      "toolArgs": {
+        "command": "git push origin +main"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: git rm of a test file asks",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git rm tests/math.test.js"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "ask"
+      },
+      "match": {
+        "permissionDecisionReason": "CK-TEST-DEL"
+      }
+    }
+  },
+  {
+    "name": "pre-guard: commit denied while .adc/ is tracked",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "setup": {
+      "tracked_state": true
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "git commit -m \"wip\""
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "tracked by git"
+      }
+    }
+  },
+  {
+    "name": "tracked .adc/: brief says so, other hooks stay silent and write nothing",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "setup": {
+      "tracked_state": true
+    },
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "is tracked by git"
+      },
+      "session": null
+    },
+    "then": [
+      {
+        "event": "post-edit",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "toolName": "edit",
+          "toolArgs": {
+            "path": "tests/a.test.js",
+            "new_str": "it.only(1)"
+          }
+        },
+        "expect": {
+          "equals": {},
+          "session": null
+        }
+      },
+      {
+        "event": "post-shell",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "toolName": "bash",
+          "toolArgs": {
+            "command": "npm test"
+          },
+          "toolResult": {
+            "textResultForLlm": "Tests: 1 passed, 1 total"
+          }
+        },
+        "expect": {
+          "equals": {},
+          "session": null
+        }
+      },
+      {
+        "event": "stop",
+        "level": "gate",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "equals": {}
+        }
+      },
+      {
+        "event": "session-end",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "reason": "complete"
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "session-end marks the session ended",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "src/a.js",
+        "new_str": "x"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "session-end",
+        "payload": {
+          "sessionId": "cc-1",
+          "timestamp": 1761400000000,
+          "cwd": "<REPO>",
+          "reason": "complete"
+        },
+        "expect": {
+          "equals": {},
+          "session": {
+            "ended.reason": "complete",
+            "summary.edits": 1
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "malformed: not-json",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": "not-json",
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "malformed: empty stdin",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "payload": "",
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "malformed: empty object",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "payload": "{}",
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "malformed: array and null",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "payload": "[1,2]",
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": "null",
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "unknown event name emits {}",
+    "event": "user-prompt",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "cc-1",
+      "timestamp": 1761400000000,
+      "cwd": "<REPO>",
+      "prompt": "x"
+    },
+    "expect": {
+      "equals": {}
+    }
+  }
+]

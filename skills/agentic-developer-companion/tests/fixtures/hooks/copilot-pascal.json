@@ -1,0 +1,287 @@
+[
+  {
+    "name": "SessionStart snake payload, --dialect copilot: Copilot-shaped output",
+    "event": "session-start",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "SessionStart",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ]
+    }
+  },
+  {
+    "name": "auto: ISO timestamp + snake payload resolves to copilot",
+    "event": "session-start",
+    "dialect_arg": "auto",
+    "payload": {
+      "hook_event_name": "SessionStart",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ],
+      "absent": [
+        "hookSpecificOutput"
+      ]
+    }
+  },
+  {
+    "name": "explicit claude is overridden by COPILOT_CLI=1",
+    "event": "session-start",
+    "dialect_arg": "claude",
+    "env": {
+      "COPILOT_CLI": "1"
+    },
+    "payload": {
+      "hook_event_name": "SessionStart",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "source": "startup"
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ]
+    }
+  },
+  {
+    "name": "Write with describe.only in a test file",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "PostToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/tests/a.test.ts",
+        "content": "describe.only('x', () => {\n  it('y', () => {});\n});\n"
+      },
+      "tool_result": {
+        "result_type": "success",
+        "text_result_for_llm": "ok"
+      }
+    },
+    "expect": {
+      "keys": [
+        "additionalContext"
+      ],
+      "match": {
+        "additionalContext": "tests/a\\.test\\.ts \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 1"
+      }
+    }
+  },
+  {
+    "name": "Edit adds # noqa in Python",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "PostToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/app.py",
+        "old_string": "import os",
+        "new_string": "import os  # noqa"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "src/app\\.py: adds a lint/type suppression"
+      }
+    }
+  },
+  {
+    "name": "Bash result with token assignment: modifiedResult keeps resultType",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "PostToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "env"
+      },
+      "tool_result": {
+        "result_type": "success",
+        "text_result_for_llm": "ADC_LIVE_TOKEN = <TOKEN>"
+      }
+    },
+    "expect": {
+      "values": {
+        "modifiedResult.resultType": "success"
+      },
+      "match": {
+        "modifiedResult.textResultForLlm": "^ADC_LIVE_TOKEN=\\[REDACTED\\]$"
+      },
+      "not_contains": [
+        "<TOKEN>"
+      ]
+    }
+  },
+  {
+    "name": "Bash git push -f is denied with a top-level decision",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "hook_event_name": "PreToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "git push -f"
+      }
+    },
+    "expect": {
+      "keys": [
+        "permissionDecision",
+        "permissionDecisionReason"
+      ],
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "Read of .adc/.env.live is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "hook_event_name": "PreToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Read",
+      "tool_input": {
+        "file_path": "<REPO>/.adc/.env.live"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "Stop with a claim in last_assistant_message sharpens the gate reason",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "payload": {
+      "hook_event_name": "PostToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "tool_name": "Edit",
+      "tool_input": {
+        "file_path": "<REPO>/src/a.js",
+        "new_string": "x"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "hook_event_name": "Stop",
+          "session_id": "cp-1",
+          "timestamp": "2026-10-25T10:00:00.000Z",
+          "cwd": "<REPO>",
+          "stop_hook_active": false,
+          "last_assistant_message": "Done. All tests pass now and the feature works."
+        },
+        "expect": {
+          "values": {
+            "decision": "block"
+          },
+          "match": {
+            "reason": "final message states \"All tests pass"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "Stop with stop_hook_active emits {}",
+    "event": "stop",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "setup": {
+      "session": {
+        "id": "cp-1",
+        "edits": 1,
+        "last_offset_s": -1
+      }
+    },
+    "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "stop_hook_active": true
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "SessionEnd emits {}",
+    "event": "session-end",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "SessionEnd",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "cwd": "<REPO>",
+      "reason": "complete"
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "no cwd: identity from the process cwd",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "hook_event_name": "PostToolUse",
+      "session_id": "cp-1",
+      "timestamp": "2026-10-25T10:00:00.000Z",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "tests/b.test.js",
+        "content": "xit(\"x\")"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "tests/b\\.test\\.js"
+      },
+      "session": {
+        "edits.count": 1
+      }
+    }
+  }
+]
