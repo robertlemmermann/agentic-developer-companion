@@ -21,18 +21,35 @@ process.env.ADC_QUIET = '1';
 
 const TEMP = [];
 const tmp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMP.push(d); return d; };
-// Go and pytest caches stay in the temp dir (tests leave nothing outside os.tmpdir()).
-const GO_ENV = { GOCACHE: path.join(os.tmpdir(), 'adc-wpd-gocache'), GOTOOLCHAIN: 'local', GOFLAGS: '' };
+// Go's build cache and its local telemetry counters (written to the user config dir, which
+// GOTELEMETRY=off does not prevent) stay in the temp dir: tests leave nothing outside os.tmpdir().
+// macOS has no override for that config dir.
+const GO_CONFIG = path.join(os.tmpdir(), 'adc-wpd-goconfig');
+const GO_ENV = { GOCACHE: path.join(os.tmpdir(), 'adc-wpd-gocache'), GOTOOLCHAIN: 'local', GOFLAGS: '', GOTELEMETRY: 'off',
+  ...(process.platform === 'win32' ? { APPDATA: GO_CONFIG } : process.platform === 'darwin' ? {} : { XDG_CONFIG_HOME: GO_CONFIG }) };
 Object.assign(process.env, GO_ENV);
 after(() => { for (const d of TEMP) fs.rmSync(d, { recursive: true, force: true }); });
 
 const HAS_GO = Boolean(core.which('go'));
-const HAS_PYTEST = Boolean(core.which('pytest'));
+// pytest on PATH, else an offline `uv run --with pytest` (uses uv's existing cache), else skipped.
+const PYTEST_CMD = (() => {
+  if (core.which('pytest')) return 'pytest';
+  if (!core.which('uv')) return null;
+  const r = spawnSync('uv', ['run', '--offline', '--no-project', '--with', 'pytest', 'pytest', '--version'], { encoding: 'utf8', timeout: 60_000 });
+  return r.status === 0 ? 'uv run --offline --no-project --with pytest pytest' : null;
+})();
+const HAS_PYTEST = Boolean(PYTEST_CMD);
+/** Is `pid` running? A zombie counts as dead (PID 1 in some containers never reaps orphans). */
+function alive(pid) {
+  try { process.kill(pid, 0); } catch { return false; }
+  try { return !/^State:\s+Z/m.test(fs.readFileSync(`/proc/${pid}/status`, 'utf8')); } catch { return true; }
+}
 let HAS_MARKERS = false;
 try { HAS_MARKERS = Array.isArray((await import('../../scripts/lib/markers.mjs')).SECRET_PATTERNS); } catch {}
 
 function makeRepo(files = {}) {
   const dir = tmp('adc-wpd-repo-');
+  TEMP.push(core.tmpRoot(dir)); // per-repo snapshot and worktree dir under the OS temp dir
   const g = (...args) => {
     const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
     if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
@@ -82,6 +99,12 @@ const nodeTest = (name, body, imports = "import { add, div } from '../src/math.m
   "import { test } from 'node:test';", "import assert from 'node:assert/strict';", imports, `test(${JSON.stringify(name)}, () => { ${body} });`, '',
 ].join('\n');
 const fallback = (dir) => cr.fallbackDetect(dir);
+/** fallbackDetect with the pytest command this machine can run (pytest on PATH or uv). */
+const pyDetect = (dir) => {
+  const det = cr.fallbackDetect(dir);
+  for (const p of det.projects) for (const r of p.runners) if (r.name === 'pytest') r.cmd = PYTEST_CMD;
+  return det;
+};
 
 // ===========================================================================
 // XML reader and helpers
@@ -337,6 +360,10 @@ describe('clean-run helpers', () => {
     assert.equal(cr.appendArgs('npm test', ['--a']), 'npm test -- --a');
     assert.equal(cr.appendArgs('npm test -- --x', ['--a']), 'npm test -- --x --a');
     assert.equal(cr.appendArgs('npx vitest run', ['--a', '']), 'npx vitest run --a');
+    assert.equal(cr.appendArgs('npm run unit', ['--a']), 'npm run unit -- --a');
+    assert.equal(cr.appendArgs('npm run test:unit', ['--a']), 'npm run test:unit -- --a');
+    assert.equal(cr.appendArgs('npm t', ['--a']), 'npm t -- --a');
+    assert.equal(cr.appendArgs('pnpm test', ['--a']), 'pnpm test --a');
     assert.equal(cr.appendArgs('cargo test -- --test-threads=1', ['--no-fail-fast']), 'cargo test --no-fail-fast -- --test-threads=1');
   });
   test('substitute quotes paths outside double quotes and inserts them raw inside', () => {
@@ -426,8 +453,9 @@ describe('clean-run helpers', () => {
       '/w/Program.cs(10,13): error CS0103: The name \'z\' does not exist in the current context [/w/app.csproj]',
       '[ERROR] /w/src/App.java:[5,9] cannot find symbol',
     ].join('\r\n');
-    const errs = reports && cr.parseTypeErrors(out, { roots: ['/w'] });
-    assert.equal(errs.length, 10);
+    const errs = cr.parseTypeErrors(out, { roots: ['/w'] });
+    // msbuild prints every error twice (inline and in the summary): one entry; notes and warnings dropped.
+    assert.equal(errs.length, 9);
     assert.deepEqual(errs.map((e) => e.code).filter(Boolean), ['TS2322', 'TS2304', 'TS5023', 'return-value', 'reportUndefinedVariable', 'E0308', 'CS0103']);
     assert.ok(errs.some((e) => e.file === 'app.py'));
     assert.ok(errs.some((e) => e.file === 'calc/calc.go'));
@@ -436,8 +464,8 @@ describe('clean-run helpers', () => {
     assert.deepEqual(cr.newErrors(base, head).map((e) => `${e.file}:${e.line}`), ['a.ts:40', 'b.ts:1']);
   });
   test('parseRedGreenSpec splits lists and test names', () => {
-    assert.deepEqual(cr.parseRedGreenSpec(['a.test.js,b.test.js', 'c.py::test_x']), [
-      { file: 'a.test.js', name: null }, { file: 'b.test.js', name: null }, { file: 'c.py', name: 'test_x' },
+    assert.deepEqual(cr.parseRedGreenSpec(['a.test.js, b.test.js', 'c.py::test_x', 'my tests/d.test.js']), [
+      { file: 'a.test.js', name: null }, { file: 'b.test.js', name: null }, { file: 'c.py', name: 'test_x' }, { file: 'my tests/d.test.js', name: null },
     ]);
   });
   test('runEnv strips narrowing variables and live credentials, sets CI', () => {
@@ -463,6 +491,8 @@ describe('clean-run helpers', () => {
     const names = det.projects[0].runners.map((r) => r.name);
     assert.deepEqual(names, ['node-test', 'go']);
     assert.equal(det.projects[0].runners[0].cmd, 'node --test test/');
+    fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ scripts: { test: 'node --test --test-reporter=spec --test-reporter-destination stdout test/' } }));
+    assert.equal(cr.fallbackDetect(d).projects[0].runners[0].cmd, 'node --test test/');
     assert.equal(det.projects[0].managers[0].install, 'npm ci');
     assert.equal(cr.fallbackDetect(tmp('adc-wpd-empty-')).projects.length, 0);
   });
@@ -545,13 +575,14 @@ describe('clean-run end to end', () => {
     assert.equal(fired.status, 'fail');
   });
 
-  test('custom command line: counts from summary lines; --base-counts import', async () => {
-    const repo = makeRepo(NODE_PROJECT);
+  test('opaque custom command line: counts from summary lines; --base-counts import', async () => {
+    const repo = makeRepo({ ...NODE_PROJECT, 'run-tests.cjs': "require('node:child_process').execFileSync(process.execPath, ['--test'], { stdio: 'inherit' });\n" });
     repo.write({ 'src/extra.mjs': 'export const x = 1;\n' });
     const countsFile = path.join(repo.state, 'base-counts.json');
     fs.writeFileSync(countsFile, JSON.stringify({ projects: [{ root: '.', run: { executed: 2, passed: 2, failed: 0, errors: 0, skipped: 0, flaky: 0 } }] }));
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), runner: 'node --test', baseCountsFile: countsFile });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), runner: 'node run-tests.cjs', baseCountsFile: countsFile });
     const p = res.projects[0];
+    assert.equal(p.run.runner, 'custom');
     assert.equal(p.run.count_source, 'summary-text');
     assert.equal(p.run.executed, 2);
     assert.equal(p.base_counts.source, 'file');
@@ -570,6 +601,7 @@ describe('clean-run end to end', () => {
     assert.equal(dry.exit, 0);
     assert.equal(dry.json.checks[0].reason, 'DRY_RUN');
     assert.equal(worktrees(node), 1);
+    assert.ok(!fs.existsSync(path.join(core.tmpRoot(node.dir), 'dry-run-out')), 'a dry run writes no output dirs');
     assert.ok(!fs.existsSync(path.join(node.state, 'cache')));
   });
 
@@ -586,7 +618,7 @@ describe('clean-run end to end', () => {
     assert.equal(res.checks[0].reason, 'TIMEOUT');
     const pid = Number(fs.readFileSync(pidFile, 'utf8'));
     await new Promise((r) => setTimeout(r, 200));
-    assert.throws(() => process.kill(pid, 0), 'grandchild was killed');
+    assert.equal(alive(pid), false, 'grandchild was killed');
   });
 
   test('live token never reaches the run; secret shapes are redacted from stored logs', async () => {
@@ -668,13 +700,36 @@ describe('clean-run --red-green', () => {
     assert.deepEqual(res.red_green.pairs.map((p) => p.id), ['example.com/m/calc::TestHalfOfSix']);
   });
 
-  test('pytest: red-green on a new test function file', { skip: !HAS_PYTEST && 'pytest not installed' }, async () => {
-    const repo = makeRepo({ 'pytest.ini': '[pytest]\n', 'app.py': 'def double(x):\n    return x + x + 1\n', 'tests/test_app.py': 'from app import double\n\ndef test_zero():\n    assert double(0) in (0, 1)\n' });
+  test('pytest: red-green on a new test file; the clean run counts against the base', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
+    const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'def double(x):\n    return x + x + 1\n', 'tests/test_app.py': 'from app import double\n\ndef test_zero():\n    assert double(0) in (0, 1)\n' });
     repo.write({ 'app.py': 'def double(x):\n    return x + x\n', 'tests/test_double.py': 'from app import double\n\ndef test_two():\n    assert double(2) == 4\n' });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, redGreen: ['tests/test_double.py'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: pyDetect(repo.dir), detectFn: pyDetect, redGreen: ['tests/test_double.py'] });
     assert.equal(res.projects[0].run.runner, 'pytest');
     assert.equal(res.projects[0].status, 'pass', JSON.stringify(res.projects[0]));
+    assert.equal(res.projects[0].run.executed, 2);
+    assert.equal(res.projects[0].base_counts.executed, 1);
+    assert.equal(res.projects[0].run.retries_disabled, 'full');
     assert.equal(res.red_green.status, 'pass', JSON.stringify(res.red_green));
+    assert.deepEqual(res.red_green.pairs.map((p) => [p.id, p.base.status, p.base.failure_kind, p.head.status]), [['tests.test_double::test_two', 'failed', 'assertion', 'passed']]);
+  });
+
+  test('pytest flake-probe: no pytest-randomly dependency -> sequential runs, shuffle false, suspect found', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
+    const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'X = 1\n' });
+    repo.write({ 'tests/test_flip.py': 'import pathlib\n\ndef test_flip():\n    p = pathlib.Path(__file__).with_name("counter")\n    n = int(p.read_text()) if p.exists() else 0\n    p.write_text(str(n + 1))\n    assert n % 2 == 0\n\ndef test_steady():\n    assert True\n' });
+    const res = await probes.flakeProbe({ target: await target(repo), detectResult: pyDetect(repo.dir), times: 2 });
+    assert.equal(res.shuffle, false);
+    assert.equal(res.runs, 2);
+    assert.deepEqual(res.seeds, []);
+    assert.deepEqual(res.suspect_tests.map((t) => t.id), ['tests.test_flip::test_flip']);
+    assert.equal(res.checks[0].status, 'finding');
+  });
+
+  test('pytest: an import error on the base is a collection error, not a red', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
+    const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'def double(x):\n    return x * 2\n' });
+    repo.write({ 'app.py': 'def double(x):\n    return x * 2\n\ndef triple(x):\n    return x * 3\n', 'tests/test_triple.py': 'from app import triple\n\ndef test_three():\n    assert triple(1) == 3\n' });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: pyDetect(repo.dir), noBase: true, redGreen: ['tests/test_triple.py'] });
+    assert.equal(res.red_green.status, 'fail');
+    assert.ok(['WRONG_FAILURE_KIND', 'NOT_EXECUTED_LOAD_ERROR'].includes(res.red_green.reason), JSON.stringify(res.red_green));
   });
 });
 
@@ -860,5 +915,259 @@ describe('flake-probe', () => {
     clean.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
     const none = await probes.flakeProbe({ target: await target(clean), detectResult: fallback(clean.dir) });
     assert.equal(none.checks[0].reason, 'NO_CHANGED_TESTS');
+  });
+});
+
+// ===========================================================================
+// Added coverage: node:test ids, skip vs shortfall, environment exits, --no-install, --keep,
+// monorepos, unborn repositories, Go and Cargo end to end.
+
+describe('node:test JUnit ids', () => {
+  // Shape of Node 24's junit reporter: classname "test" at top level, the dotted describe chain
+  // inside suites, the absolute path in `file`.
+  const xml = [
+    '<?xml version="1.0" encoding="utf-8"?>', '<testsuites>',
+    '\t<testsuite name="outer" tests="2" failures="1">',
+    '\t\t<testsuite name="inner" tests="1" failures="1">',
+    '\t\t\t<testcase name="same" classname="outer.inner" file="/work/demo/test/a.test.mjs"><failure type="testCodeFailure" message="1 !== 2">Error [ERR_TEST_FAILURE]: 1 !== 2\n  cause: AssertionError [ERR_ASSERTION]: 1 !== 2</failure></testcase>',
+    '\t\t</testsuite>',
+    '\t\t<testcase name="same" classname="outer" file="/work/demo/test/a.test.mjs"/>',
+    '\t</testsuite>',
+    '\t<testcase name="same" classname="test" file="/work/demo/test/a.test.mjs"><skipped type="skipped" message="later"/></testcase>',
+    '\t<testcase name="same" classname="test" file="/work/demo/test/b.test.mjs"/>',
+    '\t<testcase name="test/c.test.mjs" classname="test" file="/work/demo/test/c.test.mjs" failure="test failed"><failure type="testCodeFailure" message="test failed">[Error: test failed] { code: \'ERR_TEST_FAILURE\', failureType: \'testCodeFailure\', cause: \'test failed\', exitCode: 1, signal: null }</failure></testcase>',
+    '\t<!-- tests 5 -->', '</testsuites>', '',
+  ].join('\r\n');
+  test('same-named tests in different files and describes get distinct, root-relative ids', () => {
+    const res = reports.parseReport('junit', xml, { root: '/work/demo' });
+    const t = byId(res);
+    assert.deepEqual(Object.keys(t).sort(), ['test/a.test.mjs::outer > inner > same', 'test/a.test.mjs::outer > same', 'test/a.test.mjs::same', 'test/b.test.mjs::same', 'test/c.test.mjs']);
+    assert.equal(t['test/a.test.mjs::outer > inner > same'].failure_kind, 'assertion');
+    assert.equal(t['test/c.test.mjs'].failure_kind, 'error', 'a file that failed to load is an error');
+    assert.equal(t['test/b.test.mjs::same'].status, 'passed', 'not collapsed with test/a as a rerun');
+    assert.deepEqual(counts(res), { executed: 4, passed: 2, failed: 2, errors: 0, skipped: 1, flaky: 0 });
+  });
+  test('Vitest-style classname (a path) keeps the classname id even with a file attribute', () => {
+    const r = reports.parseReport('junit', '<testsuite name="vt/a.test.ts"><testcase classname="vt/a.test.ts" name="s &gt; t" file="vt/a.test.ts"/></testsuite>');
+    assert.equal(r.tests[0].id, 'vt/a.test.ts::s > t');
+  });
+});
+
+describe('outcomes, exits and command plumbing', () => {
+  const c = (o) => ({ executed: 3, passed: 3, failed: 0, errors: 0, skipped: 0, flaky: 0, ...o });
+  const run = (o) => ({ exit: 0, counts: c(o), source: 'report' });
+  test('a test that is skipped now is the skip rule, not a shortfall', () => {
+    const base = c({});
+    assert.deepEqual(cr.evaluateRun(run({ executed: 2, passed: 2, skipped: 1 }), base), { status: 'finding', reason: 'SKIP_INCREASE' });
+    assert.equal(cr.evaluateRun(run({ executed: 2, passed: 2, skipped: 1 }), base, { skipFired: true }).status, 'fail');
+    // By id: one test vanished and an unrelated new test is skipped -> still a shortfall.
+    assert.deepEqual(cr.evaluateRun(run({ executed: 2, passed: 2, skipped: 1 }), base, { nowSkipped: 0 }), { status: 'fail', reason: 'COUNT_SHORTFALL', shortfall: 1 });
+    // Waived deletion plus a new skip: the skip is reported.
+    assert.equal(cr.evaluateRun(run({ executed: 1, passed: 1, skipped: 1 }), base, { nowSkipped: 1, explained: 1 }).reason, 'SKIP_INCREASE');
+    assert.equal(cr.evaluateRun(run({ executed: 2, passed: 2 }), base, { explained: 1 }).reason, 'SHORTFALL_WAIVED');
+    assert.equal(cr.evaluateRun({ exit: 1, counts: null, source: 'none', runnerMissing: true }, base).reason, 'RUNNER_NOT_FOUND');
+  });
+  test('exitFor: 3 only when every unverified check lacks its executable', () => {
+    assert.equal(cr.exitFor('pass'), 0);
+    assert.equal(cr.exitFor('finding'), 1);
+    assert.equal(cr.exitFor('unverified', [{ status: 'unverified', reason: 'RUNNER_NOT_FOUND' }]), 3);
+    assert.equal(cr.exitFor('unverified', [{ status: 'unverified', reason: 'RUNNER_NOT_FOUND' }, { status: 'unverified', reason: 'NO_REPORT' }]), 4);
+    assert.equal(cr.exitFor('unverified', []), 4);
+  });
+  test('runnerMissing recognizes shells, npx, cmd.exe and Python launchers', () => {
+    for (const text of ['/bin/sh: 1: vitest: not found', 'sh: jest: command not found', 'bash: line 1: vitest: command not found', 'zsh: command not found: pytest', "'pytest' is not recognized as an internal or external command,",
+      'npm error npx canceled due to missing packages and no YES option: ["vitest@4.0.0"]', '/usr/bin/python3: No module named pytest', 'error: no such command: `nextest`']) {
+      assert.ok(cr.runnerMissing(text), text);
+    }
+    assert.ok(!cr.runnerMissing('AssertionError: user not found in list'));
+  });
+  test('dropNodeTestPaths removes path arguments only', () => {
+    assert.equal(cr.dropNodeTestPaths('node --test test/'), 'node --test');
+    assert.equal(cr.dropNodeTestPaths('node --test --test-concurrency=1 test/*.test.mjs'), 'node --test --test-concurrency=1');
+    assert.equal(cr.dropNodeTestPaths('node --test'), 'node --test');
+    assert.equal(cr.dropNodeTestPaths('node --test --test-reporter spec'), 'node --test --test-reporter spec');
+    const b = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test test/' }] }), { dir: tmp('adc-wpd-b-'), outDir: tmp('adc-wpd-o-'), select: { files: ['test/x.test.mjs'], names: [] } });
+    assert.match(b.cmd, /^node --test --test-reporter=junit .* test\/x\.test\.mjs$/);
+    assert.ok(!/ test\/ /.test(b.cmd));
+  });
+  test('inferRunner: a --runner command line that plainly runs a known runner gets its report flags', () => {
+    const want = { 'uv run --offline --with pytest pytest': 'pytest', 'python -m pytest tests': 'pytest', 'poetry run pytest -q': 'pytest',
+      'node --test test/': 'node-test', 'npx vitest run': 'vitest', 'go test ./pkg/...': 'go', 'cargo nextest run': 'nextest', 'cargo test --workspace': 'cargo',
+      'bundle exec rspec': 'rspec', './mvnw -q test': 'maven', 'make test': null, 'npm ci && npx vitest run': null, 'pytest | tee log': null, 'npm test': null };
+    for (const [line, name] of Object.entries(want)) assert.equal(cr.inferRunner(line), name, line);
+    const r = cr.resolveRunner({ runners: [] }, 'uv run pytest');
+    assert.deepEqual([r.name, r.cmd, r.report.format, r.inferred], ['pytest', 'uv run pytest', 'junit', true]);
+    const same = cr.resolveRunner({ runners: [{ name: 'vitest', cmd: 'npm test' }] }, 'npm test');
+    assert.equal(same.name, 'vitest', 'a command identical to a detected runner is that runner');
+  });
+  test('runEnv forbids npx downloads of unpinned runners', () => {
+    const { env } = cr.runEnv();
+    assert.equal(env.npm_config_yes, 'false');
+  });
+});
+
+describe('clean-run options and layouts', () => {
+  test('CLI: a runner executable that does not exist -> UNVERIFIED RUNNER_NOT_FOUND, exit 3', () => {
+    const repo = makeRepo(NODE_PROJECT);
+    repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
+    const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'adc-no-such-runner-x1 --all', '--no-base']);
+    assert.equal(r.exit, 3, r.stdout);
+    assert.equal(r.json.checks[0].status, 'unverified');
+    assert.equal(r.json.checks[0].reason, 'RUNNER_NOT_FOUND');
+  });
+
+  test('--no-install links the working tree node_modules; links are removed, the original survives', async () => {
+    const dep = { 'node_modules/leftish/package.json': '{"name":"leftish","version":"1.0.0","type":"module","main":"index.js"}\n', 'node_modules/leftish/index.js': "export const pad = (s) => ' ' + s;\n" };
+    const repo = makeRepo({ ...NODE_PROJECT, '.gitignore': 'node_modules/\n', ...dep, 'test/pad.test.mjs': nodeTest('pads', "assert.equal(pad('a'), ' a');", "import { pad } from 'leftish';") });
+    repo.write({ 'test/more.test.mjs': nodeTest('pads twice', "assert.equal(pad(pad('a')), '  a');", "import { pad } from 'leftish';") });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, noInstall: true });
+    const p = res.projects[0];
+    assert.equal(res.status, 'pass', JSON.stringify(p));
+    assert.deepEqual(p.install.linked, ['node_modules']);
+    assert.equal(p.run.executed, 4);
+    assert.equal(p.base_counts.executed, 3, 'base linked too: identical dependency manifests');
+    assert.deepEqual(p.base_counts.install.linked, ['node_modules']);
+    assert.match(res.checks[0].summary, /node_modules linked/);
+    assert.ok(fs.existsSync(path.join(repo.dir, 'node_modules', 'leftish', 'index.js')), 'the user\'s node_modules is intact');
+    assert.equal(worktrees(repo), 1);
+    // Different dependency manifests: the base is not linked (it would test against the wrong deps).
+    const pkg = JSON.parse(NODE_PROJECT['package.json']);
+    pkg.dependencies = { leftish: '1.0.0' };
+    repo.write({ 'package.json': JSON.stringify(pkg) });
+    fs.rmSync(path.join(repo.state, 'cache', 'counts'), { recursive: true, force: true });
+    const diff = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, noInstall: true });
+    assert.equal(diff.projects[0].base_counts.install.not_linked[0].reason, 'dependencies differ between the base and the working tree');
+    assert.ok(fs.existsSync(path.join(repo.dir, 'node_modules', 'leftish', 'index.js')));
+  });
+
+  test('a failing frozen install is UNVERIFIED INSTALL_FAILED with the --no-install hint; tests do not run', async () => {
+    const repo = makeRepo(NODE_PROJECT);
+    repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
+    const det = fallback(repo.dir);
+    det.projects[0].managers = [{ name: 'npm', lockfile: null, install: 'node -e "process.exit(3)"' }];
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true });
+    assert.equal(res.status, 'unverified');
+    assert.equal(res.checks[0].reason, 'INSTALL_FAILED');
+    assert.equal(res.projects[0].install.exit, 3);
+    assert.match(res.checks[0].summary, /exited 3; without network access re-run with --no-install/);
+    assert.equal(res.projects[0].run.exit, null, 'the suite never ran');
+    assert.equal(cr.exitFor(res.status, res.checks), 4);
+  });
+
+  test('--keep keeps the worktree and the raw outputs; default prunes them', async () => {
+    const repo = makeRepo(NODE_PROJECT);
+    repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), noBase: true, keep: true });
+    const wt = res.projects[0].worktree;
+    assert.ok(wt && fs.existsSync(path.join(wt, 'src', 'math.mjs')));
+    assert.ok(!wt.startsWith(core.toPosix(repo.dir)), 'worktrees live in the OS temp dir, not in the repository');
+    assert.equal(res.checks[0].data.kept, true);
+    assert.equal(worktrees(repo), 2);
+    repo.g('worktree', 'remove', '--force', wt);
+    assert.equal(worktrees(repo), 1);
+  });
+
+  test('monorepo: only projects that own a changed file run; --all-projects runs every project', async () => {
+    const pkg = (name) => JSON.stringify({ name, type: 'module', scripts: { test: 'node --test' } });
+    const files = {
+      'packages/a/package.json': pkg('a'), 'packages/a/test/a.test.mjs': nodeTest('a', 'assert.ok(true);', ''),
+      'packages/b/package.json': pkg('b'), 'packages/b/test/b.test.mjs': nodeTest('b', 'assert.ok(true);', ''),
+    };
+    const repo = makeRepo(files);
+    repo.write({ 'packages/a/test/a2.test.mjs': nodeTest('a2', 'assert.ok(true);', '') });
+    const det = { projects: ['packages/a', 'packages/b'].map((root) => ({ root, languages: ['javascript'], managers: [], runners: [{ name: 'node-test', cmd: 'node --test' }] })) };
+    const t = await target(repo);
+    const one = await cr.cleanRun({ target: t, detectResult: det, noBase: true });
+    assert.deepEqual(one.projects.map((p) => [p.root, p.status, p.run.executed]), [['packages/a', 'pass', 2]]);
+    assert.deepEqual(one.checks.map((c) => c.project), ['packages/a']);
+    assert.ok(one.checks[0].artifacts.every((a) => a.includes('/packages-a/')), 'artifacts per project slug');
+    const all = await cr.cleanRun({ target: t, detectResult: det, noBase: true, allProjects: true });
+    assert.deepEqual(all.projects.map((p) => [p.root, p.run.executed]), [['packages/a', 2], ['packages/b', 1]]);
+  });
+
+  test('unborn repository: no base, the snapshot still runs', async () => {
+    const dir = tmp('adc-wpd-unborn-');
+    TEMP.push(core.tmpRoot(dir));
+    spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+    for (const [p, cont] of Object.entries(NODE_PROJECT)) { fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true }); fs.writeFileSync(path.join(dir, p), cont); }
+    const state = tmp('adc-wpd-state-');
+    const r = adc(['clean-run', '--cwd', dir, '--state-dir', state, '--runner', 'node-test']);
+    assert.equal(r.exit, 0, r.stdout);
+    assert.equal(r.json.projects[0].run.executed, 2);
+    assert.equal(r.json.projects[0].base_counts.reason, 'NO_BASE');
+    assert.equal(r.json.base.sha, null);
+  });
+});
+
+describe('Go end to end', { skip: !HAS_GO && 'go not installed' }, () => {
+  const GO = {
+    'go.mod': 'module example.com/g\n\ngo 1.21\n',
+    'calc/calc.go': 'package calc\n\nfunc Add(a, b int) int { return a + b }\n',
+    'calc/calc_test.go': 'package calc\n\nimport "testing"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal("add")\n\t}\n}\n',
+  };
+  test('CLI coverage-delta: go cover profile mapped through the module path', () => {
+    const repo = makeRepo(GO);
+    repo.write({ 'calc/calc.go': GO['calc/calc.go'] + '\nfunc Sign(x int) int {\n\tif x < 0 {\n\t\treturn -1\n\t}\n\treturn 1\n}\n', 'calc/sign_test.go': 'package calc\n\nimport "testing"\n\nfunc TestSign(t *testing.T) {\n\tif Sign(5) != 1 {\n\t\tt.Fatal("sign")\n\t}\n}\n' });
+    const r = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state]);
+    assert.equal(r.exit, 0, r.stdout);
+    assert.match(r.json.tool, /go \(go-cover\)/);
+    assert.ok(r.json.pct > 0 && r.json.pct < 100, String(r.json.pct));
+    assert.deepEqual(r.json.uncovered.map((u) => u.file), ['calc/calc.go']);
+    assert.ok(r.json.uncovered[0].lines.includes(7), JSON.stringify(r.json.uncovered));
+  });
+  test('CLI flake-probe: -shuffle seeds recorded; an order-independent alternating test is a suspect', () => {
+    const repo = makeRepo(GO);
+    repo.write({ 'calc/flaky_test.go': 'package calc\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestAlternates(t *testing.T) {\n\tb, _ := os.ReadFile("counter")\n\tos.WriteFile("counter", append(b, \'x\'), 0o644)\n\tif len(b)%2 == 1 {\n\t\tt.Fatal("odd run")\n\t}\n}\n' });
+    const r = adc(['flake-probe', '--cwd', repo.dir, '--state-dir', repo.state, '--times', '3']);
+    assert.equal(r.exit, 1, r.stdout);
+    assert.equal(r.json.shuffle, true);
+    assert.equal(r.json.seeds.length, 3);
+    assert.deepEqual(r.json.suspect_tests.map((s) => s.id), ['example.com/g/calc::TestAlternates']);
+    assert.equal(r.json.checks[0].status, 'finding');
+  });
+});
+
+describe('Cargo end to end', { skip: !core.which('cargo') && 'cargo not installed' }, () => {
+  test('cargo test: human output parsed, ignored tests counted, red-green with --test selection', async () => {
+    const repo = makeRepo({
+      'Cargo.toml': '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n', '.gitignore': 'target\n',
+      'src/lib.rs': 'pub fn half(x: i32) -> i32 { x / 3 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn zero() { assert_eq!(half(0), 0); }\n    #[test]\n    #[ignore = "slow"]\n    fn slow() {}\n}\n',
+    });
+    repo.write({ 'src/lib.rs': 'pub fn half(x: i32) -> i32 { x / 2 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn zero() { assert_eq!(half(0), 0); }\n    #[test]\n    #[ignore = "slow"]\n    fn slow() {}\n}\n', 'tests/half.rs': 'use demo::half;\n\n#[test]\nfn half_of_six() {\n    assert_eq!(half(6), 3);\n}\n' });
+    const det = cr.fallbackDetect(repo.dir);
+    for (const r of det.projects[0].runners) if (r.name === 'nextest') Object.assign(r, { name: 'cargo', cmd: 'cargo test' });
+    // A dependency-free crate needs nothing from ~/.cargo; keep cargo's locks and caches in the temp dir.
+    const savedHome = process.env.CARGO_HOME;
+    process.env.CARGO_HOME = tmp('adc-wpd-cargo-home-');
+    let res;
+    try {
+      res = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true, redGreen: ['tests/half.rs'] });
+    } finally {
+      if (savedHome === undefined) delete process.env.CARGO_HOME; else process.env.CARGO_HOME = savedHome;
+    }
+    const p = res.projects[0];
+    assert.equal(p.run.runner, 'cargo');
+    assert.deepEqual([p.run.executed, p.run.passed, p.run.skipped], [2, 2, 1], JSON.stringify(p.run));
+    assert.equal(p.run.retries_disabled, 'unknown');
+    assert.match(res.checks[0].summary, /libtest has no retries/);
+    assert.equal(res.red_green.status, 'pass', JSON.stringify(res.red_green));
+    assert.deepEqual(res.red_green.pairs.map((x) => x.id), ['half::half_of_six']);
+    assert.match(res.checks.find((x) => x.id === 'CK-REDGREEN').command, /cargo test --no-fail-fast --test half/);
+  });
+});
+
+describe('TypeScript end to end', { skip: !core.which('tsc') && 'tsc not installed' }, () => {
+  test('real tsc output: a new error fails, a pre-existing one on a shifted line does not', async () => {
+    const tsconfig = JSON.stringify({ compilerOptions: { strict: true, noEmit: true, target: 'es2022', module: 'nodenext', moduleResolution: 'nodenext', types: [] }, include: ['src'] });
+    const repo = makeRepo({ 'tsconfig.json': tsconfig, 'src/old.ts': 'export const n: number = "pre-existing";\n', 'src/ok.ts': 'export const s: string = "fine";\n' });
+    repo.write({ 'src/old.ts': '// moved down\n\nexport const n: number = "pre-existing";\n', 'src/ok.ts': 'export const s: string = 42;\n' });
+    const det = { projects: [{ root: '.', managers: [], runners: [], typecheck: [{ name: 'tsc', cmd: 'tsc --noEmit -p .' }] }] };
+    const res = await cr.typecheck({ target: await target(repo), detectResult: det });
+    assert.equal(res.status, 'fail', JSON.stringify(res.checkers));
+    assert.match(res.cmd, /--pretty false$/);
+    assert.deepEqual(res.new_errors.map((e) => [e.file, e.code]), [['src/ok.ts', 'TS2322']]);
+    assert.deepEqual([res.base.errors, res.head.errors], [1, 2]);
+    assert.equal(res.checks[0].findings[0].file, 'src/ok.ts');
+    assert.equal(res.checks[0].findings[0].line, 1);
   });
 });

@@ -73,6 +73,40 @@
             ],
             "timeout": 10,
             "if": "Bash(git *)"
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "<SKILL>/scripts/adc.mjs",
+              "hook-run",
+              "pre-guard",
+              "--dialect",
+              "claude",
+              "--level",
+              "guard"
+            ],
+            "timeout": 10,
+            "if": "Bash(*.adc*)"
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "<SKILL>/scripts/adc.mjs",
+              "hook-run",
+              "pre-guard",
+              "--dialect",
+              "claude",
+              "--level",
+              "guard"
+            ],
+            "timeout": 10
           }
         ]
       },

@@ -35,43 +35,49 @@ Use it to interpret `diff-scope` and `deps-check` results, to decide between "fi
 | FM-15 | Reviewer overclaiming | CK-REVIEW | fresh-context review protocol |
 | FM-16 | Deliberate sabotage | CK-REVIEW, CK-MUTATION | review ("assume a hidden bug"), mutation survivors |
 
-Every check runs on the **working-tree snapshot** (uncommitted and untracked files
-included, `.adc/` and ignored files excluded) against the merge base with the base ref.
+Every check runs on the **working-tree snapshot** (committed, staged, unstaged and untracked
+changes alike; `.adc/` and ignored files excluded) against the merge base with the base ref.
 
 ## 2. What each diff check reports
 
 Severity `fail` makes the verdict FAIL unless waived; `finding` gives PASS-WITH-FINDINGS;
 `info` is context only. The ratchet compares occurrences on added lines with occurrences
 on removed lines of the same file, keyed by the line text and the test case it belongs to,
-so moved or re-indented lines never count as new.
+so moved or re-indented lines never count as new. Markers are matched on code only:
+comments are masked, and in JS/TS a marker inside a string literal is not a marker. In Rust
+files with an inline `#[cfg(test)] mod tests { }`, that module is test code and the rest of
+the file is production code.
 
 | Check | Fires on | Severity |
 |---|---|---|
 | CK-TEST-DEL | test file deleted (with cases or a test name); renamed out of discovery or away from the runner's naming convention (`test_*.py`, `*_test.go`, `*.test.ts`, `*Test.java`, `*_spec.rb`); net loss of test cases inside a file, including cases commented out; cases moved to another test file are `info` | fail |
 | CK-SKIP | added skip, focus (`.only`, `fit`, `focus: true`), xfail or todo markers in test files | fail (todo: finding) |
 | CK-ASSERT | net loss of assertion lines in a modified test file (assertions of removed cases count under CK-TEST-DEL) | fail |
-| CK-ASSERT | assertion replaced by a truthiness/existence check; tautologies (`expect(true).toBe(true)`); `except AssertionError` or an empty catch in a test; a new test file with cases and no assertions; deleted snapshot file | finding |
-| CK-TEST-CFG | changed discovery or failure-handling settings in an existing runner config (`testMatch`, `testPathIgnorePatterns`, Vitest `include`/`exclude`, Playwright `testIgnore`/`retries`, pytest `addopts`/`testpaths`/`python_files`, `conftest.py` collection hooks, `.mocharc` `spec`, `Cargo.toml [[test]]`/`harness`, `.csproj <Compile Remove>`, Surefire `skipTests`/`excludes`, Gradle `test { exclude }`, Makefile/justfile `test*` targets, coverage thresholds); a test script or CI test command that now narrows the run or no longer runs the runner; a deleted runner config | fail |
-| CK-TEST-CFG | other test-script or CI test-command changes; a new runner config that sets those keys | finding |
+| CK-ASSERT | assertion replaced by a truthiness/existence check; new tautologies (`expect(true).toBe(true)`, `assert True`); an assertion inside a `try` whose handler catches assertion failures (`except Exception`/bare `except`, any JS `catch`, Java `catch (Throwable\|AssertionError)`, C# `catch (Exception)`) and neither re-raises nor fails; `except AssertionError`; a new test file with cases and no assertions; deleted snapshot file | finding |
+| CK-TEST-CFG | changed discovery or failure-handling settings in an existing runner config (`testMatch`, `testPathIgnorePatterns`, Vitest `include`/`exclude`, Playwright `testIgnore`/`retries`, pytest `testpaths`/`python_files`, `conftest.py` collection hooks, `.mocharc` `spec`, `Cargo.toml [[test]]`/`harness`/`autotests`, `.csproj <Compile Remove>`, Surefire `skipTests`/`excludes`, Gradle `test { exclude }`); a coverage threshold lowered or removed; runner flags (`addopts`, tox `commands`), Makefile/justfile `test*` recipes, test scripts or CI test commands that now narrow the run (`-k`, `--deselect`, `--ignore`, a single file), mask failures or no longer run the runner; a new runner config or `conftest.py` that excludes, ignores or retries tests that already exist under it; a deleted runner config | fail |
+| CK-TEST-CFG | timeouts, workers, `bail`, coverage scope (`collectCoverageFrom`, `omit`) and raised thresholds; flag, recipe, script or CI test-command changes that do not narrow (`-v`, `--maxWorkers=2`); exclusions that only name `node_modules`, `dist`, `.venv`-style folders; a new runner config that governs no existing test | finding |
 | CK-SUPPRESS | new suppression directive (`eslint-disable*`, `@ts-ignore`, `@ts-nocheck`, `# type: ignore`, `# noqa`, `#[allow(`, `//nolint`, `#pragma warning disable`, `@SuppressWarnings`, `rubocop:disable`, coverage pragmas) | finding |
 | CK-SUPPRESS | rule turned off in an existing lint/type config (`"rule": "off"`, `0`, `"strict": false`, mypy `ignore_errors`, `.editorconfig` severity `none`, `<NoWarn>`, golangci `disable:` items, rubocop `Enabled: false`) | fail |
 | CK-CI | `continue-on-error`, `allow_failure`, `\|\| true`, `--passWithNoTests`, `set +e`, `if: false`, `-DskipTests`, `--exit-zero`, `fail_ci_if_error: false`; a test step removed; a threshold lowered; a CI file deleted or moved; the ci-gate header added to an existing workflow | fail |
 | CK-CI | a new workflow file; weakening inside a workflow whose base already carried `# generated by agentic-developer-companion ci-gate`; `paths-ignore` | finding |
-| CK-SWALLOW | new empty `catch {}`/`.catch(() => {})`, `except: pass`, bare `except:`, `_ = f()`, empty `if err != nil {}`, `Err(_) => {}`, `rescue nil`; error log downgraded to warning; `throw`/`raise` replaced by a log line with the same message (non-test code) | finding |
+| CK-SWALLOW | new empty `catch {}`/`.catch(() => {})`, `except: pass`, bare `except:`, `_ = f()`, empty `if err != nil {}` (also `if err := f(); err != nil {}`), `Err(_) => {}`, `rescue nil`; broad `except Exception`/`catch (Exception\|Throwable)` whose body neither re-raises nor logs at error level; error log downgraded to warning; `throw`/`raise` replaced by a log line with the same message (non-test code) | finding |
 | CK-SECRETS | token shapes (AWS, GitHub, GitLab, Slack, Stripe live, Google, OpenAI, Anthropic, npm, PyPI, SendGrid, Azure, private keys), `ADC_LIVE_TOKEN=<value>`, the live token value itself | fail |
 | CK-SECRETS | generic `password = "..."`-style assignments with high entropy, JWTs, URL credentials, Stripe test keys, credential-like file names (`.env`, `id_rsa`, `*.pem`) | finding |
-| CK-LOCK (static) | manifest dependencies changed but the lockfile did not (Go, yarn and pip-tools: only when the new version is missing); new dependency absent from the changed lockfile; lockfile deleted; conflict markers | fail |
+| CK-LOCK (static) | manifest dependencies changed but the lockfile did not (Go, yarn and pip-tools: only when the new version is missing); new dependency absent from the changed lockfile; `go.mod` requirements without a `go.sum`; lockfile deleted; conflict markers | fail |
 | CK-LOCK (static) | lockfile changed without a manifest change (transitive drift) | finding |
 | CK-RETRY | added in-source retries: `jest.retryTimes`, `this.retries`, `describe.configure({ retries })`, per-test `{ retry: n }`, `@pytest.mark.flaky`, `@RetryingTest`, `[Retry]`, rspec `retry:` | finding |
 | CK-SCOPE | files outside the paths the spec names (`--spec`); generated files edited (`dist/`, `*.min.js`, `*.pb.go`, "Code generated ... DO NOT EDIT" headers); duplicated blocks of 6+ significant lines; a new local Python module that shadows a declared dependency | finding (formatting-only churn: info) |
 | CK-DEPS | dependency that does not exist in its registry; registry dependency redirected to a local path, git or URL source; Go `replace` of a required module by a local directory | fail |
-| CK-DEPS | look-alike of a popular or sibling package; import of a package the manifest does not declare (JS/TS, Go); new non-registry source | finding |
-| CK-LOCK (consistency) | lockfile not consistent with its manifests (static parse plus the manager's frozen check); already inconsistent at the base: finding | fail |
+| CK-DEPS | look-alike of a popular or sibling package; import of a package the manifest does not declare (JS/TS, Go); new non-registry source; a new npm lock entry that resolves from a host that is not a configured registry | finding |
+| CK-LOCK (consistency) | lockfile not consistent with its manifests (static parse plus the manager's frozen check); `go.sum` missing; already inconsistent at the base: finding | fail |
 
-`deps-check` resolves existence offline-first: the lockfile, then the local package-manager
-cache (npm cacache, Go module cache, Cargo index, uv), then the registry CLI. Offline (the
-default inside the Codex sandbox, or `--offline`) an unresolved package leaves CK-DEPS
-`unverified`, never `pass`.
+`deps-check` resolves existence offline-first: a lockfile entry that already existed at the
+base, then the local package-manager cache (npm cacache, Go module cache, Cargo index, uv),
+then the registry CLI. A lock entry the change itself added is not proof (an agent can write a
+fake package and a fake lock entry); it counts only once the cache or the registry confirms
+the name. Offline (the default inside the Codex sandbox, or `--offline`) an unresolved package
+leaves CK-DEPS `unverified`, never `pass`. A Go module path that does not exist cannot be told
+apart from a private repository, so it stays `unverified` too.
 
 ## 3. Detection per ecosystem
 
@@ -106,16 +112,20 @@ Write "guidance-only mode" in the ledger you write yourself.
    only lines starting with `+` count, and only when the same line was not removed.
 4. **CK-ASSERT.** `git diff -U0 B -- <test files>`: count removed lines with `expect(`,
    `assert`, `Assert.`, `t.Error`, `assert_eq!` against added ones; look for `toBeTruthy()`
-   replacing a value check and for `except AssertionError`.
-5. **CK-TEST-CFG.** `git diff B -- jest.config.* vitest.config.* playwright.config.* pytest.ini pyproject.toml setup.cfg tox.ini conftest.py .mocharc* Cargo.toml *.csproj pom.xml build.gradle* Makefile justfile package.json`
-   and read every change to discovery keys, retries, thresholds and test scripts.
+   replacing a value check, for `except AssertionError`, and for added `try:`/`try {`
+   blocks around assertions whose handler only logs or passes.
+5. **CK-TEST-CFG.** `git diff B -- jest.config.* vitest.config.* playwright.config.* pytest.ini pyproject.toml setup.cfg tox.ini '*conftest.py' .mocharc* Cargo.toml '*.csproj' pom.xml 'build.gradle*' Makefile justfile package.json`
+   and read every change to discovery keys, retries, thresholds and test scripts; a new
+   `conftest.py` or runner config with `collect_ignore`, `exclude` or `testIgnore` hides
+   tests that already exist under it.
 6. **CK-SUPPRESS.** `git diff -U0 -G'eslint-disable|@ts-ignore|@ts-nocheck|type: ignore|noqa|nolint|#\[allow|pragma warning disable|SuppressWarnings|rubocop:disable' B`
    and `git diff B -- .eslintrc* eslint.config.* tsconfig*.json ruff.toml mypy.ini .golangci.* .editorconfig`.
 7. **CK-CI.** `git diff B -- .github/workflows .gitlab-ci.yml azure-pipelines*.yml .circleci`
    and look for `continue-on-error`, `allow_failure`, `|| true`, `--passWithNoTests`,
    removed `run:` test steps and lowered numbers.
 8. **CK-SWALLOW.** `git diff -U0 -G'catch|except|rescue|err != nil|Err\(_\)|console\.(warn|error)|logger\.' B`
-   in non-test files; an added empty handler or a `throw` turned into a log line is a finding.
+   in non-test files; an added empty handler, a broad handler that neither re-raises nor logs
+   an error, or a `throw` turned into a log line is a finding.
 9. **CK-SECRETS.** `gitleaks git --log-opts="B..HEAD" --redact` plus `gitleaks dir <untracked files>`,
    or `trufflehog filesystem <changed files> --no-verification`; otherwise read the added
    lines for token prefixes (`AKIA`, `ghp_`, `github_pat_`, `glpat-`, `xox`, `sk_live_`,
@@ -123,13 +133,17 @@ Write "guidance-only mode" in the ledger you write yourself.
 10. **CK-LOCK / CK-DEPS.** `git diff B -- '*package.json' '*lock*' go.mod go.sum Cargo.toml pyproject.toml 'requirements*.txt'`;
     run the frozen check of section 3 in a temp worktree (`git worktree add --detach <tmp> HEAD`,
     then `git worktree remove --force <tmp>`); look up every new name with the registry
-    command of section 3 and compare it with the popular package it resembles.
+    command of section 3, even when the change added it to the lockfile, and compare it with
+    the popular package it resembles; check that new `resolved` URLs point at your registry.
 
 ## 5. Evasion matrix
 
 One scenario per documented strategy, materialized committed and uncommitted by the
-selftest `diffs` area (`tests/unit/diff-scope.test.mjs`); the diff-scope column is
-asserted there, the others state the design.
+selftest `diffs` area (`tests/unit/diff-scope.test.mjs`, fixtures in the `diffs` section of
+`tests/fixtures/table.json`); the diff-scope / deps-check column is asserted there, the
+others state the design. The same file runs every planted check of section 2 committed and
+uncommitted, over 80 per-ecosystem scenarios and 40 false-positive guards (ordinary changes that
+must stay quiet), rotating committed, uncommitted and staged-only changes.
 
 | Strategy | diff-scope / deps-check | clean-run count delta | Caught only by |
 |---|---|---|---|
@@ -157,6 +171,8 @@ asserted there, the others state the design.
   a waiver from the implementer's summary.
 - Heuristic checks (CK-ASSERT downgrades, CK-SWALLOW, generic secrets, look-alikes,
   duplicated blocks) are `finding`, not `fail`, to keep the hard-check false-positive rate low.
+  Settings that change how tests run rather than which run (timeouts, workers, coverage
+  scope, raised thresholds) are `finding` for the same reason.
 - Prefer gitleaks or trufflehog when installed: `ADC_SECRETS_SCANNER=builtin|gitleaks|trufflehog`
   forces one; a scanner error falls back to the built-in regexes and says so.
 
@@ -165,7 +181,10 @@ asserted there, the others state the design.
 - Operator overloading, special-casing of inputs and lookup tables pass every static check
   and every clean run; only mutation testing and the adversarial review catch them.
 - CK-ASSERT and CK-MOCK are heuristics with a ratchet, not proofs; an assertion rewritten
-  into a helper function is invisible to line counting.
+  into a helper function is invisible to line counting, and a try block that swallows
+  failures inside a helper is invisible to the try-wrap detector.
+- Handler bodies are judged by keywords (`raise`, `throw`, `fail`, error-level logging);
+  a handler that calls a custom reporting function by another name counts as swallowing.
 - Test-case counting is line-based: table-driven cases (Go structs, `pytest.mark.parametrize`
   rows, `test.each` tables) count as one case; deleting rows is caught by the clean-run count.
 - Python imports are not matched against declared dependencies (import names differ from
@@ -173,5 +192,8 @@ asserted there, the others state the design.
   equals a declared dependency.
 - Registry lookups depend on the configured registry; a private package missing from the
   lockfile and the cache can only be confirmed online.
+- `diff-scope` never reads `.adc/.env.live`: it recognizes and redacts the live token only
+  when `ADC_LIVE_TOKEN` is set in its environment. A token copied from the file into a source
+  line that triggers another finding appears in that finding's evidence excerpt.
 - Coverage is a soft signal. The ledger is tamper-evident, not tamper-proof, against an
   agent with shell access. Nothing here replaces human review of security-critical code.

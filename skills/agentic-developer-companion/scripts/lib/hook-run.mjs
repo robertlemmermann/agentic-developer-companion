@@ -274,11 +274,12 @@ function fallbackClassify(file) {
 let markersCache;
 async function loadMarkers() {
   if (markersCache !== undefined) return markersCache;
-  const m = { classifyPath: fallbackClassify, scanSecrets: null, source: 'fallback', ...FALLBACK };
+  const m = { classifyPath: fallbackClassify, scanSecrets: null, scanText: null, source: 'fallback', ...FALLBACK };
   try {
     const mod = await import('./markers.mjs');
     if (typeof mod.classifyPath === 'function') m.classifyPath = mod.classifyPath;
     if (typeof mod.scanSecrets === 'function') m.scanSecrets = mod.scanSecrets;
+    if (typeof mod.scanText === 'function') m.scanText = mod.scanText;
     for (const k of Object.keys(FALLBACK)) if (Array.isArray(mod[k]) && mod[k].length) m[k] = mod[k];
     m.source = 'markers.mjs';
   } catch {}
@@ -346,7 +347,13 @@ export function fallbackSummary(text) {
 // ---------------------------------------------------------------------------
 // Scanning helpers
 
-/** Run `{id, re}` catalog entries over text; returns `[{id, line, text}]` (line numbers 1-based). */
+/** Line `n` (1-based) of the scanned text in the edited file; null where a patch hunk gives no number. */
+const mapLine = (lineMap, n) => (lineMap ? (n - 1 < lineMap.length ? lineMap[n - 1] ?? null : null) : n);
+
+/**
+ * Run `{id, re}` catalog entries over text; returns `[{id, line, text}]` (line numbers 1-based).
+ * The built-in fallback for when markers.mjs is absent: it ignores `langs`, `code` and `next`.
+ */
 export function scanCatalog(text, catalog, lineMap = null) {
   const hits = [];
   if (!text || !Array.isArray(catalog)) return hits;
@@ -371,7 +378,7 @@ export function scanCatalog(text, catalog, lineMap = null) {
     while ((m = g.exec(text)) && guard++ < 50) {
       const idx = lineAt(m.index);
       const lineText = text.slice(starts[idx], idx + 1 < starts.length ? starts[idx + 1] - 1 : text.length);
-      hits.push({ id: entry.id || 'marker', line: lineMap ? (lineMap[idx] ?? idx + 1) : idx + 1, text: truncate(lineText.trim(), 80) });
+      hits.push({ id: entry.id || 'marker', line: mapLine(lineMap, idx + 1), text: truncate(lineText.trim(), 80) });
       if (m[0] === '') g.lastIndex++;
     }
   }
@@ -379,16 +386,35 @@ export function scanCatalog(text, catalog, lineMap = null) {
   return hits.filter((h) => { const k = `${h.id}:${h.line}`; if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
+/**
+ * Scan with markers.mjs `scanText` when it is loaded: it honors each entry's `langs` (by the file
+ * name), masks comments for `code` entries and checks `next` for multi-line constructs, so a
+ * commented-out `it.only`, a Python `# noqa` regex on a JS file or a multi-line catch block with
+ * a body do not produce notes. Falls back to scanCatalog.
+ */
+export function scanEdit(markers, text, catalog, file, lineMap = null) {
+  if (!text || !Array.isArray(catalog)) return [];
+  if (markers && typeof markers.scanText === 'function') {
+    try {
+      const res = markers.scanText(text, catalog, { file: file || undefined });
+      if (Array.isArray(res)) return res.map((h) => ({ id: h.id || 'marker', line: mapLine(lineMap, h.line), text: truncate(String(h.text || '').trim(), 80) }));
+    } catch {}
+  }
+  return scanCatalog(text, catalog, lineMap);
+}
+
 function scanSecretsIn(markers, text, lineMap) {
   if (!text) return [];
   if (markers.scanSecrets) {
     try {
       const res = markers.scanSecrets(text);
-      if (Array.isArray(res)) return res.map((r) => ({ id: r.id || 'secret', line: lineMap ? (lineMap[(r.line || 1) - 1] ?? r.line) : r.line, text: '' }));
+      if (Array.isArray(res)) return res.map((r) => ({ id: r.id || 'secret', line: mapLine(lineMap, r.line || 1), text: '' }));
     } catch {}
   }
   return scanCatalog(text, FALLBACK_SECRETS, lineMap).map((h) => ({ ...h, text: '' }));
 }
+
+const at = (x) => (x.line != null ? `at line ${x.line}` : 'in an added line');
 
 /** Classification merged with the cached detect.json test globs. */
 function classify(markers, rel, detectCache) {
@@ -591,6 +617,9 @@ export function newestLedger(evidenceDir) {
     } catch {}
   }
   stats.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? 1 : -1));
+  // The few most recently written files are read; among them the newest by created_at wins, the
+  // order `evidence` itself uses (an `evidence add` to an older ledger only bumps its mtime).
+  let best = null;
   for (const s of stats.slice(0, 5)) {
     const led = readJson(path.join(evidenceDir, s.name), null);
     if (!led || typeof led !== 'object' || Array.isArray(led)) continue;
@@ -598,7 +627,46 @@ export function newestLedger(evidenceDir) {
     // created_at is when verify snapshotted the tree; later `evidence add` calls do not make it fresher.
     const ts = [led.created_at, led.finalized_at, led.updated_at].find((t) => typeof t === 'string' && !Number.isNaN(Date.parse(t)))
       || new Date(s.mtimeMs).toISOString();
-    return { file: s.name, verdict: typeof led.verdict === 'string' ? led.verdict : null, ts, finalized: Boolean(led.finalized_at) };
+    const row = { file: s.name, verdict: typeof led.verdict === 'string' ? led.verdict : null, ts, finalized: Boolean(led.finalized_at) };
+    if (!best || Date.parse(row.ts) > Date.parse(best.ts)) best = row;
+  }
+  return best;
+}
+
+/**
+ * The last assistant message from the tail of a host transcript (bounded read, no scan). Copilot's
+ * camelCase `agentStop` payload carries only `transcriptPath`, a JSONL of events whose
+ * `assistant.message` entries hold `data.content` (measured, CLI 1.0.103); Claude-style
+ * `{type:'assistant', message:{content:[{type:'text'}]}}` lines are read too.
+ */
+export function lastAssistantMessage(file, { maxBytes = 256 * 1024 } = {}) {
+  if (typeof file !== 'string' || !file) return null;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, maxBytes);
+    if (!len) return null;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    if (size > len) lines.shift();
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const l = lines[i].trim();
+      if (!l.startsWith('{') || !/assistant/.test(l)) continue;
+      let e;
+      try { e = JSON.parse(l); } catch { continue; }
+      if (e && e.type === 'assistant.message' && e.data && typeof e.data.content === 'string' && e.data.content.trim()) return e.data.content;
+      const content = e && e.type === 'assistant' && e.message ? e.message.content : null;
+      if (Array.isArray(content)) {
+        const text = content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n');
+        if (text.trim()) return text;
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
   }
   return null;
 }
@@ -682,7 +750,8 @@ async function sessionStart(h) {
   const tracked = trackedState(h.st, h.repo);
   if (tracked && tracked.length) {
     lines.push(`The companion state dir ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); scripts refuse to run and hooks stay silent until it is untracked: ${ADC_CMD} doctor.`);
-    if (debugOn(h.env)) process.stderr.write(`adc hook-run: session-start: STATE_TRACKED (${tracked.length} file(s))\n`);
+    // A diagnostic, never a different exit code (Copilot denies tool calls on non-zero preToolUse exits).
+    process.stderr.write(`adc hook-run: ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); hooks stay silent until it is untracked\n`);
     h.noWrite = true;
   }
   await record(h, (s) => {
@@ -724,18 +793,19 @@ async function postEdit(h) {
     const content = contents.find((x) => x.path === p) || (contents.length === 1 && !contents[0].path ? contents[0] : null) ||
       (paths.length === 1 ? contents[0] : null);
     const text = content ? content.text : '';
-    const lineMap = content && content.lines ? content.lines : null;
+    const lineMap = content && content.lines ? content.lines : content && content.fragment ? [] : null;
     const hits = [];
+    const scan = (catalog) => scanEdit(markers, text, catalog, rel, lineMap);
     if (c.test) {
-      for (const x of scanCatalog(text, markers.SKIP_MARKERS, lineMap)) hits.push(`adds a skip/focus marker (${x.id}) at line ${x.line}: ${x.text}`);
-      for (const x of scanCatalog(text, markers.IN_SOURCE_RETRIES, lineMap)) hits.push(`adds an in-source retry (${x.id}) at line ${x.line}`);
+      for (const x of scan(markers.SKIP_MARKERS)) hits.push(`adds a skip/focus marker (${x.id}) ${at(x)}: ${x.text}`);
+      for (const x of scan(markers.IN_SOURCE_RETRIES)) hits.push(`adds an in-source retry (${x.id}) ${at(x)}`);
     }
-    if (c.ci) for (const x of scanCatalog(text, markers.CI_WEAKENING, lineMap)) hits.push(`weakens a CI step (${x.id}) at line ${x.line}: ${x.text}`);
+    if (c.ci) for (const x of scan(markers.CI_WEAKENING)) hits.push(`weakens a CI step (${x.id}) ${at(x)}: ${x.text}`);
     if (!c.generated) {
-      for (const x of scanCatalog(text, markers.SUPPRESSIONS, lineMap)) hits.push(`adds a lint/type suppression (${x.id}) at line ${x.line}`);
-      for (const x of scanCatalog(text, markers.SWALLOW_PATTERNS, lineMap)) hits.push(`adds an exception-swallowing pattern (${x.id}) at line ${x.line}`);
+      for (const x of scan(markers.SUPPRESSIONS)) hits.push(`adds a lint/type suppression (${x.id}) ${at(x)}`);
+      for (const x of scan(markers.SWALLOW_PATTERNS)) hits.push(`adds an exception-swallowing pattern (${x.id}) ${at(x)}`);
     }
-    for (const x of scanSecretsIn(markers, text, lineMap)) hits.push(`adds a value shaped like a secret (${x.id}) at line ${x.line}`);
+    for (const x of scanSecretsIn(markers, text, lineMap)) hits.push(`adds a value shaped like a secret (${x.id}) ${at(x)}`);
     findings += hits.length;
     const label = names.length ? ` (${names.map((n) => CLASS_LABEL[n]).join(', ')})` : '';
     const op = ops.get(p);
@@ -799,6 +869,7 @@ async function postShell(h) {
       cmd_head: runInfo.head,
       class: runInfo.class,
       exit: norm.exit_code,
+      exit_source: norm.exit_source,
       counts: counts ? { passed: counts.passed ?? null, failed: counts.failed ?? null, skipped: counts.skipped ?? null, runner: counts.runner ?? null } : null,
       parse_source: counts ? 'summary-line' : 'none',
       source: 'hook:post-shell',
@@ -838,24 +909,25 @@ async function stop(h) {
     return {};
   }
   const epoch = Number(edits.count);
+  if (h.level === 'advise' ? gate.last_notice_epoch === epoch : gate.last_block_epoch === epoch) return {};
+  if (h.level !== 'advise' && (gate.consecutive || 0) >= MAX_CONSECUTIVE_BLOCKS) {
+    log(h, { condition: 'BLOCK_CAP', consecutive: gate.consecutive });
+    return {};
+  }
   const ledText = led ? `newest ledger ${led.file} (verdict ${led.verdict || 'none'}, ${led.ts})` : 'no ledger yet';
   let claim = '';
-  if (norm.last_message) {
+  // Copilot payloads carry no last message; its transcript tail is read only when a notice is due.
+  const lastMessage = norm.last_message || lastAssistantMessage(norm.transcript_path);
+  if (lastMessage) {
     for (const re of CLAIM_RE) {
-      const m = re.exec(norm.last_message);
+      const m = re.exec(lastMessage);
       if (m) { claim = ` The final message states "${truncate(m[0], 60)}"; observed test runs do not support that claim, only CK-CLEANRUN in a ledger does.`; break; }
     }
   }
   const reasonCore = `${epoch} edit event(s) in this session are newer than the verification evidence (${ledText}).`;
   if (h.level === 'advise') {
-    if (gate.last_notice_epoch === epoch) return {};
     await record(h, (s) => { s.gate.notices = (s.gate.notices || 0) + 1; s.gate.last_notice_epoch = epoch; });
     return { context: `agentic-developer-companion: ${reasonCore} ${ADC_CMD} verify --json records a ledger and verdict.${claim}` };
-  }
-  if (gate.last_block_epoch === epoch) return {};
-  if ((gate.consecutive || 0) >= MAX_CONSECUTIVE_BLOCKS) {
-    log(h, { condition: 'BLOCK_CAP', consecutive: gate.consecutive });
-    return {};
   }
   await record(h, (s) => {
     s.gate.blocks = (s.gate.blocks || 0) + 1;

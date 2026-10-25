@@ -3,13 +3,62 @@
  "note": "Placeholders: {{repeat N|text}}, {{bytes N}}, {{base64 N}}, {{secret aws}}, {{literal-token}} are expanded by tests/unit/tooling-lint.test.mjs at run time (no secret-shaped literal is stored here).",
  "cases": [
   {
-   "name": "doc: Agent Skills spec example (pdf-processing)",
-   "doc": "agentskills specification.mdx examples",
+   "name": "doc: Agent Skills spec example (pdf-processing); its flow-style metadata fails skills-ref",
+   "doc": "agentskills specification.mdx examples; skills-ref @69ef37e rejects the flow mapping (measured 2026-10-25)",
    "files": {
     "skills/pdf-processing/SKILL.md": "---\nname: pdf-processing\ndescription: Extract text and tables from PDF files, fill forms, merge documents. Use when working with PDF files or when the user mentions PDFs, forms, or document extraction.\nlicense: Proprietary. LICENSE.txt has complete terms\ncompatibility: Requires git, docker, jq, and access to the internet\nmetadata: {author: example-org, version: \"1.0\"}\nallowed-tools: Bash(git:*) Bash(jq:*) Read\n---\n# PDF processing\n\n## Instructions\n\nUse pdfplumber to extract text from the PDF.\n"
    },
    "lint": [
     "skills/pdf-processing"
+   ],
+   "host": "all",
+   "strict": true,
+   "expect": {
+    "clean_for": [
+     "copilot",
+     "claude",
+     "codex"
+    ],
+    "severity": {
+     "SK-FM-STRICTYAML": {
+      "spec": "error"
+     }
+    },
+    "count": {
+     "SK-FM-STRICTYAML": 1
+    },
+    "no_security": true
+   }
+  },
+  {
+   "name": "doc: Agent Skills spec example in block style (what skills-ref accepts)",
+   "doc": "agentskills specification.mdx example, metadata written in block style",
+   "files": {
+    "skills/pdf-processing/SKILL.md": "---\nname: pdf-processing\ndescription: Extract text and tables from PDF files, fill forms, merge documents. Use when working with PDF files or when the user mentions PDFs, forms, or document extraction.\nlicense: Proprietary. LICENSE.txt has complete terms\ncompatibility: Requires git, docker, jq, and access to the internet\nmetadata:\n  author: example-org\n  version: \"1.0\"\nallowed-tools: Bash(git:*) Bash(jq:*) Read\n---\n# PDF processing\n\n## Instructions\n\nUse pdfplumber to extract text from the PDF.\n"
+   },
+   "lint": [
+    "skills/pdf-processing"
+   ],
+   "host": "all",
+   "strict": true,
+   "expect": {
+    "clean_for": [
+     "spec",
+     "copilot",
+     "claude",
+     "codex"
+    ],
+    "no_security": true
+   }
+  },
+  {
+   "name": "doc: a SKILL.md as rewritten by gh skill install (sorted keys, quoted scalars, provenance in metadata)",
+   "doc": "gh 2.99.0 skill install --from-local output (measured 2026-10-25) plus metadata.github-* provenance keys",
+   "files": {
+    ".agents/skills/release-notes/SKILL.md": "---\ncompatibility: 'Needs git on PATH. Windows: PowerShell 7 or Git Bash.'\ndescription: 'Drafts release notes from merged pull requests. Use when the user asks for a changelog: it''s grouped by label.'\nlicense: MIT\nmetadata:\n    author: example-org\n    github-path: skills/release-notes\n    github-pinned: true\n    github-ref: v1.2.0\n    github-repo: https://github.com/example-org/release-tools\n    github-tree-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n    local-path: /home/dev/src/release-tools/skills/release-notes\n    short-description: Draft release notes from merged PRs\n    version: 1.2.0\nname: release-notes\n---\n# Release notes\n\nCollect the merged pull requests since the last tag and group them by label.\n"
+   },
+   "lint": [
+    ".agents/skills"
    ],
    "host": "all",
    "strict": true,
@@ -91,20 +140,19 @@
    "strict": true,
    "expect": {
     "rules": [
-     "SK-FIELD-NONSPEC",
-     "SK-FIELD-IGNORED"
+     "SK-FIELD-NONSPEC"
     ],
     "severity": {
      "SK-FIELD-NONSPEC": {
       "spec": "error"
-     },
-     "SK-FIELD-IGNORED": {
-      "codex": "note"
      }
     },
     "clean_for": [
-     "copilot",
-     "claude"
+     "copilot"
+    ],
+    "hosts_only": [
+     "spec",
+     "copilot"
     ]
    }
   },
@@ -595,6 +643,23 @@
    }
   },
   {
+   "name": "doc: Claude Code hook with an if condition and the exec form",
+   "doc": "code.claude.com/docs/en/hooks (research digest qa-methodology.md: the block-rm example)",
+   "files": {
+    "home/.claude/settings.json": "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"if\": \"Bash(rm *)\",\n            \"command\": \"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-rm.sh\",\n            \"args\": []\n          }\n        ]\n      }\n    ]\n  }\n}\n"
+   },
+   "lint": [
+    "home/.claude/settings.json"
+   ],
+   "host": "claude",
+   "expect": {
+    "clean_for": [
+     "claude"
+    ],
+    "no_security": true
+   }
+  },
+  {
    "name": "skill: name format and directory",
    "files": {
     "skills/My_Skill/SKILL.md": "---\nname: My_Skill\ndescription: Does a thing. Use when testing.\n---\n# Skill\n\nDo the thing.\n",
@@ -737,6 +802,82 @@
      "SK-FM-YAML",
      "SK-FILENAME"
     ]
+   }
+  },
+  {
+   "name": "skill: constructs strictyaml rejects (flow, anchor, alias, tag)",
+   "files": {
+    "skills/strict-yaml/SKILL.md": "---\nname: strict-yaml\ndescription: &d Does a thing. Use when testing.\nallowed-tools: [Read, Grep]\nlicense: !!str MIT\nmetadata:\n  summary: *d\n---\n# Skill\n\nDo the thing.\n"
+   },
+   "lint": [
+    "skills"
+   ],
+   "expect": {
+    "rules": [
+     "SK-FM-STRICTYAML"
+    ],
+    "severity": {
+     "SK-FM-STRICTYAML": {
+      "spec": "warning"
+     }
+    },
+    "count": {
+     "SK-FM-STRICTYAML": 4
+    },
+    "clean_for": [
+     "copilot",
+     "claude",
+     "codex"
+    ]
+   }
+  },
+  {
+   "name": "skill: hosts follow the folder (.claude/skills, .github/skills, .agents/skills, skills/)",
+   "files": {
+    ".claude/skills/c-only/SKILL.md": "---\nname: c-only\ndescription: Does a thing. Use when testing.\neffort: high\n---\nRun it on $ARGUMENTS.\n",
+    ".github/skills/gh-only/SKILL.md": "---\nname: gh-only\ndescription: Does a thing. Use when testing.\nargument-hint: \"[x]\"\n---\n# Title\n\nDo the thing.\n",
+    ".agents/skills/shared/SKILL.md": "---\nname: shared\ndescription: Does a thing. Use when testing.\n---\n# Title\n\nDo the thing.\n",
+    "skills/source/SKILL.md": "---\nname: source\ndescription: Does a thing. Use when testing.\n---\n# Title\n\nDo the thing.\n"
+   },
+   "lint": [
+    "."
+   ],
+   "expect": {
+    "rules": [
+     "SK-SUBST",
+     "SK-FIELD-IGNORED"
+    ],
+    "absent_for": {
+     "codex": [
+      "SK-SUBST",
+      "SK-FIELD-IGNORED"
+     ],
+     "claude": [
+      "SK-FIELD-IGNORED"
+     ]
+    },
+    "reads": {
+     ".claude/skills/c-only/SKILL.md": [
+      "spec",
+      "claude",
+      "copilot"
+     ],
+     ".github/skills/gh-only/SKILL.md": [
+      "spec",
+      "copilot"
+     ],
+     ".agents/skills/shared/SKILL.md": [
+      "spec",
+      "copilot",
+      "codex"
+     ],
+     "skills/source/SKILL.md": [
+      "spec",
+      "copilot",
+      "claude",
+      "codex"
+     ]
+    }
    }
   },
   {
@@ -1237,6 +1378,29 @@
    }
   },
   {
+   "name": "agents: mcp-servers and metadata are notes (VS Code and IDEs ignore them)",
+   "files": {
+    ".github/agents/with-mcp.agent.md": "---\nname: with-mcp\ndescription: Reviews code with the GitHub MCP server.\ntools: [\"read\", \"github/*\"]\nmcp-servers:\n  github:\n    type: local\n    command: github-mcp-server\n    tools: [\"*\"]\nmetadata:\n  owner: platform-team\n---\n# Title\n\nDo the thing.\n"
+   },
+   "lint": [
+    ".github/agents"
+   ],
+   "host": "copilot",
+   "expect": {
+    "clean_for": [
+     "copilot"
+    ],
+    "severity": {
+     "AG-FIELD-SURFACE": {
+      "copilot": "note"
+     }
+    },
+    "count": {
+     "AG-FIELD-SURFACE": 2
+    }
+   }
+  },
+  {
    "name": "agents: Claude field rules and plugin agents",
    "files": {
     ".claude/agents/nameless.md": "---\ndescription: Reviews code.\n---\n# Title\n\nDo the thing.\n",
@@ -1351,7 +1515,30 @@
    "expect": {
     "rules": [
      "HK-CP-PLUGIN-CWD"
+    ],
+    "absent": [
+     "HK-CP-PLUGIN-PATHS"
     ]
+   }
+  },
+  {
+   "name": "copilot hooks: plugin script paths and plugin state",
+   "files": {
+    "cpp2/plugin.json": "{\n  \"name\": \"cpp2\",\n  \"description\": \"x\"\n}\n",
+    "cpp2/skills/.keep": "",
+    "cpp2/hooks.json": "{\n  \"version\": 1,\n  \"hooks\": {\n    \"sessionStart\": [\n      {\n        \"type\": \"command\",\n        \"bash\": \"./hooks/start.sh\",\n        \"powershell\": \"./hooks/start.ps1\",\n        \"timeoutSec\": 5\n      }\n    ],\n    \"postToolUse\": [\n      {\n        \"type\": \"command\",\n        \"bash\": \"node hooks/post.mjs\",\n        \"powershell\": \"node hooks/post.mjs\",\n        \"cwd\": \"${PLUGIN_ROOT}\",\n        \"timeoutSec\": 5\n      }\n    ],\n    \"agentStop\": [\n      {\n        \"type\": \"command\",\n        \"bash\": \"echo done >> \\\"${PLUGIN_ROOT}/state.log\\\"\",\n        \"powershell\": \"Add-Content -Path \\\"$env:PLUGIN_DATA/state.log\\\" -Value done\",\n        \"timeoutSec\": 5\n      }\n    ],\n    \"sessionEnd\": [\n      {\n        \"type\": \"command\",\n        \"bash\": \"node \\\"${PLUGIN_ROOT}/hooks/end.mjs\\\"\",\n        \"powershell\": \"node \\\"$env:PLUGIN_ROOT/hooks/end.mjs\\\"\",\n        \"timeoutSec\": 5\n      }\n    ]\n  }\n}\n",
+    "cpp2/hooks/end.mjs": "import fs from 'node:fs';\nfs.writeFileSync(process.env.PLUGIN_DATA + '/end.json', '{}');\n"
+   },
+   "lint": [
+    "cpp2"
+   ],
+   "expect": {
+    "rules": [
+     "HK-CP-PLUGIN-PATHS"
+    ],
+    "count": {
+     "HK-CP-PLUGIN-PATHS": 2
+    }
    }
   },
   {

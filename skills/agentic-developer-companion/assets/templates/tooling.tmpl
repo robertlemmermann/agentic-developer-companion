@@ -199,7 +199,6 @@ This skill runs only when the user invokes it by name; the words after the name 
 //   node {{script_path}} --dialect copilot|claude|codex --event <event name>
 // Test it with: node --test {{test_path}}
 
-import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 // Stay well under the host timeout (the generated configs allow 10 seconds).
@@ -265,11 +264,16 @@ export function format(dialect, event, decision) {
   return {};
 }
 
+let emitted = false;
+
+/** Print exactly one JSON object and exit 0 once it is flushed (pipes are asynchronous on some OSes). */
 function emit(obj) {
+  if (emitted) return;
+  emitted = true;
   // ASCII-only JSON: Windows PowerShell re-encodes stdout with the console code page.
-  const text = JSON.stringify(obj).replace(/[\u007f-￿]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-  process.stdout.write(text + '\n');
-  process.exit(0);
+  const text = JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+  process.exitCode = 0;
+  process.stdout.write(text + '\n', () => process.exit(0));
 }
 
 function arg(name, fallback) {
@@ -277,21 +281,28 @@ function arg(name, fallback) {
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-export function main() {
-  setTimeout(() => emit({}), TIME_LIMIT_MS).unref();
+/** Decide for one raw stdin payload; any error is "no decision". */
+export function handle(raw, dialect, eventArg) {
   try {
-    const dialect = arg('dialect', 'claude');
-    let raw = '';
-    try { raw = readFileSync(0, 'utf8'); } catch { raw = ''; }
-    const payload = raw.trim() ? JSON.parse(raw) : {};
+    const payload = String(raw || '').trim() ? JSON.parse(raw) : {};
     const norm = normalize(payload, dialect);
-    const event = arg('event', norm.event || '');
+    const event = eventArg || norm.event || '';
     // Never block a stop the host already continued once (loop protection).
-    if (norm.stopHookActive) emit({});
-    emit(format(dialect, event, decide(norm, event)));
+    if (norm.stopHookActive) return {};
+    return format(dialect, event, decide(norm, event));
   } catch {
-    emit({});
+    return {};
   }
+}
+
+export function main() {
+  // stdin is read asynchronously so the time limit also covers a host that never closes it.
+  const timer = setTimeout(() => emit({}), TIME_LIMIT_MS);
+  let raw = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { raw += chunk; });
+  process.stdin.on('error', () => { clearTimeout(timer); emit({}); });
+  process.stdin.on('end', () => { clearTimeout(timer); emit(handle(raw, arg('dialect', 'claude'), arg('event', null))); });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

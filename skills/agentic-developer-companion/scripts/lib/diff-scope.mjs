@@ -13,7 +13,7 @@ import {
 import { emptyTree, diffNameStatus, diffLines, showFile, lsTree } from './git.mjs';
 import { prepareTarget, snapshotExcludes } from './state.mjs';
 import * as M from './markers.mjs';
-import { parseManifest, isParsableManifest, manifestDelta, lockFor, lockIndex, lockHas, lockManager, normPypi } from './deps.mjs';
+import { parseManifest, isParsableManifest, manifestDelta, lockFor, lockIndex, lockHas, lockManager, normPypi, goSumNeeded } from './deps.mjs';
 
 export const CHECK_FM = Object.freeze({
   'CK-SCOPE': ['FM-11'], 'CK-TEST-DEL': ['FM-01'], 'CK-SKIP': ['FM-01'], 'CK-ASSERT': ['FM-01', 'FM-03'],
@@ -81,6 +81,24 @@ async function makeState(target, detectResult, env) {
     linesCache.set(text, l);
     return l;
   }
+  // Rust keeps unit tests in `#[cfg(test)] mod tests { }` inside production files: those files
+  // count as test files for test-case bookkeeping, but only the module's lines are test code.
+  const rangeCache = new Map();
+  S.testRanges = (side, file) => {
+    if (M.langOf(file) !== 'rs' || M.classifyPath(file).test || (detectIsTest && detectIsTest(file))) return null;
+    const k = `${side}\u0000${file}`;
+    if (!rangeCache.has(k)) {
+      const lines = side === 'base' ? S.baseLines(file) : S.headLines(file);
+      const ranges = lines ? M.rustTestRanges(lines) : [];
+      rangeCache.set(k, ranges.length ? ranges : null);
+    }
+    return rangeCache.get(k);
+  };
+  /** Is `line` of `file` test code? (Always true in a test file, only inside the test module of a mixed one.) */
+  S.testLine = (side, file, line) => {
+    const r = S.testRanges(side, file);
+    return !r || r.some(([a, b]) => line >= a && line <= b);
+  };
   const caseCache = new Map();
   S.cases = (side, file) => {
     const k = `${side}\u0000${file}`;
@@ -177,6 +195,17 @@ function newHits(S, f, catalogs, { context = false, fileFilter = null } = {}) {
   return multisetSubtract(headHits.map((h) => ({ ...h, k: headKey(h) })), baseKeys, (x) => x.k);
 }
 
+/** Like newHits for structural detectors `fn(lines, file) -> [{ id, line, text }]`. */
+function newDerivedHits(S, f, fn) {
+  if (f.status === 'D' || f.binary || !f.added.length) return [];
+  const added = lineSet(f.added);
+  const headHits = fn(sideLines(S, f, 'head'), f.path).filter((h) => added.has(h.line));
+  if (!headHits.length) return [];
+  const removed = lineSet(f.removed);
+  const baseHits = f.old_path && f.removed.length ? fn(sideLines(S, f, 'base'), f.old_path).filter((h) => removed.has(h.line)) : [];
+  return multisetSubtract(headHits, baseHits, (h) => `${h.id}|${norm(h.text)}`);
+}
+
 // ---------------------------------------------------------------------------
 // CK-TEST-DEL: deleted or renamed-away test files, test cases removed inside a file
 
@@ -201,13 +230,17 @@ function checkTestDeletion(S) {
     const oldTest = f.status !== 'A' && f.old_path && S.isTest(f.old_path, 'base');
     const newTest = f.status !== 'D' && S.isTest(f.path, 'head');
     if (!oldTest && !newTest) continue;
+    // A modified file that stops looking like a test (a Rust module whose #[cfg(test)] block was
+    // deleted) is still compared case by case, so the loss shows up.
+    const keepsPath = f.status === 'M' || f.status === 'T';
+    const headSide = newTest || (oldTest && keepsPath);
     const baseL = oldTest ? S.baseLines(f.old_path) : null;
-    const headL = newTest ? S.headLines(f.path) : null;
+    const headL = headSide ? S.headLines(f.path) : null;
     const baseCases = oldTest ? S.cases('base', f.old_path) : [];
-    const headCases = newTest ? S.cases('head', f.path) : [];
+    const headCases = headSide ? S.cases('head', f.path) : [];
     casesBase += baseCases.length;
     casesHead += headCases.length;
-    const entry = { f, oldTest, newTest, baseCases, headCases, baseL, headL };
+    const entry = { f, oldTest, newTest, headSide, baseCases, headCases, baseL, headL };
     perFile.push(entry);
     const added = multisetSubtract(headCases, baseCases.map((c) => ({ k: caseKey(c, baseL) })), (c) => (c.k !== undefined ? c.k : caseKey(c, headL)));
     for (const c of added) {
@@ -226,7 +259,7 @@ function checkTestDeletion(S) {
   S.removedCaseRanges = new Map();
   const assertionCount = (lines, file) => (lines ? M.scanText(lines, M.ASSERTION_LINE, { file }).length : 0);
   for (const e of perFile) {
-    const { f, oldTest, newTest, baseCases, headCases, baseL } = e;
+    const { f, oldTest, newTest, headSide, baseCases, headCases, baseL } = e;
     const removed = multisetSubtract(baseCases, headCases.map((c) => ({ k: caseKey(c, e.headL) })), (c) => (c.k !== undefined ? c.k : caseKey(c, baseL)));
     // Remember which base line ranges belong to removed cases (their assertions count here, not in CK-ASSERT).
     if (removed.length && f.old_path) {
@@ -271,7 +304,7 @@ function checkTestDeletion(S) {
       }
       S.add('CK-TEST-DEL', 'info', f.path, null, `test file renamed: ${f.old_path} -> ${f.path}`, '');
     }
-    if (!oldTest || !newTest || !baseCases.length) continue;
+    if (!oldTest || !headSide || !baseCases.length) continue;
     const netLoss = baseCases.length - headCases.length;
     if (netLoss <= 0) continue;
     const notMoved = [];
@@ -326,6 +359,10 @@ function inRanges(line, ranges) {
   return (ranges || []).some(([a, b]) => line >= a && line <= b);
 }
 
+// In tests, only handlers that catch assertion failures matter: explicit AssertionError catches,
+// try blocks around assertions (tryWrappedAssertions), suppress(Exception) and `rescue nil`.
+const TEST_SWALLOW = [M.ASSERTION_SWALLOW, M.SWALLOW_PATTERNS.filter((e) => e.id === 'swallow.py-suppress' || e.id === 'swallow.rb')];
+
 function checkAssertions(S) {
   let base = 0;
   let head = 0;
@@ -341,16 +378,20 @@ function checkAssertions(S) {
     const oldTest = f.status !== 'A' && f.old_path && S.isTest(f.old_path, 'base');
     const headL = sideLines(S, f, 'head');
     const added = lineSet(f.added);
-    const headAll = M.scanText(headL, M.ASSERTION_LINE, { file: f.path });
+    const inTest = (side, file) => (h) => S.testLine(side, file, h.line);
+    const headAll = M.scanText(headL, M.ASSERTION_LINE, { file: f.path }).filter(inTest('head', f.path));
     head += headAll.length;
-    for (const h of M.scanText(headL, M.TAUTOLOGIES, { file: f.path, lines: added })) {
+    for (const h of newHits(S, f, M.TAUTOLOGIES).filter(inTest('head', f.path))) {
       S.add('CK-ASSERT', 'finding', f.path, h.line, 'assertion that can never fail', h.text, { rule: h.id });
     }
     const swallowLines = new Set();
-    for (const h of newHits(S, f, [M.ASSERTION_SWALLOW, M.SWALLOW_PATTERNS])) {
+    const swallowed = [...newHits(S, f, TEST_SWALLOW), ...newDerivedHits(S, f, M.tryWrappedAssertions)]
+      .filter(inTest('head', f.path)).sort((a, b) => a.line - b.line);
+    for (const h of swallowed) {
       if (swallowLines.has(h.line)) continue;
       swallowLines.add(h.line);
-      S.add('CK-ASSERT', 'finding', f.path, h.line, 'error handling in a test can swallow assertion failures', h.text, { rule: h.id });
+      S.add('CK-ASSERT', 'finding', f.path, h.line, h.id === 'assert-swallow.try-wrap'
+        ? 'assertion wrapped in a try block whose handler swallows the failure' : 'error handling in a test swallows assertion failures', h.text, { rule: h.id });
     }
     if (f.status === 'A' || !oldTest) {
       const cases = S.cases('head', f.path);
@@ -360,10 +401,11 @@ function checkAssertions(S) {
       continue;
     }
     const baseL = sideLines(S, f, 'base');
-    base += M.scanText(baseL, M.ASSERTION_LINE, { file: f.old_path }).length;
+    base += M.scanText(baseL, M.ASSERTION_LINE, { file: f.old_path }).filter(inTest('base', f.old_path)).length;
     const ranges = S.removedCaseRanges?.get(f.old_path);
-    const removedA = M.scanText(baseL, M.ASSERTION_LINE, { file: f.old_path, lines: lineSet(f.removed) }).filter((h) => !inRanges(h.line, ranges));
-    const addedA = M.scanText(headL, M.ASSERTION_LINE, { file: f.path, lines: added });
+    const removedA = M.scanText(baseL, M.ASSERTION_LINE, { file: f.old_path, lines: lineSet(f.removed) })
+      .filter((h) => !inRanges(h.line, ranges)).filter(inTest('base', f.old_path));
+    const addedA = M.scanText(headL, M.ASSERTION_LINE, { file: f.path, lines: added }).filter(inTest('head', f.path));
     const net = removedA.length - addedA.length;
     if (net > 0) {
       const gone = multisetSubtract(removedA, addedA, (h) => norm(h.text));
@@ -494,21 +536,24 @@ export function narrowsCommand(before, after) {
 function relevantCfgKey(file, lines, idx) {
   const base = path.posix.basename(file).toLowerCase();
   const { keys, section } = keyPath(lines, idx);
-  const own = keys[0]?.toLowerCase();
+  // keys[0] is the line's own key only when the line has one (Groovy `exclude '...'` has none).
+  const parents = keyOf(lines[idx] || '') ? keys.slice(1) : keys;
+  const own = keyOf(lines[idx] || '') ? keys[0]?.toLowerCase() : undefined;
   const sec = (section || '').toLowerCase();
   const hit = (list) => list.find((k) => TEST_CFG_KEYS.has(k.toLowerCase()) || TEST_CFG_KEYS.has(k.toLowerCase().split('.').pop()));
   if (base === 'pyproject.toml') {
     if (!/^tool\.(?:pytest|coverage|tox|nox)/.test(sec)) return null;
-    return hit(keys) || (sec.startsWith('tool.pytest') ? keys[keys.length - 1] || sec : null);
+    return hit(keys) || null;
   }
   if (base === 'setup.cfg' || base === 'tox.ini') {
     if (!/^(?:tool:pytest|pytest|coverage:|testenv|tox)/.test(sec)) return null;
     return hit(keys) || null;
   }
-  if (base === 'pytest.ini') return sec === 'pytest' ? (hit(keys) || keys[keys.length - 1] || 'pytest') : null;
+  if (base === 'pytest.ini') return sec === 'pytest' ? (hit(keys) || null) : null;
   if (base === 'cargo.toml') {
     if (/^(?:\[)?test$/.test(sec) || sec === 'test' || /^(?:lib|bin|package)$/.test(sec)) {
-      if (sec === 'test') return keys[0] || 'test';
+      // A [[test]] target is one setting: report the section once, not each of its keys.
+      if (sec === 'test') return '[[test]]';
       return ['test', 'harness', 'autotests', 'autobins'].includes(own) ? own : null;
     }
     return null;
@@ -521,17 +566,17 @@ function relevantCfgKey(file, lines, idx) {
   if (base === 'pom.xml') {
     const block = enclosingBlock(lines, idx, 'plugin');
     const inRunner = /surefire|failsafe/.test(block);
-    const inProps = keys.slice(1).some((k) => k.toLowerCase() === 'properties');
+    const inProps = parents.some((k) => k.toLowerCase() === 'properties');
     if (!inRunner && !inProps) return null;
     if (inProps) return /^(?:skiptests|maven\.test\.skip|skipits|maven\.test\.failure\.ignore|surefire\.\w+)$/i.test(own || '') ? own : null;
     return hit(keys) || null;
   }
   if (base === 'build.gradle' || base === 'build.gradle.kts') {
-    const inTest = keys.slice(1).some((k) => /^(?:test|tests|tasks\.test|tasks\.named|withType|retry|filter|useJUnitPlatform)$/i.test(k)) || /\btest\s*\{|tasks\.test|withType\s*\(\s*Test|named\s*\(\s*["']test/.test(lines[idx]);
+    const inTest = parents.some((k) => /^(?:test|tests|tasks\.test|tasks\.named|withType|retry|filter|useJUnitPlatform)$/i.test(k)) || /\btest\s*\{|tasks\.test|withType\s*\(\s*Test|named\s*\(\s*["']test/.test(lines[idx]);
     if (!inTest) return null;
     return hit(keys) || (/\b(?:exclude|include|excludeTestsMatching|includeTestsMatching|enabled|ignoreFailures|onlyIf|maxRetries)\b/.exec(lines[idx])?.[0] ?? null);
   }
-  if (/^vite\.config\./.test(base)) return keys.slice(1).some((k) => k === 'test') ? (hit(keys) || 'test') : null;
+  if (/^vite\.config\./.test(base)) return parents.some((k) => k === 'test') ? (hit(keys) || 'test') : null;
   if (/^(?:makefile|gnumakefile|.+\.mk|justfile|\.justfile)$/.test(base)) {
     for (let j = idx; j >= 0; j--) {
       const m = /^([A-Za-z0-9_.%/-]+)\s*:(?!=)/.exec(lines[j]);
@@ -545,9 +590,52 @@ function relevantCfgKey(file, lines, idx) {
   if (base === 'codecov.yml' || base === '.codecov.yml') return hit(keys) || null;
   if (base === '.rspec' || base === 'rakefile') return base === '.rspec' ? '.rspec' : (/test|spec/i.test(lines[idx]) ? 'task' : null);
   if (base === 'conftest.py') return /\b(?:collect_ignore(?:_glob)?|pytest_collection_modifyitems|pytest_ignore_collect|pytest_collect_file|pytest_deselected|items\.remove|deselect)\b/.test(lines[idx]) ? 'collection hook' : null;
-  if (/^deno\.jsonc?$/.test(base)) return keys.slice(1).includes('test') || own === 'test' ? 'test' : null;
+  if (/^deno\.jsonc?$/.test(base)) return parents.includes('test') || own === 'test' ? 'test' : null;
   // Dedicated runner configs: jest, vitest, playwright, cypress, mocha, karma, ava, nyc, c8, nextest, runsettings, phpunit.
   return hit(keys) || null;
+}
+
+// Settings that hide tests or failures (as opposed to, say, a reporter or a timeout).
+const MASKING_KEYS = /^(?:testpathignorepatterns|modulepathignorepatterns|exclude|excludes|testignore|ignore|collect_ignore|collect_ignore_glob|norecursedirs|collection hook|testexcludes|excludetestsmatching|skiptests|skip|skipits|maven\.test\.skip|testfailureignore|ignorefailures|grepinvert|exclude-pattern|excludespecpattern|excludedgroups|excludetags|autotests|harness|compile|retries|retry|reruns|passwithnotests|\[\[test\]\])$/i;
+// Coverage thresholds: lowering or removing one fails, raising one is a finding.
+const THRESHOLD_KEYS = /^(?:coveragethreshold|thresholds|branches|functions|lines|statements|fail_under|target|threshold|minimum_coverage)$/i;
+// Tuning and coverage-scope settings change how tests run or are measured, not which ones run.
+const SOFT_CFG_KEYS = /^(?:bail|testtimeout|timeout|shard|test-threads|fail-fast|maxworkers|workers|slow|collectcoveragefrom|coveragepathignorepatterns|omit|exclude_lines|exclude_also|source|per-file)$/i;
+/** Severity of one changed runner setting: { severity, why }. */
+function settingSeverity(key, before, after, base) {
+  if (COMMAND_KEYS.test(key) || MAKE_LIKE.test(base)) {
+    // Command lines and runner flags: only a narrowing, masking or lowered threshold fails.
+    const reason = narrowsCommand(before, after) || (thresholdLowered(before, after) ? 'lowers a threshold' : null);
+    return reason ? { severity: 'fail', why: ` (${reason})` } : { severity: after ? 'finding' : 'fail', why: '' };
+  }
+  if (THRESHOLD_KEYS.test(key)) {
+    if (!after) return { severity: 'fail', why: ' (threshold removed)' };
+    return thresholdLowered(before, after) ? { severity: 'fail', why: ' (threshold lowered)' } : { severity: 'finding', why: '' };
+  }
+  if (SOFT_CFG_KEYS.test(key)) return { severity: 'finding', why: '' };
+  return { severity: 'fail', why: '' };
+}
+// Settings whose value is a command line or runner flags: judged with narrowsCommand.
+const COMMAND_KEYS = /^(?:addopts|commands|cmds|cmd|script|run)$/i;
+const MAKE_LIKE = /^(?:makefile|gnumakefile|.+\.mk|justfile|\.justfile|taskfile\.ya?ml)$/;
+// Exclusions that only name dependency, build or cache folders are routine, not tampering.
+const CONVENTIONAL_DIR = /^(?:<rootdir>\/?)?\/?\.?(?:node_modules|dist|build|out|coverage|\.?venv|env|vendor|target|\.git|\.next|\.nuxt|__pycache__|\.tox|\.nox|\.cache|\.pytest_cache|\.mypy_cache|site-packages|bower_components|tmp|temp)(?:\/[*]{0,2})?\/?$/i;
+function benignExclusion(text) {
+  const value = String(text).replace(/^[^:=]*[:=]/, '');
+  const tokens = value.split(/[\s,[\]()'"`]+/).map((t) => t.replace(/^\*\*\//, '').replace(/\/\*\*$/, '')).filter(Boolean);
+  return tokens.length > 0 && tokens.every((t) => CONVENTIONAL_DIR.test(t));
+}
+/** Number of base test files under the directory a runner config governs. */
+function governedBaseTests(S, file) {
+  const dir = path.posix.dirname(file);
+  let n = 0;
+  for (const p of S.baseFiles()) if ((dir === '.' || p.startsWith(`${dir}/`)) && M.isCodeFile(p) && S.isTest(p, 'base')) n++;
+  return n;
+}
+function thresholdLowered(before, after) {
+  const re = new RegExp(M.THRESHOLD.source, 'g');
+  const b = new Map([...String(before).matchAll(re)].map((m) => [m[1].replace(/\s+/g, ''), Number(m[2])]));
+  return [...String(after).matchAll(re)].some((m) => b.has(m[1].replace(/\s+/g, '')) && Number(m[2]) < b.get(m[1].replace(/\s+/g, '')));
 }
 
 function checkTestConfig(S) {
@@ -585,8 +673,21 @@ function checkTestConfig(S) {
     touched++;
     if (f.status === 'A') {
       const keys = [...groups.keys()];
-      S.add('CK-TEST-CFG', 'finding', file, groups.get(keys[0]).added[0]?.line ?? null,
-        `new runner configuration ${file} sets ${keys.slice(0, 6).join(', ')}; confirm it does not narrow test discovery or enable retries`, groups.get(keys[0]).added[0]?.text || '');
+      // A new config that narrows or masks tests which already exist under it is tampering.
+      const masking = keys.filter((k) => {
+        const g = groups.get(k);
+        if (COMMAND_KEYS.test(k)) return g.added.some((x) => narrowsCommand('', x.text));
+        return MASKING_KEYS.test(k) && !g.added.every((x) => benignExclusion(x.text));
+      });
+      const governed = masking.length ? governedBaseTests(S, file) : 0;
+      const first = groups.get(masking[0] || keys[0]).added[0];
+      if (governed) {
+        S.add('CK-TEST-CFG', 'fail', file, first?.line ?? null,
+          `new runner configuration ${file} sets ${masking.slice(0, 6).join(', ')}, narrowing or masking ${governed} existing test file(s) it governs`, first?.text || '');
+      } else {
+        S.add('CK-TEST-CFG', 'finding', file, first?.line ?? null,
+          `new runner configuration ${file} sets ${keys.slice(0, 6).join(', ')}; confirm it does not narrow test discovery or enable retries`, first?.text || '');
+      }
       continue;
     }
     if (f.status === 'D') {
@@ -601,8 +702,10 @@ function checkTestConfig(S) {
       const first = g.added[0] || g.removed[0];
       const before = g.removed.map((x) => norm(x.text)).join(' ');
       const after = g.added.map((x) => norm(x.text)).join(' ');
-      S.add('CK-TEST-CFG', 'fail', file, g.added[0]?.line ?? null,
-        `test runner setting "${g.key}" changed in ${file}${before ? `: "${truncate(before, 80)}"` : ''}${after ? ` -> "${truncate(after, 80)}"` : ' (removed)'}`,
+      let { severity, why } = settingSeverity(g.key, before, after, base);
+      if (MASKING_KEYS.test(g.key) && !g.removed.length && g.added.every((x) => benignExclusion(x.text))) severity = 'finding';
+      S.add('CK-TEST-CFG', severity, file, g.added[0]?.line ?? null,
+        `test runner setting "${g.key}" changed in ${file}${before ? `: "${truncate(before, 80)}"` : ''}${after ? ` -> "${truncate(after, 80)}"` : ' (removed)'}${why}`,
         first.text, { side: g.added[0] ? 'head' : 'base' });
     }
   }
@@ -642,10 +745,20 @@ function packageJsonTestConfig(S, f) {
       .filter((x) => JSON.stringify(before[k]?.[x]) !== JSON.stringify(after[k]?.[x])));
     const relevant = [...changedKeys].filter((x) => TEST_CFG_KEYS.has(x.toLowerCase()));
     if (!relevant.length && before[k] != null && after[k] != null) continue;
-    S.add('CK-TEST-CFG', before[k] == null ? 'finding' : 'fail', file, lineOf(k),
+    const masks = relevant.some((x) => MASKING_KEYS.test(x) && !benignExclusion(JSON.stringify(after[k]?.[x] ?? '')));
+    const judged = relevant.map((x) => settingSeverity(x, JSON.stringify(before[k]?.[x] ?? ''), after[k]?.[x] == null ? '' : JSON.stringify(after[k][x]), 'package.json').severity);
+    const severity = before[k] == null ? (masks && governedBaseTests(S, file) ? 'fail' : 'finding')
+      : after[k] == null || !relevant.length || judged.includes('fail') ? 'fail' : 'finding';
+    S.add('CK-TEST-CFG', severity, file, lineOf(k),
       `"${k}" configuration in package.json changed${relevant.length ? ` (${relevant.join(', ')})` : before[k] == null ? ' (added)' : ' (removed)'}`, truncate(a, 160));
   }
 }
+
+/** A CI line reduced to its command: YAML keys (`- run:`, `script:`), list dashes and block markers removed. */
+export function ciCommand(text) {
+  return norm(String(text ?? '').replace(/^\s*-?\s*(?:(?:run|script|command|cmd|commands|inlineScript|bash|pwsh|powershell|sh)\s*:\s*)?(?:[|>][-+]?\s*)?/, ''));
+}
+const withoutThresholds = (t) => ciCommand(t).replace(new RegExp(M.THRESHOLD.source, 'g'), (m, k) => k);
 
 /** CI files: changed test commands go to CK-TEST-CFG (CK-CI handles weakening and removals). */
 function ciTestCommands(S, f) {
@@ -654,17 +767,17 @@ function ciTestCommands(S, f) {
   const removed = f.removed.filter((x) => TEST_COMMAND.test(x.text));
   const added = f.added.filter((x) => TEST_COMMAND.test(x.text));
   const pairs = Math.min(removed.length, added.length);
-  const unmatchedRemoved = multisetSubtract(removed, added, (x) => norm(x.text));
-  const unmatchedAdded = multisetSubtract(added, removed, (x) => norm(x.text));
+  const unmatchedRemoved = multisetSubtract(removed, added, (x) => ciCommand(x.text));
+  const unmatchedAdded = multisetSubtract(added, removed, (x) => ciCommand(x.text));
   for (let i = 0; i < Math.min(pairs, unmatchedRemoved.length, unmatchedAdded.length); i++) {
     const b = unmatchedRemoved[i].text;
     const a = unmatchedAdded[i].text;
-    // Failure-masking edits (|| true, --passWithNoTests, ...) are CK-CI's; report each edit once.
-    if (M.scanText([a], M.CI_WEAKENING).length) continue;
-    const why = narrowsCommand(b, a);
+    // Failure-masking edits (|| true, --passWithNoTests, ...) and lowered thresholds are CK-CI's; report each edit once.
+    if (M.scanText([a], M.CI_WEAKENING).length || withoutThresholds(a) === withoutThresholds(b)) continue;
+    const why = narrowsCommand(ciCommand(b), ciCommand(a));
     n++;
     S.add('CK-TEST-CFG', why ? 'fail' : 'finding', f.path, unmatchedAdded[i].line,
-      `CI test command changed: "${truncate(norm(b), 80)}" -> "${truncate(norm(a), 80)}"${why ? ` (${why})` : ''}`, a);
+      `CI test command changed: "${truncate(ciCommand(b), 80)}" -> "${truncate(ciCommand(a), 80)}"${why ? ` (${why})` : ''}`, a);
   }
   return n;
 }
@@ -799,7 +912,7 @@ function checkCi(S) {
     const removedTests = f.removed.filter((x) => TEST_COMMAND.test(x.text));
     const addedTests = f.added.filter((x) => TEST_COMMAND.test(x.text));
     if (removedTests.length > addedTests.length) {
-      const gone = multisetSubtract(removedTests, addedTests, (x) => norm(x.text));
+      const gone = multisetSubtract(removedTests, addedTests, (x) => ciCommand(x.text));
       const first = gone[0] || removedTests[0];
       S.add('CK-CI', hardSeverity, f.path, null, `${removedTests.length - addedTests.length} test step(s) removed from ${f.path}`, first.text, { side: 'base', rule: 'ci.test-step-removed' });
     }
@@ -824,10 +937,16 @@ function checkSwallow(S) {
   let fresh = 0;
   for (const f of S.files) {
     if (f.status === 'D' || f.binary || !f.lang || f.class.generated) continue;
-    if (S.isTest(f.path, 'head')) continue;
-    for (const h of newHits(S, f, M.SWALLOW_PATTERNS)) {
+    const mixed = S.testRanges('head', f.path);
+    if (S.isTest(f.path, 'head') && !mixed) continue;
+    const prod = (h) => !mixed || !S.testLine('head', f.path, h.line);
+    const seenLines = new Set();
+    for (const h of newHits(S, f, M.SWALLOW_PATTERNS).filter(prod)) {
+      if (seenLines.has(h.line)) continue;
+      seenLines.add(h.line);
       fresh++;
-      S.add('CK-SWALLOW', 'finding', f.path, h.line, 'error swallowed: the failure is caught and dropped', h.text, { rule: h.id });
+      S.add('CK-SWALLOW', 'finding', f.path, h.line, /broad/.test(h.id)
+        ? 'broad exception handler neither re-raises nor reports the error' : 'error swallowed: the failure is caught and dropped', h.text, { rule: h.id });
     }
     // error-level log replaced by a lower level with the same text
     const levelOf = (t) => {
@@ -840,7 +959,7 @@ function checkSwallow(S) {
     if (removedErr.length) {
       for (const x of f.added) {
         const l = levelOf(x.text);
-        if (!l || l.rank == null || l.rank >= 3) continue;
+        if (!l || l.rank == null || l.rank >= 3 || !prod(x)) continue;
         if (removedErr.some((r) => r.l.key === l.key)) {
           fresh++;
           S.add('CK-SWALLOW', 'finding', f.path, x.line, 'error log downgraded to a lower level', x.text, { rule: 'swallow.log-downgrade' });
@@ -854,7 +973,7 @@ function checkSwallow(S) {
       for (const t of removedThrows) {
         const lit = /(["'`])((?:\\.|(?!\1).){6,})\1/.exec(t.text)?.[2];
         if (!lit) continue;
-        const logged = f.added.find((x) => M.LOG_CALL.test(x.text) && x.text.includes(lit));
+        const logged = f.added.find((x) => M.LOG_CALL.test(x.text) && x.text.includes(lit) && prod(x));
         if (logged) {
           fresh++;
           S.add('CK-SWALLOW', 'finding', f.path, logged.line, 'exception replaced by a log message; callers no longer see the failure', logged.text, { rule: 'swallow.throw-to-log' });
@@ -1000,7 +1119,14 @@ function checkLockStatic(S) {
     if (lock) handledLocks.add(lock);
     if (!touched.length) continue;
     pairs++;
-    if (!lock) continue;
+    if (!lock) {
+      const needs = goSumNeeded(after);
+      if (needs.length) {
+        S.add('CK-LOCK', 'fail', f.path, null, `${f.path} requires ${needs.length} module(s) but there is no go.sum next to it`,
+          needs.slice(0, 4).map((d) => `${d.name}@${d.spec}`).join(', '), { rule: 'lock.missing' });
+      }
+      continue;
+    }
     const lockChanged = changed.has(lock);
     const idx = lockIndex(lock, S.read(S.to, lock));
     if (!idx.ok) continue;

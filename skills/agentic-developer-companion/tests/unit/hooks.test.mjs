@@ -309,7 +309,8 @@ test('extractPaths and parsePatch cover every dialect, apply_patch headers and o
   assert.deepEqual(files[1].added, [{ line: 4, text: 'added' }]);
   assert.equal(files[1].moveTo, 'src/new.js');
   const content = dialects.extractContent({ tool_name: 'MultiEdit', tool_input: { file_path: 'a.js', edits: [{ new_string: 'one' }, { new_string: 'two' }] } });
-  assert.deepEqual(content, [{ path: 'a.js', op: 'update', text: 'one\ntwo' }]);
+  assert.deepEqual(content, [{ path: 'a.js', op: 'update', text: 'one\ntwo', fragment: true }]);
+  assert.deepEqual(dialects.extractContent({ tool_name: 'Write', tool_input: { file_path: 'b.js', content: 'x' } }), [{ path: 'b.js', op: 'write', text: 'x' }]);
   assert.deepEqual(dialects.extractPatterns({ tool_input: { pattern: '.adc/**', path: '.' } }), ['.adc/**']);
 });
 
@@ -382,6 +383,83 @@ test('scanCatalog reports line numbers, honors patch line maps and multi-line pa
   const hits = hookRun.scanCatalog('a\ntry { x() } catch (e) {\n}\nit.only(1)', [{ id: 'empty-catch', re: /catch\s*(?:\([^)]*\))?\s*\{\s*\}/ }, { id: 'only', re: '\\bit\\.only\\(' }]);
   assert.deepEqual(hits.map((h) => [h.id, h.line]), [['empty-catch', 2], ['only', 4]]);
   assert.deepEqual(hookRun.scanCatalog('x\nit.only(1)', [{ id: 'only', re: /it\.only/ }], [10, 12]).map((h) => h.line), [12]);
+  // A patch hunk without line numbers maps to null, never to a guessed number.
+  assert.deepEqual(hookRun.scanCatalog('x\nit.only(1)', [{ id: 'only', re: /it\.only/ }], [null, null]).map((h) => h.line), [null]);
+});
+
+const HAS_MARKERS = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'markers.mjs'));
+
+test('scanEdit uses markers.mjs scanText: languages, comment masking and multi-line constructs', { skip: HAS_MARKERS ? false : 'markers.mjs not built yet' }, async () => {
+  const markers = await import('../../scripts/lib/markers.mjs');
+  const m = { scanText: markers.scanText };
+  const multiCatch = 'try {\n  run();\n} catch (e) {\n  log(e);\n}\n';
+  assert.deepEqual(hookRun.scanEdit(m, multiCatch, markers.SWALLOW_PATTERNS, 'src/a.js'), [], 'a catch block with a body is not swallowing');
+  assert.deepEqual(hookRun.scanEdit(m, 'try { run(); } catch (e) {\n}\n', markers.SWALLOW_PATTERNS, 'src/a.js').map((h) => [h.id, h.line]), [['swallow.empty-catch', 1]]);
+  assert.deepEqual(hookRun.scanEdit(m, 'const a = 1; // # noqa\n', markers.SUPPRESSIONS, 'src/a.js'), [], 'a Python directive in a JS file');
+  assert.equal(hookRun.scanEdit(m, 'x = 1  # noqa\n', markers.SUPPRESSIONS, 'src/a.py')[0].id, 'suppress.py-noqa');
+  assert.deepEqual(hookRun.scanEdit(m, "// it.only was here\nit('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js'), [], 'commented-out focus');
+  assert.deepEqual(hookRun.scanEdit(m, "a\nit.only('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js', [7, null]).map((h) => h.line), [null]);
+  // Without markers.mjs the built-in scanner still reports.
+  assert.equal(hookRun.scanEdit({}, "it.only('x')", [{ id: 'only', re: /it\.only/ }], 'a.js').length, 1);
+});
+
+test('exitFromText reads the exit code the hosts print into results (Copilot trailer, Codex header)', () => {
+  assert.equal(dialects.exitFromText('# pass 1\n<shellId: 0 completed with exit code 1>'), 1);
+  assert.equal(dialects.exitFromText('ok\n<shellId: my-shell completed with exit code 0>\n'), 0);
+  assert.equal(dialects.exitFromText('Exit code: 2\nWall time: 0.1 seconds\nOutput:\nfailed'), 2);
+  assert.equal(dialects.exitFromText('the docs say Exit code: 2 somewhere'), null);
+  assert.equal(dialects.exitFromText(''), null);
+  assert.equal(dialects.exitFromText(null), null);
+  const n = dialects.normalizePayload({ sessionId: 's', toolName: 'bash', toolArgs: { command: 'npm test' }, toolResult: { resultType: 'success', textResultForLlm: 'x\n<shellId: 3 completed with exit code 7>' } }, 'copilot', 'post-shell');
+  assert.deepEqual([n.exit_code, n.exit_source], [7, 'result-text']);
+  const p = dialects.normalizePayload({ session_id: 's', tool_name: 'Bash', tool_response: { stdout: '<shellId: 3 completed with exit code 7>', exit_code: 3 } }, 'claude', 'post-shell');
+  assert.deepEqual([p.exit_code, p.exit_source], [3, 'payload']);
+});
+
+test('extractPaths reads Copilot grep/rg/glob `paths` as a string or an array; parsePatch marks unnumbered hunks', () => {
+  assert.deepEqual(dialects.extractPaths({ tool_name: 'grep', tool_input: { pattern: 'x', paths: '/r/.adc' } }), ['/r/.adc']);
+  assert.deepEqual(dialects.extractPaths({ tool_name: 'rg', tool_input: { pattern: 'x', paths: ['/r/.adc', '/r/src'] } }), ['/r/.adc', '/r/src']);
+  const files = dialects.parsePatch(['*** Begin Patch', '*** Update File: src/a.js', '@@ function x', '-a', '+b', '*** Add File: t/a.test.js', '+one', '+two', '*** End Patch'].join('\n'));
+  assert.deepEqual(files[0].added, [{ line: null, text: 'b' }]);
+  assert.deepEqual(files[1].added, [{ line: 1, text: 'one' }, { line: 2, text: 'two' }]);
+});
+
+test('lastAssistantMessage reads the tail of Copilot and Claude transcripts (bounded, partial lines skipped)', () => {
+  const dir = tmp('adc-transcript-');
+  const copilotFile = path.join(dir, 'events.jsonl');
+  const filler = JSON.stringify({ type: 'tool.execution_complete', data: { result: 'x'.repeat(5000) } });
+  fs.writeFileSync(copilotFile, [
+    JSON.stringify({ type: 'assistant.message', data: { content: 'Earlier: tests are green' } }),
+    ...Array.from({ length: 80 }, () => filler),
+    JSON.stringify({ type: 'assistant.message', data: { content: 'All tests pass now.', toolRequests: [] } }),
+    JSON.stringify({ type: 'assistant.message', data: { content: '', toolRequests: [{ name: 'bash' }] } }),
+    JSON.stringify({ type: 'assistant.turn_end', data: {} }),
+  ].join('\n') + '\n');
+  assert.equal(hookRun.lastAssistantMessage(copilotFile), 'All tests pass now.');
+  assert.equal(hookRun.lastAssistantMessage(copilotFile, { maxBytes: 64 }), null, 'only the bounded tail is read');
+  const claudeFile = path.join(dir, 'claude.jsonl');
+  fs.writeFileSync(claudeFile, `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Everything works.' }] } })}\n${JSON.stringify({ type: 'user', message: { content: 'x' } })}\n`);
+  assert.equal(hookRun.lastAssistantMessage(claudeFile), 'Everything works.');
+  assert.equal(hookRun.lastAssistantMessage(path.join(dir, 'missing.jsonl')), null);
+  assert.equal(hookRun.lastAssistantMessage(null), null);
+});
+
+test('newestLedger picks the newest created_at among recently written ledgers and skips foreign JSON', () => {
+  const dir = tmp('adc-evidence-');
+  const write = (name, doc, mtimeS) => {
+    const f = path.join(dir, name);
+    fs.writeFileSync(f, JSON.stringify(doc));
+    const t = new Date(Date.now() + mtimeS * 1000);
+    fs.utimesSync(f, t, t);
+  };
+  write('a.json', { schema: 'adc-evidence/1', verdict: 'PASS', created_at: iso(-60) }, 0); // older ledger, touched last
+  write('b.json', { schema: 'adc-evidence/1', verdict: 'FAIL', created_at: iso(-10) }, -5);
+  write('c.json', { schema: 'adc-trace/1', created_at: iso(0) }, 2);
+  write('d.md', { x: 1 }, 3);
+  const led = hookRun.newestLedger(dir);
+  assert.equal(led.file, 'b.json');
+  assert.equal(led.verdict, 'FAIL');
+  assert.equal(hookRun.newestLedger(path.join(dir, 'missing')), null);
 });
 
 test('findRepo resolves linked worktrees, and the exclude entry lands in the common git dir', () => {
@@ -447,6 +525,16 @@ async function viaLauncher(file, mode, filter = () => true) {
   return cases.length;
 }
 
+/** The first case per event: the rendered command is the same string for every case of an event. */
+function onePerEvent(pred) {
+  const seen = new Set();
+  return (c) => {
+    if (!pred(c) || seen.has(c.event)) return false;
+    seen.add(c.event);
+    return true;
+  };
+}
+
 const copilotOnly = (c) => [c, ...(c.then || [])].every((s) => (s.dialect_arg || c.dialect_arg) === 'copilot');
 const claudeOnly = (c) => [c, ...(c.then || [])].every((s) => (s.dialect_arg || c.dialect_arg) === 'claude');
 const codexOnly = (c) => [c, ...(c.then || [])].every((s) => (s.dialect_arg || c.dialect_arg) === 'codex');
@@ -463,7 +551,8 @@ test('fixtures through the rendered Copilot bash strings (bash -c)', { skip: BAS
 
 test('fixtures through the rendered Codex command (sh -c) and commandWindows (pwsh -Command)', { timeout: 180_000 }, async (t) => {
   if (SH) await viaLauncher('codex', 'codex-sh', codexOnly);
-  if (PWSH) await viaLauncher('codex', 'codex-pwsh', codexOnly);
+  // Every case already ran through sh; under pwsh one case per event proves the same strings parse and run.
+  if (PWSH) await viaLauncher('codex', 'codex-pwsh', onePerEvent(codexOnly));
   if (!SH && !PWSH) t.skip('no sh or pwsh');
 });
 
@@ -473,7 +562,7 @@ test('fixtures through the rendered Claude user-scope exec form (command + args,
 
 test('fixtures through the Claude project-scope shell form (--dialect auto) under sh and pwsh', { timeout: 180_000 }, async (t) => {
   if (SH) await viaLauncher('claude', 'claude-shell-sh', claudeOnly);
-  if (PWSH) await viaLauncher('claude', 'claude-shell-pwsh', claudeOnly);
+  if (PWSH) await viaLauncher('claude', 'claude-shell-pwsh', onePerEvent(claudeOnly));
   if (!SH && !PWSH) t.skip('no sh or pwsh');
 });
 
@@ -517,6 +606,51 @@ test('Copilot guards print {} with exit 0 when node is missing, crashes or is to
     const res = await spawnAsync(NODE_OLD, [ADC, 'hook-run', 'pre-guard', '--dialect', 'copilot'], { input, env: baseEnv(), cwd: repo });
     assert.deepEqual(assertHookOutput(res, 'old node direct'), {});
   }
+});
+
+test('Codex commands fail open under pwsh -Command and sh -c: missing or crashing node is a non-blocking failure, old node prints {}', { skip: core.IS_WINDOWS ? 'POSIX fake executables' : false, timeout: 120_000 }, async () => {
+  // Codex runs the bare command: exit 0 parses stdout, exit 2 with stderr blocks, any other exit is a
+  // non-blocking failure. So the launch must never end with exit 2 or with JSON-looking stdout.
+  const repo = makeRepo();
+  const h = handlerFor('codex', 'guard', 'pre-guard');
+  const input = JSON.stringify({ session_id: 'cx-fo', turn_id: 't', cwd: repo, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push --force' } });
+  const sysPath = ['/usr/bin', '/bin'].join(path.delimiter);
+  const variants = [
+    ['missing node', tmp('adc-empty-path-')],
+    ['crashing node', `${fakeNodeDir('echo "Segmentation fault" >&2; exit 139')}${path.delimiter}${sysPath}`],
+    ['node exiting 2', `${fakeNodeDir('echo "fatal" >&2; exit 2')}${path.delimiter}${sysPath}`],
+  ];
+  for (const [label, PATH] of variants) {
+    const env = { ...baseEnv(), PATH };
+    const launches = [];
+    if (PWSH) launches.push(['pwsh', await spawnAsync(PWSH, ['-NoProfile', '-Command', h.commandWindows], { input, env, cwd: repo })]);
+    if (SH) launches.push(['sh', await spawnAsync(SH, ['-c', h.command], { input, env, cwd: repo })]);
+    for (const [launcher, res] of launches) {
+      assert.notEqual(res.code, 0, `${launcher} ${label}: must not look like a decision`);
+      assert.equal(res.stdout.trim().startsWith('{'), false, `${launcher} ${label}: no JSON on stdout`);
+      // pwsh -Command collapses every failure to 1 (openai/codex#54072); sh passes the code through,
+      // and a node that really exits 2 would block under sh, which is why adc.mjs always exits 0.
+      if (launcher === 'pwsh') assert.equal(res.code, 1, `pwsh ${label}: exit ${res.code}`);
+    }
+  }
+  if (NODE_OLD) {
+    const env = { ...baseEnv(), PATH: `${path.dirname(NODE_OLD)}${path.delimiter}${sysPath}` };
+    if (PWSH) assert.deepEqual(assertHookOutput(await spawnAsync(PWSH, ['-NoProfile', '-Command', h.commandWindows], { input, env, cwd: repo }), 'pwsh old node'), {});
+    if (SH) assert.deepEqual(assertHookOutput(await spawnAsync(SH, ['-c', h.command], { input, env, cwd: repo }), 'sh old node'), {});
+  }
+});
+
+test('a non-ASCII payload through the Codex commandWindows under pwsh arrives intact, stdout byte-identical to a direct run', { skip: PWSH ? false : 'pwsh not installed', timeout: 60_000 }, async () => {
+  const repo = makeRepo();
+  const payload = (r) => JSON.stringify({ session_id: 'cx-u', turn_id: 't', cwd: r, hook_event_name: 'PostToolUse', tool_name: 'apply_patch',
+    tool_input: { command: "*** Begin Patch\n*** Add File: tests/ünïcödé ✓.test.js\n+it.only('héllo wörld ✓', () => {});\n*** End Patch\n" } });
+  const h = handlerFor('codex', 'advise', 'post-edit');
+  const viaPwsh = await spawnAsync(PWSH, ['-NoProfile', '-Command', h.commandWindows], { input: payload(repo), env: baseEnv(), cwd: repo });
+  const obj = assertHookOutput(viaPwsh, 'codex pwsh non-ASCII');
+  assert.match(obj.hookSpecificOutput.additionalContext, /tests\/ünïcödé ✓\.test\.js \(test file\)[\s\S]*héllo wörld ✓/);
+  const repo2 = makeRepo();
+  const direct = await spawnAsync(process.execPath, [ADC, 'hook-run', 'post-edit', '--dialect', 'codex'], { input: payload(repo2), env: baseEnv(), cwd: repo2 });
+  assert.equal(viaPwsh.bytes.toString('hex'), direct.bytes.toString('hex'), 'byte-identical stdout');
 });
 
 test('a non-ASCII payload through pwsh -Command arrives intact and stdout is byte-identical to a direct run', { skip: PWSH ? false : 'pwsh not installed', timeout: 60_000 }, async () => {
@@ -609,6 +743,256 @@ test('--state-dir and ADC_HOME relocate hook state', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Real hosts, offline: each installed CLI is driven by a scripted fake model endpoint on
+// 127.0.0.1 (no account, no network, no cost), with this skill's hooks registered through
+// `setup hooks --write` in a temp HOME. The assertions read what the host passed to the model.
+
+const findBin = (name, extra = []) => core.which(name) || extra.find((p) => fs.existsSync(p)) || null;
+const HOST_BIN = {
+  copilot: findBin('copilot', ['/opt/hostclis/bin/copilot']),
+  claude: findBin('claude', ['/opt/claude-code/bin/claude']),
+  codex: findBin('codex', ['/opt/hostclis/bin/codex']),
+};
+// Copilot unpacks a ~240 MB package into $HOME/.cache on first start; reuse an unpacked copy.
+const COPILOT_DIST = (() => {
+  const base = path.join(os.homedir(), '.cache', 'copilot', 'pkg', `${process.platform}-${process.arch}`);
+  try { return fs.readdirSync(base).sort().reverse().map((v) => path.join(base, v)).find((d) => fs.existsSync(path.join(d, 'package.json'))) || null; } catch { return null; }
+})();
+const OFFLINE = { HTTPS_PROXY: 'http://127.0.0.1:9', HTTP_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', http_proxy: 'http://127.0.0.1:9', NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost' };
+
+/**
+ * A fake model endpoint (OpenAI chat completions, OpenAI Responses, Anthropic Messages; streaming).
+ * Step n of `steps` answers the request that carries n tool results: `{ call: name, args }` or `{ text }`.
+ */
+async function startFakeModel(steps) {
+  const http = await import('node:http');
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch {}
+      const url = req.url.split('?')[0];
+      requests.push({ url, body });
+      const sse = () => res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+      if (req.method === 'GET') return json({ object: 'list', data: [{ id: 'fake', object: 'model', type: 'model' }] });
+      const pick = (n, names) => { const s = steps[n] || { text: 'done' }; return s.call && names.includes(s.call) ? s : { text: s.text || 'done' }; };
+      if (url.endsWith('/chat/completions')) {
+        const n = (body.messages || []).filter((m) => m.role === 'tool').length;
+        const s = pick(n, (body.tools || []).map((t) => (t.function ? t.function.name : '')));
+        const base = { id: `c${requests.length}`, object: 'chat.completion.chunk', created: 1, model: body.model };
+        const delta = s.call
+          ? { role: 'assistant', content: null, tool_calls: [{ index: 0, id: `call_${requests.length}`, type: 'function', function: { name: s.call, arguments: JSON.stringify(s.args) } }] }
+          : { role: 'assistant', content: s.text };
+        sse();
+        res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: s.call ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+        res.end('data: [DONE]\n\n');
+        return undefined;
+      }
+      if (url.endsWith('/responses')) {
+        const n = (body.input || []).filter((i) => /_output$/.test(String(i.type))).length;
+        const s = pick(n, (body.tools || []).map((t) => t.name));
+        const custom = s.call && (body.tools || []).some((t) => t.name === s.call && t.type === 'custom');
+        const item = !s.call ? { type: 'message', id: `m${n}`, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: s.text, annotations: [] }] }
+          : custom ? { type: 'custom_tool_call', id: `t${n}`, call_id: `call_${requests.length}`, name: s.call, input: s.args.input, status: 'completed' }
+            : { type: 'function_call', id: `f${n}`, call_id: `call_${requests.length}`, name: s.call, arguments: JSON.stringify(s.args), status: 'completed' };
+        const response = { id: `r${requests.length}`, object: 'response', created_at: 1, model: body.model, status: 'completed', output: [item],
+          usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 } };
+        sse();
+        for (const [type, o] of [['response.created', { response: { ...response, status: 'in_progress', output: [] } }], ['response.output_item.done', { output_index: 0, item }], ['response.completed', { response }]]) {
+          res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...o })}\n\n`);
+        }
+        res.end();
+        return undefined;
+      }
+      if (url.endsWith('/messages/count_tokens')) return json({ input_tokens: 1 });
+      if (url.endsWith('/messages')) {
+        let n = 0;
+        for (const m of body.messages || []) if (Array.isArray(m.content)) n += m.content.filter((b) => b.type === 'tool_result').length;
+        const names = (body.tools || []).map((t) => t.name);
+        const s = names.length ? pick(n, names) : { text: 'title' };
+        const block = s.call ? { type: 'tool_use', id: `toolu_${requests.length}`, name: s.call, input: {} } : { type: 'text', text: '' };
+        const delta = s.call ? { type: 'input_json_delta', partial_json: JSON.stringify(s.args) } : { type: 'text_delta', text: s.text };
+        const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+        sse();
+        for (const [type, o] of [
+          ['message_start', { message: { id: `msg_${requests.length}`, type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage } }],
+          ['content_block_start', { index: 0, content_block: block }], ['content_block_delta', { index: 0, delta }], ['content_block_stop', { index: 0 }],
+          ['message_delta', { delta: { stop_reason: s.call ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }], ['message_stop', {}],
+        ]) res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...o })}\n\n`);
+        res.end();
+        return undefined;
+      }
+      return json({});
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${server.address().port}`, requests, close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }) };
+}
+
+/** Register this skill's hooks for `host` (guard level) with the real CLI command, in a temp HOME. */
+function registerForHost(host, repo, env) {
+  const r = spawnSync(process.execPath, [ADC, 'setup', 'hooks', '--host', host, '--level', 'guard', '--write', '--json', '--cwd', repo], { encoding: 'utf8', env });
+  assert.equal(r.status, 0, `setup hooks --host ${host}: ${r.stderr}`);
+  assert.equal(JSON.parse(r.stdout).written, true, `setup hooks --host ${host} wrote nothing`);
+}
+
+/** The latest request body that carried tools, and the session file the hooks wrote. */
+function hostResult(model, repo) {
+  const last = [...model.requests].reverse().find((r) => r.body && (r.body.messages || r.body.input) && (r.body.tools || []).length);
+  const sessions = path.join(repo, '.adc', 'sessions');
+  const files = fs.existsSync(sessions) ? fs.readdirSync(sessions).filter((f) => f.endsWith('.json')) : [];
+  return { body: last ? last.body : {}, session: files.length ? core.readJson(path.join(sessions, files[0])) : null };
+}
+
+const count = (text, needle) => text.split(needle).length - 1;
+const asText = (v) => (typeof v === 'string' ? v : JSON.stringify(v));
+
+/** What the host showed the model, by channel (the last request of the run). */
+function channels(body) {
+  const ch = { user: '', system: '', tool: '' };
+  for (const m of body.messages || []) {
+    if (m.role === 'tool') ch.tool += asText(m.content);
+    else if (m.role === 'system') ch.system += asText(m.content);
+    else if (m.role === 'user' && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b.type === 'tool_result') ch.tool += asText(b.content);
+        else ch.user += asText(b.text ?? b);
+      }
+    } else if (m.role === 'user') ch.user += asText(m.content);
+  }
+  for (const i of body.input || []) {
+    if (/_output$/.test(String(i.type))) ch.tool += asText(i.output);
+    else if (i.type === 'message' && i.role === 'developer') ch.system += asText(i.content);
+    else if (i.type === 'message' && i.role === 'user') ch.user += asText(i.content);
+  }
+  return ch;
+}
+const hostSkip = (name, extra = null) => (HOST_BIN[name] ? extra : `${name} CLI not installed`) || false;
+
+describe('real hosts with the registered hooks (offline, scripted fake model)', { concurrency: 3 }, () => {
+  test('Copilot CLI: brief, post-edit note, guard denials, modifiedResult redaction, stop gate', {
+    skip: hostSkip('copilot', COPILOT_DIST ? null : 'no unpacked Copilot package in ~/.cache/copilot/pkg (run copilot once)'), timeout: 90_000,
+  }, async () => {
+    const repo = makeRepo();
+    fs.mkdirSync(path.join(repo, 'tests')); // Copilot's create tool needs the parent directory
+    const home = tmp('adc-host-copilot-');
+    const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, COPILOT_HOME: path.join(home, '.copilot') });
+    registerForHost('copilot', repo, env);
+    const model = await startFakeModel([
+      { call: 'create', args: { path: `${repo}/tests/e2e.test.js`, file_text: "const test = require('node:test');\ntest.only('e2e', () => {});\n" } },
+      { call: 'bash', args: { command: 'node --test tests/', description: 'run tests' } },
+      { call: 'view', args: { path: `${repo}/.adc/.env.live` } },
+      { call: 'grep', args: { pattern: 'TOKEN', paths: `${repo}/.adc` } },
+      { call: 'bash', args: { command: 'git push --force origin main', description: 'push' } },
+      { call: 'bash', args: { command: `echo ADC_LIVE_TOKEN=${TOKEN}`, description: 'echo' } },
+      { text: 'All tests pass now.' },
+    ]);
+    try {
+      const res = await spawnAsync(HOST_BIN.copilot, ['-p', 'run the scripted task', '--allow-all', '--no-ask-user'], {
+        cwd: repo, timeoutMs: 80_000,
+        env: { ...env, COPILOT_OFFLINE: 'true', COPILOT_PROVIDER_BASE_URL: `${model.url}/v1`, COPILOT_PROVIDER_API_KEY: 'fake', COPILOT_MODEL: 'gpt-4.1', COPILOT_AUTO_UPDATE: 'false', COPILOT_CLI_DIST_DIR: COPILOT_DIST },
+      });
+      assert.equal(res.code, 0, `copilot exit ${res.code}: ${res.stderr.slice(-800)}`);
+      const { body, session } = hostResult(model, repo);
+      const ch = channels(body);
+      // Copilot injects the brief and the stop block as user messages and appends post-edit notes to the tool result.
+      assert.ok(ch.user.includes('agentic-developer-companion is installed'), 'session brief reached the model');
+      assert.match(ch.tool, /tests\/e2e\.test\.js \(test file\): adds a skip\/focus marker/, 'post-edit note reached the model');
+      assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 3, 'view, grep and force-push denied');
+      assert.ok(ch.tool.includes('ADC_LIVE_TOKEN=[REDACTED]') && !ch.tool.includes(TOKEN), 'modifiedResult redacted the token in the result');
+      assert.equal(count(ch.user, 'agentic-developer-companion completion gate'), 1, 'stop gate blocked once');
+      assert.equal(session.dialect, 'copilot');
+      assert.equal(session.tool, 'copilot-cli');
+      assert.equal(session.edits.count, 1);
+      assert.equal(typeof session.observed_runs[0].exit, 'number', 'exit code from the result trailer');
+      assert.equal(session.observed_runs[0].exit_source, 'result-text');
+      assert.equal(session.guard.denials, 3);
+      assert.equal(session.gate.blocks, 1);
+      assert.ok(session.ended, 'sessionEnd fired');
+    } finally { await model.close(); }
+  });
+
+  test('Claude Code: brief and note as system context, Read and shell .env.live denied, stop feedback', {
+    skip: hostSkip('claude'), timeout: 90_000,
+  }, async () => {
+    const repo = makeRepo();
+    const home = tmp('adc-host-claude-');
+    const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') });
+    registerForHost('claude', repo, env);
+    const model = await startFakeModel([
+      { call: 'Write', args: { file_path: `${repo}/tests/e2e.test.js`, content: "const test = require('node:test');\ntest.only('e2e', () => {});\n" } },
+      { call: 'Bash', args: { command: 'node --test tests/', description: 'run tests' } },
+      { call: 'Read', args: { file_path: `${repo}/.adc/.env.live` } },
+      { call: 'Bash', args: { command: 'cat .adc/.env.live', description: 'creds' } },
+      { call: 'Bash', args: { command: 'git push --force origin main', description: 'push' } },
+      { text: 'All tests pass now.' },
+    ]);
+    try {
+      const res = await spawnAsync(HOST_BIN.claude, ['-p', 'run the scripted task', '--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,Read,Write,Edit', '--output-format', 'json'], {
+        cwd: repo, timeoutMs: 80_000,
+        env: { ...env, ANTHROPIC_BASE_URL: model.url, ANTHROPIC_API_KEY: 'sk-fake', DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+      });
+      assert.equal(res.code, 0, `claude exit ${res.code}: ${res.stderr.slice(-800)} ${res.stdout.slice(-400)}`);
+      const { body, session } = hostResult(model, repo);
+      const ch = channels(body);
+      // Claude Code passes hook context as system messages and stop feedback as a user message.
+      assert.ok(ch.system.includes('agentic-developer-companion is installed'), 'session brief');
+      assert.match(ch.system, /agentic-developer-companion notes on this edit[\s\S]*tests\/e2e\.test\.js \(test file\)/, 'post-edit note');
+      assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 3, 'Read, cat .adc/.env.live and force-push denied');
+      assert.match(ch.user, /completion gate[\s\S]*The final message states "All tests pass/, 'stop gate with the claim');
+      assert.equal(session.dialect, 'claude');
+      assert.equal(session.edits.count, 1);
+      assert.equal(session.observed_runs[0].class, 'test');
+      assert.equal(session.guard.denials, 3);
+    } finally { await model.close(); }
+  });
+
+  test('Codex: brief and note as developer messages, shell and apply_patch guard denials, stop gate', {
+    skip: hostSkip('codex'), timeout: 90_000,
+  }, async () => {
+    const repo = makeRepo();
+    const home = tmp('adc-host-codex-');
+    const codexHome = path.join(home, '.codex');
+    const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, CODEX_HOME: codexHome, SHELL: '/bin/bash' });
+    registerForHost('codex', repo, env);
+    const model = await startFakeModel([
+      { call: 'apply_patch', args: { input: "*** Begin Patch\n*** Add File: tests/e2e.test.js\n+const test = require('node:test');\n+test.only('e2e', () => {});\n*** End Patch\n" } },
+      { call: 'exec_command', args: { cmd: 'node --test tests/' } },
+      { call: 'exec_command', args: { cmd: 'cat .adc/.env.live' } },
+      { call: 'exec_command', args: { cmd: 'git push --force origin main' } },
+      { call: 'apply_patch', args: { input: '*** Begin Patch\n*** Add File: .adc/evidence/forged.json\n+{}\n*** End Patch\n' } },
+      { text: 'All tests pass.' },
+    ]);
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), [
+      'model = "gpt-5.5"', 'model_provider = "fake"', '[model_providers.fake]', 'name = "fake"', `base_url = "${model.url}/v1"`,
+      'env_key = "FAKE_API_KEY"', 'wire_api = "responses"', `[projects."${core.toPosix(repo)}"]`, 'trust_level = "trusted"', '',
+    ].join('\n'));
+    try {
+      const res = await spawnAsync(HOST_BIN.codex, ['exec', '--skip-git-repo-check', '--dangerously-bypass-hook-trust', '-s', 'workspace-write', '--json', 'run the scripted task'], {
+        cwd: repo, timeoutMs: 80_000, env: { ...env, FAKE_API_KEY: 'fake' },
+      });
+      assert.equal(res.code, 0, `codex exit ${res.code}: ${res.stderr.slice(-800)}`);
+      const { body, session } = hostResult(model, repo);
+      const ch = channels(body);
+      // Codex passes hook context as developer messages and the stop block as a user message.
+      assert.ok(ch.system.includes('agentic-developer-companion is installed'), 'session brief');
+      assert.match(ch.system, /tests\/e2e\.test\.js \(test file\): adds a skip\/focus marker/, 'post-edit note');
+      assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 3, 'cat .env.live, force-push and the .adc/ patch denied');
+      assert.ok(!fs.existsSync(path.join(repo, '.adc', 'evidence', 'forged.json')), 'the denied patch was not applied');
+      assert.equal(count(ch.user, 'agentic-developer-companion completion gate'), 1, 'stop gate');
+      assert.equal(session.dialect, 'codex');
+      assert.equal(session.permission_mode, 'bypassPermissions');
+      assert.equal(session.edits.count, 1);
+      assert.equal(session.guard.denials, 3);
+    } finally { await model.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Rendering
 
 const SNAP_SKILL = '/opt/skills/agentic-developer-companion';
@@ -648,7 +1032,7 @@ function renderVariant(host, opts) {
     fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
     fs.writeFileSync(path.join(skillDir, 'scripts', 'adc.mjs'), '');
   }
-  const r = hooksRender.renderHooks({ host, scope: opts.scope || null, level: opts.level || 'advise', nodePath: opts.nodePath || null, skillDir, root, home: SNAP_HOME, env: {} });
+  const r = hooksRender.renderHooks({ host, scope: opts.scope || null, level: opts.level || 'advise', nodePath: opts.nodePath || null, skillDir, root, home: SNAP_HOME, env: {}, shortPath: null });
   const snap = { target_file: r.target_file, skill_path: r.skill_path, node: r.node, warnings: r.warnings, config: r.config };
   return { r, snap: JSON.parse(JSON.stringify(snap).split(core.toPosix(root)).join('<REPO>')) };
 }
@@ -717,6 +1101,28 @@ test('rendered strings quote paths with spaces and shell metacharacters correctl
   if (PWSH) assert.ok(assertHookOutput(await spawnAsync(PWSH, ['-NoProfile', '-Command', abs.powershell], { input: inp, env: { ...baseEnv(), PATH: '/nonexistent' }, cwd: repo }), 'abs node pwsh').additionalContext);
 });
 
+test('Windows Node paths with spaces: shell-form hosts render the 8.3 short path, bare in every shell', () => {
+  const ok = (stdout) => () => ({ exit: 0, stdout });
+  assert.equal(hooksRender.windowsShortPath('C:\\Program Files\\nodejs\\node.exe', ok('C:\\PROGRA~1\\nodejs\\node.exe\r\n')), 'C:\\PROGRA~1\\nodejs\\node.exe');
+  assert.equal(hooksRender.windowsShortPath('x', ok('C:\\Program Files\\x.exe\n')), null, 'short names disabled: still has a space');
+  assert.equal(hooksRender.windowsShortPath('x', () => ({ exit: 1, stdout: '' })), null);
+  const short = () => 'C:\\PROGRA~1\\nodejs\\node.exe';
+  const nodePath = 'C:/Program Files/nodejs/node.exe';
+  const cx = hooksRender.renderHooks({ host: 'codex', nodePath, skillDir: SNAP_WIN, home: SNAP_HOME, env: {}, shortPath: short });
+  const h = cx.config.hooks.SessionStart[0].hooks[0];
+  assert.equal(h.commandWindows, `C:\\PROGRA~1\\nodejs\\node.exe "${SNAP_WIN}/scripts/adc.mjs" hook-run session-start --dialect codex`);
+  assert.equal(h.command, `C:/PROGRA~1/nodejs/node.exe "${SNAP_WIN}/scripts/adc.mjs" hook-run session-start --dialect codex`);
+  assert.deepEqual(cx.warnings, []);
+  const root = makeRepo();
+  const cl = hooksRender.renderHooks({ host: 'claude', scope: 'project', root, nodePath, skillDir: SKILL, home: SNAP_HOME, env: {}, shortPath: short });
+  assert.match(cl.config.hooks.Stop[0].hooks[0].command, /^C:\/PROGRA~1\/nodejs\/node\.exe "/);
+  // Exec form needs no short path; without a short name the PowerShell form and a warning remain.
+  assert.equal(hooksRender.renderHooks({ host: 'claude', nodePath, skillDir: SNAP_WIN, home: SNAP_HOME, env: {}, shortPath: short }).config.hooks.Stop[0].hooks[0].command, nodePath);
+  const none = hooksRender.renderHooks({ host: 'codex', nodePath, skillDir: SNAP_WIN, home: SNAP_HOME, env: {}, shortPath: () => null });
+  assert.match(none.config.hooks.SessionStart[0].hooks[0].commandWindows, /^& "C:\\Program Files\\nodejs\\node\.exe" /);
+  assert.equal(none.warnings.length, 1);
+});
+
 test('renderHooks validates its inputs and resolves targets per host and scope', () => {
   assert.throws(() => hooksRender.renderHooks({ host: 'cursor' }), (e) => e.exit === 2);
   assert.throws(() => hooksRender.renderHooks({ host: 'claude', level: 'block' }), (e) => e.exit === 2);
@@ -768,7 +1174,7 @@ test('writeHooks merges into existing configs, keeps foreign entries and keys, b
   hooksRender.writeHooks(hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SKILL, home, env, root }), { root });
   hooksRender.writeHooks(hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SKILL, home, env, root }), { root });
   data = JSON.parse(fs.readFileSync(claudeFile, 'utf8'));
-  assert.equal(data.hooks.PreToolUse.length, 3);
+  assert.equal(data.hooks.PreToolUse.length, 4, 'the foreign group plus Bash, PowerShell and the file tools');
   assert.deepEqual(data.hooks.PreToolUse[0], foreign);
   assert.equal(data.hooks.Stop.length, 1);
   assert.deepEqual(data.hooks.Stop[0].hooks[0].args.slice(-2), ['--level', 'guard']);

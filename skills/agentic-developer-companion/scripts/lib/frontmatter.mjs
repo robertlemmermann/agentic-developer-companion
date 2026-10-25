@@ -1,7 +1,8 @@
 // YAML frontmatter for SKILL.md, agents, instructions and prompt files: a parser for the YAML
 // subset the hosts use (block and flow collections, plain, quoted, literal and folded scalars,
-// comments, anchors, aliases) and a stringifier whose output parses back to the same data.
-// Zero dependencies; imported by tooling-lint.mjs and tooling-port.mjs.
+// comments, anchors, aliases) and a stringifier whose output parses back to the same data, plus
+// a normalizer that compares `gh skill install` copies with their source. Zero dependencies;
+// imported by tooling-lint.mjs and tooling-port.mjs.
 
 export class YamlError extends Error {
   constructor(message, line = null, code = 'YAML_SYNTAX') {
@@ -84,12 +85,15 @@ class Parser {
     this.warnings = [];
     this.keyLines = {};
     this.anchors = new Map();
+    this.constructs = [];
   }
 
   ln(i) { return i + 1 + this.offset; }
   fail(message, i, code = 'YAML_SYNTAX') { throw new YamlError(message, this.ln(i), code); }
   warn(message, i, code) { this.warnings.push({ line: this.ln(i), code, message }); }
   error(message, i, code) { this.errors.push({ line: this.ln(i), code, message }); }
+  // Valid YAML that strict parsers (strictyaml in skills-ref) reject: flow, anchor, alias, tag.
+  construct(kind, i, path, text) { this.constructs.push({ kind, line: this.ln(i), path: path || null, text }); }
 
   indentOf(i) {
     const line = this.lines[i];
@@ -280,6 +284,7 @@ class Parser {
       if (!m) break;
       if (m[1] === '&') anchor = m[2];
       else tag = '!' + m[2];
+      this.construct(m[1] === '&' ? 'anchor' : 'tag', j, path, m[0].trim());
       c += m[0].length;
       text = text.slice(m[0].length);
     }
@@ -310,6 +315,7 @@ class Parser {
         if (!m) break;
         if (m[1] === '&') anchor = m[2];
         else tag = '!' + m[2];
+        this.construct(m[1] === '&' ? 'anchor' : 'tag', j, path, m[0].trim());
         c += m[0].length;
       }
       if (c >= line.length || isBlank(line.slice(c))) {
@@ -336,6 +342,7 @@ class Parser {
       const m = /^\*([^\s,\[\]{}]+)/.exec(line.slice(c));
       const name = m ? m[1] : '';
       if (!this.anchors.has(name)) this.fail(`unknown alias *${name}`, j, 'UNKNOWN_ALIAS');
+      this.construct('alias', j, path, `*${name}`);
       this.expectLineEnd(j, c + 1 + name.length);
       r = { value: structuredClone(this.anchors.get(name)), next: j + 1 };
     } else {
@@ -539,6 +546,7 @@ class Parser {
     }
     if (endLine < 0) this.fail('unterminated flow collection', j, 'UNTERMINATED_FLOW');
     this.expectLineEnd(endLine, endCol);
+    this.construct('flow', j, path, this.lines[j][col] === '[' ? '[...]' : '{...}');
     const fp = new FlowParser(text, this, j);
     const value = fp.parseValue();
     fp.skipWs();
@@ -729,7 +737,8 @@ class FlowParser {
 
 /**
  * Parse YAML text and report every problem instead of throwing.
- * Returns { value, errors[{line, code, message}], warnings[...], keyLines{path: line} }.
+ * Returns { value, errors[{line, code, message}], warnings[...], keyLines{path: line},
+ * constructs[{kind: 'flow'|'anchor'|'alias'|'tag', line, path, text}] }.
  */
 export function parseYamlDocument(text, { lineOffset = 0 } = {}) {
   const src = String(text ?? '').replace(/^\ufeff/, '');
@@ -742,7 +751,7 @@ export function parseYamlDocument(text, { lineOffset = 0 } = {}) {
     p.errors.push({ line: err.line, code: err.code, message: err.reason });
     value = null;
   }
-  return { value, errors: p.errors, warnings: p.warnings, keyLines: p.keyLines };
+  return { value, errors: p.errors, warnings: p.warnings, keyLines: p.keyLines, constructs: p.constructs };
 }
 
 /** Parse YAML text (maps, lists, block/flow, quoted and folded scalars). Throws YamlError. */
@@ -761,7 +770,7 @@ const FM_CLOSE = /^(?:---|\.\.\.)[ \t]*$/;
 /**
  * Split a Markdown file into YAML frontmatter and body. Line endings in `body` are normalized
  * to LF. Returns { data, body, bodyStartLine, errors[], warnings[], hasFrontmatter, keyLines,
- * raw, bom, crlf, openLine, closeLine, lateOpenLine }.
+ * constructs[], raw, bom, crlf, openLine, closeLine, lateOpenLine }.
  */
 export function parseFrontmatter(text) {
   const src = String(text ?? '');
@@ -770,7 +779,7 @@ export function parseFrontmatter(text) {
   const lines = t.split(/\r?\n/);
   const out = {
     data: {}, body: lines.join('\n'), bodyStartLine: 1, errors: [], warnings: [], hasFrontmatter: false,
-    keyLines: {}, raw: null, bom, crlf: /\r\n/.test(t), openLine: null, closeLine: null, lateOpenLine: null,
+    keyLines: {}, constructs: [], raw: null, bom, crlf: /\r\n/.test(t), openLine: null, closeLine: null, lateOpenLine: null,
   };
   if (!FM_OPEN.test(lines[0])) {
     const first = lines.findIndex((l) => l.trim() !== '');
@@ -794,6 +803,7 @@ export function parseFrontmatter(text) {
   out.errors.push(...doc.errors);
   out.warnings.push(...doc.warnings);
   out.keyLines = doc.keyLines;
+  out.constructs = doc.constructs;
   if (doc.value === null || doc.value === undefined) out.data = {};
   else if (typeof doc.value !== 'object' || Array.isArray(doc.value)) {
     out.errors.push({ line: 2, code: 'FM_NOT_MAPPING', message: 'frontmatter must be a YAML mapping of "key: value" lines' });
@@ -801,6 +811,37 @@ export function parseFrontmatter(text) {
   out.body = lines.slice(close + 1).join('\n');
   out.bodyStartLine = close + 2;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Installed copies: `gh skill install` rewrites SKILL.md frontmatter (keys sorted, scalars
+// re-quoted) and adds provenance inside `metadata` (`github-*` for remote installs,
+// `local-path` for --from-local); `gh skill publish` strips `metadata.github-*` again.
+
+/** Matches a `metadata` key that `gh skill install` adds (install provenance, not authored data). */
+export const INSTALL_METADATA_KEY = /^(?:github-[a-z0-9-]+|local-path)$/;
+
+const sortDeep = (v) => {
+  if (Array.isArray(v)) return v.map(sortDeep);
+  if (v === null || typeof v !== 'object') return v;
+  const o = {};
+  for (const k of Object.keys(v).sort()) setKey(o, k, sortDeep(v[k]));
+  return o;
+};
+
+/**
+ * Frontmatter data for a semantic comparison of an installed copy with its source: install
+ * provenance removed (an emptied `metadata` is dropped) and keys sorted at every level.
+ */
+export function normalizeSkillFrontmatter(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return data;
+  const copy = { ...data };
+  if (copy.metadata && typeof copy.metadata === 'object' && !Array.isArray(copy.metadata)) {
+    const meta = Object.fromEntries(Object.entries(copy.metadata).filter(([k]) => !INSTALL_METADATA_KEY.test(k)));
+    if (Object.keys(meta).length) copy.metadata = meta;
+    else delete copy.metadata;
+  }
+  return sortDeep(copy);
 }
 
 // ---------------------------------------------------------------------------

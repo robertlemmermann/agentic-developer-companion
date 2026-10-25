@@ -1,8 +1,9 @@
 // `tooling lint`: validate instructions, skills, agents, prompt files, hooks, plugins and MCP
 // configs against each host's documented rules (plan §11.2). Every rule has an id, the hosts
 // it applies to with a severity per host, and a source citation; the catalog is `RULES`.
-// External validators (skills-ref, claude plugin validate, gh skill, copilot, waza) are merged
-// when installed. Read-only: nothing is written.
+// The hosts' own validators (skills-ref, claude plugin validate, gh skill publish --dry-run,
+// copilot skill/instruction list, codex debug prompt-input and doctor, waza) are merged when
+// installed; none of them runs a model turn. Read-only: lint writes nothing.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -13,7 +14,7 @@ import {
 } from './core.mjs';
 import { repoRoot } from './git.mjs';
 import { resolveStateDir, assertStateUntracked } from './state.mjs';
-import { parseFrontmatter, parseYamlDocument } from './frontmatter.mjs';
+import { parseFrontmatter, parseYamlDocument, INSTALL_METADATA_KEY } from './frontmatter.mjs';
 
 export const HOSTS = Object.freeze(['spec', 'copilot', 'claude', 'codex']);
 const HOST_LABEL = { spec: 'Agent Skills spec', copilot: 'Copilot', claude: 'Claude Code', codex: 'Codex' };
@@ -62,6 +63,7 @@ export const SOURCES = Object.freeze({
   'vsc-mcp': 'VS Code: MCP configuration and migration - docs/agents/reference/mcp-configuration.md, migrate-customizations.md',
   'ac-hooks': 'github/awesome-copilot instructions/hooks.instructions.md (hook anti-patterns)',
   'anti-patterns': 'Tooling anti-pattern catalog (research digest tooling-authoring.md section f: secrets, hostnames, paths, Windows, pinning)',
+  'measured': 'Measured in the build container 2026-10-25: skills-ref @69ef37e (strictyaml), gh 2.99.0, Claude Code 2.1.310, Copilot CLI 1.0.103, Codex 0.164.0',
 });
 
 // ---------------------------------------------------------------------------
@@ -87,6 +89,7 @@ export const RULES = Object.freeze([
   R('SK-FM-BOM', 'skill', 'spec=warning codex=warning', 'No UTF-8 byte-order mark before the opening "---"', 'skills-ref cx-skills'),
   R('SK-FM-YAML', 'skill', ALL4('error'), 'Frontmatter is valid YAML (Claude Code loads a malformed block with no fields)', 'cl-skills skills-ref cx-skills'),
   R('SK-FM-COLON', 'skill', 'spec=error copilot=error claude=error codex=warning', 'No unquoted ": " inside a scalar (only Codex auto-repairs it)', 'cx-skills cl-skills'),
+  R('SK-FM-STRICTYAML', 'skill', 'spec=warning', 'Block-style YAML only: skills-ref parses with strictyaml, which rejects flow collections, anchors, aliases and tags', 'skills-ref measured', { strict: Object.freeze({ spec: 'error' }) }),
   R('SK-NAME-REQUIRED', 'skill', 'spec=error copilot=error', '`name` is present (Claude Code and Codex default to the directory name)', 'spec cp-skills'),
   R('SK-NAME-LENGTH', 'skill', 'spec=error copilot=error claude=warning codex=error', '`name` is 1-64 characters', 'spec skills-ref cx-skills'),
   R('SK-NAME-FORMAT', 'skill', 'spec=error copilot=error claude=warning codex=warning', '`name` uses lowercase letters, digits and single inner hyphens (VS Code silently skips other names)', 'spec vsc-skills cl-bp'),
@@ -103,7 +106,7 @@ export const RULES = Object.freeze([
   R('SK-FIELD-IGNORED', 'skill', 'copilot=warning claude=warning codex=note', 'A frontmatter field the host does not read', 'cp-cli vsc-skills cl-skills cx-skills'),
   R('SK-METADATA-MAP', 'skill', 'spec=error codex=warning', '`metadata` is a mapping', 'spec cx-skills'),
   R('SK-METADATA-STRING', 'skill', 'spec=warning', '`metadata` values are strings (quote versions such as "1.0")', 'spec'),
-  R('SK-SHORTDESC', 'skill', 'codex=warning', '`metadata.short-description` is 25-64 characters', 'cx-yaml'),
+  R('SK-SHORTDESC', 'skill', 'codex=note', '`metadata.short-description` is 25-64 characters (skill-creator guidance; Codex\'s own skills deviate)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
   R('SK-COMPAT-LENGTH', 'skill', 'spec=error claude=warning', '`compatibility` is 1-500 characters', 'spec cl-skills'),
   R('SK-ALLOWED-TOOLS-TYPE', 'skill', 'spec=warning', '`allowed-tools` is a space-separated string in the spec', 'spec'),
   R('SK-BODY-LINES', 'skill', 'spec=warning claude=warning', 'The body stays under 500 lines', 'spec cl-skills'),
@@ -122,8 +125,8 @@ export const RULES = Object.freeze([
   // agents/openai.yaml (Codex sidecar)
   R('CX-YAML-PARSE', 'codex-skill-meta', 'codex=error', 'agents/openai.yaml is valid YAML', 'cx-yaml'),
   R('CX-YAML-FIELD', 'codex-skill-meta', 'codex=warning', 'agents/openai.yaml uses only interface, dependencies and policy keys', 'cx-yaml'),
-  R('CX-YAML-SHORTDESC', 'codex-skill-meta', 'codex=warning', '`interface.short_description` is 25-64 characters', 'cx-yaml'),
-  R('CX-YAML-PROMPT', 'codex-skill-meta', 'codex=warning', '`interface.default_prompt` mentions the skill as $<skill-name>', 'cx-yaml'),
+  R('CX-YAML-SHORTDESC', 'codex-skill-meta', 'codex=note', '`interface.short_description` is 25-64 characters (guidance)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
+  R('CX-YAML-PROMPT', 'codex-skill-meta', 'codex=note', '`interface.default_prompt` mentions the skill as $<skill-name> (guidance)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
   R('CX-YAML-POLICY', 'codex-skill-meta', 'codex=error', '`policy.allow_implicit_invocation` is a boolean', 'cx-yaml'),
   R('CX-YAML-DEPS', 'codex-skill-meta', 'codex=warning', '`dependencies.tools[].type` is "mcp" and names a server', 'cx-yaml'),
   // Legacy Claude commands and prompt files
@@ -159,7 +162,7 @@ export const RULES = Object.freeze([
   R('AG-FILENAME', 'agent', 'copilot=error', 'Agent file names use only . - _ a-z A-Z 0-9', 'cp-agents'),
   R('AG-BODY-LENGTH', 'agent', 'copilot=error', 'The agent prompt is at most 30,000 characters', 'cp-agents'),
   R('AG-FIELD', 'agent', 'copilot=warning claude=warning', 'Agent frontmatter uses only documented fields', 'cp-agents vsc-agents cl-agents'),
-  R('AG-FIELD-SURFACE', 'agent', 'copilot=warning', 'Fields that some Copilot surfaces ignore (handoffs, argument-hint in the cloud agent; retired infer)', 'cp-agents'),
+  R('AG-FIELD-SURFACE', 'agent', 'copilot=warning', 'Fields that some Copilot surfaces ignore (handoffs, argument-hint in the cloud agent; retired infer; mcp-servers, metadata in VS Code as a note)', 'cp-agents'),
   R('AG-TOOLS', 'agent', 'copilot=warning', '`tools` entries are known aliases, server/tool, server/* or "*"', 'cp-agents'),
   R('AG-ENUM', 'agent', 'copilot=error claude=error', 'Enumerated agent fields use documented values', 'cp-agents cl-agents'),
   R('AG-PLUGIN-FIELDS', 'agent', 'claude=warning', 'Plugin subagents cannot use hooks, mcpServers, permissionMode or initialPrompt', 'cl-plugins'),
@@ -191,6 +194,7 @@ export const RULES = Object.freeze([
   R('HK-CP-OUTPUT-IGNORED', 'hooks', 'copilot=note', 'Output of errorOccurred, sessionEnd, preCompact and userPromptSubmitted command hooks is not processed', 'cp-hooks'),
   R('HK-CP-DISABLED', 'hooks', 'copilot=warning', '`disableAllHooks: true` turns the file off', 'cp-hooks'),
   R('HK-CP-PLUGIN-CWD', 'hooks', 'copilot=warning', 'Plugin preToolUse entries set "cwd": "${PLUGIN_ROOT}"', 'cp-2540'),
+  R('HK-CP-PLUGIN-PATHS', 'hooks', 'copilot=warning', 'Plugin hooks reach their scripts through ${PLUGIN_ROOT} (relative paths resolve against the project) and keep state in ${PLUGIN_DATA}', 'cp-2540 cp-plugins'),
   R('HK-XS-COMMAND', 'hooks', 'copilot=error', 'A Copilot `command` string parses in both bash and PowerShell (it is copied to both)', 'cp-hooks'),
   // Claude hooks
   R('HK-CL-JSON', 'hooks', 'claude=error', 'The settings or hooks file is valid JSON', 'cl-hooks'),
@@ -269,10 +273,12 @@ export const RULES = Object.freeze([
   SEC('SEC-UNPINNED', 'An MCP server or hook runs an unpinned remote package (npx -y pkg, @latest, :latest)', 'anti-patterns'),
   // External validators (merged when installed)
   R('EXT-SKILLS-REF', 'external', 'spec=error', '`skills-ref validate` passes', 'skills-ref'),
-  R('EXT-CLAUDE-VALIDATE', 'external', 'claude=error', '`claude plugin validate --strict --json` reports no errors (warnings are merged as warnings)', 'cl-validate'),
-  R('EXT-GH-SKILL', 'external', 'spec=warning', '`gh skill publish --dry-run` passes', 'cp-skills'),
-  R('EXT-COPILOT-SKILL', 'external', 'copilot=warning', '`copilot skill list --json` lists the skill as enabled', 'cp-cli'),
-  R('EXT-COPILOT-INSTRUCTION', 'external', 'copilot=warning', '`copilot instruction list --json` lists the instruction file', 'cp-cli'),
+  R('EXT-CLAUDE-VALIDATE', 'external', 'claude=error', '`claude plugin validate --strict --json` reports no errors (warnings merged as warnings; a bare skills directory is not applicable)', 'cl-validate measured'),
+  R('EXT-GH-SKILL', 'external', 'spec=error', '`gh skill publish --dry-run` validation passes (its warnings are merged as notes)', 'cp-skills measured'),
+  R('EXT-COPILOT-SKILL', 'external', 'copilot=warning', '`copilot skill list --json` lists the skill from its location as enabled (a same-named copy elsewhere is a note)', 'cp-cli measured'),
+  R('EXT-COPILOT-INSTRUCTION', 'external', 'copilot=warning', '`copilot instruction list --json` lists the instruction file', 'cp-cli measured'),
+  R('EXT-CODEX-SKILL', 'external', 'codex=warning', '`codex debug prompt-input` lists the skill in <skills_instructions> (no model call)', 'cx-skills measured'),
+  R('EXT-CODEX-CONFIG', 'external', 'codex=warning', '`codex doctor --json` reports no unrecognized config.toml settings (no model call)', 'cx-config measured'),
   R('EXT-WAZA', 'external', 'copilot=warning', '`waza spec verify` passes for the skill eval', 'cp-skills'),
 ]);
 
@@ -802,6 +808,25 @@ function homeDirs(env = process.env, home = os.homedir()) {
 
 const under = (abs, dir) => abs === dir || abs.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
 
+/**
+ * Hosts that load a SKILL.md from where it lies (plan section 3.1): Claude Code reads only
+ * .claude/skills, Codex .agents/skills and its own folders, Copilot (CLI, VS Code, cloud) the
+ * .github, .agents and .claude skill folders. A skill anywhere else (a source tree such as
+ * skills/<name>/, a plugin) is linted for every host.
+ */
+function skillReaders(abs, H) {
+  const parentOf = path.posix.dirname(path.posix.dirname(abs));
+  const inUser = (dir) => parentOf === dir;
+  if (inUser(`${H.claude}/skills`)) return ['spec', 'claude', 'copilot'];
+  if (inUser(`${H.copilot}/skills`)) return ['spec', 'copilot'];
+  if (inUser(`${H.codex}/skills`)) return ['spec', 'codex'];
+  if (/(?:^|\/)\.claude\/skills$/.test(parentOf)) return ['spec', 'claude', 'copilot'];
+  if (/(?:^|\/)\.github\/skills$/.test(parentOf)) return ['spec', 'copilot'];
+  if (/(?:^|\/)\.agents\/skills$/.test(parentOf)) return ['spec', 'copilot', 'codex'];
+  if (/(?:^|\/)\.codex\/skills$/.test(parentOf)) return ['spec', 'codex'];
+  return ['spec', 'copilot', 'claude', 'codex'];
+}
+
 function findUp(startDir, rel, stopAt) {
   let d = startDir;
   for (let i = 0; i < 12; i++) {
@@ -831,7 +856,7 @@ export function classifyToolingPath(absPath, { root = null, env = process.env, h
   const pluginRoot = (marker) => findUp(path.dirname(absPath), marker, root);
   const res = (kind, sub, reads, extra = {}) => ({ kind, sub, scope, reads, ...extra });
 
-  if (b === 'SKILL.md' || b.toLowerCase() === 'skill.md') return res('skill', 'skill', ['spec', 'copilot', 'claude', 'codex']);
+  if (b === 'SKILL.md' || b.toLowerCase() === 'skill.md') return res('skill', 'skill', skillReaders(abs, H));
   if (b === 'openai.yaml' && parent === 'agents' && fs.existsSync(path.join(path.dirname(path.dirname(absPath)), 'SKILL.md'))) {
     return res('codex-skill-meta', 'openai-yaml', ['codex']);
   }
@@ -1049,6 +1074,20 @@ function frontmatterOf(text) {
   return text.startsWith('---') || text.charCodeAt(0) === 0xfeff ? parseFrontmatter(text) : null;
 }
 
+/** The first other reference file that mentions `file` (by references/<name> or bare name). */
+function refMentions(refDir, file) {
+  const name = path.basename(file);
+  let entries = [];
+  try { entries = fs.readdirSync(refDir, { withFileTypes: true }); } catch { return null; }
+  for (const e of entries) {
+    const other = path.join(refDir, e.name);
+    if (!e.isFile() || other === file) continue;
+    const text = readTextNormalized(other) || '';
+    if (text.includes(`references/${name}`) || new RegExp(`(?:^|[\\s(\\[\`'"/])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(text)) return `references/${e.name}`;
+  }
+  return null;
+}
+
 /** Links, references, footprint and body rules for a skill directory. */
 function skillStructure(fl, dir, body, offset) {
   const linked = new Set();
@@ -1078,7 +1117,11 @@ function skillStructure(fl, dir, body, offset) {
         const full = path.join(d, e.name);
         const rel = toPosix(path.relative(dir, full));
         if (e.isDirectory()) { fl.emit('SK-REF-DEPTH', { message: `${rel}/ nests reference files more than one level deep` }); walk(full); continue; }
-        if (!linked.has(full)) fl.emit('SK-REF-UNLINKED', { message: `${rel} is not linked from SKILL.md, so hosts may never load it` });
+        if (!linked.has(full)) {
+          const via = refMentions(refDir, full);
+          fl.emit('SK-REF-UNLINKED', { message: via ? `${rel} is linked only from ${via}, two levels below SKILL.md; link it from SKILL.md (hosts follow references one level deep)`
+            : `${rel} is not linked from SKILL.md, so hosts may never load it` });
+        }
       }
     };
     walk(refDir);
@@ -1123,6 +1166,11 @@ async function lintSkillFile(fl) {
     else if (w.code === 'RESERVED_INDICATOR') fl.emit('SK-FM-YAML', { line: w.line, message: `frontmatter YAML: ${w.message}` });
     else fl.emit('SK-FM-YAML', { line: w.line, message: `frontmatter YAML: ${w.message}`, severity: 'warning' });
   }
+  const STRICT_WHAT = { flow: 'a flow-style collection', anchor: 'the anchor', alias: 'the alias', tag: 'the tag' };
+  for (const c of fm.errors.length ? [] : fm.constructs || []) {
+    fl.emit('SK-FM-STRICTYAML', { line: c.line, field: c.path || undefined,
+      message: `${STRICT_WHAT[c.kind]} ${c.text}${c.path ? ` in \`${c.path}\`` : ''}: skills-ref (strictyaml) rejects it; ${c.kind === 'flow' ? 'write one "key: value" or "- item" per line' : 'write the value out in block style'}` });
+  }
   const data = fm.data || {};
   const L = (k) => fm.keyLines[k] || null;
   if (fm.hasFrontmatter && !fm.errors.length) {
@@ -1166,6 +1214,8 @@ async function lintSkillFile(fl) {
       if (!isObj(m)) fl.emit('SK-METADATA-MAP', { line: L('metadata'), message: '`metadata` must be a mapping of string keys to string values' });
       else {
         for (const [k, v] of Object.entries(m)) {
+          // Install provenance (gh skill install) is not authored data and is stripped on publish.
+          if (INSTALL_METADATA_KEY.test(k)) continue;
           if (typeof v !== 'string') fl.emit('SK-METADATA-STRING', { line: L(`metadata.${k}`), field: `metadata.${k}`, message: `\`metadata.${k}\` is a ${v === null ? 'null' : Array.isArray(v) ? 'list' : typeof v}; quote it as a string` });
         }
         if (own(m, 'short-description')) {
@@ -1514,6 +1564,7 @@ async function lintAgent(fl) {
         if (!COPILOT_AGENT_FIELDS.has(k)) fl.emit('AG-FIELD', { only: ['copilot'], line: L(k), field: k, message: `unknown agent field "${k}" (ignored)` });
         else if (k === 'handoffs' || k === 'argument-hint') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, message: `"${k}" is VS Code-only; the cloud agent ignores it` });
         else if (k === 'infer') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, message: '"infer" is retired; use disable-model-invocation' });
+        else if (k === 'mcp-servers' || k === 'metadata') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, severity: 'note', message: `"${k}" is used by Copilot CLI and the cloud agent; VS Code and IDE agents ignore it` });
       }
       for (const [k, vals] of Object.entries(COPILOT_AGENT_ENUMS)) {
         if (own(data, k) && !vals.includes(data[k])) fl.emit('AG-ENUM', { only: ['copilot'], line: L(k), field: k, message: `${k} "${data[k]}" is not one of ${vals.join(', ')}` });
@@ -1720,9 +1771,32 @@ function lintCopilotEntry(fl, event, e, line, cloudVisible, nested) {
   if (pluginRoot && ['preToolUse', 'PreToolUse'].includes(event) && e.cwd !== '${PLUGIN_ROOT}') {
     fl.emit('HK-CP-PLUGIN-CWD', { line, message: 'plugin preToolUse hook without "cwd": "${PLUGIN_ROOT}" may not fire (copilot-cli#2540)' });
   }
+  if (pluginRoot) copilotPluginPaths(fl, event, e, strings, scripts, line);
   for (const s of strings) {
     const pkg = unpinnedPackage(s);
     if (pkg) { fl.sec('SEC-UNPINNED', { line, message: `${event}: runs ${pkg} without a pinned version`, evidence: s }); break; }
+  }
+}
+
+const CP_ROOT_VAR = '(?:PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PLUGIN_ROOT)';
+const CP_SCRIPT = new RegExp(`(\\$\\{?${CP_ROOT_VAR}\\}?|\\$env:${CP_ROOT_VAR}|\\$\\{?PLUGIN_DATA\\}?)?([\\\\/]?[\\w.@~-][\\w.@~\\\\/-]*\\.(?:mjs|cjs|js|ts|py|sh|ps1|rb|pl))\\b`, 'g');
+const CP_WRITES_ROOT = new RegExp(`(?:>>?|\\bOut-File\\b[^\\n]*|\\bSet-Content\\b[^\\n]*|\\btee\\s+(?:-a\\s+)?)\\s*["']?(?:\\$\\{?|\\$env:)${CP_ROOT_VAR}|(?:writeFile|appendFile|createWriteStream|mkdir)\\w*\\([^\\n]*${CP_ROOT_VAR}`);
+
+/** Copilot plugin hooks: scripts relative to the project (copilot-cli#2540) and state under the plugin root. */
+function copilotPluginPaths(fl, event, e, strings, scripts, line) {
+  const rootCwd = typeof e.cwd === 'string' && new RegExp(`^(?:\\$\\{?${CP_ROOT_VAR}\\}?)`).test(e.cwd);
+  if (!rootCwd) {
+    for (const s of strings) {
+      for (const m of s.matchAll(CP_SCRIPT)) {
+        const p = m[2];
+        if (m[1] || p.startsWith('/') || p.startsWith('\\') || p.startsWith('~') || WIN_ABS_RE.test(p)) continue;
+        fl.emit('HK-CP-PLUGIN-PATHS', { line, message: `${event}: "${p}" resolves against the project directory, not the plugin; write "\${PLUGIN_ROOT}/${p.replace(/^\.[\\/]/, '')}" or set "cwd": "\${PLUGIN_ROOT}"`, evidence: s });
+        return;
+      }
+    }
+  }
+  if (strings.some((s) => CP_WRITES_ROOT.test(s)) || scripts.some((s) => CP_WRITES_ROOT.test(s.text))) {
+    fl.emit('HK-CP-PLUGIN-PATHS', { line, message: `${event}: writes under \${PLUGIN_ROOT}, which is replaced on every plugin update; keep state in \${PLUGIN_DATA}` });
   }
 }
 
@@ -2115,7 +2189,10 @@ async function mcpServerChecks(fl, name, s, text, { sub, hostTypes }) {
   if (JSON.stringify(s).includes('${input:')) {
     fl.emit('MC-INPUT', { line, severity: sub === 'vscode' ? 'note' : undefined, message: sub === 'vscode' ? `server "${name}" uses \${input:...}; VS Code does not forward it to the Copilot harness` : `server "${name}" uses \${input:...}, which only VS Code resolves` });
   }
-  if (sub !== 'vscode' && sub !== 'agent-plugins' && s.tools === undefined) fl.emit('MC-CLOUD', { line, message: `server "${name}" has no "tools" list (required when this JSON is used for the cloud agent)` });
+  if (sub !== 'vscode' && sub !== 'agent-plugins') {
+    const missing = ['type', 'tools'].filter((k) => s[k] === undefined);
+    if (missing.length) fl.emit('MC-CLOUD', { line, message: `server "${name}" has no ${missing.map((k) => `"${k}"`).join(' or ')} (both are required when this JSON is pasted into the cloud agent's MCP settings)` });
+  }
   for (const bag of ['env', 'headers']) {
     if (!isObj(s[bag])) continue;
     for (const [k, val] of Object.entries(s[bag])) {
@@ -2204,34 +2281,116 @@ async function lintCodexConfig(fl) {
 // ---------------------------------------------------------------------------
 // External validators (run when installed; results merged into the per-host findings)
 
-function execTool(exe, args, { cwd, timeoutMs = 90_000 } = {}) {
+/** Spawn a validator CLI (Windows: .cmd shims through the shell); the default `exec` of runExternalValidators. */
+export function execTool(exe, args, { cwd, env, timeoutMs = 90_000 } = {}) {
+  let file = exe;
+  // npm puts an extensionless sh script next to the .cmd shim; Windows cannot spawn the former.
+  if (IS_WINDOWS && !path.extname(file)) file = ['.exe', '.cmd', '.bat'].map((e) => file + e).find((f) => fs.existsSync(f)) || file;
   // npm-installed CLIs are .cmd shims on Windows, which only start through the shell.
-  if (IS_WINDOWS && /\.(?:cmd|bat)$/i.test(exe)) return runShell([quoteArg(exe), ...args.map(quoteArg)].join(' '), { cwd, timeoutMs });
-  return run(exe, args, { cwd, timeoutMs });
+  if (IS_WINDOWS && /\.(?:cmd|bat)$/i.test(file)) return runShell([quoteArg(file), ...args.map(quoteArg)].join(' '), { cwd, env, timeoutMs });
+  return run(file, args, { cwd, env, timeoutMs });
 }
 
 const firstLines = (text, n = 8) => String(text || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, n);
 
+function realOrResolved(p) {
+  let r = path.resolve(p);
+  try { r = fs.realpathSync.native(r); } catch {}
+  return IS_WINDOWS ? r.toLowerCase() : r;
+}
+const samePath = (a, b) => realOrResolved(a) === realOrResolved(b);
+
+/** Skill folders each host lists from `root` (only skills there can be checked with the host CLI). */
+function hostSkillRoots(host, root, env, home) {
+  const H = homeDirs(env, home);
+  if (host === 'copilot') {
+    const extra = String(env.COPILOT_SKILLS_DIRS || '').split(',').map((d) => d.trim()).filter(Boolean);
+    return [path.join(root, '.github', 'skills'), path.join(root, '.agents', 'skills'), path.join(root, '.claude', 'skills'),
+      `${H.copilot}/skills`, `${H.home}/.agents/skills`, ...extra];
+  }
+  // Codex reads .agents/skills from the project root down to the cwd (the root here) and ~/.agents/skills.
+  return [path.join(root, '.agents', 'skills'), `${H.home}/.agents/skills`];
+}
+const listedFrom = (s, roots) => roots.some((r) => samePath(path.dirname(s.dir), r));
+
+// gh skill publish discovers skills/<name>, skills/<scope>/<name>, <name> at the root and plugins/<scope>/skills/<name>.
+function ghDiscovers(s, root) {
+  const rel = toPosix(path.relative(root, s.dir));
+  return /^skills\/[^/]+$/.test(rel) || /^skills\/[^/]+\/[^/]+$/.test(rel) || /^[^/.][^/]*$/.test(rel) || /^plugins\/[^/]+\/skills\/[^/]+$/.test(rel);
+}
+
+/** Instruction files `copilot instruction list` reports for the repository root (nested AGENTS.md load per cwd). */
+function copilotListsInstruction(file, root) {
+  const rel = toPosix(path.relative(root, file));
+  return /^(?:AGENTS|CLAUDE|GEMINI)\.md$/.test(rel) || rel === '.github/copilot-instructions.md' ||
+    /^\.github\/instructions\/.+\.instructions\.md$/.test(rel) || /^\.claude\/rules\/.+\.md$/.test(rel);
+}
+
+/** skills-ref prints "Validation failed for <dir>:" and one "- <problem>" item per problem (items may wrap). */
+function skillsRefProblems(text) {
+  const items = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const m = /^\s*- (.*)$/.exec(line);
+    if (m) items.push(m[1].trim());
+    else if (items.length && line.trim()) items[items.length - 1] += ` ${line.trim()}`;
+  }
+  const out = items.length ? items : firstLines(text).filter((l) => !/^Validation failed for\b/.test(l));
+  return out.map((m) => truncate(m.replace(/\s+/g, ' '), 300));
+}
+
+/** Skills named in Codex's <skills_instructions> block: [{ name, file }] or null when the block is absent. */
+export function codexListedSkills(stdout) {
+  const texts = [];
+  const collect = (v) => {
+    if (typeof v === 'string') { if (v.includes('<skills_instructions>')) texts.push(v); }
+    else if (Array.isArray(v)) v.forEach(collect);
+    else if (isObj(v)) Object.values(v).forEach(collect);
+  };
+  try { collect(JSON.parse(stdout)); } catch {}
+  if (!texts.length && String(stdout).includes('<skills_instructions>')) texts.push(String(stdout).replace(/\\n/g, '\n').replace(/\\"/g, '"'));
+  if (!texts.length) return null;
+  const out = [];
+  for (const t of texts) {
+    const block = t.slice(t.indexOf('<skills_instructions>'), t.includes('</skills_instructions>') ? t.indexOf('</skills_instructions>') : undefined);
+    const roots = {};
+    for (const m of block.matchAll(/^- `(r\d+)` = `([^`]+)`\s*$/gm)) roots[m[1]] = m[2];
+    for (const line of block.split('\n')) {
+      const m = /^- ([^:`\n][^:\n]*): .*\(file: ([^)]+)\)\s*$/.exec(line);
+      if (!m) continue;
+      const f = m[2].trim();
+      const alias = /^(r\d+)\/(.*)$/.exec(f);
+      out.push({ name: m[1].trim(), file: alias && roots[alias[1]] ? path.join(roots[alias[1]], ...alias[2].split('/')) : f });
+    }
+  }
+  return out;
+}
+
 /**
- * Run the hosts' own validators that are installed. `targets`: { root, skills: [{dir, file}],
- * plugins: [dir], instructions: [abs], hosts: [...] }. Returns [{ tool, target, status:
- * 'pass'|'fail'|'error'|'skipped', exit, command, summary, findings: [{ abs, host, rule, severity, message }] }].
+ * Run the hosts' own validators that are installed. `targets`: { root, skills: [{dir, file, name}],
+ * plugins: [dir], instructions: [abs], codexConfigs: [abs], hosts: [...], env, home }. Returns
+ * [{ tool, target, status: 'pass'|'fail'|'error'|'skipped'|'not-applicable', exit, command, summary,
+ * findings: [{ abs, host, rule, severity, message }] }]. `exec`, `which` and `version` are injectable.
  */
 export function runExternalValidators(targets, { exec = execTool, which: whichFn = which, version = toolVersion } = {}) {
   const out = [];
-  const { root, skills = [], plugins = [], instructions = [], hosts = HOSTS } = targets;
+  const { root, skills = [], plugins = [], instructions = [], codexConfigs = [], hosts = HOSTS, env = process.env, home = os.homedir() } = targets;
   const want = (h) => hosts.includes(h);
-  const rel = (p) => toPosix(path.relative(root, p)) || '.';
+  // Paths inside the root are shown relative to it, others (user-scope files) in full.
+  const shown = (p) => { const r = path.relative(root, String(p)); return r === '' ? '.' : !r.startsWith('..') && !path.isAbsolute(r) ? toPosix(r) : toPosix(p); };
+  const rel = shown;
+  const statusOf = (r) => (r.exit === 0 ? 'pass' : r.exit === null || r.error ? 'error' : 'fail');
+  const push = (tool, target, status, command, summary, findings = [], exit = null) => out.push({ tool, target, status, exit, command, summary, findings });
 
   if (want('spec') && skills.length) {
-    const exe = whichFn('skills-ref') || whichFn('agentskills');
+    const exe = whichFn('skills-ref');
     for (const s of skills) {
-      if (!exe) { out.push({ tool: 'skills-ref', target: rel(s.dir), status: 'skipped', exit: null, command: `skills-ref validate ${rel(s.dir)}`, summary: 'skills-ref is not installed (pip install skills-ref)', findings: [] }); continue; }
+      const command = `skills-ref validate ${rel(s.dir)}`;
+      if (!exe) { push('skills-ref', rel(s.dir), 'skipped', command, 'skills-ref is not on PATH (uv tool install "git+https://github.com/agentskills/agentskills#subdirectory=skills-ref")'); continue; }
       const r = exec(exe, ['validate', s.dir], { cwd: root });
-      const lines = firstLines(r.stdout + '\n' + r.stderr);
-      const status = r.exit === 0 ? 'pass' : r.exit === null ? 'error' : 'fail';
-      out.push({ tool: 'skills-ref', target: rel(s.dir), status, exit: r.exit, command: `skills-ref validate ${rel(s.dir)}`, summary: lines[0] || status,
-        findings: status === 'fail' ? (lines.length ? lines : ['validation failed']).map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error', message: `skills-ref: ${m}` })) : [] });
+      const status = statusOf(r);
+      const problems = status === 'fail' ? skillsRefProblems(`${r.stdout}\n${r.stderr}`) : [];
+      push('skills-ref', rel(s.dir), status, command, status === 'fail' ? `${problems.length} problem(s): ${problems[0] || 'validation failed'}` : firstLines(r.stdout + '\n' + r.stderr)[0] || status,
+        (problems.length ? problems : status === 'fail' ? ['validation failed'] : []).map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error', message: `skills-ref: ${m}` })), r.exit);
     }
   }
 
@@ -2241,84 +2400,160 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
     const v = exe ? version('claude') : null;
     for (const dir of claudeDirs) {
       const command = `claude plugin validate ${rel(dir)} --strict --json`;
-      if (!exe) { out.push({ tool: 'claude plugin validate', target: rel(dir), status: 'skipped', exit: null, command, summary: 'claude is not installed', findings: [] }); continue; }
-      if (!v || !v.version || !versionGte(v.version, '2.1.259')) { out.push({ tool: 'claude plugin validate', target: rel(dir), status: 'skipped', exit: null, command, summary: `Claude Code ${v?.version || '?'} is older than 2.1.259 (--json)`, findings: [] }); continue; }
+      if (!exe) { push('claude plugin validate', rel(dir), 'skipped', command, 'claude is not on PATH'); continue; }
+      if (!v || !v.version || !versionGte(v.version, '2.1.259')) { push('claude plugin validate', rel(dir), 'skipped', command, `Claude Code ${v?.version || '?'} is older than 2.1.259 (no --json)`); continue; }
       const r = exec(exe, ['plugin', 'validate', dir, '--strict', '--json'], { cwd: root });
       let report = null;
       try { report = JSON.parse(r.stdout); } catch {}
-      if (!report || r.exit === 2 || r.exit === null) {
-        out.push({ tool: 'claude plugin validate', target: rel(dir), status: 'error', exit: r.exit, command, summary: firstLines(r.stderr || r.stdout)[0] || 'no JSON report', findings: [] });
+      if (!isObj(report) || r.exit === 2 || r.exit === null) {
+        push('claude plugin validate', rel(dir), 'error', command, firstLines(r.stderr || r.stdout)[0] || 'no JSON report', [], r.exit);
+        continue;
+      }
+      const contents = Array.isArray(report.contents) ? report.contents : [];
+      const manifestErrors = isObj(report.manifest) && Array.isArray(report.manifest.errors) ? report.manifest.errors : [];
+      const bareSkills = !fs.existsSync(path.join(dir, '.claude-plugin'));
+      // Measured on 2.1.310: a skills directory yields success with manifest null and contents [];
+      // that only means nothing was validated, never that the skills passed.
+      if (bareSkills && !contents.length && (!report.manifest || manifestErrors.every((e) => e.path === 'directory'))) {
+        push('claude plugin validate', rel(dir), 'not-applicable', command, 'claude plugin validate does not validate a bare skills directory (contents: []); the built-in rules apply instead', [], r.exit);
         continue;
       }
       const findings = [];
       const take = (entry) => {
-        if (!entry || !entry.file) return;
-        const abs = path.resolve(entry.file);
+        if (!isObj(entry) || !entry.file) return;
+        const abs = path.resolve(dir, entry.file);
         if (statSafe(abs)?.isDirectory()) return;
         for (const e of entry.errors || []) findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'error', message: `claude plugin validate: ${e.path ? `${e.path}: ` : ''}${e.message}` });
         for (const w of entry.warnings || []) findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'warning', message: `claude plugin validate: ${w.path ? `${w.path}: ` : ''}${w.message}` });
       };
       take(report.manifest);
-      for (const c of report.contents || []) take(c);
-      const dirErrors = (report.manifest?.errors || []).filter(() => statSafe(path.resolve(report.manifest.file || '.'))?.isDirectory());
-      out.push({ tool: 'claude plugin validate', target: rel(dir), status: report.success ? 'pass' : 'fail', exit: r.exit, command,
-        summary: report.success ? 'validation passed' : `${findings.length || dirErrors.length} issue(s)${dirErrors.length ? `: ${dirErrors[0].message}` : ''}`, findings });
+      for (const c of contents) take(c);
+      // Plugin-directory listing findings (README, LICENSE, icon) concern publishing, not loading.
+      const manifestFile = [path.join(dir, '.claude-plugin', 'plugin.json'), path.join(dir, '.claude-plugin', 'marketplace.json')].find((f) => fs.existsSync(f));
+      for (const d of (isObj(report.directory) && Array.isArray(report.directory.findings) ? report.directory.findings : [])) {
+        if (manifestFile) findings.push({ abs: manifestFile, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'note', message: `claude plugin validate (plugin directory listing): ${d.title || d.code}${d.message ? `: ${truncate(d.message, 160)}` : ''}` });
+      }
+      const dirErrors = manifestErrors.filter(() => statSafe(path.resolve(dir, report.manifest.file || '.'))?.isDirectory());
+      const failed = report.success === false || findings.some((f) => f.severity === 'error');
+      push('claude plugin validate', rel(dir), failed ? 'fail' : 'pass', command,
+        failed ? `${findings.filter((f) => f.severity !== 'note').length || dirErrors.length} issue(s)${dirErrors.length ? `: ${dirErrors[0].message}` : ''}` : 'validation passed', findings, r.exit);
     }
   }
 
   if (want('spec') && skills.length) {
-    const exe = whichFn('gh');
+    const command = `gh skill publish --dry-run ${rel(root)}`;
+    const ghSkills = skills.filter((s) => ghDiscovers(s, root));
+    const exe = ghSkills.length ? whichFn('gh') : null;
     const v = exe ? version('gh') : null;
-    const command = 'gh skill publish --dry-run';
-    if (!exe) out.push({ tool: 'gh skill publish', target: '.', status: 'skipped', exit: null, command, summary: 'gh is not installed', findings: [] });
-    else if (!v?.version || !versionGte(v.version, '2.90.0')) out.push({ tool: 'gh skill publish', target: '.', status: 'skipped', exit: null, command, summary: `gh ${v?.version || '?'} has no "gh skill" (needs 2.90.0+)`, findings: [] });
+    if (!ghSkills.length) push('gh skill publish', '.', 'not-applicable', command, 'no linted skill is where gh skill publish looks (skills/*/, skills/<scope>/*/, <dir>/ at the root, plugins/<scope>/skills/*/)');
+    else if (!exe) push('gh skill publish', '.', 'skipped', command, 'gh is not on PATH');
+    else if (!v?.version || !versionGte(v.version, '2.90.0')) push('gh skill publish', '.', 'skipped', command, `gh ${v?.version || '?'} has no "gh skill" (needs 2.90.0+)`);
     else {
-      const r = exec(exe, ['skill', 'publish', '--dry-run'], { cwd: root });
-      const lines = firstLines(r.stdout + '\n' + r.stderr);
-      const status = r.exit === 0 ? 'pass' : r.exit === null ? 'error' : 'fail';
-      out.push({ tool: 'gh skill publish', target: '.', status, exit: r.exit, command, summary: lines[0] || status,
-        findings: status === 'fail' ? skills.map((s) => ({ abs: s.file, host: 'spec', rule: 'EXT-GH-SKILL', severity: 'warning', message: `gh skill publish --dry-run: ${lines[0] || 'failed'}` })) : [] });
+      const r = exec(exe, ['skill', 'publish', '--dry-run', root], { cwd: root });
+      // Output lines are "<error|warning>\t<skill>\t<message>"; repository-level lines have no skill.
+      const findings = [];
+      const repoLines = [];
+      for (const line of `${r.stdout}\n${r.stderr}`.split(/\r?\n/)) {
+        const m = /^(error|warning)\t([^\t]*)\t(.+)$/.exec(line.trim() ? line : '');
+        if (!m) continue;
+        const s = m[2] ? ghSkills.find((x) => x.name === m[2] || path.basename(x.dir) === m[2]) : null;
+        if (s) findings.push({ abs: s.file, host: 'spec', rule: 'EXT-GH-SKILL', severity: m[1] === 'error' ? 'error' : 'note', message: `gh skill publish --dry-run: ${m[3].trim()}` });
+        else if (!m[2]) repoLines.push(`${m[1]}: ${m[3].trim()}`);
+      }
+      const errors = findings.filter((f) => f.severity === 'error').length;
+      const status = r.exit === 0 ? 'pass' : errors ? 'fail' : 'error';
+      push('gh skill publish', '.', status, command, [status === 'pass' ? 'dry run passed' : errors ? `${errors} validation error(s)` : firstLines(r.stderr || r.stdout)[0] || 'gh failed', ...repoLines].join('; '), findings, r.exit);
     }
   }
 
   if (want('copilot') && (skills.length || instructions.length)) {
-    const exe = whichFn('copilot');
-    if (!exe) out.push({ tool: 'copilot', target: '.', status: 'skipped', exit: null, command: 'copilot skill list --json; copilot instruction list --json', summary: 'copilot is not installed', findings: [] });
+    const cpSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('copilot', root, env, home)));
+    const cpInstructions = instructions.filter((f) => copilotListsInstruction(f, root));
+    const exe = cpSkills.length || cpInstructions.length ? whichFn('copilot') : null;
+    const listing = (args) => {
+      const r = exec(exe, args, { cwd: root, timeoutMs: 60_000 });
+      let rows = null;
+      try { const j = JSON.parse(r.stdout); rows = Array.isArray(j) ? j : Array.isArray(j?.skills) ? j.skills : Array.isArray(j?.instructions) ? j.instructions : null; } catch {}
+      return { r, rows };
+    };
+    if (!cpSkills.length && !cpInstructions.length) push('copilot', '.', 'not-applicable', 'copilot skill list --json; copilot instruction list --json', 'no linted skill or instruction file is in a location Copilot CLI lists from the repository root');
+    else if (!exe) push('copilot', '.', 'skipped', 'copilot skill list --json; copilot instruction list --json', 'copilot is not on PATH');
     else {
-      const listing = (args) => {
-        const r = exec(exe, args, { cwd: root, timeoutMs: 60_000 });
-        let rows = null;
-        try { const j = JSON.parse(r.stdout); rows = Array.isArray(j) ? j : Array.isArray(j?.skills) ? j.skills : Array.isArray(j?.instructions) ? j.instructions : null; } catch {}
-        return { r, rows };
-      };
-      if (skills.length) {
+      if (cpSkills.length) {
         const { r, rows } = listing(['skill', 'list', '--json']);
         const findings = [];
-        if (rows) {
-          for (const s of skills) {
-            const name = s.name || path.basename(s.dir);
-            const row = rows.find((x) => (x.path && path.resolve(String(x.path)).startsWith(path.resolve(s.dir))) || x.name === name);
-            if (!row) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list does not show "${name}" from this location` });
-            else if (row.enabled === false) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list shows "${name}" as disabled` });
-          }
+        for (const s of rows ? cpSkills : []) {
+          const name = s.name || path.basename(s.dir);
+          const here = rows.find((x) => x.path && samePath(String(x.path), s.dir));
+          const other = rows.find((x) => x.name === name);
+          if (here && here.enabled === false) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list shows "${name}" as disabled` });
+          else if (!here && other) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'note', message: `Copilot loads "${name}" from ${other.path ? shown(other.path) : other.source || '?'} (first found wins); this copy is not used by Copilot` });
+          else if (!here) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list does not show "${name}" although it is in a Copilot skill folder` });
         }
-        out.push({ tool: 'copilot skill list', target: '.', status: rows ? (findings.length ? 'fail' : 'pass') : 'error', exit: r.exit, command: 'copilot skill list --json', summary: rows ? `${rows.length} skill(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings });
+        push('copilot skill list', '.', rows ? (findings.some((f) => f.severity !== 'note') ? 'fail' : 'pass') : 'error', 'copilot skill list --json',
+          rows ? `${rows.length} skill(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings, r.exit);
       }
-      if (instructions.length) {
+      if (cpInstructions.length) {
         const { r, rows } = listing(['instruction', 'list', '--json']);
         const findings = [];
         if (rows) {
-          const listed = new Set(rows.map((x) => (x.sourcePath ? path.resolve(root, String(x.sourcePath)) : null)).filter(Boolean));
-          for (const f of instructions) if (!listed.has(path.resolve(f))) findings.push({ abs: f, host: 'copilot', rule: 'EXT-COPILOT-INSTRUCTION', severity: 'warning', message: 'copilot instruction list does not show this file' });
+          const listed = rows.map((x) => (x.sourcePath ? path.resolve(root, String(x.sourcePath)) : null)).filter(Boolean);
+          for (const f of cpInstructions) if (!listed.some((l) => samePath(l, f))) findings.push({ abs: f, host: 'copilot', rule: 'EXT-COPILOT-INSTRUCTION', severity: 'warning', message: 'copilot instruction list does not show this file' });
         }
-        out.push({ tool: 'copilot instruction list', target: '.', status: rows ? (findings.length ? 'fail' : 'pass') : 'error', exit: r.exit, command: 'copilot instruction list --json', summary: rows ? `${rows.length} instruction source(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings });
+        push('copilot instruction list', '.', rows ? (findings.length ? 'fail' : 'pass') : 'error', 'copilot instruction list --json',
+          rows ? `${rows.length} instruction source(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings, r.exit);
       }
     }
   }
 
-  if (want('codex') && whichFn('codex')) {
-    out.push({ tool: 'codex', target: '.', status: 'skipped', exit: null, command: 'codex exec --strict-config --ephemeral "reply OK"',
-      summary: 'codex exec --strict-config runs a model turn (billed); run it by hand to check config.toml keys', findings: [] });
+  if (want('codex') && skills.length) {
+    const command = 'codex debug prompt-input "x"';
+    const cxSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('codex', root, env, home)));
+    const exe = cxSkills.length ? whichFn('codex') : null;
+    if (!cxSkills.length) push('codex', '.', 'not-applicable', command, 'no linted skill is in .agents/skills at the repository root or in ~/.agents/skills');
+    else if (!exe) push('codex', '.', 'skipped', command, 'codex is not on PATH');
+    else {
+      // Renders the model input locally (no model call, no sign-in needed) and lists discovered skills.
+      const r = exec(exe, ['debug', 'prompt-input', 'x'], { cwd: root, timeoutMs: 60_000 });
+      const listed = r.exit === 0 ? codexListedSkills(r.stdout) : null;
+      const findings = [];
+      for (const s of listed ? cxSkills : []) {
+        const name = s.name || path.basename(s.dir);
+        const here = listed.find((x) => samePath(x.file, s.file));
+        const other = listed.find((x) => x.name === name);
+        if (!here && other) findings.push({ abs: s.file, host: 'codex', rule: 'EXT-CODEX-SKILL', severity: 'note', message: `Codex lists "${name}" from ${shown(other.file)}; this copy is not the one it uses` });
+        else if (!here) findings.push({ abs: s.file, host: 'codex', rule: 'EXT-CODEX-SKILL', severity: 'warning', message: `codex debug prompt-input does not list "${name}" (disabled in config.toml, invalid frontmatter, or not discovered)` });
+      }
+      push('codex', '.', listed ? (findings.some((f) => f.severity !== 'note') ? 'fail' : 'pass') : 'error', command,
+        listed ? `${listed.length} skill(s) in <skills_instructions>` : firstLines(r.stderr || r.stdout)[0] || 'no <skills_instructions> block in the output', findings, r.exit);
+    }
+  }
+  if (want('codex') && codexConfigs.length) {
+    // `codex exec --strict-config` would bill a model turn; `codex doctor --json` lists the
+    // ignored (unrecognized) settings per loaded config layer for free.
+    const command = 'codex doctor --json';
+    const exe = whichFn('codex');
+    if (!exe) for (const f of codexConfigs) push('codex doctor', rel(f), 'skipped', command, 'codex is not on PATH');
+    else {
+      const r = exec(exe, ['doctor', '--json'], { cwd: root, timeoutMs: 60_000 });
+      let report = null;
+      try { report = JSON.parse(r.stdout); } catch {}
+      const load = isObj(report?.checks?.['config.load']) ? report.checks['config.load'] : null;
+      const details = isObj(load?.details) ? load.details : {};
+      const ignored = [];
+      for (const line of String(details['startup warning'] || '').split('\n')) {
+        const m = /^\s*(\S+) \((.+)\): `([^`]+)` is ignored/.exec(line);
+        if (m) ignored.push({ layer: m[1], file: m[2], key: m[3] });
+      }
+      const loaded = [details['config.toml'], ...ignored.map((x) => x.file)].filter((x) => typeof x === 'string');
+      for (const f of codexConfigs) {
+        if (!load) { push('codex doctor', rel(f), 'error', command, firstLines(r.stderr || r.stdout)[0] || 'no config.load check in the report', [], r.exit); continue; }
+        const findings = ignored.filter((x) => samePath(x.file, f)).map((x) => ({ abs: f, host: 'codex', rule: 'EXT-CODEX-CONFIG', severity: 'warning', message: `codex doctor: Codex ignores \`${x.key}\` (unrecognized ${x.layer} setting)` }));
+        if (findings.length) push('codex doctor', rel(f), 'fail', command, `${findings.length} unrecognized setting(s)`, findings, r.exit);
+        else if (loaded.some((x) => samePath(x, f))) push('codex doctor', rel(f), 'pass', command, 'no unrecognized settings', [], r.exit);
+        else push('codex doctor', rel(f), 'not-applicable', command, 'Codex did not load this file from the repository root (project config needs a trusted project)', [], r.exit);
+      }
+    }
   }
 
   if (want('copilot') && skills.length) {
@@ -2327,11 +2562,12 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
       const name = s.name || path.basename(s.dir);
       const evalFile = [path.join(root, 'evals', name, 'eval.yaml'), path.join(s.dir, 'evals', 'eval.yaml')].find((f) => fs.existsSync(f));
       const command = `waza spec verify ${rel(s.dir)} ${evalFile ? rel(evalFile) : `evals/${name}/eval.yaml`} --fail`;
-      if (!exe || !evalFile) { out.push({ tool: 'waza', target: rel(s.dir), status: 'skipped', exit: null, command, summary: !exe ? 'waza is not installed' : 'no eval.yaml for this skill', findings: [] }); continue; }
+      if (!exe || !evalFile) { push('waza', rel(s.dir), 'skipped', command, !exe ? 'waza is not on PATH' : 'no eval.yaml for this skill'); continue; }
       const r = exec(exe, ['spec', 'verify', s.dir, evalFile, '--fail'], { cwd: root });
-      const status = r.exit === 0 ? 'pass' : r.exit === null ? 'error' : 'fail';
-      out.push({ tool: 'waza', target: rel(s.dir), status, exit: r.exit, command, summary: firstLines(r.stdout + '\n' + r.stderr)[0] || status,
-        findings: status === 'fail' ? [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning', message: `waza spec verify: ${firstLines(r.stdout + '\n' + r.stderr)[0] || 'failed'}` }] : [] });
+      const status = statusOf(r);
+      const first = firstLines(r.stdout + '\n' + r.stderr)[0];
+      push('waza', rel(s.dir), status, command, first || status,
+        status === 'fail' ? [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning', message: `waza spec verify: ${first || 'failed'}` }] : [], r.exit);
     }
   }
   return out;
@@ -2371,8 +2607,9 @@ function summarize(run, files, external) {
     }
   }
   for (const x of run.security) s.by_rule[x.rule] = (s.by_rule[x.rule] || 0) + 1;
-  s.external = { ran: external.filter((e) => e.status !== 'skipped').length, failed: external.filter((e) => e.status === 'fail').length,
-    skipped: external.filter((e) => e.status === 'skipped').length };
+  const count = (st) => external.filter((e) => e.status === st).length;
+  s.external = { ran: count('pass') + count('fail') + count('error'), passed: count('pass'), failed: count('fail'), errors: count('error'),
+    skipped: count('skipped'), not_applicable: count('not-applicable') };
   s.clean = s.errors === 0 && s.security_errors === 0 && (!run.strict || (s.warnings === 0 && s.security === 0));
   return s;
 }
@@ -2420,7 +2657,8 @@ export async function lintPaths(paths = [], opts = {}) {
     const plugins = [...new Set(run.files.filter((f) => (f.cls.kind === 'plugin' && f.cls.sub === 'claude') || (f.cls.kind === 'marketplace' && f.cls.sub === 'claude'))
       .map((f) => pluginRootOf(f)))];
     const instructions = run.files.filter((f) => f.cls.kind === 'instructions' && f.cls.reads.includes('copilot')).map((f) => f.abs);
-    ext = runExternalValidators({ root, skills, plugins, instructions, hosts: run.selected }, opts);
+    const codexConfigs = run.files.filter((f) => f.cls.kind === 'codex-config').map((f) => f.abs);
+    ext = runExternalValidators({ root, skills, plugins, instructions, codexConfigs, hosts: run.selected, env, home }, opts);
     const byAbs = new Map(run.files.map((f) => [path.resolve(f.abs), f]));
     for (const e of ext) {
       for (const f of e.findings) {
@@ -2436,7 +2674,10 @@ export async function lintPaths(paths = [], opts = {}) {
   return out;
 }
 
-/** Lint one skill directory (SKILL.md, agents/openai.yaml) against every host; async. */
+/**
+ * Lint one skill directory (SKILL.md, agents/openai.yaml) against every host; async. Paths and
+ * the external validators' discovery are relative to the enclosing Git repository when there is one.
+ */
 export async function lintSkillDir(dir, { strict = false, host = 'all', external = false, ...rest } = {}) {
   const abs = path.resolve(dir);
   const targets = [path.join(abs, 'SKILL.md')];
@@ -2447,7 +2688,7 @@ export async function lintSkillDir(dir, { strict = false, host = 'all', external
   }
   const meta = path.join(abs, 'agents', 'openai.yaml');
   if (fs.existsSync(meta)) targets.push(meta);
-  return lintPaths(targets, { strict, host, external, root: abs, ...rest });
+  return lintPaths(targets, { strict, host, external, root: repoRootSafe(abs) || abs, ...rest });
 }
 
 /** Exit code for a lint result: 1 on errors (or, with strict, any warning or security finding). */
@@ -2481,9 +2722,11 @@ export const lintCommand = defineCommand({
   usage: [
     'usage: adc.mjs tooling lint [paths...] [--host all|copilot|claude|codex] [--strict] [--no-external] [--allow-host <host>]',
     '  Lints instructions, skills, agents, prompt files, hooks, plugins and MCP configs against each host\'s rules.',
-    '  No paths: the whole repository. --strict: only the six spec fields are allowed and warnings fail.',
-    '  --no-external (or ADC_LINT_NO_EXTERNAL=1): skip skills-ref, claude plugin validate, gh skill, copilot, waza.',
-    '  Exit: 0 clean, 1 findings, 2 usage.',
+    '  No paths: the whole repository. --strict: only the six spec fields and block-style YAML; warnings fail.',
+    '  --no-external (or ADC_LINT_NO_EXTERNAL=1): skip skills-ref, claude plugin validate, gh skill publish,',
+    '  copilot skill/instruction list, codex debug prompt-input and doctor, waza (none runs a model turn).',
+    '  --allow-host <host> (repeatable): HTTP hooks to this host are not a security finding.',
+    '  Exit: 0 clean, 1 findings, 2 usage, 3 tracked .adc/.',
   ].join('\n'),
   options: {
     host: { type: 'string' },

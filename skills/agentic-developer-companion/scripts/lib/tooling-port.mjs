@@ -466,6 +466,12 @@ export function toSkillName(label) {
 const agentFileName = (name) => String(name).replace(/[^.\-_a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
 
 export const SKILL_DIRS = Object.freeze({ copilot: '.github/skills', claude: '.claude/skills', codex: '.agents/skills' });
+/**
+ * Codex-only skills (agents translated to skills): Copilot also loads `.agents/skills`, where such
+ * a skill would duplicate the Copilot agent. Codex reads `.codex/skills` in a repository (checked
+ * with codex-cli 0.164.0, `codex debug prompt-input`, 2026-10-25); Copilot and Claude Code do not.
+ */
+export const CODEX_ONLY_SKILLS_DIR = '.codex/skills';
 
 function skillDirHosts(prefix) {
   if (prefix === '.github/skills') return { host: 'copilot', hosts: ['copilot'] };
@@ -789,7 +795,10 @@ function relativeArg(arg) {
   return !/^[-$/~\\]/.test(arg) && !/^[A-Za-z]:/.test(arg) && !/^[a-z]+:\/\//i.test(arg) && (arg.includes('/') || SCRIPT_EXT.test(arg));
 }
 
-/** Rewrite script paths between Claude's `${CLAUDE_PROJECT_DIR}` and repo-relative paths. */
+/**
+ * Rewrite script paths between Claude's `${CLAUDE_PROJECT_DIR}` and repo-relative paths.
+ * `claude` prefixes relative scripts (exec form); `claude-repo` and the other hosts keep them relative.
+ */
 function rebaseArgs(args, target, notes) {
   return args.map((a) => {
     if (target !== 'claude' && /^\$\{CLAUDE_PROJECT_DIR\}\//.test(a)) {
@@ -873,8 +882,11 @@ export function renderHookConfig(entries, target, { file = 'hooks', guard = fals
         h.args = rebaseArgs(e.exec.args, 'claude', notes).map((a) => a.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, '${CLAUDE_PLUGIN_ROOT}/').replace(/\$\{PLUGIN_ROOT\}/g, '${CLAUDE_PLUGIN_ROOT}'));
       } else if (e.exec) {
         // Repository settings: Copilot CLI and VS Code run these hooks too, and their handling of
-        // exec form is undocumented, so one shell string (valid in sh, Git Bash and PowerShell).
-        h.command = joinPosix([e.exec.program, ...rebaseArgs(e.exec.args, 'claude', notes)]);
+        // exec form is undocumented, so one shell string valid in sh, Git Bash and PowerShell.
+        // ${CLAUDE_PROJECT_DIR} is not (PowerShell reads it as an unset variable, and Copilot
+        // does not set it), so script paths stay repository-relative.
+        h.command = joinPosix([e.exec.program, ...rebaseArgs(e.exec.args, 'claude-repo', notes)]);
+        if (e.exec.args.some(relativeArg)) manual.add('Repository hooks in .claude/settings.json use repository-relative script paths (Copilot runs them too, in bash and PowerShell): start Claude Code and Copilot from the repository root.');
       } else if (e.posix) {
         h.command = e.posix;
         if (e.windows && e.windows !== e.posix) dropped.push({ file, field: 'powershell/commandWindows', value: e.windows, reason: 'Claude Code runs one command per hook (Git Bash on Windows when installed, else PowerShell)' });
@@ -1301,7 +1313,17 @@ function sectionMerge(id, block) {
   };
 }
 
-function convertInstructions(src, cls, targets, ctx) {
+/** Text without the port-managed section for `id` (so a file's own imports can be inspected). */
+function stripPortSections(text, id) {
+  const begin = `<!-- adc:port begin ${id} -->`;
+  const end = `<!-- adc:port end ${id} -->`;
+  const cur = String(text || '');
+  const a = cur.indexOf(begin);
+  const b = cur.indexOf(end);
+  return a >= 0 && b > a ? cur.slice(0, a) + cur.slice(b + end.length) : cur;
+}
+
+function convertInstructions(src, cls, targets) {
   const outputs = [];
   const dropped = [];
   const manual = [];
@@ -1323,11 +1345,14 @@ function convertInstructions(src, cls, targets, ctx) {
       if (Buffer.byteLength(content) > 32768) manual.push(`AGENTS.md would be ${Buffer.byteLength(content)} bytes; Codex loads at most 32 KiB of AGENTS.md content in total.`);
       outputs.push({ path: 'AGENTS.md', content, host, kind: 'instructions' });
       if (base === 'CLAUDE.local.md') manual.push('CLAUDE.local.md is personal; consider keeping it out of the shared AGENTS.md.');
+      else manual.push(`Copilot reads AGENTS.md as well as ${base}, so these rules now load twice in Copilot: prefer AGENTS.md as the single source (move the shared rules there, keep ${base} for host-only notes, and give Claude Code an @AGENTS.md import).`);
     } else if (host === 'claude') {
       if (base === 'CLAUDE.md' || base === 'CLAUDE.local.md') { notes.push(`claude: reads ${src.rel} natively`); continue; }
       const importLine = `@${src.rel}`;
-      const block = `${importLine}\n`;
-      outputs.push({ path: 'CLAUDE.md', content: `${markerLine(src.rel)}\n${block}`, merge: sectionMerge(src.rel, block), host, kind: 'instructions' });
+      const merge = sectionMerge(src.rel, `${importLine}\n`);
+      // A CLAUDE.md that already imports the source (hand-written or ported) stays as it is.
+      const importMerge = (cur) => (findImports(stripPortSections(cur, src.rel)).some((i) => toPosix(i.ref).replace(/^\.\//, '') === src.rel) ? cur : merge(cur));
+      outputs.push({ path: 'CLAUDE.md', content: merge(`${markerLine(src.rel)}\n`), merge: importMerge, host, kind: 'instructions' });
       if (base === 'AGENTS.md') notes.push('claude: Claude Code reads AGENTS.md only when no CLAUDE.md exists; the @AGENTS.md import keeps one source for both');
       else manual.push(`Copilot CLI also reads CLAUDE.md: check \`copilot instruction list --json\` that ${src.rel} is not loaded twice.`);
     } else if (host === 'copilot') {
@@ -1690,7 +1715,7 @@ function convertAgent(src, cls, targets) {
     if (host === cls.host) { notes.push(`${host}: native`); continue; }
     if (host === 'codex') {
       const name = toSkillName(ir.name);
-      const dir = `${SKILL_DIRS.codex}/${name}`;
+      const dir = `${CODEX_ONLY_SKILLS_DIR}/${name}`;
       outputs.push({ path: `${dir}/SKILL.md`, content: skillFrontmatter({ name, description: ir.description, host: 'codex' }) + '\n' + ir.body, host, kind: 'skill' });
       outputs.push({ path: `${dir}/agents/openai.yaml`, content: renderOpenAiYaml({ name, description: ir.description, implicit: ir.disableModelInvocation !== true }), host, kind: 'skill' });
       if (ir.tools) dropped.push({ file: src.rel, field: 'tools', value: ir.tools.join(', '), reason: 'Codex skills have no tool restriction; state limits in the body' });

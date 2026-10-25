@@ -223,13 +223,14 @@ describe('tooling port', () => {
     const src = '---\nname: reviewer\ndescription: Reviews diffs for missing tests.\ntools: [\'read\', \'search\', \'edit\']\nmodel: GPT-5\nhandoffs:\n  - label: Fix\n    agent: fixer\nuser-invocable: true\n---\n\nYou review diffs.\n';
     const dir = tmpRepo({ '.github/agents/reviewer.agent.md': src });
     const r = await P.port({ path: '.github/agents/reviewer.agent.md', root: dir, to: 'all' });
-    assert.deepEqual(r.written.map((w) => w.path).sort(), ['.agents/skills/reviewer/SKILL.md', '.agents/skills/reviewer/agents/openai.yaml', '.claude/agents/reviewer.md']);
+    // Codex gets a skill in .codex/skills: Copilot also reads .agents/skills and would see it twice.
+    assert.deepEqual(r.written.map((w) => w.path).sort(), ['.claude/agents/reviewer.md', '.codex/skills/reviewer/SKILL.md', '.codex/skills/reviewer/agents/openai.yaml']);
     assert.ok(r.dropped_fields.some((d) => d.field === 'handoffs' && /Claude/.test(d.reason)));
     const claude = P.readFrontmatter(read(dir, '.claude/agents/reviewer.md'));
     assert.equal(claude.data.tools, 'Read, Grep, Glob, Edit, Write');
     assert.equal(claude.data.omitClaudeMd, true);
     assert.equal(claude.body.trim(), 'You review diffs.');
-    assert.match(read(dir, '.agents/skills/reviewer/agents/openai.yaml'), /default_prompt: .*\$reviewer/);
+    assert.match(read(dir, '.codex/skills/reviewer/agents/openai.yaml'), /default_prompt: .*\$reviewer/);
     assert.ok(r.manual_steps.some((m) => /unverified/.test(m)));
     // back to Copilot in a separate output tree
     const back = await P.port({ path: '.claude/agents/reviewer.md', root: dir, to: 'copilot', out: 'rt' });
@@ -252,7 +253,8 @@ describe('tooling port', () => {
     const claude = JSON.parse(read(dir, '.claude/settings.json'));
     const post = claude.hooks.PostToolUse[0];
     assert.equal(post.matcher, 'Edit|Write');
-    assert.equal(post.hooks[0].command, 'node "${CLAUDE_PROJECT_DIR}/scripts/check.mjs" --x');
+    // Copilot runs repository .claude/settings.json hooks in bash and PowerShell: no ${CLAUDE_PROJECT_DIR}.
+    assert.equal(post.hooks[0].command, 'node scripts/check.mjs --x');
     assert.equal(post.hooks[0].timeout, 10);
     assert.ok(r.dropped_fields.some((d) => d.field === 'hooks.errorOccurred'), 'errorOccurred has no Claude/Codex event');
     assert.ok(r.dropped_fields.some((d) => d.field === 'powershell/commandWindows'), 'Claude keeps one command per hook');
@@ -449,7 +451,8 @@ describe('tooling cost', () => {
     assert.ok(ok.json.totals.codex.always_on_tokens > 100);
     const over = adc(dir, 'tooling', 'cost', '--max-tokens', '50');
     assert.equal(over.exit, 1);
-    assert.deepEqual(over.json.over_max.sort(), ['codex', 'copilot']);
+    // No CLAUDE.md, so Claude Code reads AGENTS.md as well (v2.1.277+).
+    assert.deepEqual(over.json.over_max.sort(), ['claude', 'codex', 'copilot']);
     assert.equal(adc(dir, 'tooling', 'cost', '--host', 'cursor').exit, 2);
   });
 });
@@ -496,7 +499,7 @@ describe('tooling scaffold', () => {
     assert.match(fs.readFileSync(path.join(dir, 'out-instructions-all', 'CLAUDE.md'), 'utf8'), /^@AGENTS\.md$/m);
     assert.match(fs.readFileSync(path.join(dir, 'out-instructions-all', 'AGENTS.md'), 'utf8'), /`npm test`/);
     assert.equal(P.readFrontmatter(fs.readFileSync(path.join(dir, 'out-prompt-claude', '.claude', 'skills', 'demo-prompt', 'SKILL.md'), 'utf8')).data['disable-model-invocation'], true);
-    assert.ok(fs.existsSync(path.join(dir, 'out-agent-codex', '.agents', 'skills', 'demo-agent', 'agents', 'openai.yaml')));
+    assert.ok(fs.existsSync(path.join(dir, 'out-agent-codex', '.codex', 'skills', 'demo-agent', 'agents', 'openai.yaml')));
   });
 
   test('never overwrites without --force; --force merges JSON with a backup', async () => {
@@ -508,7 +511,7 @@ describe('tooling scaffold', () => {
     assert.ok(forced.written.some((w) => w.path === '.claude/settings.json' && w.action === 'merge'));
     const merged = JSON.parse(read(dir, '.claude/settings.json'));
     assert.deepEqual(merged.permissions, { allow: ['Read'] });
-    assert.equal(merged.hooks.PostToolUse[0].hooks[0].command, 'node "${CLAUDE_PROJECT_DIR}/scripts/hooks/guard.mjs" --dialect claude --event PostToolUse');
+    assert.equal(merged.hooks.PostToolUse[0].hooks[0].command, 'node scripts/hooks/guard.mjs --dialect claude --event PostToolUse');
     assert.equal(forced.backups.length, 1);
     assert.match(forced.backups[0], /\.adc\/tooling\/backups\//);
     assert.ok(fs.existsSync(forced.backups[0]));
@@ -517,7 +520,10 @@ describe('tooling scaffold', () => {
   test('the generated hook handler passes its own fixture tests', async () => {
     const dir = tmpRepo({});
     await T.scaffoldTooling('hooks', { values: { for: 'all', name: 'edit-guard', events: 'PostToolUse,PreToolUse,Stop', write: true, cwd: dir } });
-    const res = spawnSync(process.execPath, ['--test', path.join(dir, 'scripts', 'hooks', 'edit-guard.test.mjs')], { cwd: dir, encoding: 'utf8', timeout: 60_000 });
+    // A nested `node --test` inherits NODE_TEST_CONTEXT and would report to this runner instead of stdout.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const res = spawnSync(process.execPath, ['--test', '--test-reporter=tap', path.join(dir, 'scripts', 'hooks', 'edit-guard.test.mjs')], { cwd: dir, env, encoding: 'utf8', timeout: 60_000 });
     assert.equal(res.status, 0, res.stdout + res.stderr);
     assert.match(res.stdout, /# pass 7/);
     const cp = JSON.parse(read(dir, '.github/hooks/edit-guard.json'));
@@ -551,7 +557,8 @@ describe('tooling trigger-set', () => {
     assert.deepEqual(s.per_query_pass_rate, { a: 0.6667, b: 0.3333, c: 0.6667 });
     assert.equal(s.suite_score, 0.6667);
     assert.equal(s.errors, 1);
-    assert.deepEqual(s.run_scores.map((x) => Number(x.toFixed(4))), [0.6667, 0.6667, 0.3333]);
+    // Per run k: the share of queries whose k-th run behaved as labeled (an error never does).
+    assert.deepEqual(s.run_scores, [0.3333, 1, 0.3333]);
     assert.ok(s.sd > 0);
     const split = T.assignSplit(Array.from({ length: 20 }, (_, i) => ({ id: `q${i}`, query: `q ${i}`, should_trigger: i < 10 })));
     assert.equal(split.filter((q) => q.split === 'train').length, 12);

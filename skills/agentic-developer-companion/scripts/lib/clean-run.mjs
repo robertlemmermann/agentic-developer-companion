@@ -16,7 +16,7 @@ import { prepareTarget } from './state.mjs';
 import { parseReport, parseSummaryText, normalizeFormat, detectReportFormat, rootVariants, isTestPath } from './reports.mjs';
 
 const FM_CLEANRUN = ['FM-02', 'FM-13'];
-const FM_REDGREEN = ['FM-03', 'FM-01'];
+const FM_REDGREEN = ['FM-03'];
 const FM_TYPES = ['FM-04'];
 const DEFAULT_TIMEOUT_S = 1800;
 const LOG_HEAD = 2 * 1024 * 1024;
@@ -76,8 +76,15 @@ export const RUNNER_DEFAULTS = Object.freeze({
     report: { flag: '--junit-xml=<f>', format: 'junit' },
     retries_off: { mechanism: '-p no:rerunfailures', coverage: 'full' },
     select: 'pytest',
-    shuffle: (seed) => ['-p', 'randomly', `--randomly-seed=${seed}`], shuffleRequires: ['pytest-randomly', 'pytest_randomly'],
+    shuffle: (seed) => [`--randomly-seed=${seed}`], shuffleRequires: ['pytest-randomly', 'pytest_randomly'],
     coverage: { flag: '--cov --cov-report=xml:<c>', format: 'cobertura', file: 'coverage.xml', requires: ['pytest-cov', 'pytest_cov'] },
+  },
+  // unittest prints summary lines only: counts, no test ids (red-green and per-id rules need a report).
+  unittest: {
+    cmd: 'python -m unittest discover',
+    report: { format: 'summary-text', stdout: true },
+    retries_off: { mechanism: 'unittest has no retries', coverage: 'full' },
+    select: 'none',
   },
   go: {
     cmd: 'go test ./...',
@@ -126,7 +133,7 @@ export const RUNNER_DEFAULTS = Object.freeze({
   },
 });
 
-const RUNNER_ALIASES = { 'node:test': 'node-test', node: 'node-test', 'cargo-test': 'cargo', 'cargo-nextest': 'nextest', 'go-test': 'go', 'dotnet-test': 'dotnet', surefire: 'maven', unittest: 'pytest' };
+const RUNNER_ALIASES = { 'node:test': 'node-test', node: 'node-test', 'cargo-test': 'cargo', 'cargo-nextest': 'nextest', 'go-test': 'go', 'dotnet-test': 'dotnet', surefire: 'maven' };
 
 // Environment that narrows or redirects a test run, or carries credentials: never inherited.
 const SCRUB_ENV = ['NODE_TEST_CONTEXT', 'PYTEST_ADDOPTS', 'GOFLAGS', 'VITEST', 'VITEST_MODE', 'VITEST_POOL_ID', 'VITEST_WORKER_ID', 'JEST_WORKER_ID', 'NEXTEST_RETRIES', 'NEXTEST_PROFILE', 'CARGO_TARGET_DIR'];
@@ -201,7 +208,8 @@ const toPosixIfNeeded = (p) => (IS_WINDOWS ? String(p) : toPosix(p));
 export function appendArgs(cmd, args) {
   const extra = args.filter((a) => a != null && a !== '').join(' ');
   if (!extra) return cmd;
-  if (/^\s*npm(?:\.cmd)?\s+(?:run(?:-script)?\s+)?(?:test|t)\b/.test(cmd) && !/\s--(?:\s|$)/.test(cmd)) return `${cmd} -- ${extra}`;
+  // npm treats flags after a script name as its own config unless they follow `--`.
+  if (/^\s*npm(?:\.cmd)?\s+(?:(?:run|run-script|rum|urn)\s+\S+|test|tst|t)(?:\s|$)/.test(cmd) && !/\s--(?:\s|$)/.test(cmd)) return `${cmd} -- ${extra}`;
   if (/^\s*cargo\s+(?:test|nextest\s+run)\b/.test(cmd) && /\s--(?:\s|$)/.test(cmd)) {
     const i = cmd.search(/\s--(?:\s|$)/);
     return `${cmd.slice(0, i)} ${extra}${cmd.slice(i)}`;
@@ -295,9 +303,20 @@ export function runEnv(extra = {}) {
     const live = /^ADC_LIVE_/.test(k) || k === 'ADC_TEST_RUN_ID' || k === 'ADC_PROBE_RESULT' || k === 'ADC_PROBE_ID';
     if (SCRUB_ENV.includes(k) || live) { delete env[k]; removed.add(live ? 'ADC_LIVE_*' : k); }
   }
-  const set = { CI: 'true', ADC_CLEAN_RUN: '1', NO_COLOR: '1', FORCE_COLOR: '0', PYTHONDONTWRITEBYTECODE: '1', ...extra };
+  // npm_config_yes=false: with CI set, `npx <tool>` would otherwise download an unpinned tool when
+  // the project does not have it installed, and the clean run would test with the wrong version.
+  const set = {
+    CI: 'true', ADC_CLEAN_RUN: '1', NO_COLOR: '1', FORCE_COLOR: '0', PYTHONDONTWRITEBYTECODE: '1',
+    npm_config_yes: 'false', npm_config_update_notifier: 'false', npm_config_fund: 'false', npm_config_audit: 'false', ...extra,
+  };
   return { env: { ...env, ...set }, removed: [...removed], set: Object.keys(set) };
 }
+
+// Output of a shell, npx, a Python launcher or a .NET host that could not find the program to run.
+const RUNNER_MISSING_RE = /^(?:[\w./-]+(?: \d+)?: )+(?:command )?not found\s*$|^\w+: command not found: \S+\s*$|is not recognized as an internal or external command|npx canceled due to missing packages|npm (?:ERR!|error) could not determine executable to run|No module named (?:pytest|mypy|pyright)\b|^error: no such command: `|Could not execute because the specified command or file was not found|Could not find or load main class org\.apache\.maven/m;
+
+/** True when a run's output says the runner itself is missing (not that tests failed). */
+export const runnerMissing = (text) => RUNNER_MISSING_RE.test(String(text || ''));
 
 // ---------------------------------------------------------------------------
 // Worktree pool: one worktree per (commit, purpose) per process, removed at exit unless kept.
@@ -313,7 +332,7 @@ export function acquireWorktree(root, commit, label, { keep = false, fresh = fal
   if (cur) releaseEntry(key, cur);
   const dir = path.join(tmpRoot(root), `${label}-${String(commit).slice(0, 12)}-${nonce().slice(0, 6)}`);
   worktreeAdd(root, commit, dir);
-  const entry = { key, root, commit, label, dir, keep, dirty: false, installed: new Map() };
+  const entry = { key, root, commit, label, dir, keep, dirty: false, installed: new Map(), links: [] };
   POOL.set(key, entry);
   if (!exitHook) {
     exitHook = true;
@@ -324,7 +343,12 @@ export function acquireWorktree(root, commit, label, { keep = false, fresh = fal
 
 function releaseEntry(key, entry) {
   POOL.delete(key);
-  if (!entry.keep) { try { worktreeRemove(entry.root, entry.dir); } catch {} }
+  if (entry.keep) return;
+  // Remove dependency links first, so no recursive delete can ever reach the user's node_modules.
+  for (const link of entry.links || []) {
+    try { fs.unlinkSync(link); } catch { try { fs.rmdirSync(link); } catch {} }
+  }
+  try { worktreeRemove(entry.root, entry.dir); } catch {}
 }
 
 /** Remove every pooled worktree that was not kept (also runs at process exit). */
@@ -364,7 +388,7 @@ export function fallbackDetect(root) {
     if (lock) project.managers.push({ name: lock.startsWith('pnpm') ? 'pnpm' : lock.startsWith('yarn') ? 'yarn' : lock.startsWith('bun') ? 'bun' : 'npm', lockfile: lock, install });
     const script = String((pkg.scripts || {}).test || '');
     const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-    if (/\bnode\s+(?:[^|&;]*\s)?--test\b/.test(script)) project.runners.push(runner('node-test', { cmd: script.replace(/\s+--test-reporter[^\s]*(?:\s+\S+)?/g, '').trim() }));
+    if (/\bnode\s+(?:[^|&;]*\s)?--test\b/.test(script)) project.runners.push(runner('node-test', { cmd: script.replace(/\s+--test-reporter(?:-destination)?(?:=\S+|\s+(?!-)\S+)/g, '').trim() }));
     else if (/\bvitest\b/.test(script) || deps.vitest) project.runners.push(runner('vitest'));
     else if (/\bjest\b/.test(script) || deps.jest) project.runners.push(runner('jest'));
     else if (/\bmocha\b/.test(script) || deps.mocha) project.runners.push(runner('mocha'));
@@ -429,6 +453,25 @@ function walkSome(root, pred, depth = 0) {
   return false;
 }
 
+// A `--runner` command line that plainly invokes a known runner gets that runner's report and
+// retries-off flags (appended at the end). Lines with shell operators stay opaque: appended
+// flags would reach the last command, not the runner.
+const INFER_RUNNER = [
+  ['node-test', /^node(?:\.exe)?\s(?:.*\s)?--test(?:\s|$)/], ['playwright', /\bplaywright\s+test\b/], ['vitest', /\bvitest\b/],
+  ['jest', /\bjest\b/], ['mocha', /\bmocha\b/], ['pytest', /(?:^|[\s/\\])(?:py\.test|pytest)(?:\.exe)?(?:\s|$)/],
+  ['nextest', /\bcargo\s+nextest\s+run\b/], ['cargo', /\bcargo\s+test\b/], ['go', /\bgo\s+test\b/],
+  ['dotnet', /\bdotnet\s+test\b/], ['rspec', /\brspec\b/], ['maven', /(?:^|[\s/\\])mvnw?(?:\.cmd)?\s(?:.*\s)?test(?:\s|$)/],
+  ['gradle', /(?:^|[\s/\\])gradlew?(?:\.bat)?\s(?:.*\s)?test(?:\s|$)/],
+];
+
+/** Runner name for a command line such as `uv run pytest` or `go test ./pkg/...`, or null. */
+export function inferRunner(line) {
+  const s = String(line || '').trim();
+  if (!s || /&&|\|\||[;|<>`]|\$\(/.test(s)) return null;
+  const hit = INFER_RUNNER.find(([, re]) => re.test(s));
+  return hit ? hit[0] : null;
+}
+
 /** Normalized runner: detect's entry completed with RUNNER_DEFAULTS; `--runner` may name a runner or give a command. */
 export function resolveRunner(project, runnerOpt = null) {
   const detected = Array.isArray(project && project.runners) ? project.runners : [];
@@ -444,8 +487,13 @@ export function resolveRunner(project, runnerOpt = null) {
     return { ...def, ...r, name, cmd, report, retries_off: r.retries_off || def.retries_off || { mechanism: 'unknown', coverage: 'unknown' } };
   };
   if (runnerOpt) {
-    if (/\s/.test(runnerOpt.trim())) {
-      return { name: 'custom', cmd: runnerOpt.trim(), report: null, retries_off: { mechanism: 'custom command (not modified)', coverage: 'unknown' }, select: 'none', source: '--runner' };
+    const line = String(runnerOpt).trim();
+    if (/\s/.test(line)) {
+      const same = detected.find((r) => r.cmd && String(r.cmd).trim() === line);
+      if (same) return { ...complete(same), source: same.source || 'detect' };
+      const kind = inferRunner(line);
+      if (kind) return { ...complete({ name: kind, cmd: line }), source: '--runner', inferred: true };
+      return { name: 'custom', cmd: line, report: null, retries_off: { mechanism: 'custom command (not modified)', coverage: 'unknown' }, select: 'none', source: '--runner' };
     }
     const want = canon(runnerOpt);
     const hit = detected.find((r) => canon(r.name) === want);
@@ -478,9 +526,66 @@ export function projectOf(file, projects) {
 
 const projectDir = (wt, project) => (project.root && project.root !== '.' ? path.join(wt.dir, project.root) : wt.dir);
 
+const NODE_LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'];
+
+/** Dependency manifest identity of a Node project at a commit vs the working tree (lockfile, else package.json deps). */
+function sameNodeDeps(root, commit, rel) {
+  const p = (f) => (rel ? `${rel}/${f}` : f);
+  for (const lock of NODE_LOCKFILES) {
+    const work = readText(path.join(root, rel, lock));
+    const at = showFile(root, commit, p(lock));
+    if (work != null || at != null) return work != null && at != null && work.replace(/\r\n/g, '\n') === at.replace(/\r\n/g, '\n');
+  }
+  const deps = (text) => {
+    try { const j = JSON.parse(text); return JSON.stringify([j.dependencies || {}, j.devDependencies || {}, j.optionalDependencies || {}]); } catch { return null; }
+  };
+  const a = deps(readText(path.join(root, rel, 'package.json'), ''));
+  return a != null && a === deps(showFile(root, commit, p('package.json')) || '');
+}
+
+/**
+ * --no-install: link the working tree's node_modules into the worktree (junction on Windows) so
+ * a Node project can run offline. Snapshot worktrees always match the working tree; a base
+ * worktree is linked only when its dependency manifests are identical and the project has no
+ * workspace links (those resolve to the working tree's packages, i.e. the snapshot's code).
+ */
+function linkDependencies(wt, project) {
+  const rel = project.root && project.root !== '.' ? project.root : '';
+  const out = { linked: [], not_linked: [] };
+  const src = path.join(wt.root, rel, 'node_modules');
+  const dest = path.join(wt.dir, rel, 'node_modules');
+  if (!fs.existsSync(path.join(wt.dir, rel, 'package.json')) || !fs.existsSync(src) || fs.existsSync(dest)) return out;
+  const relPath = toPosix(path.join(rel, 'node_modules'));
+  if (wt.label === 'base') {
+    const ws = (dir) => Boolean((readJson(path.join(dir, 'package.json'), {}) || {}).workspaces) || fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'));
+    const workspaces = ws(path.join(wt.root, rel)) || (rel && ws(wt.root));
+    if (workspaces) { out.not_linked.push({ path: relPath, reason: 'workspace links would resolve to the working tree' }); return out; }
+    if (!sameNodeDeps(wt.root, wt.commit, rel)) { out.not_linked.push({ path: relPath, reason: 'dependencies differ between the base and the working tree' }); return out; }
+  }
+  try {
+    fs.symlinkSync(src, dest, IS_WINDOWS ? 'junction' : 'dir');
+    wt.links.push(dest);
+    out.linked.push(relPath);
+  } catch (err) {
+    out.not_linked.push({ path: relPath, reason: err.code || err.message });
+  }
+  return out;
+}
+
+/** The install record without timings noise, or null when nothing happened. */
+const installSummary = (i) => (i && (i.cmd || i.linked || i.not_linked)
+  ? { cmd: i.cmd || null, exit: i.exit ?? null, ...(i.linked ? { linked: i.linked } : {}), ...(i.not_linked ? { not_linked: i.not_linked } : {}) } : null);
+
 /** Frozen install for `project` in worktree `wt` (once per directory per worktree). */
 export async function installProject(wt, project, { noInstall = false, timeoutMs, logFile } = {}) {
-  if (noInstall) return { cmd: null, exit: null, ms: 0, skipped: 'no-install' };
+  if (noInstall) {
+    const key = `no-install:${projectDir(wt, project)}`;
+    if (wt.installed.has(key)) return wt.installed.get(key);
+    const links = wt.links ? linkDependencies(wt, project) : { linked: [], not_linked: [] };
+    const out = { cmd: null, exit: null, ms: 0, skipped: 'no-install', ...(links.linked.length ? { linked: links.linked } : {}), ...(links.not_linked.length ? { not_linked: links.not_linked } : {}) };
+    wt.installed.set(key, out);
+    return out;
+  }
   const managers = Array.isArray(project.managers) ? project.managers : [];
   const m = managers.find((x) => x && x.install) || null;
   if (!m) return { cmd: null, exit: null, ms: 0, skipped: 'no frozen install command detected' };
@@ -512,23 +617,27 @@ function cargoTargetDir(dir) {
  * `seed` adds the runner's shuffle flags; `coverage` adds its coverage flags.
  * Returns { cmd, env, report: { path|dir|stdout, format }, applied: { retries, select, shuffle, coverage } }.
  */
-export function buildRunCommand(runner, { dir, outDir, select = null, seed = null, coverage = false } = {}) {
-  ensureDir(outDir);
+export function buildRunCommand(runner, { dir, outDir, select = null, seed = null, coverage = false, plan = false } = {}) {
+  // `plan`: compute the command only (dry runs write nothing and run no cargo metadata).
+  if (!plan) ensureDir(outDir);
   const fmt = runner.report ? normalizeFormat(runner.report.format) || runner.report.format : null;
   const ext = { junit: 'xml', trx: 'trx', 'jest-json': 'json', 'rspec-json': 'json', 'go-test-json': 'jsonl', 'cargo-text': 'txt' }[fmt] || 'out';
   const values = { f: path.join(outDir, `report.${ext}`), d: path.join(outDir, 'reports'), c: null, cdir: path.join(outDir, 'coverage'), target: null };
-  ensureDir(values.d);
+  if (!plan) ensureDir(values.d);
   const applied = { retries: null, select: null, shuffle: null, coverage: null };
   let cmd = runner.cmd;
   const env = {};
   if (coverage && runner.coverage && runner.coverage.cmd) cmd = runner.coverage.cmd;
+  // node --test: every added flag goes before the file patterns, which are re-appended last.
+  let nodePaths = [];
+  if (runner.name === 'node-test') ({ head: cmd, paths: nodePaths } = splitNodeTestCmd(cmd, runner.paths));
   if (runner.name === 'cargo' && /^\s*cargo\s+test\b/.test(cmd) && !/--no-fail-fast/.test(cmd)) cmd = appendArgs(cmd, ['--no-fail-fast']);
   if (runner.name === 'nextest' && !/--no-fail-fast/.test(cmd)) cmd = appendArgs(cmd, ['--no-fail-fast']);
   const extra = [];
   const rep = runner.report;
   if (rep && rep.nextestConfig) {
-    writeFileAtomic(path.join(values.d, 'nextest-adc.toml'), '[profile.adc-ci]\nfail-fast = false\nretries = 0\n\n[profile.adc-ci.junit]\npath = "junit.xml"\n');
-    values.target = toPosix(cargoTargetDir(dir));
+    if (!plan) writeFileAtomic(path.join(values.d, 'nextest-adc.toml'), '[profile.adc-ci]\nfail-fast = false\nretries = 0\n\n[profile.adc-ci.junit]\npath = "junit.xml"\n');
+    values.target = plan ? '<target>' : toPosix(cargoTargetDir(dir));
   }
   if (rep && rep.flag && !(coverage && runner.coverage && runner.coverage.cmd)) extra.push(substitute(rep.flag, values));
   if (rep && rep.env) for (const [k, v] of Object.entries(rep.env)) env[k] = String(v).replace(/<f>/g, values.f).replace(/<d>/g, values.d);
@@ -547,6 +656,7 @@ export function buildRunCommand(runner, { dir, outDir, select = null, seed = nul
   }
   if (select && (select.files.length || select.names.length)) {
     const sel = selectionArgs(runner, select, dir);
+    if (sel && runner.name === 'node-test' && select.files.length) { cmd = dropNodeTestPaths(cmd); nodePaths = []; }
     if (sel) {
       if (sel.replacePackages) cmd = cmd.replace(/(\s)\.\/\.\.\.(?=\s|$)/, `$1${sel.replacePackages.map(quoteArg).join(' ')}`);
       if (sel.replacePackages && !/\s\.\/\S/.test(cmd)) extra.push(...sel.replacePackages.map(quoteArg));
@@ -554,6 +664,7 @@ export function buildRunCommand(runner, { dir, outDir, select = null, seed = nul
       applied.select = sel.describe;
     }
   }
+  extra.push(...nodePaths);
   cmd = appendArgs(cmd, extra);
   const fillPath = (t) => String(t).replace(/<(f|d|c|cdir|target)>/g, (m, k) => (values[k] != null ? values[k] : m));
   const report = !rep ? null
@@ -562,6 +673,56 @@ export function buildRunCommand(runner, { dir, outDir, select = null, seed = nul
         : rep.dir ? { dir: path.resolve(dir, fillPath(rep.dir)), glob: rep.glob || '*', format: fmt }
           : { path: values.f, format: fmt };
   return { cmd, env, report, applied, coverageFile: values.c, coverageDir: values.cdir };
+}
+
+// node options that take their value as the next argument (`--import tsx`, `--test-concurrency 1`).
+const NODE_VALUE_OPTS = new Set(['--import', '--require', '-r', '--loader', '--experimental-loader', '--conditions', '-C',
+  '--env-file', '--env-file-if-exists', '--input-type', '--title', '--disable-warning', '--watch-path', '--experimental-config-file',
+  '--test-concurrency', '--test-name-pattern', '--test-skip-pattern', '--test-reporter', '--test-reporter-destination',
+  '--test-timeout', '--test-shard', '--test-isolation', '--test-global-setup', '--test-coverage-include', '--test-coverage-exclude',
+  '--test-coverage-branches', '--test-coverage-functions', '--test-coverage-lines', '--test-random-seed']);
+
+/**
+ * Split a `node --test` command line into the part before its file patterns and the patterns.
+ * node treats everything after the first pattern as arguments, so added flags must go before
+ * them (`node --test test/ --test-reporter=junit` runs nothing as intended). Uses detect's
+ * `paths` when they are the command's tail; otherwise tokenizes. Unclear lines stay whole.
+ */
+export function splitNodeTestCmd(cmd, paths = null) {
+  const s = String(cmd || '').replace(/\s+$/, '');
+  if (Array.isArray(paths) && paths.length) {
+    const tail = ` ${paths.join(' ')}`;
+    if (s.endsWith(tail)) return { head: s.slice(0, -tail.length), paths: [...paths] };
+  }
+  const at = /(?:^|\s)--test(?=\s|$)/.exec(s);
+  if (!at) return { head: s, paths: [] };
+  const end = at.index + at[0].length;
+  const rest = s.slice(end);
+  const tokens = [...rest.matchAll(/\s+("[^"]*"|'[^']*'|\S+)/g)].map((m) => ({ text: m[1], start: m.index }));
+  let cut = -1;
+  for (let i = 0, value = false; i < tokens.length; i++) {
+    const t = tokens[i].text;
+    if (value) { value = false; continue; }
+    if (t.startsWith('-')) { value = !t.includes('=') && NODE_VALUE_OPTS.has(t); continue; }
+    cut = i;
+    break;
+  }
+  if (cut === -1) return { head: s, paths: [] };
+  const tail = tokens.slice(cut).map((t) => t.text);
+  // Options after a pattern, or shell operators: not a plain pattern list, leave the line alone.
+  if (tail.some((t) => /^-/.test(t) || /^[&|;<>()]/.test(t) || /[&|;<>]$/.test(t))) return { head: s, paths: [] };
+  return { head: s.slice(0, end) + rest.slice(0, tokens[cut].start), paths: tail };
+}
+
+/**
+ * `node --test test/` restricted to files must not keep its own path arguments (they would run
+ * the whole directory again). Only trailing arguments that look like paths or globs are dropped.
+ */
+export function dropNodeTestPaths(cmd) {
+  const m = /^(\s*node(?:\.exe)?\b.*?\s--test\b(?:\s+--[\w-]+(?:=\S+)?)*)((?:\s+(?!-)\S+)+)\s*$/.exec(cmd);
+  if (!m) return cmd;
+  const args = m[2].trim().split(/\s+/);
+  return args.every((a) => /[/\\*]|\.[cm]?[jt]sx?$/.test(a)) ? m[1] : cmd;
 }
 
 /** Runner arguments that restrict a run to `files` (repo-relative to the project) and test `names`. */
@@ -606,6 +767,19 @@ const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const goTestNames = (file) => [...readText(file, '').matchAll(/^func (Test\w*)\(\w+ \*testing\.T\)/gm)].map((m) => m[1]);
 const classNames = (file) => [...readText(file, '').matchAll(/\bclass\s+([A-Z]\w*)/g)].map((m) => m[1]);
 
+/** A reused worktree may hold reports of an earlier run (fixed paths, report dirs): never parse those. */
+function clearStaleReport(report, roots) {
+  if (!report) return;
+  const inside = (p) => roots.some((r) => { const rel = path.relative(r, p); return rel && !rel.startsWith('..') && !path.isAbsolute(rel); });
+  try {
+    if (report.path && inside(report.path)) fs.rmSync(report.path, { force: true });
+    if (report.dir && inside(report.dir) && fs.existsSync(report.dir)) {
+      const re = new RegExp(`^${report.glob.split('*').map(escapeRe).join('.*')}$`);
+      for (const f of fs.readdirSync(report.dir)) if (re.test(f)) fs.rmSync(path.join(report.dir, f), { force: true });
+    }
+  } catch {}
+}
+
 function collectReportText(report, stdoutText) {
   if (!report) return null;
   if (report.stdout) return fs.existsSync(report.stdout) ? readText(report.stdout, '') : stdoutText;
@@ -627,14 +801,15 @@ export function parseRunOutput(report, stdoutText, stderrText, roots) {
     const fmt = (report && report.format) || detectReportFormat(text);
     return parseReport(fmt || 'auto', text, opts);
   };
+  // Runners without a report (unittest, minitest, make/just/npm wrappers) have summary lines only.
+  const summaryOnly = Boolean(report && report.format === 'summary-text');
   try {
-    if (raw && raw.multi) {
+    if (summaryOnly) { /* nothing to parse as a report */ } else if (raw && raw.multi) {
       const parts = raw.multi.map((m) => parseOne(m.text));
       const tests = parts.flatMap((p) => p.tests);
       const sum = (k) => parts.reduce((a, p) => a + (p[k] || 0), 0);
       return { counts: { executed: sum('executed'), passed: sum('passed'), failed: sum('failed'), errors: sum('errors'), skipped: sum('skipped'), flaky: sum('flaky') }, tests, source: 'report', format: parts[0] ? parts[0].format : null, reportText: raw.multi.map((m) => m.text).join('\n') };
-    }
-    if (raw != null && String(raw).trim()) {
+    } else if (raw != null && String(raw).trim()) {
       const p = parseOne(raw);
       const { tests, format, ...counts } = p;
       return { counts: pickCounts(counts), tests, source: 'report', format, reportText: raw, seeds: p.seeds || [] };
@@ -668,14 +843,16 @@ export async function runProject(wt, project, runner, { outDir, noInstall = fals
   if (install.cmd && install.exit !== 0) {
     return { ...base, exit: null, ms: 0, counts: null, tests: [], source: 'none', status: 'unverified', reason: install.timedOut ? 'INSTALL_TIMEOUT' : 'INSTALL_FAILED' };
   }
+  clearStaleReport(built.report, [wt.dir, outDir]);
   const { env, removed, set } = runEnv(built.env);
   log(`run: ${built.cmd} (in ${toPosix(dir)})`);
   fs.appendFileSync(logFile, `$ ${built.cmd}\n`);
   const res = await runStep(built.cmd, { cwd: dir, env, timeoutMs, logFile, captureFile: built.report && built.report.stdout ? built.report.stdout : null });
   const parsed = parseRunOutput(built.report, res.stdout, res.stderr, [dir, wt.dir]);
   const reportPath = built.report ? (built.report.stdout || built.report.path || built.report.dir || null) : null;
+  const missing = !parsed.counts && res.exit !== 0 && runnerMissing(`${res.stderr}\n${res.stdout}`.slice(-20_000));
   return {
-    ...base, exit: res.exit, signal: res.signal, ms: res.ms, timedOut: res.timedOut, error: res.error,
+    ...base, exit: res.exit, signal: res.signal, ms: res.ms, timedOut: res.timedOut, error: res.error, ...(missing ? { runnerMissing: true } : {}),
     counts: parsed.counts, tests: parsed.tests, source: parsed.source, format: parsed.format, seeds: parsed.seeds || [],
     report_path: reportPath && fs.existsSync(reportPath) ? reportPath : null, reportText: parsed.reportText,
     env: { set, removed }, stdoutTail: truncateTail(res.stdout, 4000), stderrTail: truncateTail(res.stderr, 4000),
@@ -796,29 +973,49 @@ export function testMatchesFile(t, file, { goModule = null, projectRoot = '.' } 
   return false;
 }
 
-/** Status for one project run (§9.1.1). */
-export function evaluateRun(run, base, { explained = 0, skipFired = false } = {}) {
+/**
+ * Status for one project run (§9.1.1). `explained`: base tests gone from the run whose deletion
+ * was waived (CK-TEST-DEL); `nowSkipped`: base tests that still exist but are skipped now (by id;
+ * estimated from the skipped counts when null). Skipped tests fall under the skip rule, not the
+ * shortfall rule; only tests that vanished from the run are a shortfall.
+ */
+export function evaluateRun(run, base, { explained = 0, skipFired = false, nowSkipped = null } = {}) {
   if (run.status === 'unverified') return { status: 'unverified', reason: run.reason };
   if (run.timedOut) return { status: 'unverified', reason: 'TIMEOUT' };
   if (run.error === 'ENOENT' || run.exit === 127 || (IS_WINDOWS && run.exit === 9009)) return { status: 'unverified', reason: 'RUNNER_NOT_FOUND' };
   const c = run.counts;
-  if (!c) return { status: 'unverified', reason: run.source === 'none' && run.exit === 0 ? 'COUNTS_UNKNOWN' : 'NO_REPORT' };
+  if (!c) return { status: 'unverified', reason: run.runnerMissing ? 'RUNNER_NOT_FOUND' : run.source === 'none' && run.exit === 0 ? 'COUNTS_UNKNOWN' : 'NO_REPORT' };
   if (c.executed === 0) return { status: 'unverified', reason: 'NO_TESTS_EXECUTED' };
   if (c.failed > 0 || c.errors > 0) return { status: 'fail', reason: 'TESTS_FAILED' };
+  let waived = null;
   if (base && c.executed < base.executed) {
-    const shortfall = base.executed - c.executed;
-    if (explained >= shortfall) return { status: 'finding', reason: 'SHORTFALL_WAIVED', shortfall };
-    return { status: 'fail', reason: 'COUNT_SHORTFALL', shortfall };
+    const drop = base.executed - c.executed;
+    const skipShift = Math.min(drop, nowSkipped != null ? nowSkipped : Math.max(0, c.skipped - (base.skipped || 0)));
+    const shortfall = drop - skipShift;
+    if (shortfall > explained) return { status: 'fail', reason: 'COUNT_SHORTFALL', shortfall };
+    if (shortfall > 0) waived = { status: 'finding', reason: 'SHORTFALL_WAIVED', shortfall };
   }
   if (run.exit !== 0) return { status: 'fail', reason: 'EXIT_NONZERO' };
-  if (base && c.skipped > base.skipped) return { status: skipFired ? 'fail' : 'finding', reason: 'SKIP_INCREASE' };
+  if (base && c.skipped > (base.skipped || 0)) return { status: skipFired ? 'fail' : 'finding', reason: 'SKIP_INCREASE' };
+  if (waived) return waived;
   if (c.flaky > 0) return { status: 'finding', reason: 'FLAKY' };
   return { status: 'pass', reason: null };
 }
 
 const RANK = { fail: 5, unverified: 4, finding: 3, 'pass-with-baseline': 2, pass: 1, skipped: 0 };
 export const worstStatus = (list) => list.reduce((a, s) => ((RANK[s] ?? 0) > (RANK[a] ?? 0) ? s : a), 'skipped');
-export const exitFor = (status) => (status === 'fail' || status === 'finding' ? EXIT.FINDINGS : status === 'unverified' ? EXIT.UNVERIFIABLE : EXIT.OK);
+const ENV_REASONS = new Set(['RUNNER_NOT_FOUND', 'CHECKER_NOT_FOUND']);
+
+/**
+ * Command exit code: 1 for fail/finding, 4 for unverified, 3 when every unverified check is
+ * unverified only because the runner or checker executable is missing (environment, §7.2).
+ */
+export function exitFor(status, checks = null) {
+  if (status === 'fail' || status === 'finding') return EXIT.FINDINGS;
+  if (status !== 'unverified') return EXIT.OK;
+  const open = (checks || []).filter((c) => c && c.status === 'unverified');
+  return open.length && open.every((c) => ENV_REASONS.has(c.reason)) ? EXIT.ENV : EXIT.UNVERIFIABLE;
+}
 
 const fmtCounts = (c) => (c ? `${c.executed} executed, ${c.passed} passed, ${c.failed} failed, ${c.errors} errors, ${c.skipped} skipped, ${c.flaky} flaky` : 'no counts');
 
@@ -913,7 +1110,7 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   }
   const others = (project.runners || []).map((r) => r.name).filter((n) => n && n !== runner.name && RUNNER_ALIASES[n] !== runner.name);
   if (dryRun) {
-    const built = buildRunCommand(runner, { dir: path.join(tmpRoot(root), 'dry-run'), outDir: path.join(tmpRoot(root), 'dry-run-out') });
+    const built = buildRunCommand(runner, { dir: path.join(tmpRoot(root), 'dry-run'), outDir: path.join(tmpRoot(root), 'dry-run-out'), plan: true });
     prow.status = 'skipped';
     prow.reason = 'DRY_RUN';
     prow.run = { cmd: built.cmd, runner: runner.name };
@@ -939,7 +1136,7 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   // Base counts.
   let base = null;
   if (!noBase) base = await baseCounts({ target, project, runner, slug, baseCountsFile, noInstall, timeoutMs, outRoot, keep, detectFn });
-  prow.base_counts = base ? { ...pickCounts(base), source: base.source, ...(base.cmd ? { cmd: base.cmd } : {}), ...(base.status ? { status: base.status } : {}) } : (noBase ? { source: 'none', reason: '--no-base' } : null);
+  prow.base_counts = base ? { ...(Number.isFinite(base.executed) ? pickCounts(base) : {}), source: base.source, ...(base.cmd ? { cmd: base.cmd } : {}), ...(base.status ? { status: base.status } : {}), ...(base.reason ? { reason: base.reason } : {}), ...(base.install ? { install: base.install } : {}) } : (noBase ? { source: 'none', reason: '--no-base' } : null);
   const baseOk = base && Number.isFinite(base.executed) ? base : null;
   if (baseOk && runRec.counts) {
     prow.delta = { executed: runRec.counts.executed - baseOk.executed, passed: runRec.counts.passed - baseOk.passed, failed: runRec.counts.failed - baseOk.failed, skipped: runRec.counts.skipped - baseOk.skipped, flaky: runRec.counts.flaky - (baseOk.flaky || 0) };
@@ -948,14 +1145,18 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   const headTree = target.snapshot.head ? gitTry(root, ['rev-parse', `${target.snapshot.head}^{tree}`]) : null;
   if (runRec.counts && headTree === tree && target.snapshot.head) writeCountsCache(target.state, target.snapshot.head, slug, { project: prow.root, runner: runner.name, cmd: runRec.cmd, counts: runRec.counts, tests: runRec.tests });
 
-  // A shortfall explained by waived test deletions (CK-TEST-DEL) is a finding, not a failure.
+  // A shortfall explained by waived test deletions (CK-TEST-DEL) is a finding, not a failure;
+  // base tests that are merely skipped now are counted by id when both runs have ids.
   let explained = 0;
-  if (baseOk && runRec.counts && runRec.counts.executed < baseOk.executed && waived.length && Array.isArray(baseOk.tests)) {
-    const headIds = new Set((runRec.tests || []).map((t) => t.id));
-    const gone = baseOk.tests.filter((t) => t.status !== 'skipped' && !headIds.has(t.id));
-    explained = gone.filter((t) => waived.some((w) => w.file && testMatchesFile(t, w.file, { projectRoot: prow.root }))).length;
+  let nowSkipped = null;
+  if (baseOk && runRec.counts && runRec.counts.executed < baseOk.executed && Array.isArray(baseOk.tests) && baseOk.tests.length && (runRec.tests || []).length) {
+    const headById = new Map(runRec.tests.map((t) => [t.id, t]));
+    const ranInBase = baseOk.tests.filter((t) => t.status !== 'skipped');
+    nowSkipped = ranInBase.filter((t) => headById.has(t.id) && headById.get(t.id).status === 'skipped').length;
+    const gone = ranInBase.filter((t) => !headById.has(t.id));
+    if (waived.length) explained = gone.filter((t) => waived.some((w) => w.file && testMatchesFile(t, w.file, { projectRoot: prow.root }))).length;
   }
-  const verdict = evaluateRun(runRec, baseOk, { explained, skipFired: fired.includes('CK-SKIP') });
+  const verdict = evaluateRun(runRec, baseOk, { explained, skipFired: fired.includes('CK-SKIP'), nowSkipped });
   prow.status = verdict.status;
   prow.reason = verdict.reason;
   const findings = [];
@@ -968,10 +1169,14 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   const parts = [fmtCounts(runRec.counts)];
   if (baseOk) parts.push(`(base: ${baseOk.executed}/${baseOk.passed}/${baseOk.failed}/${baseOk.skipped})`);
   else if (prow.base_counts && prow.base_counts.source === 'none') parts.push('(no base counts)');
+  else if (prow.base_counts && prow.base_counts.status === 'unverified') parts.push(`(the base run gave no counts: ${prow.base_counts.reason}; shortfall not checked)`);
   parts.push(`retries_disabled: ${prow.run.retries_disabled}`);
   if (prow.run.retries_disabled !== 'full') parts.push(`(${prow.run.mechanism})`);
+  if (baseOk && (baseOk.failed || baseOk.errors) && verdict.reason === 'TESTS_FAILED') parts.push(`(the base fails too: ${baseOk.failed} failed, ${baseOk.errors} errors)`);
   if (verdict.reason && verdict.status !== 'pass') parts.push(`- ${verdict.reason}${verdict.shortfall ? ` (${verdict.shortfall} fewer tests than the base)` : ''}`);
   if (runRec.source === 'summary-text') parts.push('[counts from summary lines, no report]');
+  if (runRec.install && runRec.install.linked) parts.push('[--no-install: node_modules linked from the working tree]');
+  if (/^INSTALL_/.test(verdict.reason || '')) parts.push(`(\`${runRec.install.cmd}\` exited ${runRec.install.exit ?? 'on timeout'}; without network access re-run with --no-install to use the installed dependencies)`);
   if (others.length) parts.push(`[not run: ${others.join(', ')}]`);
   prow.summary = parts.join(' ');
   if (!keep) fs.rmSync(outRoot, { recursive: true, force: true });
@@ -1003,14 +1208,15 @@ async function baseCounts({ target, project, runner, slug, baseCountsFile, noIns
   try {
     const bdet = detectFn ? await detectFn(baseWt.dir) : await loadDetect(baseWt.dir, null);
     const bp = (bdet.projects || []).find((p) => toPosix(p.root || '.') === toPosix(project.root || '.'));
-    const br = bp ? resolveRunner(bp, runner.source === '--runner' && runner.name === 'custom' ? runner.cmd : runner.name) : null;
+    const br = bp ? resolveRunner(bp, runner.source === '--runner' && (runner.name === 'custom' || runner.inferred) ? runner.cmd : runner.name) : null;
     if (br) baseRunner = br;
   } catch {}
   const rec = await runProject(baseWt, project, baseRunner, { outDir: path.join(outRoot, slug, 'base'), noInstall, timeoutMs });
   const stored = await storeArtifacts(target, target.snapshot.tree, slug, rec, { prefix: 'base-' });
-  if (!rec.counts) return { source: 'run', status: 'unverified', reason: rec.reason || 'NO_REPORT', cmd: rec.cmd, artifacts: stored.artifacts };
+  const install = installSummary(rec.install);
+  if (!rec.counts) return { source: 'run', status: 'unverified', reason: rec.reason || (rec.runnerMissing ? 'RUNNER_NOT_FOUND' : 'NO_REPORT'), cmd: rec.cmd, artifacts: stored.artifacts, ...(install ? { install } : {}) };
   writeCountsCache(target.state, sha, slug, { project: toPosix(project.root || '.'), runner: runner.name, cmd: rec.cmd, counts: rec.counts, tests: rec.tests });
-  return { ...rec.counts, tests: rec.tests, source: 'run', cmd: rec.cmd, status: rec.counts.failed || rec.counts.errors ? 'base-failing' : 'ok', artifacts: stored.artifacts };
+  return { ...rec.counts, tests: rec.tests, source: 'run', cmd: rec.cmd, status: rec.counts.failed || rec.counts.errors ? 'base-failing' : 'ok', artifacts: stored.artifacts, ...(install ? { install } : {}) };
 }
 
 /** A ledger check entry (plan §9.2); command, summary and finding texts are redacted. */
@@ -1022,9 +1228,10 @@ export function makeCheck({ id, fm, project = '.', status, reason = null, cost =
 // ---------------------------------------------------------------------------
 // Red-green proof (§9.4, §10.1 step 4): base + only the new test files must fail by assertion; the snapshot must pass.
 
-/** Parse `--red-green` values: comma/space separated `path` or `path::test-name`. */
+/** Parse `--red-green` values: comma-separated `path` or `path::test-name` entries. */
 export function parseRedGreenSpec(values) {
-  const list = (Array.isArray(values) ? values : [values]).flatMap((v) => String(v || '').split(/[,\s]+/)).filter(Boolean);
+  // Commas separate entries (repeat the flag for more); spaces may be part of a path.
+  const list = (Array.isArray(values) ? values : [values]).flatMap((v) => String(v || '').split(',')).map((v) => v.trim()).filter(Boolean);
   return list.map((v) => {
     const i = v.indexOf('::');
     return i === -1 ? { file: toPosix(v), name: null } : { file: toPosix(v.slice(0, i)), name: v.slice(i + 2) };
@@ -1106,7 +1313,11 @@ async function redGreenProof({ target, projects, files, runnerOpt, noInstall, ke
   }
   const proven = res.pairs.filter((p) => p.base.status === 'failed' && p.base.failure_kind === 'assertion' && (p.head.status === 'passed'));
   const wrongKind = res.pairs.filter((p) => (p.base.status === 'failed' || p.base.status === 'error') && p.base.failure_kind !== 'assertion');
-  const notGreen = res.pairs.filter((p) => p.base.status !== 'missing' && !['passed', 'skipped'].includes(p.head.status));
+  // Not green: anything failing in the snapshot, and every assertion red that does not pass there.
+  // A file-level load error on the base has no counterpart id in the snapshot; that is a wrong
+  // failure kind (below), not a missing green.
+  const isRed = (p) => p.base.status === 'failed' && p.base.failure_kind === 'assertion';
+  const notGreen = res.pairs.filter((p) => ['failed', 'error', 'flaky'].includes(p.head.status) || (isRed(p) && p.head.status !== 'passed'));
   const findings = [
     ...wrongKind.map((p) => ({ id: 'CK-REDGREEN', severity: 'fail', file: specs[0].file, line: null, message: `fails on the base with an error, not an assertion: ${p.id}`, evidence: truncate(p.base.message || '', 200) })),
     ...notGreen.map((p) => ({ id: 'CK-REDGREEN', severity: 'fail', file: specs[0].file, line: null, message: `does not pass in the snapshot: ${p.id} (${p.head.status})`, evidence: truncate(p.head.message || '', 200) })),
@@ -1251,11 +1462,12 @@ export async function typecheck({ target, detectResult = null, strict = false, r
       fs.appendFileSync(logFile, `$ ${cmd}\n`);
       const res = await runStep(cmd, { cwd: dir, env: runEnv().env, timeoutMs, logFile });
       let errors = parseTypeErrors(`${res.stdout}\n${res.stderr}`, { roots: [dir, wt.dir] });
-      if (res.exit !== 0 && !errors.length && !res.timedOut) {
+      const missing = res.exit !== 0 && !errors.length && runnerMissing(`${res.stderr}\n${res.stdout}`.slice(-20_000));
+      if (res.exit !== 0 && !errors.length && !res.timedOut && !missing) {
         const first = `${res.stderr}\n${res.stdout}`.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || `exit ${res.exit}`;
         errors = [{ file: null, line: null, code: `exit-${res.exit}`, message: truncate(first, 300) }];
       }
-      return { exit: res.exit, ms: res.ms, errors, install, timedOut: res.timedOut, error: res.error, log_path: logFile };
+      return { exit: res.exit, ms: res.ms, errors, install, timedOut: res.timedOut, error: res.error, missing, log_path: logFile };
     };
     const head = await runIn(acquireWorktree(root, target.snapshot.commit, 'typecheck', { keep }), 'head');
     const base = target.base.sha ? await runIn(acquireWorktree(root, target.base.sha, 'base', { keep }), 'base') : { exit: null, errors: [], absent: true };
@@ -1263,23 +1475,34 @@ export async function typecheck({ target, detectResult = null, strict = false, r
     const storedBase = base.log_path ? await storeArtifacts(target, tree, slug, { log_path: base.log_path }, { prefix: `typecheck-${c.name}-base-` }) : { artifacts: [] };
     if (!keep) fs.rmSync(outRoot, { recursive: true, force: true });
     const fresh = newErrors(base.errors || [], head.errors);
+    // A base check that could not run (failed install, missing checker, timeout, or only an
+    // unparseable crash while the snapshot has real errors) is no baseline: comparing against it
+    // would report every pre-existing error as new.
+    const synthetic = (e) => /^exit-/.test(String(e.code || ''));
+    const baseProblem = base.absent ? null
+      : base.failed || (base.timedOut && 'TIMEOUT') || ((base.missing || base.error === 'ENOENT' || base.exit === 127 || (IS_WINDOWS && base.exit === 9009)) && 'CHECKER_NOT_FOUND')
+        || (base.error && 'SPAWN_FAILED')
+        || (base.errors.length && base.errors.every(synthetic) && fresh.some((e) => !synthetic(e)) && 'UNPARSEABLE_FAILURE') || null;
     let status;
     let reason = null;
     if (head.timedOut) { status = 'unverified'; reason = 'TIMEOUT'; }
     else if (head.failed) { status = 'unverified'; reason = head.failed; }
-    else if (head.error === 'ENOENT' || head.exit === 127 || (IS_WINDOWS && head.exit === 9009)) { status = 'unverified'; reason = 'CHECKER_NOT_FOUND'; }
+    else if (head.missing || head.error === 'ENOENT' || head.exit === 127 || (IS_WINDOWS && head.exit === 9009)) { status = 'unverified'; reason = 'CHECKER_NOT_FOUND'; }
     else if (strict && head.errors.length) { status = 'fail'; reason = 'STRICT_ERRORS'; }
+    else if (!head.errors.length) status = 'pass';
+    else if (baseProblem) { status = 'unverified'; reason = 'BASE_UNAVAILABLE'; }
     else if (fresh.length) { status = 'fail'; reason = 'NEW_ERRORS'; }
-    else if (head.errors.length) { status = 'pass-with-baseline'; reason = 'PRE_EXISTING_ERRORS'; }
-    else status = 'pass';
-    const summary = `${c.name}: ${head.errors.length} error(s) in the snapshot, ${base.absent ? 'no base' : `${base.errors.length} in the base`}, ${fresh.length} new${strict ? ' (strict)' : ''}`;
-    const rec = { name: c.name, project: prel, cmd, base: { exit: base.exit ?? null, errors: (base.errors || []).length }, head: { exit: head.exit, errors: head.errors.length }, new_errors: fresh, status, reason };
+    else { status = 'pass-with-baseline'; reason = 'PRE_EXISTING_ERRORS'; }
+    const baseText = base.absent ? 'no base' : baseProblem ? `the base check did not run (${baseProblem}${baseProblem === 'INSTALL_FAILED' ? '; re-run with --no-install' : ''})` : `${base.errors.length} in the base`;
+    const summary = `${c.name}: ${head.errors.length} error(s) in the snapshot, ${baseText}, ${reason === 'BASE_UNAVAILABLE' ? 'new errors unknown' : `${fresh.length} new`}${strict ? ' (strict)' : ''}`;
+    const known = reason === 'BASE_UNAVAILABLE' ? [] : fresh;
+    const rec = { name: c.name, project: prel, cmd, base: { exit: base.exit ?? null, errors: (base.errors || []).length, ...(baseProblem ? { problem: baseProblem } : {}) }, head: { exit: head.exit, errors: head.errors.length }, new_errors: known, status, reason };
     out.checkers.push(rec);
     out.checks.push(makeCheck({
       id: 'CK-TYPES', fm: FM_TYPES, project: prel, status, reason, command: cmd, cwd: null, exit_code: head.exit, duration_ms: (head.ms || 0) + (base.ms || 0), summary,
       output_sha256: storedHead.output_sha256, artifacts: [...storedHead.artifacts, ...storedBase.artifacts],
-      findings: (strict ? head.errors : fresh).slice(0, 100).map((e) => ({ id: 'CK-TYPES', severity: 'fail', file: e.file ? (prel === '.' ? e.file : `${prel}/${e.file}`) : null, line: e.line, message: `${e.code ? `${e.code}: ` : ''}${e.message}`, evidence: truncate(e.message, 200) })),
-      data: { checker: c.name, base: rec.base, head: rec.head, new_errors: fresh.length, strict: Boolean(strict) },
+      findings: (strict ? head.errors : known).slice(0, 100).map((e) => ({ id: 'CK-TYPES', severity: 'fail', file: e.file ? (prel === '.' ? e.file : `${prel}/${e.file}`) : null, line: e.line, message: `${e.code ? `${e.code}: ` : ''}${e.message}`, evidence: truncate(e.message, 200) })),
+      data: { checker: c.name, base: rec.base, head: rec.head, new_errors: reason === 'BASE_UNAVAILABLE' ? null : fresh.length, strict: Boolean(strict) },
     }));
   }
   const primary = out.checkers[0] || {};
@@ -1321,7 +1544,7 @@ export const cleanRunCommand = defineCommand({
     const summary = res.projects.length
       ? res.projects.map((p) => `${p.root}: ${p.status}${p.reason ? ` (${p.reason})` : ''}`).join('; ') + (res.red_green ? `; red-green: ${res.red_green.status}` : '')
       : (res.checks[0] && res.checks[0].summary) || res.status;
-    return { result: res, exit: exitFor(res.status), summary: `${res.status.toUpperCase()} - ${summary}` };
+    return { result: res, exit: exitFor(res.status, res.checks), summary: `${res.status.toUpperCase()} - ${summary}` };
   },
 });
 
@@ -1343,6 +1566,6 @@ export const typecheckCommand = defineCommand({
     }
     const res = await typecheck({ target, detectResult, strict: Boolean(values.strict), runner: isCmd ? null : opt, checkerCmd: isCmd ? opt : null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: values.timeout ? Number(values.timeout) : DEFAULT_TIMEOUT_S, dryRun: ctx.dryRun });
     const summary = res.checks.map((c) => c.summary).join('; ');
-    return { result: res, exit: exitFor(res.status === 'pass-with-baseline' ? 'pass' : res.status), summary: `${res.status.toUpperCase()} - ${summary}` };
+    return { result: res, exit: exitFor(res.status === 'pass-with-baseline' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${summary}` };
   },
 });

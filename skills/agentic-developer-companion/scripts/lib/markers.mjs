@@ -1,6 +1,7 @@
 // Pattern catalogs for the diff-scoped checks (plan §9.1 steps 3-8, Appendix A) and the
 // post-edit hook: skip/focus markers, suppressions, swallowed errors, CI weakening, in-source
-// retries, secrets, assertion and test-case lines, plus heuristic path classification.
+// retries, secrets, assertion and test-case lines, plus heuristic path classification and two
+// structural detectors (try blocks that swallow assertions, Rust inline test modules).
 // Imports only core.mjs: hooks load this module, so no git, no filesystem, no network.
 
 import { toPosix } from './core.mjs';
@@ -115,23 +116,85 @@ function stripLineComment(line, lang) {
   return i === -1 ? line : line.slice(0, i);
 }
 
+// Blank string literals so brace counting and keyword checks ignore their contents.
+const STRING_LITERAL = /(["'`])(?:\\.|(?!\1).)*\1/g;
+const blankStrings = (line) => String(line ?? '').replace(STRING_LITERAL, (s) => s[0] + ' '.repeat(Math.max(0, s.length - 2)) + s[0]);
+const indentOf = (line) => line.length - line.trimStart().length;
+
+/**
+ * The `{ ... }` block that opens at or after column `col` of line `i` (0-based) in
+ * comment-masked lines: { start, end, body } with 0-based line numbers, or null.
+ */
+function braceBlock(masked, i, col = 0) {
+  let depth = 0;
+  let open = null;
+  const body = [];
+  for (let j = i; j < masked.length && j < i + 2000; j++) {
+    const line = blankStrings(masked[j]);
+    let k = j === i ? col : 0;
+    let seg = '';
+    for (; k < line.length; k++) {
+      const c = line[k];
+      if (c === '{') {
+        depth++;
+        if (open == null) { open = { line: j, col: k }; continue; }
+      } else if (c === '}' && open != null) {
+        depth--;
+        if (depth === 0) {
+          body.push(seg);
+          return { start: open.line, end: j, endCol: k, body: body.join('\n') };
+        }
+      }
+      if (open != null) seg += c;
+    }
+    if (open != null) body.push(seg);
+  }
+  return null;
+}
+
+/** The indented block under line `i` (0-based) plus any inline remainder after its `:`. */
+function indentBlock(masked, i) {
+  const head = masked[i] || '';
+  const inline = head.slice(head.indexOf(':') + 1).trim();
+  const base = indentOf(head);
+  const body = inline ? [inline] : [];
+  let end = i;
+  for (let j = i + 1; j < masked.length; j++) {
+    const l = masked[j];
+    if (!l.trim()) continue;
+    if (indentOf(l) <= base) break;
+    body.push(l);
+    end = j;
+  }
+  return { start: i, end, body: body.join('\n') };
+}
+
+/** Handler body of a `catch`/`except`/`rescue` line, for entries that inspect it (`bodyNot`). */
+function handlerBody(masked, i, lang) {
+  if (lang === 'py' || lang === 'rb') return indentBlock(masked, i);
+  const at = blankStrings(masked[i]).search(/\bcatch\b/);
+  return braceBlock(masked, i, at === -1 ? 0 : at);
+}
+
 // ---------------------------------------------------------------------------
-// Catalogs. Entry shape: { id, re, langs?, code?, kind?, severity?, next? }.
+// Catalogs. Entry shape: { id, re, langs?, code?, kind?, severity?, next?, bodyNot? }.
 //  - langs: language families the entry applies to (absent = any file)
 //  - code: match against comment-masked text (directive catalogs match raw text)
 //  - next: for multi-line constructs, the next non-blank code line must match `next`
+//  - blank: also blank string literals first (a marker inside a string is not a marker)
+//  - bodyNot: the handler block opened on the line must be non-empty and must not match
 
 /** Skip, focus, xfail and todo markers (plan Appendix A FM-01); applied to test files only. */
 export const SKIP_MARKERS = [
-  { id: 'skip.js-prefixed', langs: ['js'], code: true, kind: 'skip', re: /(?<![\w$.])(?:xit|xtest|xdescribe|xcontext|xspecify|xsuite)\s*\(/ },
-  { id: 'skip.js-focus-prefixed', langs: ['js'], code: true, kind: 'focus', re: /(?<![\w$.])(?:fit|fdescribe|fcontext|fspecify)\s*\(/ },
-  { id: 'skip.js-only', langs: ['js'], code: true, kind: 'focus', re: /\b(?:it|test|describe|context|suite|specify)(?:\.(?:concurrent|sequential|serial|parallel|describe|each|step))*\.only\b/ },
-  { id: 'skip.js-skip', langs: ['js'], code: true, kind: 'skip', re: /\b(?:it|test|describe|context|suite|specify)(?:\.(?:concurrent|sequential|serial|parallel|describe|each|step))*\.(?:skip|skipIf|runIf|fixme)\b/ },
-  { id: 'skip.js-todo', langs: ['js'], code: true, kind: 'todo', re: /\b(?:it|test|describe)(?:\.(?:concurrent|describe))*\.todo\b/ },
-  { id: 'skip.js-failing', langs: ['js'], code: true, kind: 'xfail', re: /\b(?:it|test)(?:\.(?:concurrent))*\.(?:failing|fails)\b/ },
+  { id: 'skip.js-prefixed', langs: ['js'], code: true, blank: true, kind: 'skip', re: /(?<![\w$.])(?:xit|xtest|xdescribe|xcontext|xspecify|xsuite)\s*\(/ },
+  { id: 'skip.js-focus-prefixed', langs: ['js'], code: true, blank: true, kind: 'focus', re: /(?<![\w$.])(?:fit|fdescribe|fcontext|fspecify)\s*\(/ },
+  { id: 'skip.js-only', langs: ['js'], code: true, blank: true, kind: 'focus', re: /\b(?:it|test|describe|context|suite|specify)(?:\.(?:concurrent|sequential|serial|parallel|describe|each|step))*\.only\b/ },
+  { id: 'skip.js-skip', langs: ['js'], code: true, blank: true, kind: 'skip', re: /\b(?:it|test|describe|context|suite|specify)(?:\.(?:concurrent|sequential|serial|parallel|describe|each|step))*\.(?:skip|skipIf|runIf|fixme)\b/ },
+  { id: 'skip.js-todo', langs: ['js'], code: true, blank: true, kind: 'todo', re: /\b(?:it|test|describe)(?:\.(?:concurrent|describe))*\.todo\b/ },
+  { id: 'skip.js-failing', langs: ['js'], code: true, blank: true, kind: 'xfail', re: /\b(?:it|test)(?:\.(?:concurrent))*\.(?:failing|fails)\b/ },
   { id: 'skip.js-bracket', langs: ['js'], code: true, kind: 'skip', re: /\b(?:it|test|describe)\s*\[\s*['"](?:only|skip)['"]\s*\]/ },
-  { id: 'skip.js-this-skip', langs: ['js'], code: true, kind: 'skip', re: /\bthis\.skip\s*\(/ },
-  { id: 'skip.js-pending', langs: ['js'], code: true, kind: 'skip', re: /(?<![\w$.])pending\s*\(\s*\)/ },
+  { id: 'skip.js-this-skip', langs: ['js'], code: true, blank: true, kind: 'skip', re: /\bthis\.skip\s*\(/ },
+  { id: 'skip.js-pending', langs: ['js'], code: true, blank: true, kind: 'skip', re: /(?<![\w$.])pending\s*\(\s*\)/ },
   { id: 'skip.py-mark', langs: ['py'], code: true, kind: 'skip', re: /\bpytest\.mark\.(?:skip|skipif|xfail)\b/ },
   { id: 'skip.py-call', langs: ['py'], code: true, kind: 'skip', re: /\bpytest\.(?:skip|xfail|importorskip)\s*\(/ },
   { id: 'skip.py-unittest', langs: ['py'], code: true, kind: 'skip', re: /@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b|\bself\.skipTest\s*\(|\braise\s+(?:unittest\.)?SkipTest\b/ },
@@ -154,9 +217,9 @@ export const TEST_CASE_LINE = [
   { id: 'case.go', langs: ['go'], code: true, re: /^func\s+((?:Test|Fuzz|Example)\w*)\s*\(/, name: 1 },
   { id: 'case.go-subtest', langs: ['go'], code: true, re: /\bt\.Run\s*\(\s*"((?:\\.|[^"\\])*)"/, name: 1 },
   { id: 'case.rs', langs: ['rs'], code: true, re: /^\s*#\[(?:[\w]+::)?(?:test|rstest|test_case|quickcheck|proptest)\b[^\]]*\]/, lookahead: /\bfn\s+(\w+)/ },
-  { id: 'case.jvm', langs: ['jvm'], code: true, re: /@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|Property)\b/, lookahead: /\b(?:void|fun|def)\s+`?([^`(\s]+(?: [^`(]+)*)`?\s*\(/ },
-  { id: 'case.cs', langs: ['cs'], code: true, re: /\[\s*(?:\w+\s*,\s*)*(?:Fact|Theory|Test|TestMethod|TestCase|DataTestMethod|SkippableFact|SkippableTheory)\b/, lookahead: /\b(?:void|Task|ValueTask)\s+(\w+)\s*\(/ },
-  { id: 'case.rb', langs: ['rb'], code: true, re: /^\s*(?:it|specify|example|scenario|test)\b\s*\(?\s*(?:(['"])((?:\\.|(?!\1).)*)\1)?/, name: 2 },
+  { id: 'case.jvm', langs: ['jvm'], code: true, re: /@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|Property|RetryingTest|RepeatedIfExceptionsTest|CartesianTest)\b/, lookahead: /\b(?:void|fun|def)\s+`?([^`(\s]+(?: [^`(]+)*)`?\s*\(/ },
+  { id: 'case.cs', langs: ['cs'], code: true, re: /\[\s*(?:\w+\s*,\s*)*(?:Fact|Theory|Test|TestMethod|TestCase|DataTestMethod|SkippableFact|SkippableTheory|RetryFact|RetryTheory)\b/, lookahead: /\b(?:void|Task|ValueTask)\s+(\w+)\s*\(/ },
+  { id: 'case.rb', langs: ['rb'], code: true, re: /^\s*(?:[xf]?(?:it|specify|example|scenario)|test)\b\s*\(?\s*(?:(['"])((?:\\.|(?!\1).)*)\1)?/, name: 2 },
   { id: 'case.rb-minitest', langs: ['rb'], code: true, re: /^\s*def\s+(test_\w+)/, name: 1 },
   { id: 'case.php', langs: ['php'], code: true, re: /\bfunction\s+(test\w+)\s*\(/, name: 1 },
   { id: 'case.php-pest', langs: ['php'], code: true, re: /^\s*(?:it|test)\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1/, name: 2 },
@@ -259,6 +322,9 @@ export const LINT_CONFIG_WEAKENING = [
 /** Keys whose list items are exclusions (an added item under them turns a check off or narrows it). */
 export const LINT_EXCLUSION_KEYS = /^(?:ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|exclude|extend-exclude|extend_exclude|per-file-ignores|per_file_ignores|disable|disabled|skip-dirs|skip-files|skip_dirs|skip_files|exclude-dirs|exclude-files|exclude_dirs|exclude_files|exclude_rules|unfixable|globalIgnores)$/i;
 
+// A handler body that re-raises, fails, exits or reports at error level is not a swallow.
+const HANDLED = /\b(?:raise|throw|rethrow|panic|abort|exit|fail|Fail)\b|\b(?:log|logger|logging|LOG|_log|_logger|Log|Logger|console|self\.log|self\.logger|this\.log|this\.logger)\s*\.\s*(?:error|exception|critical|fatal|severe|LogError|LogCritical|Error|Fatal)\b|\bprintStackTrace\b|\breport\w*\(|\bcapture_?[Ee]xception\b/;
+
 /** Error handling that swallows failures (FM-07); non-test files (in tests they are CK-ASSERT). */
 export const SWALLOW_PATTERNS = [
   { id: 'swallow.empty-catch', langs: ['js', 'jvm', 'cs', 'php', 'swift', 'c', 'dart'], code: true, re: /\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/ },
@@ -269,12 +335,16 @@ export const SWALLOW_PATTERNS = [
   { id: 'swallow.py-bare-except', langs: ['py'], code: true, re: /^\s*except\s*:/ },
   { id: 'swallow.py-suppress', langs: ['py'], code: true, re: /\b(?:contextlib\.)?suppress\s*\(\s*(?:Exception|BaseException)\s*\)/ },
   { id: 'swallow.go-blank-error', langs: ['go'], code: true, re: /^\s*_\s*(?:,\s*_\s*)?=\s*[\w.]+\s*\(/ },
-  { id: 'swallow.go-empty-err', langs: ['go'], code: true, re: /\bif\s+err\s*!=\s*nil\s*\{\s*\}/ },
-  { id: 'swallow.go-empty-err', langs: ['go'], code: true, re: /\bif\s+err\s*!=\s*nil\s*\{\s*$/, next: /^\s*\}/ },
-  { id: 'swallow.go-err-return-nil', langs: ['go'], code: true, re: /\bif\s+err\s*!=\s*nil\s*\{\s*return\s+nil\s*\}/ },
+  { id: 'swallow.go-empty-err', langs: ['go'], code: true, re: /\bif\b[^{]*\berr\s*!=\s*nil\s*\{\s*\}/ },
+  { id: 'swallow.go-empty-err', langs: ['go'], code: true, re: /\bif\b[^{]*\berr\s*!=\s*nil\s*\{\s*$/, next: /^\s*\}/ },
+  { id: 'swallow.go-err-return-nil', langs: ['go'], code: true, re: /\bif\b[^{]*\berr\s*!=\s*nil\s*\{\s*return\s+nil\s*\}/ },
   { id: 'swallow.rs', langs: ['rs'], code: true, re: /\bErr\s*\(\s*_\w*\s*\)\s*=>\s*(?:\{\s*\}|\(\s*\))|\.ok\s*\(\s*\)\s*;\s*$/ },
   { id: 'swallow.rb', langs: ['rb'], code: true, re: /\brescue\s+nil\b|\brescue\s*(?:Exception|StandardError)?\s*(?:=>\s*\w+)?\s*;\s*(?:nil\s*;\s*)?end\b/ },
   { id: 'swallow.rb', langs: ['rb'], code: true, re: /^\s*rescue\b[^;]*$/, next: /^\s*end\b/ },
+  // Broad handlers whose body neither re-raises nor reports at error level (plan Appendix A FM-07).
+  { id: 'swallow.py-broad-except', langs: ['py'], code: true, re: /^\s*except\s*\(?\s*(?:Exception|BaseException)\s*\)?(?:\s+as\s+\w+)?\s*:/, bodyNot: HANDLED },
+  { id: 'swallow.broad-catch', langs: ['jvm'], code: true, re: /\bcatch\s*\(\s*(?:final\s+)?(?:java\.lang\.)?(?:Exception|Throwable|RuntimeException)\s+\w+\s*\)\s*\{/, bodyNot: HANDLED },
+  { id: 'swallow.broad-catch', langs: ['cs'], code: true, re: /\bcatch\s*(?:\(\s*(?:System\.)?Exception(?:\s+\w+)?\s*\))?\s*\{/, bodyNot: HANDLED },
 ];
 
 /** Logging calls with their level (used to detect error -> warning downgrades). */
@@ -301,10 +371,10 @@ export const THRESHOLD = /(--(?:cov-)?fail-under[= ]|\bfail_under\s*[=:]\s*|--(?
 
 /** In-source retries added to tests (FM-13, CK-RETRY). */
 export const IN_SOURCE_RETRIES = [
-  { id: 'retry.jest', langs: ['js'], code: true, re: /\bjest\.retryTimes\s*\(/ },
-  { id: 'retry.mocha', langs: ['js'], code: true, re: /\bthis\.retries\s*\(\s*[1-9]/ },
-  { id: 'retry.playwright', langs: ['js'], code: true, re: /\.describe\.configure\s*\(\s*\{[^}]*\bretries\s*:\s*[1-9]/ },
-  { id: 'retry.js-options', langs: ['js'], code: true, re: /\b(?:it|test|describe)(?:\.(?:only|skip|concurrent|sequential))*\s*\(\s*(['"`])(?:(?!\1).)*\1\s*,\s*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/ },
+  { id: 'retry.jest', langs: ['js'], code: true, blank: true, re: /\bjest\.retryTimes\s*\(/ },
+  { id: 'retry.mocha', langs: ['js'], code: true, blank: true, re: /\bthis\.retries\s*\(\s*[1-9]/ },
+  { id: 'retry.playwright', langs: ['js'], code: true, blank: true, re: /\.describe\.configure\s*\(\s*\{[^}]*\bretries\s*:\s*[1-9]/ },
+  { id: 'retry.js-options', langs: ['js'], code: true, blank: true, re: /\b(?:it|test|describe)(?:\.(?:only|skip|concurrent|sequential))*\s*\(\s*(['"`])(?:(?!\1).)*\1\s*,\s*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/ },
   { id: 'retry.py', langs: ['py'], code: true, re: /@pytest\.mark\.flaky\b|@flaky\b|\bpytest\.mark\.flaky\b|@(?:pytest\.mark\.)?retry\b/ },
   { id: 'retry.jvm', langs: ['jvm'], code: true, re: /@(?:RetryingTest|Retry|RepeatedIfExceptionsTest|Flaky)\b|\bretryAnalyzer\s*=/ },
   { id: 'retry.cs', langs: ['cs'], code: true, re: /\[\s*(?:\w+\s*,\s*)*(?:Retry|RetryFact|RetryTheory)\b/ },
@@ -337,9 +407,10 @@ export const SECRET_PATTERNS = [
   { id: 'secret.private-key', severity: 'fail', re: /(-{5}BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY(?: BLOCK)?-{5})/ },
   { id: 'secret.jwt', severity: 'finding', re: /\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/ },
   { id: 'secret.url-credentials', severity: 'finding', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/([^/\s:@'"`]{2,64}:[^/\s:@'"`]{6,128})@([^\s/'"`]+)/ },
-  // The value must end at a quote, whitespace or end of line: code such as `X = token;` and
-  // placeholders such as `[REDACTED]`, `<token>`, `${VAR}` or `process.env.X` are not values.
-  { id: 'secret.adc-live-token', severity: 'fail', re: /\bADC_LIVE_TOKEN\s*[:=]\s*["']?(?![[<{$%]|process\.|os\.|env\.|getenv)([^\s"'`;,()]{6,})(?=["'`]|\s|$)/ },
+  // A value is quoted, or unquoted and last on its line (dotenv, YAML, shell): code such as
+  // `{ ADC_LIVE_TOKEN: token }` and placeholders such as `[REDACTED]`, `<token>`, `${VAR}` or
+  // `process.env.X` are not values.
+  { id: 'secret.adc-live-token', severity: 'fail', re: /\bADC_LIVE_TOKEN\s*[:=]\s*(?:["'](?![[<{$%]|process\.|os\.|env\.|getenv)([^\s"'`;,()]{6,})["']|(?![[<{$%"']|process\.|os\.|env\.|getenv)([^\s"'`;,()]{6,})(?=\s*(?:#.*)?$))/ },
   { id: 'secret.generic-assignment', severity: 'finding', generic: true,
     re: /\b(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?key|passw(?:or)?d|pwd)\b["']?\s*[:=]\s*["']([^"'\s]{12,200})["']/i },
 ];
@@ -379,7 +450,7 @@ export function scanSecrets(text) {
       re.lastIndex = 0;
       let m;
       while ((m = re.exec(line))) {
-        const value = m[1] || m[0];
+        const value = m[1] || m[2] || m[0];
         if (p.generic && !plausibleGeneric(value, line)) continue;
         if (p.id === 'secret.url-credentials' && !plausibleUrlCredential(m[1], m[2])) continue;
         hits.push({ id: p.id, severity: p.severity, value, index: m.index + m[0].indexOf(value) });
@@ -457,7 +528,7 @@ export function scanText(text, catalogs, opts = {}) {
     const seen = new Set();
     for (const e of entries) {
       if (seen.has(e.id)) continue;
-      const subject = e.code ? getMasked()[i] : raw[i];
+      const subject = e.code ? (e.blank ? blankStrings(getMasked()[i]) : getMasked()[i]) : raw[i];
       if (!subject || !e.re.test(subject)) continue;
       if (e.next) {
         const src = e.code ? getMasked() : raw;
@@ -465,12 +536,100 @@ export function scanText(text, catalogs, opts = {}) {
         while (j < src.length && !src[j].trim()) j++;
         if (j >= src.length || !e.next.test(src[j])) continue;
       }
+      if (e.bodyNot) {
+        const block = handlerBody(getMasked(), i, lang);
+        // Empty and `pass`-only bodies belong to the empty-handler entries, not to this one.
+        if (!block || /^(?:\s|pass\b|\.\.\.|continue\b|;)*$/.test(block.body) || e.bodyNot.test(blankStrings(block.body))) continue;
+      }
       seen.add(e.id);
       const hit = { id: e.id, line: i + 1, text: raw[i].trim().slice(0, 240) };
       if (e.kind) hit.kind = e.kind;
       if (e.severity) hit.severity = e.severity;
       if (e.scope) hit.scope = e.scope;
       out.push(hit);
+    }
+  }
+  return out;
+}
+
+const FAILS_TEST = /\b(?:raise|throw|rethrow|fail|Fail|assert\w*|Assert|expect|done)\b|\$this->fail|\bpytest\.fail\b|\bself\.fail\b/;
+const BROAD_FOR_ASSERTIONS = {
+  py: (t) => !t || /\b(?:Exception|BaseException|AssertionError)\b/.test(t),
+  js: () => true,
+  dart: () => true,
+  // JUnit/Kotest assertions throw java.lang.AssertionError subclasses, which `catch (Exception)` misses.
+  jvm: (t) => /\b(?:Throwable|Error|AssertionError|AssertionFailedError|ComparisonFailure|MultipleFailuresError)\b/.test(t),
+  cs: (t) => !t || /^(?:System\.)?Exception\b|\b(?:AssertionException|XunitException|AssertFailedException|AssertActualExpectedException)\b/.test(t.trim()),
+  php: (t) => /\b(?:Exception|Throwable|AssertionFailedError|ExpectationFailedException)\b/.test(t),
+};
+
+/**
+ * Assertions wrapped in a try block whose handler catches assertion failures and neither
+ * re-raises nor fails the test (plan Appendix A FM-01 "try/except wrapped around assertions").
+ * Returns [{ id, line, text }] with the handler line (1-based).
+ */
+export function tryWrappedAssertions(lines, file) {
+  const lang = langOf(file);
+  const broad = BROAD_FOR_ASSERTIONS[lang];
+  if (!broad) return [];
+  const raw = Array.isArray(lines) ? lines : String(lines ?? '').split(/\r?\n/);
+  const masked = maskComments(raw, lang);
+  const asserts = new Set(scanText(raw, ASSERTION_LINE, { file }).map((h) => h.line - 1));
+  const hasAssert = (a, b) => { for (let k = a; k <= b; k++) if (asserts.has(k)) return true; return false; };
+  const out = [];
+  const hit = (j) => out.push({ id: 'assert-swallow.try-wrap', line: j + 1, text: raw[j].trim().slice(0, 240) });
+  for (let i = 0; i < masked.length; i++) {
+    if (lang === 'py') {
+      if (!/^\s*try\s*:\s*$/.test(masked[i])) continue;
+      const body = indentBlock(masked, i);
+      if (!hasAssert(i + 1, body.end)) continue;
+      const base = indentOf(masked[i]);
+      for (let j = body.end + 1; j < masked.length; j++) {
+        const l = masked[j];
+        if (!l.trim()) continue;
+        if (indentOf(l) !== base || !/^\s*(?:except|else|finally)\b/.test(l)) break;
+        const m = /^\s*except\b\s*([^:]*):/.exec(l);
+        if (!m) continue;
+        const handler = indentBlock(masked, j);
+        if (broad(m[1].replace(/\s+as\s+\w+\s*$/, '').trim()) && !FAILS_TEST.test(blankStrings(handler.body))) hit(j);
+        j = handler.end;
+      }
+      continue;
+    }
+    const t = blankStrings(masked[i]);
+    const at = t.search(/\btry\s*\{/);
+    if (at === -1) continue;
+    const tryBlock = braceBlock(masked, i, at);
+    if (!tryBlock || !hasAssert(tryBlock.start, tryBlock.end)) continue;
+    // The catch clause follows the closing brace, on the same line or the next non-blank one.
+    let j = tryBlock.end;
+    let rest = blankStrings(masked[j]).slice(tryBlock.endCol + 1);
+    if (!rest.trim()) {
+      j++;
+      while (j < masked.length && !masked[j].trim()) j++;
+      rest = blankStrings(masked[j] || '');
+    }
+    const m = /^\s*catch\s*(?:\(([^)]*)\))?\s*\{/.exec(rest);
+    if (!m) continue;
+    const handler = braceBlock(masked, j, blankStrings(masked[j]).indexOf('catch'));
+    if (handler && broad(String(m[1] || '').replace(/\s+\$?\w+\s*$/, '').trim()) && !FAILS_TEST.test(handler.body)) hit(j);
+  }
+  return out;
+}
+
+/** 1-based [start, end] line ranges of Rust `#[cfg(test)] mod ... { }` blocks. */
+export function rustTestRanges(lines) {
+  const raw = Array.isArray(lines) ? lines : String(lines ?? '').split(/\r?\n/);
+  const masked = maskComments(raw, 'rs');
+  const out = [];
+  for (let i = 0; i < masked.length; i++) {
+    if (!/#\[cfg\(\s*test\s*\)\]/.test(masked[i])) continue;
+    for (let j = i; j < Math.min(masked.length, i + 4); j++) {
+      const at = masked[j].search(/\bmod\s+\w+\s*\{/);
+      if (at === -1) { if (/\bmod\s+\w+\s*;/.test(masked[j])) break; continue; }
+      const block = braceBlock(masked, j, at);
+      if (block) { out.push([i + 1, block.end + 1]); i = block.end; }
+      break;
     }
   }
   return out;

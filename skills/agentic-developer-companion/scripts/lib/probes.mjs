@@ -238,7 +238,7 @@ export async function coverageDelta({ target, detectResult = null, failUnder = n
         extra.command = extra.command || runRec.cmd;
         extra.exit_code = extra.exit_code ?? runRec.exit;
         extra.duration_ms = (extra.duration_ms || 0) + (runRec.ms || 0);
-        if (!produced) { reasons.push(`${prel}: the coverage run wrote no report (exit ${runRec.exit})`); out.projects.push({ root: prel, runner: r.name, status: 'unverified', reason: runRec.status === 'unverified' ? runRec.reason : 'NO_COVERAGE_REPORT', cmd: runRec.cmd, exit: runRec.exit }); continue; }
+        if (!produced) { reasons.push(`${prel}: the coverage run wrote no report (exit ${runRec.exit})`); out.projects.push({ root: prel, runner: r.name, status: 'unverified', reason: runRec.status === 'unverified' ? runRec.reason : runRec.runnerMissing ? 'RUNNER_NOT_FOUND' : runRec.timedOut ? 'TIMEOUT' : 'NO_COVERAGE_REPORT', cmd: runRec.cmd, exit: runRec.exit }); continue; }
         const parsed = parseCoverage(cv.format, readText(produced, ''), { root: [pdir], goModule: goModuleFor(pdir, '.') });
         files = {};
         for (const [p, d] of Object.entries(parsed.files)) files[toRepoPath(p, project, wt.dir)] = d;
@@ -253,8 +253,8 @@ export async function coverageDelta({ target, detectResult = null, failUnder = n
     if (!keep) fs.rmSync(outRoot, { recursive: true, force: true });
     if (dryRun) return finish('skipped', 'DRY_RUN', `dry run: would run the suite with coverage for ${owners.map((p) => p.root || '.').join(', ')}`);
     if (!tools.length) {
-      const unverified = out.projects.some((p) => p.status === 'unverified');
-      return finish(unverified ? 'unverified' : 'skipped', unverified ? 'NO_COVERAGE_REPORT' : 'NO_COVERAGE_TOOL', reasons.join('; ') || 'no coverage could be collected', extra);
+      const unverified = out.projects.find((p) => p.status === 'unverified');
+      return finish(unverified ? 'unverified' : 'skipped', unverified ? unverified.reason : 'NO_COVERAGE_TOOL', reasons.join('; ') || 'no coverage could be collected', extra);
     }
     out.tool = tools.join(', ');
     out.source = out.projects.every((p) => p.source === 'cache' || p.status !== 'measured') ? 'cache' : 'run';
@@ -490,7 +490,7 @@ export async function mutationScope({ target, detectResult = null, budgetMin = D
 // ---------------------------------------------------------------------------
 // flake-probe
 
-const UNKNOWN_FLAG_RE = /Unrecognized CLI Parameter|unknown option|Unknown option|no such option|unrecognized arguments|flag provided but not defined|Unknown argument|error: unexpected argument/;
+const UNKNOWN_FLAG_RE = /Unrecognized CLI Parameter|bad option: --|unknown option|Unknown option|no such option|unrecognized arguments|flag provided but not defined|Unknown argument|error: unexpected argument/;
 
 /** Changed or new test files of the snapshot, or the `--tests` list (paths, or `path::name`). */
 async function testsToProbe(target, det, tests) {
@@ -593,7 +593,7 @@ export async function flakeProbe({ target, detectResult = null, times = DEFAULT_
       extra.exit_code = extra.exit_code ?? rec.exit;
       if (!rec.counts) {
         prow.status = 'unverified';
-        prow.reason = rec.status === 'unverified' ? rec.reason : rec.timedOut ? 'TIMEOUT' : 'NO_REPORT';
+        prow.reason = rec.status === 'unverified' ? rec.reason : rec.timedOut ? 'TIMEOUT' : rec.runnerMissing ? 'RUNNER_NOT_FOUND' : 'NO_REPORT';
         unverified = unverified || prow.reason;
         break;
       }
@@ -653,7 +653,7 @@ export const coverageDeltaCommand = defineCommand({
   async run(ctx, values) {
     const { target, detectResult } = await setup(ctx, values);
     const res = await coverageDelta({ target, detectResult, failUnder: values['fail-under'] ?? null, report: values.report || null, runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: timeoutOf(values), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 
@@ -668,7 +668,7 @@ export const mutationScopeCommand = defineCommand({
   async run(ctx, values) {
     const { target, detectResult } = await setup(ctx, values);
     const res = await mutationScope({ target, detectResult, budgetMin: values.budget ? Number(values.budget) : DEFAULT_BUDGET_MIN, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 
@@ -682,7 +682,7 @@ export const flakeProbeCommand = defineCommand({
   async run(ctx, values) {
     const { target, detectResult } = await setup(ctx, values);
     const res = await flakeProbe({ target, detectResult, times: values.times ? Number(values.times) : DEFAULT_TIMES, tests: values.tests ? values.tests.flatMap((t) => t.split(',')) : null, runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: timeoutOf(values), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 

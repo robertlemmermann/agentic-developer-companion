@@ -112,6 +112,19 @@ function exitCodeFrom(...values) {
   return null;
 }
 
+// Exit codes the hosts print into the result text (measured 2026-10-25): Copilot CLI 1.0.103 ends
+// shell results with `<shellId: 0 completed with exit code 1>`; Codex 0.164 starts apply_patch
+// results with `Exit code: 0\nWall time: ...`. Anything else stays null.
+const COPILOT_EXIT_TRAILER = /<shellId: [^>\s]+ completed with exit code (-?\d+)>\s*$/;
+const CODEX_EXIT_HEADER = /^Exit code: (-?\d+)\r?\nWall time:/;
+
+/** Exit code printed by the host into a tool result, or null. */
+export function exitFromText(text) {
+  if (typeof text !== 'string' || !text) return null;
+  const m = COPILOT_EXIT_TRAILER.exec(text.slice(-200)) || CODEX_EXIT_HEADER.exec(text.slice(0, 200));
+  return m ? Number(m[1]) : null;
+}
+
 /** The shell command line of a shell tool call (string, argv array, or `bash -lc <cmd>`). */
 export function shellCommand(input) {
   const v = decodeMaybeJson(input);
@@ -150,6 +163,9 @@ export function normalizePayload(payload, dialect, event) {
   const resultObj = decodeMaybeJson(rawResult);
   const resultType = isObj(resultObj) ? (resultObj.resultType ?? resultObj.result_type ?? null) : null;
   const lastMessage = p.last_assistant_message ?? p.lastAssistantMessage ?? null;
+  const resultTextValue = rawResult == null ? null : resultText(resultObj);
+  const payloadExit = exitCodeFrom(resultObj, p);
+  const textExit = payloadExit == null ? exitFromText(resultTextValue) : null;
 
   return {
     dialect,
@@ -163,9 +179,10 @@ export function normalizePayload(payload, dialect, event) {
     tool_name: toolName == null ? null : String(toolName),
     tool_kind: toolKind(toolName, toolInput),
     tool_input: toolInput,
-    tool_result_text: rawResult == null ? null : resultText(resultObj),
+    tool_result_text: resultTextValue,
     tool_result_type: resultType == null ? null : String(resultType),
-    exit_code: exitCodeFrom(resultObj, p),
+    exit_code: payloadExit ?? textExit,
+    exit_source: payloadExit != null ? 'payload' : textExit != null ? 'result-text' : null,
     stop_hook_active: p.stop_hook_active === true || p.stopHookActive === true,
     last_message: typeof lastMessage === 'string' ? lastMessage : null,
     source: typeof p.source === 'string' ? p.source : null,
@@ -189,7 +206,8 @@ const cleanPath = (s) => toPosix(String(s).trim().replace(/^["']|["']$/g, ''));
 
 /**
  * Parse every `apply_patch` body found in the tool input. Returns
- * `[{path, op: 'add'|'update'|'delete', moveTo?, added: [{line, text}]}]`.
+ * `[{path, op: 'add'|'update'|'delete', moveTo?, added: [{line, text}]}]`. `line` is the line in the
+ * new file, or null where the patch does not say: Codex-style `@@` hunks carry context, not numbers.
  */
 export function parsePatch(input) {
   const bodies = [];
@@ -207,12 +225,15 @@ export function parsePatch(input) {
   for (const body of bodies) {
     let cur = null;
     let lineNo = 0;
+    let known = false;
     for (const raw of body.split(/\r?\n/)) {
       const h = PATCH_HEADER.exec(raw);
       if (h) {
         cur = { path: cleanPath(h[2]), op: h[1].toLowerCase(), added: [] };
         files.push(cur);
         lineNo = 0;
+        // An added file is its `+` lines, so their numbers are exact; an update needs a numbered hunk.
+        known = cur.op === 'add';
         continue;
       }
       if (!cur) continue;
@@ -220,12 +241,13 @@ export function parsePatch(input) {
       if (mv) { cur.moveTo = cleanPath(mv[1]); continue; }
       if (raw.startsWith('@@')) {
         // Unified-diff style hunk headers carry the new start line when present.
-        const m = /\+(\d+)/.exec(raw);
-        lineNo = m ? Number(m[1]) - 1 : lineNo;
+        const m = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(raw);
+        known = Boolean(m);
+        lineNo = m ? Number(m[1]) - 1 : 0;
         continue;
       }
       if (raw.startsWith('*** ')) continue;
-      if (raw.startsWith('+')) { lineNo += 1; cur.added.push({ line: lineNo, text: raw.slice(1) }); }
+      if (raw.startsWith('+')) { lineNo += 1; cur.added.push({ line: known ? lineNo : null, text: raw.slice(1) }); }
       else if (raw.startsWith(' ')) lineNo += 1;
     }
   }
@@ -250,6 +272,8 @@ export function extractPaths(norm) {
     if (depth > 3 || !isObj(v)) return;
     for (const [k, val] of Object.entries(v)) {
       if (PATH_KEYS.has(k) && typeof val === 'string') add(val);
+      // Copilot's grep/rg/glob take `paths` as one string or an array (measured, CLI 1.0.103).
+      else if (PATH_LIST_KEYS.has(k) && typeof val === 'string') add(val);
       else if (PATH_LIST_KEYS.has(k) && Array.isArray(val)) val.forEach((x) => (typeof x === 'string' ? add(x) : walk(x, depth + 1)));
       else if (Array.isArray(val)) val.forEach((x) => walk(x, depth + 1));
       else if (isObj(val)) walk(val, depth + 1);
@@ -269,7 +293,8 @@ export function extractPatterns(norm) {
 /**
  * New content per edited file, for marker scanning: Write `content`, Edit `new_string`,
  * MultiEdit `edits[]`, NotebookEdit `new_source`, Copilot `file_text`/`new_str`, patch `+` lines.
- * Returns `[{path, op, text, lines?}]`.
+ * Returns `[{path, op, text, lines?, fragment?}]`: `lines` maps patch lines to file lines,
+ * `fragment` marks replacement text whose position in the file is unknown.
  */
 export function extractContent(norm) {
   const input = norm && norm.tool_input;
@@ -297,7 +322,9 @@ export function extractContent(norm) {
   }
   let op = 'update';
   if (name === 'create' || name === 'write' || (name === 'str_replace_editor' && input.command === 'create')) op = 'write';
-  if (file || texts.length) out.push({ path: file, op, text: texts.join('\n') });
+  // Replacement text (Edit new_string, edit new_str, MultiEdit, NotebookEdit cells) has no known
+  // position in the file, so its line numbers are not reported.
+  if (file || texts.length) out.push({ path: file, op, text: texts.join('\n'), ...(op === 'write' ? {} : { fragment: true }) });
   return out;
 }
 

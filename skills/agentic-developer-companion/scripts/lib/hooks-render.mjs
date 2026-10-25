@@ -107,8 +107,20 @@ function skillPathFor(host, scope, skillDir, root, warnings) {
   return { value: abs, relative: false };
 }
 
+/**
+ * The 8.3 short form of an existing Windows file (`C:\PROGRA~1\nodejs\node.exe`), or null when the
+ * volume keeps no short names or the lookup fails. A short path needs no quotes, so one bare
+ * command runs under cmd.exe, Windows PowerShell, pwsh and Git Bash alike.
+ */
+export function windowsShortPath(file, runner = run) {
+  const res = runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    `(New-Object -ComObject Scripting.FileSystemObject).GetFile('${String(file).replace(/'/g, "''")}').ShortPath`], { timeoutMs: 15_000 });
+  const out = String(res.stdout || '').trim().split(/\r?\n/).pop() || '';
+  return res.exit === 0 && /^[A-Za-z]:\\[^\s"'`$%!&|<>^]+$/.test(out) ? out : null;
+}
+
 /** Node invocations per field kind for the bare `node` or an absolute path. */
-function nodeForms(nodePath, warnings, host, scope) {
+function nodeForms(nodePath, warnings, host, scope, shortPath = null) {
   if (!nodePath) {
     return {
       bashTest: 'command -v node >/dev/null 2>&1', bash: 'node',
@@ -120,6 +132,15 @@ function nodeForms(nodePath, warnings, host, scope) {
   const win = winAbs(posix) ? posix.replace(/\//g, '\\') : posix;
   const quoted = needsQuote(posix);
   const shellForm = host === 'codex' || (host === 'claude' && scope === 'project');
+  // Shell-form hosts on Windows: a short path avoids quoting that only one of the shells accepts.
+  const short = quoted && shellForm && winAbs(posix) && shortPath ? shortPath(win) : null;
+  if (short) {
+    return {
+      bashTest: `command -v ${bashQuote(posix)} >/dev/null 2>&1`, bash: bashQuote(posix),
+      psTest: `Get-Command ${psQuote(posix)} -ErrorAction SilentlyContinue`, ps: `& ${psQuote(posix)}`,
+      exec: posix, portable: toPosix(short), windows: short, label: posix,
+    };
+  }
   if (quoted && host === 'codex') warnings.push(`the Node path needs quoting (${posix}); Codex commandWindows is rendered for a PowerShell launcher (\`& "<node>"\`), which cmd.exe cannot run`);
   if (quoted && host === 'claude' && scope === 'project') warnings.push(`the Node path needs quoting (${posix}); this shell-form command works in sh and Git Bash but not in PowerShell; prefer user scope (exec form) or a Node path without spaces`);
   if (shellForm && portableUnsafe(posix)) warnings.push('the Node path contains $, `, %, ! or a quote; shell-form commands cannot quote it for every shell');
@@ -167,7 +188,8 @@ export function isOurs(obj) {
  * Render the hook config for one host. Returns
  * `{host, scope, level, target_file, config, events, skill_path, node, next_steps, warnings, permission_rules}`.
  */
-export function renderHooks({ host, scope = null, level = 'advise', nodePath = null, skillDir = SKILL_DIR, root = null, env = process.env, home = null } = {}) {
+export function renderHooks({ host, scope = null, level = 'advise', nodePath = null, skillDir = SKILL_DIR, root = null, env = process.env, home = null,
+  shortPath = IS_WINDOWS ? windowsShortPath : null } = {}) {
   if (!HOSTS.includes(host)) throw usageError(`--host must be one of ${HOSTS.join(', ')}`);
   if (!LEVELS.includes(level)) throw usageError(`--level must be one of ${LEVELS.join(', ')}`);
   const sc = scope || (host === 'copilot-cloud' ? 'project' : 'user');
@@ -181,7 +203,7 @@ export function renderHooks({ host, scope = null, level = 'advise', nodePath = n
     warnings.push('--node-path is ignored for copilot-cloud: a committed file must not name one machine\'s Node; the cloud agent and colleagues use the node on PATH');
     np = null;
   }
-  const node = nodeForms(np, warnings, host, sc);
+  const node = nodeForms(np, warnings, host, sc, shortPath);
   const script = `${skill.value}/scripts/adc.mjs`;
   if (/["$`%!]/.test(script) && (host === 'codex' || (host === 'claude' && sc === 'project'))) {
     warnings.push('the skill path contains $, `, %, ! or a quote; shell-form commands for this host cannot quote it for every shell');
@@ -282,6 +304,9 @@ function nextSteps(host, scope, level, target, skill) {
     if (scope === 'project') steps.push('Project hooks load only when the project is trusted in your Codex config.');
     if (IS_WINDOWS) steps.push('Codex hooks on native Windows: confirm they fire with /hooks (support was disabled in 0.117 and re-enablement is undocumented).');
   }
+  // Measured 2026-10-25: Copilot CLI 1.0.103 drops agentStop context and Codex 0.164 shows a Stop
+  // systemMessage to the user only; Claude Code feeds Stop context back to the agent.
+  if (level === 'advise' && host !== 'claude') steps.push(`Level advise: the end-of-turn notice ("edits are newer than the last ledger") ${host === 'codex' ? 'is shown to you, not to the agent' : 'is dropped by Copilot at agentStop'}; register --level gate if the agent itself should be stopped once per edit epoch.`);
   if (level === 'gate') steps.push('Level gate: the stop hook blocks completion once per edit epoch until a ledger newer than the last edit exists (`verify`).');
   if (level === 'guard') steps.push('Level guard: also denies force-push, history rewrites and host read/search/edit tools under .adc/; add the printed permission_rules where your host supports them. `ask` decisions become denials in the Copilot cloud agent and CLI autopilot.');
   steps.push('`node <skill>/scripts/adc.mjs doctor` (or `hooks list`) confirms the registration; remove it again with `setup hooks --remove`.');

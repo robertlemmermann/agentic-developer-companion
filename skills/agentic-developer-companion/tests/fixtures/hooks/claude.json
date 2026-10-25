@@ -106,7 +106,7 @@
     },
     "expect": {
       "match": {
-        "hookSpecificOutput.additionalContext": "src/a\\.js: adds a lint/type suppression \\(\\S+\\) at line 1"
+        "hookSpecificOutput.additionalContext": "src/a\\.js: adds a lint/type suppression \\(\\S+\\) in an added line"
       }
     }
   },
@@ -129,7 +129,7 @@
     },
     "expect": {
       "match": {
-        "hookSpecificOutput.additionalContext": "tests/test_nb\\.ipynb[^\\n]*: adds a lint/type suppression \\(\\S+\\) at line 2"
+        "hookSpecificOutput.additionalContext": "tests/test_nb\\.ipynb[^\\n]*: adds a lint/type suppression \\(\\S+\\) in an added line"
       }
     }
   },
@@ -630,5 +630,137 @@
         }
       }
     ]
+  },
+  {
+    "name": "measured: Write with its tool_response object",
+    "event": "post-edit",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "m-cl-1",
+      "transcript_path": "/home/dev/.claude/projects/-repo/m-cl-1.jsonl",
+      "cwd": "<REPO>",
+      "prompt_id": "p-m",
+      "permission_mode": "acceptEdits",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Write",
+      "tool_input": {
+        "file_path": "<REPO>/tests/b.test.js",
+        "content": "const test = require('node:test');\ntest.only('b', () => {});\n"
+      },
+      "tool_response": {
+        "type": "create",
+        "filePath": "<REPO>/tests/b.test.js",
+        "content": "const test = require('node:test');\ntest.only('b', () => {});\n",
+        "structuredPatch": [],
+        "originalFile": null,
+        "userModified": false
+      },
+      "tool_use_id": "toolu_1",
+      "duration_ms": 3
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "match": {
+        "hookSpecificOutput.additionalContext": "tests/b\\.test\\.js \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 2"
+      }
+    }
+  },
+  {
+    "name": "measured: Bash tool_response {stdout, stderr, interrupted, isImage, noOutputExpected}",
+    "event": "post-shell",
+    "dialect_arg": "claude",
+    "payload": {
+      "session_id": "m-cl-1",
+      "transcript_path": "/home/dev/.claude/projects/-repo/m-cl-1.jsonl",
+      "cwd": "<REPO>",
+      "prompt_id": "p-m",
+      "permission_mode": "acceptEdits",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "node --test tests/ 2>&1 | tail -8",
+        "description": "run tests"
+      },
+      "tool_response": {
+        "stdout": "ℹ tests 1\nℹ pass 0\nℹ fail 1\nℹ skipped 0",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      },
+      "tool_use_id": "toolu_4"
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.exit": null,
+        "observed_runs.0.counts.failed": 1,
+        "observed_runs.0.class": "test"
+      }
+    }
+  },
+  {
+    "name": "measured: Bash cat .adc/.env.live is denied (the Bash(*.adc*) handler)",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "m-cl-1",
+      "transcript_path": "/home/dev/.claude/projects/-repo/m-cl-1.jsonl",
+      "cwd": "<REPO>",
+      "prompt_id": "p-m",
+      "permission_mode": "acceptEdits",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "cat .adc/.env.live",
+        "description": "read creds"
+      },
+      "tool_use_id": "toolu_8"
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "measured: Grep with path under .adc/ is denied",
+    "event": "pre-guard",
+    "dialect_arg": "claude",
+    "level": "guard",
+    "payload": {
+      "session_id": "m-cl-1",
+      "transcript_path": "/home/dev/.claude/projects/-repo/m-cl-1.jsonl",
+      "cwd": "<REPO>",
+      "prompt_id": "p-m",
+      "permission_mode": "acceptEdits",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Grep",
+      "tool_input": {
+        "pattern": "TOKEN",
+        "path": "<REPO>/.adc"
+      },
+      "tool_use_id": "toolu_6"
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
   }
 ]

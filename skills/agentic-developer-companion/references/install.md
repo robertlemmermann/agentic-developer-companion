@@ -74,10 +74,10 @@ Do not use symlinks: they need privileges on Windows and become text files in Gi
 
 | Host | Check |
 |---|---|
-| Copilot CLI | `copilot skill list --json` lists `agentic-developer-companion`; `/skills info agentic-developer-companion` |
+| Copilot CLI | `copilot skill list --json` lists `agentic-developer-companion` (works without signing in); `/skills info agentic-developer-companion` |
 | VS Code | type `/` in chat and look for the skill; the Agent Debug panel lists loaded skills |
-| Claude Code | `/agentic-developer-companion help`; `claude plugin validate ~/.claude/skills` for frontmatter problems |
-| Codex | the `/skills` picker shows it; `$agentic-developer-companion help` |
+| Claude Code | `/agentic-developer-companion help`; frontmatter: `node <skill>/scripts/adc.mjs tooling lint <skill> --strict` (`claude plugin validate` does not check a bare skills folder: it reports `contents: []`) |
+| Codex | the `/skills` picker shows it; `$agentic-developer-companion help`; `codex debug prompt-input "x"` prints the skill list without signing in |
 | Everywhere | `node <skill>/scripts/adc.mjs doctor` |
 
 `doctor` prints host, OS, Node and Git versions, every installed copy, the registered hooks
@@ -104,7 +104,7 @@ skill, so registration is an explicit, confirmed step.
 
 | Level | What it adds | When |
 |---|---|---|
-| `advise` (default) | session brief, post-edit notes, observed test runs, a notice when edits are newer than the last ledger | everyone |
+| `advise` (default) | session brief, post-edit notes, observed test runs, a notice when edits are newer than the last ledger (it reaches the agent in Claude Code; Copilot drops `agentStop` context and Codex shows it to you only) | everyone |
 | `gate` | blocks completion **once per edit epoch** until a ledger newer than the last edit exists | teams that require `verify` |
 | `guard` | `gate` plus a pre-tool policy: denies force-push and history rewrites, `git add -f .adc`, commit/push while `.adc/` is tracked, host read/search/edit tools under `.adc/`, shell commands naming `.adc/.env.live`; asks on CI edits and test deletions | high-trust repositories |
 
@@ -137,7 +137,8 @@ names one; `--skill-dir <dir>` renders for another copy (for example a vendored 
 replace every `<SKILL>` with the absolute skill path written with forward slashes
 (`C:/Users/me/.copilot/skills/agentic-developer-companion` on Windows), delete the
 `preToolUse` / `PreToolUse` entries unless you want `guard`, change `--level advise` on the
-stop entry for `gate`, and merge the `hooks` block into the target file below. Without Node
+stop entry to `gate` (or to `guard` when you keep the pre-tool entries), and merge the `hooks`
+block into the target file below. Without Node
 the guarded Copilot strings print `{}`, so nothing breaks, but nothing runs either.
 
 ## 6. Hook registration per host
@@ -152,9 +153,12 @@ the guarded Copilot strings print `{}`, so nothing breaks, but nothing runs eith
 **Copilot (CLI, VS Code, Copilot app).** Each entry has a `bash` and a `powershell` string,
 never `command` (it would be copied to both shells). The strings check for Node and print
 `{}` otherwise, because a failing `preToolUse` hook denies the tool call. Repository hooks
-load in `copilot -p` only in a trusted folder (`--trust-folder` or
-`GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS=true`). A project file that names a skill outside the
-repository carries your machine's path: do not commit it (the render warns).
+(`.github/hooks/`, `.claude/settings*.json`) load only in a trusted folder; in `copilot -p` that
+means `--trust-folder`, `COPILOT_ALLOW_ALL=true` or `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS=true`
+(`--allow-all` alone does not trust the folder). User hooks in `~/.copilot/hooks/` need no
+trust. A project file that names a skill outside the repository carries your machine's path:
+do not commit it (the render warns). `ask` decisions are denials in `-p` ("unable to ask user
+for confirmation"), in autopilot and in the cloud agent.
 
 **Copilot cloud agent.** Only `.github/hooks/*.json` on the default branch is read, only the
 `bash` strings run (Linux), and `ask` is treated as deny. Vendor the skill first
@@ -165,16 +169,32 @@ run on every colleague's machine that opens the repository with Copilot.
 **Claude Code.** User scope uses the exec form (`"command": "node", "args": ["<SKILL>/scripts/adc.mjs", "hook-run", …]`),
 which needs no shell and no Git Bash on Windows. Project scope is written to
 `.claude/settings.local.json` (git-excluded) as single shell strings with `--dialect auto`,
-because Copilot also reads that file and its handling of the exec form is unconfirmed.
-The guard's Bash entry uses `"if": "Bash(git *)"`, so only git commands start it; `Read`,
-`Grep`, `Glob` and the edit tools are covered by a second matcher. Add the printed
-`permissions.deny` rules (`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
+because Copilot also reads that file in a trusted folder and starts exec-form handlers
+without their `args` (measured: the handler fails, and a failing `preToolUse` would deny every
+tool call). Copilot does not read `~/.claude/settings.json`. The guard's Bash handlers use
+`"if": "Bash(git *)"` (it also matches `cd x && git push -f`) and `"if": "Bash(*.adc*)"`
+(`cat .adc/.env.live`), so other shell commands never start it; Claude's Windows `PowerShell`
+tool (used when Git Bash is absent) has its own entry; `Read`, `Grep`, `Glob` and the edit tools
+are covered by a further matcher. Add the printed `permissions.deny` rules
+(`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
 
 **Codex.** `command` and `commandWindows` are the same bare `node "<SKILL>/scripts/adc.mjs" hook-run …`
 string, valid under cmd.exe, Windows PowerShell and pwsh. Codex rejects unknown output fields,
 so the handler sends only documented keys (the stop notice is a `systemMessage`). The edit
 matcher is `apply_patch|Write|Edit`; Codex reads files through `Bash`, which is why the guard
-inspects shell arguments.
+inspects shell arguments. New hooks run only after review in `/hooks` (or for one run with
+`codex exec --dangerously-bypass-hook-trust`, meant for automation that vets its hooks). Under
+`codex exec` with approvals off an `ask` lets the call run; only `deny` stops it.
+
+**Measured payloads** (2026-10-25: Copilot CLI 1.0.103, Claude Code 2.1.310, Codex 0.164.0,
+each driven offline by a scripted model endpoint; `tests/unit/hooks.test.mjs` repeats this
+when the CLIs are installed):
+
+| Host | What the hooks receive and how output arrives |
+|---|---|
+| Copilot CLI | `toolArgs` is an object (`create` `{path, file_text}`, `edit` `{path, old_str, new_str}`, `bash` `{command}`, `view` `{path}`, `grep`/`rg`/`glob` `{pattern, paths}` with `paths` a string or an array) and the raw patch string for `apply_patch` (GPT-5 tool set), with absolute paths; shell results end with `<shellId: N completed with exit code X>`; `agentStop` has `transcriptPath` (JSONL `assistant.message` events) but no last message; hooks get `COPILOT_CLI=1`, `COPILOT_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`; PascalCase entries get snake_case payloads that keep Copilot's argument names; context is appended to the tool result, `modifiedResult` replaces it, a stop block becomes a user message |
+| Claude Code | `tool_input.file_path`/`content`/`new_string`, `tool_response` objects (`Bash`: `stdout`, `stderr`, `interrupted`); `MultiEdit` is not a tool any more (kept in the matcher, harmless); context arrives as system messages, denials as `PreToolUse:<Tool> hook error: <reason>`, a stop block as `Stop hook feedback` |
+| Codex | `apply_patch` has `tool_input.command` (patch text, relative paths); shell calls arrive as `Bash` with `tool_input.command`; `tool_response` is a string; `permission_mode` is `bypassPermissions` under `codex exec`; context arrives as developer messages, a stop block as a `<hook_prompt>` user message; SessionEnd timeouts above 3 s are clamped |
 
 ## 7. What the hooks write
 
@@ -223,8 +243,10 @@ Fallback for the two Mermaid diagrams in the README.
   exits 0 (PowerShell `-Command` collapses other exit codes, Codex issue #54072).
 - `node.exe` must be a real executable on the launcher's PATH. Version managers that expose
   `node` as a `.cmd` shim or only through a shell profile need `setup hooks --node-path`.
-  With a Node path that contains spaces, Codex `commandWindows` becomes `& "<node>" …`, which
-  needs a PowerShell launcher (the render warns).
+  A Node path with spaces (`C:\Program Files\nodejs\node.exe`) is rendered for Codex and for
+  Claude project scope as its 8.3 short path (`C:\PROGRA~1\nodejs\node.exe`), which runs bare
+  under cmd.exe, PowerShell and Git Bash; on a volume without short names Codex gets
+  `& "<node>" …` (PowerShell only) and the render warns.
 - Claude Code exec-form hooks need no Git Bash; set `CLAUDE_CODE_GIT_BASH_PATH` only for
   Claude's own Bash tool.
 - Codex hooks on native Windows were disabled in 0.117 and their re-enablement is

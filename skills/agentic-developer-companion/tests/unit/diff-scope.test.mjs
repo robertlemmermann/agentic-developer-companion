@@ -12,7 +12,7 @@ import * as core from '../../scripts/lib/core.mjs';
 import * as git from '../../scripts/lib/git.mjs';
 import * as state from '../../scripts/lib/state.mjs';
 import * as M from '../../scripts/lib/markers.mjs';
-import { diffScope, extractSpecPaths, narrowsCommand, keyPath } from '../../scripts/lib/diff-scope.mjs';
+import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand } from '../../scripts/lib/diff-scope.mjs';
 import * as deps from '../../scripts/lib/deps.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
@@ -28,7 +28,8 @@ after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 // Secrets are assembled at runtime so no secret-shaped literal exists in the repository.
 const AWS_KEY = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
 const GH_TOKEN = ['ghp', '_', 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'].join('');
-const PLACEHOLDERS = { '{{AWS_KEY}}': AWS_KEY };
+const PRIVATE_KEY_HEADER = ['-----BEGIN', ' RSA PRIVATE', ' KEY-----'].join('');
+const PLACEHOLDERS = { '{{AWS_KEY}}': AWS_KEY, '{{GH}}': GH_TOKEN, '{{PK}}': PRIVATE_KEY_HEADER };
 const fill = (s) => Object.entries(PLACEHOLDERS).reduce((t, [k, v]) => t.split(k).join(v), s);
 // Hermetic environment: built-in scanner, no live token, an empty npm cache, no network lookups.
 const NPM_CACHE = path.join(TMP, 'npm-cache');
@@ -63,11 +64,13 @@ function initRepo(files) {
 }
 
 const DIFFS = tableSection('diffs');
-let template = null;
-function scenarioRepo() {
-  if (!template) template = initRepo(DIFFS.base);
+const templates = new Map();
+/** A fresh copy of the base repository (plus a scenario's own `base` files, if any). */
+function scenarioRepo(extraBase = null) {
+  const key = extraBase ? JSON.stringify(extraBase) : '';
+  if (!templates.has(key)) templates.set(key, initRepo({ ...DIFFS.base, ...(extraBase || {}) }));
   const dir = path.join(TMP, `s${++seq}`);
-  fs.cpSync(template, dir, { recursive: true });
+  fs.cpSync(templates.get(key), dir, { recursive: true });
   return dir;
 }
 function applyOps(dir, ops) {
@@ -83,11 +86,13 @@ function applyOps(dir, ops) {
     } else throw new Error(`unknown op ${op.op}`);
   }
 }
-function prepare(ops, variant) {
-  const dir = scenarioRepo();
+/** committed: on a feature branch; uncommitted: working tree + untracked files; staged: in the index only. */
+function prepare(ops, variant, extraBase = null) {
+  const dir = scenarioRepo(extraBase);
   if (variant === 'committed') sh(dir, 'checkout', '-q', '-b', 'feature');
   applyOps(dir, ops);
   if (variant === 'committed') { sh(dir, 'add', '-A'); sh(dir, 'commit', '-q', '-m', 'change'); }
+  if (variant === 'staged') sh(dir, 'add', '-A');
   return dir;
 }
 async function targetFor(dir) {
@@ -105,7 +110,8 @@ const severities = (findings, ids = null) => {
   return out;
 };
 const sortedExpect = (e) => Object.fromEntries(Object.entries(e || {}).filter(([, v]) => v.length).map(([k, v]) => [k, [...v].sort()]));
-const resolver = (eco, name) => (name in DIFFS.registry ? DIFFS.registry[name] : null);
+const resolverFor = (registry = DIFFS.registry) => (eco, name) => (name in registry ? registry[name] : null);
+const resolver = resolverFor();
 
 // ---------------------------------------------------------------------------
 // markers.mjs
@@ -200,6 +206,50 @@ describe('markers', () => {
     assert.deepEqual(ids(['value = compute rescue nil'], 'a.rb'), ['swallow.rb@1']);
   });
 
+  test('broad handlers fire only when they neither re-raise nor report the error', () => {
+    const ids = (lines, file) => M.scanText(lines, M.SWALLOW_PATTERNS, { file }).map((h) => `${h.id}@${h.line}`);
+    assert.deepEqual(ids(['except Exception:', '    return None'], 'a.py'), ['swallow.py-broad-except@1']);
+    assert.deepEqual(ids(['except Exception as exc:', '    log.warning(exc)', '    return None'], 'a.py'), ['swallow.py-broad-except@1']);
+    assert.deepEqual(ids(['except Exception:', '    logger.exception("x")'], 'a.py'), []);
+    assert.deepEqual(ids(['except Exception:', '    raise'], 'a.py'), []);
+    assert.deepEqual(ids(['except Exception:', '    pass'], 'a.py'), ['swallow.py-except-pass@1'], 'pass-only bodies belong to the empty-handler rule');
+    assert.deepEqual(ids(['except KeyError:', '    return 0'], 'a.py'), []);
+    assert.deepEqual(ids(['} catch (Exception e) {', '  return null;', '}'], 'A.java'), ['swallow.broad-catch@1']);
+    assert.deepEqual(ids(['} catch (Exception e) {', '  throw new IllegalStateException(e);', '}'], 'A.java'), []);
+    assert.deepEqual(ids(['} catch (IOException e) {', '  return null;', '}'], 'A.java'), []);
+    assert.deepEqual(ids(['catch (Exception ex)', '{'], 'A.cs'), [], 'the brace must open on the handler line');
+    assert.deepEqual(ids(['catch {', '  return default;', '}'], 'A.cs'), ['swallow.broad-catch@1']);
+    assert.deepEqual(ids(['\tif err := os.Remove(p); err != nil {', '\t}'], 'a.go'), ['swallow.go-empty-err@1']);
+  });
+
+  test('tryWrappedAssertions: try blocks around assertions whose handler swallows the failure', () => {
+    const hits = (text, file) => M.tryWrappedAssertions(text.split('\n'), file).map((h) => h.line);
+    assert.deepEqual(hits('def test_a():\n    try:\n        assert f() == 1\n    except AssertionError:\n        pass\n', 'test_a.py'), [4]);
+    assert.deepEqual(hits('def test_a():\n    try:\n        assert f() == 1\n    except Exception as e:\n        print(e)\n', 'test_a.py'), [4]);
+    assert.deepEqual(hits('def test_a():\n    try:\n        assert f() == 1\n    except ValueError:\n        pass\n', 'test_a.py'), [], 'ValueError does not catch AssertionError');
+    assert.deepEqual(hits('def test_a():\n    try:\n        assert f() == 1\n    except Exception:\n        pytest.fail("boom")\n', 'test_a.py'), []);
+    assert.deepEqual(hits('def test_a():\n    try:\n        x = f()\n    except Exception:\n        x = None\n    assert x\n', 'test_a.py'), [], 'no assertion inside the try');
+    assert.deepEqual(hits("it('x', () => {\n  try {\n    expect(f()).toBe(1);\n  } catch (e) {\n    console.log(e);\n  }\n});", 'a.test.js'), [4]);
+    assert.deepEqual(hits("it('x', () => {\n  try {\n    expect(f()).toBe(1);\n  } catch (e) {\n    throw e;\n  }\n});", 'a.test.js'), []);
+    assert.deepEqual(hits("it('x', () => {\n  try { expect(f()).toBe(1); } catch {}\n});", 'a.test.js'), [2]);
+    assert.deepEqual(hits('@Test void a() {\n  try {\n    assertEquals(1, f());\n  } catch (Exception e) {\n  }\n}', 'ATest.java'), [], 'JUnit assertions are Errors, not Exceptions');
+    assert.deepEqual(hits('@Test void a() {\n  try {\n    assertEquals(1, f());\n  } catch (Throwable t) {\n  }\n}', 'ATest.java'), [4]);
+    assert.deepEqual(hits('[Fact] public void A() {\n  try {\n    Assert.Equal(1, F());\n  }\n  catch (Exception) { }\n}', 'ATests.cs'), [5]);
+  });
+
+  test('rustTestRanges finds inline #[cfg(test)] modules', () => {
+    const lines = ['pub fn a() -> i32 {', '    1', '}', '', '#[cfg(test)]', 'mod tests {', '    use super::*;', '    #[test]', '    fn t() { assert_eq!(a(), 1); }', '}', '', 'pub fn b() {}'];
+    assert.deepEqual(M.rustTestRanges(lines), [[5, 10]]);
+    assert.deepEqual(M.rustTestRanges(['#[cfg(test)]', 'mod tests;']), []);
+  });
+
+  test('markers inside string literals are not markers (JS)', () => {
+    const hit = (line) => M.scanText([line], M.SKIP_MARKERS, { file: 'a.test.js' }).map((h) => h.id);
+    assert.deepEqual(hit('const src = "it.only(\'x\', () => {})";'), []);
+    assert.deepEqual(hit("it.only('it.skip in a title', () => {})"), ['skip.js-only']);
+    assert.deepEqual(hit("describe['skip']('x', () => {})"), ['skip.js-bracket'], 'bracket access keeps its string');
+  });
+
   test('CI weakening, lint-config weakening and in-source retries', () => {
     const ci = (l) => M.scanText([l], M.CI_WEAKENING).map((h) => h.id);
     assert.deepEqual(ci('        continue-on-error: true'), ['ci.continue-on-error']);
@@ -255,14 +305,37 @@ describe('markers', () => {
     assert.equal(M.credentialFileName('keys/id_ed25519'), 'ssh-key');
   });
 
-  test('the skill tree itself contains no secret-shaped strings', () => {
+  test('gitleaks finds nothing in the skill tree', { skip: !core.which('gitleaks') && 'gitleaks not installed' }, () => {
+    const r = core.run('gitleaks', ['detect', '--no-git', '--source', core.SKILL_DIR, '--redact', '--no-banner', '--exit-code', '1']);
+    assert.equal(r.exit, 0, r.stdout + r.stderr);
+  });
+
+  test('the skill tree itself contains no secret-shaped strings', (t) => {
     const files = core.listFiles(core.SKILL_DIR).filter((f) => !/\.(?:png|jpg|gif|ico)$/.test(f));
+    // Hard-fail on everything that ships plus this work package's own tests and fixtures; other
+    // work packages' test files are reported (selftest's footprint area enforces them).
+    const own = (f) => !f.startsWith('tests/') || f === 'tests/unit/diff-scope.test.mjs' || f === 'tests/fixtures/_parts/diffs.json';
     const hits = [];
+    const elsewhere = [];
     for (const f of files) {
       const text = core.readText(path.join(core.SKILL_DIR, f)) || '';
-      for (const h of M.scanSecrets(text)) if (h.severity === 'fail') hits.push(`${f}:${h.line} ${h.id}`);
+      for (const h of M.scanSecrets(text)) if (h.severity === 'fail') (own(f) ? hits : elsewhere).push(`${f}:${h.line} ${h.id}`);
     }
+    if (elsewhere.length) t.diagnostic(`secret-shaped literals in other test files (build them from parts): ${elsewhere.join(', ')}`);
     assert.deepEqual(hits, []);
+  });
+
+  test('ADC_LIVE_TOKEN: quoted values and unquoted line-final values count; code identifiers do not', () => {
+    const ids = (line) => M.scanSecrets(line).map((h) => h.id);
+    const v = ['abcd', 'efgh', '1234'].join('-');
+    assert.deepEqual(ids(`ADC_LIVE_TOKEN=${v}`), ['secret.adc-live-token']);
+    assert.deepEqual(ids(`export ADC_LIVE_TOKEN="${v}"  # set by hand`), ['secret.adc-live-token']);
+    assert.deepEqual(ids(`  ADC_LIVE_TOKEN: ${v}`), ['secret.adc-live-token']);
+    assert.deepEqual(ids(`env: { ADC_LIVE_TOKEN: '${v}' },`), ['secret.adc-live-token']);
+    assert.deepEqual(ids('env: { ...ENV, ADC_LIVE_TOKEN: envToken },'), []);
+    assert.deepEqual(ids('ADC_LIVE_TOKEN: ${{ secrets.ADC_LIVE_TOKEN }}'), []);
+    assert.deepEqual(ids('const t = { ADC_LIVE_TOKEN: process.env.ADC_LIVE_TOKEN };'), []);
+    assert.ok(!M.scanSecrets(`ADC_LIVE_TOKEN=${v}`)[0].redacted.includes(v));
   });
 });
 
@@ -385,6 +458,12 @@ describe('deps parsing', () => {
     assert.deepEqual(deps.goImports('package x\n\nimport (\n\t"fmt"\n\tyaml "gopkg.in/yaml.v3"\n)\nimport "github.com/a/b"\n').map((i) => `${i.path}@${i.line}`), ['fmt@4', 'gopkg.in/yaml.v3@5', 'github.com/a/b@7']);
   });
 
+  test('goSumNeeded ignores modules replaced by local directories', () => {
+    const gomod = deps.parseManifest('go.mod', 'module m\n\nrequire (\n\tgithub.com/a/b v1.0.0\n\tgithub.com/c/d v1.0.0\n)\nreplace github.com/c/d => ../d\n');
+    assert.deepEqual(deps.goSumNeeded(gomod).map((d) => d.name), ['github.com/a/b']);
+    assert.deepEqual(deps.goSumNeeded(deps.parseManifest('package.json', '{}')), []);
+  });
+
   test('offline is the default inside the Codex sandbox', () => {
     assert.equal(deps.defaultOffline({ CODEX_SANDBOX: 'seatbelt' }), true);
     assert.equal(deps.defaultOffline({ CODEX_SANDBOX_NETWORK_DISABLED: '1' }), true);
@@ -404,6 +483,13 @@ describe('diff-scope helpers', () => {
     assert.match(narrowsCommand('npm test', 'npm test || true'), /\|\|/);
     assert.match(narrowsCommand('go test ./...', 'echo ok'), /no longer invokes/);
     assert.equal(narrowsCommand('pytest -k fast', 'pytest -k fast -q'), null, 'pre-existing flags are not new');
+  });
+
+  test('ciCommand strips YAML step syntax so moved commands compare equal', () => {
+    assert.equal(ciCommand('      - run: npm test -- --ci'), 'npm test -- --ci');
+    assert.equal(ciCommand('  script: pytest -q'), 'pytest -q');
+    assert.equal(ciCommand('        run: |'), '');
+    assert.equal(ciCommand('          python -m pytest'), 'python -m pytest');
   });
 
   test('keyPath finds the governing key in JSON/JS, YAML, INI/TOML', () => {
@@ -477,6 +563,26 @@ describe('evasion matrix (plan §13)', () => {
     }
   });
 });
+
+// Per-ecosystem catalog coverage and false-positive guards: one run each, rotating the variants.
+const ROTATION = ['uncommitted', 'committed', 'staged'];
+for (const [section, title] of [['ecosystems', 'per-ecosystem coverage'], ['benign', 'false-positive guards (ordinary changes stay quiet)']]) {
+  describe(`diff-scope ${title}`, () => {
+    (DIFFS[section] || []).forEach((s, i) => {
+      const variant = ROTATION[i % ROTATION.length];
+      test(`${s.name} (${variant})`, async () => {
+        const dir = prepare(s.ops, variant, s.base || null);
+        const target = await targetFor(dir);
+        const res = await diffScope({ target, env: ENV });
+        assert.deepEqual(severities(res.findings), sortedExpect(s.expect), JSON.stringify(res.findings.filter((f) => f.severity !== 'info'), null, 1));
+        if (s.deps_expect) {
+          const d = await deps.depsCheck({ target, offline: true, resolver: resolverFor(s.registry || DIFFS.registry), tools: false, env: ENV });
+          assert.deepEqual(severities(d.findings), sortedExpect(s.deps_expect), JSON.stringify(d.findings, null, 1));
+        }
+      });
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Behaviour that needs a custom repository
@@ -566,6 +672,89 @@ describe('diff-scope behaviour', () => {
 // ---------------------------------------------------------------------------
 // deps-check with the package managers' own lock checks (only where the tool is installed)
 
+// ---------------------------------------------------------------------------
+// External secret scanners (decision D7), exercised through fake executables on PATH
+
+describe('external secret scanners', { skip: core.IS_WINDOWS && 'fake scanners are POSIX shell shims' }, () => {
+  const fakeBin = (name, body) => {
+    const dir = fs.mkdtempSync(path.join(TMP, `bin-${name}-`));
+    const script = path.join(dir, `${name}.mjs`);
+    fs.writeFileSync(script, body);
+    const shim = path.join(dir, name);
+    fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+    fs.chmodSync(shim, 0o755);
+    return dir;
+  };
+  const GITLEAKS = `import fs from 'node:fs';
+const args = process.argv.slice(2);
+if (args[0] === 'version') { console.log(process.env.FAKE_VERSION || 'v8.21.2'); process.exit(0); }
+fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify(args));
+if (process.env.FAKE_FAIL) { console.error('fatal: fake scanner failure'); process.exit(2); }
+const report = args[args.indexOf('--report-path') + 1];
+fs.writeFileSync(report, JSON.stringify([{ RuleID: 'aws-access-token', File: 'src/aws.js', StartLine: 1, Secret: 'REDACTED', Match: 'REDACTED' }]));
+process.exit(1);
+`;
+  const TRUFFLEHOG = `import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify(args));
+const files = args.filter((a) => path.isAbsolute(a));
+for (const file of files) {
+  console.log(JSON.stringify({ SourceMetadata: { Data: { Filesystem: { file, line: 1 } } }, DetectorName: 'AWS', Raw: 'never-recorded' }));
+  console.log(JSON.stringify({ SourceMetadata: { Data: { Filesystem: { file, line: 99 } } }, DetectorName: 'AWS', Raw: 'not-an-added-line' }));
+}
+`;
+  const planted = [{ op: 'write', path: 'src/aws.js', content: "module.exports = { accessKeyId: '{{AWS_KEY}}' };\n" }];
+
+  test('gitleaks is preferred when installed; its findings and command are recorded, values never', async () => {
+    const bin = fakeBin('gitleaks', GITLEAKS);
+    const log = path.join(bin, 'args.json');
+    for (const variant of ['committed', 'uncommitted']) {
+      const dir = prepare(planted, variant);
+      const target = await targetFor(dir);
+      const env = { ...ENV, ADC_SECRETS_SCANNER: 'auto', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: log };
+      const res = await diffScope({ target, env });
+      const check = res.checks.find((c) => c.id === 'CK-SECRETS');
+      assert.equal(check.status, 'fail');
+      assert.equal(check.data.scanner, 'gitleaks');
+      assert.match(check.command, /^gitleaks git --log-opts [0-9a-f]{40}\.\.[0-9a-f]{40} --redact/);
+      assert.equal(check.exit_code, 1);
+      assert.deepEqual(res.findings.filter((f) => f.id === 'CK-SECRETS').map((f) => `${f.file}:${f.line}:${f.rule}`), ['src/aws.js:1:gitleaks.aws-access-token']);
+      const args = JSON.parse(fs.readFileSync(log, 'utf8'));
+      assert.ok(args.includes(`${target.base.sha}..${target.snapshot.commit}`), 'the range ends at the snapshot, so uncommitted and untracked files are scanned');
+      assert.ok(!JSON.stringify(res).includes(AWS_KEY));
+    }
+    const old = await diffScope({ target: await targetFor(prepare(planted, 'uncommitted')), env: { ...ENV, ADC_SECRETS_SCANNER: 'gitleaks', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: log, FAKE_VERSION: '8.18.4' } });
+    assert.equal(JSON.parse(fs.readFileSync(log, 'utf8'))[0], 'detect', 'gitleaks before 8.19 uses `detect --source`');
+    assert.equal(old.checks.find((c) => c.id === 'CK-SECRETS').status, 'fail');
+  });
+
+  test('a failing scanner falls back to the built-in regexes and says so', async () => {
+    const bin = fakeBin('gitleaks', GITLEAKS);
+    const env = { ...ENV, ADC_SECRETS_SCANNER: 'auto', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: path.join(bin, 'args.json'), FAKE_FAIL: '1' };
+    const res = await diffScope({ target: await targetFor(prepare(planted, 'uncommitted')), env });
+    const check = res.checks.find((c) => c.id === 'CK-SECRETS');
+    assert.equal(check.data.scanner, 'builtin');
+    assert.match(check.data.scanner_error, /gitleaks exited 2/);
+    assert.match(check.summary, /fell back to built-in/);
+    assert.deepEqual(severities(res.findings), { 'CK-SECRETS': ['fail'] });
+  });
+
+  test('trufflehog scans the changed files and only findings on added lines count', async () => {
+    const bin = fakeBin('trufflehog', TRUFFLEHOG);
+    const log = path.join(bin, 'args.json');
+    const env = { ...ENV, ADC_SECRETS_SCANNER: 'trufflehog', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: log };
+    const res = await diffScope({ target: await targetFor(prepare(planted, 'uncommitted')), env });
+    const check = res.checks.find((c) => c.id === 'CK-SECRETS');
+    assert.equal(check.data.scanner, 'trufflehog');
+    assert.deepEqual(res.findings.filter((f) => f.id === 'CK-SECRETS').map((f) => `${f.file}:${f.line}`), ['src/aws.js:1']);
+    const args = JSON.parse(fs.readFileSync(log, 'utf8'));
+    assert.equal(args[0], 'filesystem');
+    assert.ok(args.includes('--no-verification') && args.includes('--no-update'));
+    assert.ok(!JSON.stringify(res).includes('never-recorded'));
+  });
+});
+
 describe('deps-check lock tools', () => {
   const npmProject = (inSync) => {
     const files = {
@@ -642,6 +831,57 @@ describe('deps-check lock tools', () => {
     assert.equal(sh(dir, 'worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length, 1, 'temp worktree removed');
   });
 
+  test('a lock entry added by the change is not proof of existence; a base entry is', async () => {
+    const lockWith = (extra) => {
+      const lock = JSON.parse(DIFFS.base['package-lock.json']);
+      Object.assign(lock.packages, extra);
+      return JSON.stringify(lock, null, 2) + '\n';
+    };
+    const transitive = { 'node_modules/debug': { version: '4.3.4', resolved: 'https://registry.npmjs.org/debug/-/debug-4.3.4.tgz' } };
+    const dir = initRepo({ ...DIFFS.base, 'package-lock.json': lockWith(transitive) });
+    const pkg = JSON.parse(DIFFS.base['package.json']);
+    Object.assign(pkg.dependencies, { debug: '^4.3.4', 'adc-fabricated-pkg': '^1.0.0', 'adc-offhost-pkg': '^1.0.0' });
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
+    const lock = JSON.parse(lockWith({
+      ...transitive,
+      'node_modules/adc-fabricated-pkg': { version: '1.0.0', resolved: 'https://registry.npmjs.org/adc-fabricated-pkg/-/adc-fabricated-pkg-1.0.0.tgz', integrity: 'sha512-AAAA' },
+      'node_modules/adc-offhost-pkg': { version: '1.0.0', resolved: 'https://pkgs.attacker.example/adc-offhost-pkg-1.0.0.tgz' },
+    }));
+    lock.packages[''].dependencies = pkg.dependencies;
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify(lock, null, 2) + '\n');
+    const target = await targetFor(dir);
+    const offline = await deps.depsCheck({ target, offline: true, tools: false, env: ENV });
+    const by = Object.fromEntries(offline.new_deps.map((d) => [d.name, d]));
+    assert.equal(by.debug.exists, true, 'promoted from a transitive entry that existed at the base');
+    assert.match(by.debug.source, /^lockfile:/);
+    assert.equal(by['adc-fabricated-pkg'].exists, null);
+    assert.match(by['adc-fabricated-pkg'].source, /new entry in package-lock\.json/);
+    assert.equal(offline.checks.find((c) => c.id === 'CK-DEPS').status, 'unverified');
+    assert.ok(offline.findings.some((f) => f.rule === 'deps.unexpected-host' && /pkgs\.attacker\.example/.test(f.message)));
+    const online = await deps.depsCheck({ target, offline: false, tools: false, env: ENV, resolver: (eco, name) => name !== 'adc-fabricated-pkg' });
+    const fab = online.findings.find((f) => f.rule === 'deps.nonexistent');
+    assert.match(fab.message, /adc-fabricated-pkg.*although the change added it to the lockfile/);
+    assert.equal(online.checks.find((c) => c.id === 'CK-DEPS').status, 'fail');
+  });
+
+  test('depsCheck without an offline flag follows the sandbox default', async () => {
+    const dir = prepare([{ op: 'write', path: 'requirements.txt', content: 'adc-unknown-offline-pkg==1.0\n' }], 'uncommitted');
+    const res = await deps.depsCheck({ target: await targetFor(dir), tools: false, env: { ...ENV, CODEX_SANDBOX: 'seatbelt' } });
+    assert.equal(res.offline, true);
+    assert.equal(res.new_deps[0].source, 'offline');
+  });
+
+  test('registry lookups answer exists / does not exist (network; opt in with ADC_TEST_NETWORK=1)',
+    { skip: process.env.ADC_TEST_NETWORK !== '1' && 'set ADC_TEST_NETWORK=1 to query the public registries' }, () => {
+      const cases = [['npm', 'npm', 'left-pad'], ['pypi', 'uv', 'requests'], ['crates', 'cargo', 'serde'], ['rubygems', 'gem', 'rake']];
+      for (const [eco, tool, real] of cases) {
+        if (!core.which(tool)) continue;
+        assert.equal(deps.registryLookup(eco, real, {}).exists, true, `${eco} ${real}`);
+        assert.equal(deps.registryLookup(eco, 'adc-nonexistent-pkg-zz9', {}).exists, false, `${eco} missing`);
+      }
+      if (core.which('go')) assert.equal(deps.registryLookup('go', 'github.com/stretchr/testify', {}).exists, true);
+    });
+
   test('offline with an unknown package: CK-DEPS is unverified, never pass', async () => {
     const dir = prepare([{ op: 'write', path: 'requirements.txt', content: 'adc-unknown-offline-pkg==1.0\n' }], 'uncommitted');
     const res = await deps.depsCheck({ target: await targetFor(dir), offline: true, tools: false, env: ENV });
@@ -711,27 +951,60 @@ describe('adc.mjs end to end', () => {
     assert.equal(runAdc(['deps-check', '--bogus'], dir).status, 2);
   });
 
-  test('default state dir inside the repository (.adc/ in info/exclude)', { skip: snapshotIgnoredBug() && 'git.mjs createSnapshot exits 4 when .adc/ is already ignored (foundation change requested)' }, () => {
+  test('default state dir inside the repository (.adc/ in info/exclude), twice in a row', () => {
     const dir = prepare(DIFFS.scenarios.find((s) => s.name === 'it.only').ops, 'uncommitted');
-    const r = spawnSync(process.execPath, [ADC, 'diff-scope', '--json', '--cwd', dir], { encoding: 'utf8', env: ENV });
+    for (let i = 0; i < 2; i++) {
+      // The second run finds .adc/ already ignored through info/exclude.
+      const r = spawnSync(process.execPath, [ADC, 'diff-scope', '--json', '--cwd', dir], { encoding: 'utf8', env: ENV });
+      assert.equal(r.status, 1, r.stderr);
+      assert.ok(fs.existsSync(path.join(dir, '.adc')));
+      assert.ok(!JSON.parse(r.stdout).files.some((f) => f.path.startsWith('.adc/')));
+    }
+    assert.match(fs.readFileSync(path.join(dir, '.git', 'info', 'exclude'), 'utf8'), /^\/\.adc\/$/m);
+    assert.equal(sh(dir, 'status', '--porcelain'), 'M tests/math.test.js', 'only the planted edit; .adc/ stays invisible');
+  });
+
+  test('a tracked .adc/ makes both commands exit 3', () => {
+    const dir = scenarioRepo();
+    fs.mkdirSync(path.join(dir, '.adc'));
+    fs.writeFileSync(path.join(dir, '.adc', 'notes.json'), '{}\n');
+    sh(dir, 'add', '-f', '.adc/notes.json');
+    sh(dir, 'commit', '-q', '-m', 'oops');
+    for (const cmd of ['diff-scope', 'deps-check']) {
+      const r = spawnSync(process.execPath, [ADC, cmd, '--json', '--cwd', dir], { encoding: 'utf8', env: ENV });
+      assert.equal(r.status, 3, `${cmd}: ${r.stdout}`);
+      assert.equal(JSON.parse(r.stdout).error.code, 'STATE_TRACKED');
+    }
+  });
+
+  test('leak matrix: neither the .env.live token nor the environment token reaches the output', () => {
+    const fileToken = ['hunter2', 'abc'].join('');
+    const envToken = ['zz-second', '-value-77'].join('');
+    // diff-scope never reads .adc/.env.live (plan §7.3), so it can only redact the environment value;
+    // the file value stays out of the result because .adc/ is excluded and its line triggers nothing.
+    const dir = prepare([
+      { op: 'write', path: 'src/client.js', content: `const token = '${envToken}';\nmodule.exports = { token };\n` },
+      { op: 'write', path: 'src/other.js', content: `module.exports = '${fileToken}';\n` },
+    ], 'uncommitted');
+    fs.mkdirSync(path.join(dir, '.adc'));
+    fs.writeFileSync(path.join(dir, '.adc', '.env.live'), `ADC_LIVE_TOKEN=${fileToken}\n`);
+    fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
+    const r = spawnSync(process.execPath, [ADC, 'diff-scope', '--json', '--cwd', dir], { encoding: 'utf8', env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
     assert.equal(r.status, 1, r.stderr);
-    assert.ok(fs.existsSync(path.join(dir, '.adc')));
-    assert.ok(!JSON.parse(r.stdout).files.some((f) => f.path.startsWith('.adc/')));
+    for (const out of [r.stdout, r.stderr]) {
+      assert.ok(!out.includes(fileToken) && !out.includes(envToken), 'no token value in stdout or stderr');
+    }
+    const res = JSON.parse(r.stdout);
+    assert.ok(res.findings.some((f) => f.rule === 'secret.adc-live-token-value' && f.file === 'src/client.js'));
+    assert.ok(!res.files.some((f) => f.path.startsWith('.adc/')));
+    const d = spawnSync(process.execPath, [ADC, 'deps-check', '--json', '--offline', '--static-only', '--cwd', dir], { encoding: 'utf8', env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
+    assert.ok(!d.stdout.includes(fileToken) && !d.stdout.includes(envToken));
+  });
+
+  test('deps-check --dry-run creates no state directory', () => {
+    const dir = prepare(DIFFS.scenarios.find((s) => s.name === 'clean').ops, 'uncommitted');
+    const r = spawnSync(process.execPath, [ADC, 'deps-check', '--json', '--offline', '--static-only', '--dry-run', '--cwd', dir], { encoding: 'utf8', env: ENV });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(!fs.existsSync(path.join(dir, '.adc')));
   });
 });
-
-/** True while git.mjs passes an exclude pathspec for an already-ignored .adc/ (git add then exits 1). */
-function snapshotIgnoredBug() {
-  const dir = fs.mkdtempSync(path.join(TMP, 'probe-'));
-  sh(dir, 'init', '-q', '-b', 'main');
-  fs.mkdirSync(path.join(dir, '.adc'));
-  fs.writeFileSync(path.join(dir, '.adc', 'x'), 'x');
-  fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
-  fs.writeFileSync(path.join(dir, 'a.txt'), 'a\n');
-  try {
-    git.createSnapshot(dir, { exclude: ['.adc'] });
-    return false;
-  } catch {
-    return true;
-  }
-}

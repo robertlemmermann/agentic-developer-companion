@@ -190,7 +190,7 @@
     },
     "expect": {
       "match": {
-        "additionalContext": "src/a\\.ts: adds a lint/type suppression \\(\\S+\\) at line 1"
+        "additionalContext": "src/a\\.ts: adds a lint/type suppression \\(\\S+\\) in an added line"
       }
     }
   },
@@ -210,7 +210,7 @@
     },
     "expect": {
       "match": {
-        "additionalContext": "\\(CI\\): weakens a CI step \\(\\S+\\) at line 2: continue-on-error: true"
+        "additionalContext": "\\(CI\\): weakens a CI step \\(\\S+\\) in an added line: continue-on-error: true"
       }
     }
   },
@@ -1273,6 +1273,253 @@
     },
     "expect": {
       "equals": {}
+    }
+  },
+  {
+    "name": "measured: create with an absolute path and file_text (gpt-4.1 tool set)",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "create",
+      "toolArgs": {
+        "path": "<REPO>/tests/b.test.js",
+        "file_text": "const test = require('node:test');\ntest.only('b', () => {});\n"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "Created file <REPO>/tests/b.test.js with 61 characters"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "tests/b\\.test\\.js \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 2"
+      },
+      "session": {
+        "edits.files.0": "tests/b.test.js"
+      }
+    }
+  },
+  {
+    "name": "measured: bash result trailer carries the exit code",
+    "event": "post-shell",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "bash",
+      "toolArgs": {
+        "command": "node --test tests/",
+        "description": "run tests"
+      },
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "# tests 2\n# suites 0\n# pass 1\n# fail 1\n# skipped 0\n<shellId: 0 completed with exit code 1>"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.exit": 1,
+        "observed_runs.0.exit_source": "result-text",
+        "observed_runs.0.counts.failed": 1,
+        "observed_runs.0.cmd_head": "node --test tests/"
+      }
+    }
+  },
+  {
+    "name": "measured: grep with paths as one string under .adc/ is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "grep",
+      "toolArgs": {
+        "pattern": "TOKEN",
+        "paths": "<REPO>/.adc"
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "denies reading or searching"
+      }
+    }
+  },
+  {
+    "name": "measured: rg with a paths array under .adc/ is denied (gpt-5.4 tool set)",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "rg",
+      "toolArgs": {
+        "pattern": "TOKEN",
+        "paths": [
+          "<REPO>/.adc"
+        ]
+      }
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "measured: grep with paths as one string elsewhere is allowed",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "grep",
+      "toolArgs": {
+        "pattern": "TOKEN",
+        "paths": "<REPO>/src"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "measured: apply_patch toolArgs is the raw patch string with absolute paths",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "apply_patch",
+      "toolArgs": "*** Begin Patch\n*** Add File: <REPO>/tests/c.test.js\n+const test = require('node:test');\n+test.only('c', () => {});\n*** End Patch\n",
+      "toolResult": {
+        "resultType": "success",
+        "textResultForLlm": "Added 1 file(s): <REPO>/tests/c.test.js"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "tests/c\\.test\\.js \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 2"
+      }
+    }
+  },
+  {
+    "name": "measured: an apply_patch update without hunk numbers names no line",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "apply_patch",
+      "toolArgs": "*** Begin Patch\n*** Update File: <REPO>/src/a.js\n@@\n-export const a = 1;\n+export const a = 2; // eslint-disable-line\n*** End Patch\n"
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "src/a\\.js: adds a lint/type suppression \\(\\S+\\) in an added line"
+      }
+    }
+  },
+  {
+    "name": "measured: apply_patch adding a file under .adc/ is denied",
+    "event": "pre-guard",
+    "dialect_arg": "copilot",
+    "level": "guard",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "apply_patch",
+      "toolArgs": "*** Begin Patch\n*** Add File: <REPO>/.adc/evidence/forged.json\n+{}\n*** End Patch\n"
+    },
+    "expect": {
+      "values": {
+        "permissionDecision": "deny"
+      },
+      "match": {
+        "permissionDecisionReason": "written only by the companion"
+      }
+    }
+  },
+  {
+    "name": "measured: agentStop carries only transcriptPath; the claim is read from the transcript tail",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "level": "gate",
+    "setup": {
+      "files": {
+        "transcript/events.jsonl": "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"m-cc-1\"}}\n{\"type\":\"assistant.message\",\"data\":{\"messageId\":\"a1\",\"model\":\"gpt-4.1\",\"content\":\"\",\"toolRequests\":[{\"toolCallId\":\"c1\",\"name\":\"edit\"}]}}\n{\"type\":\"tool.execution_complete\",\"data\":{\"toolCallId\":\"c1\",\"success\":true}}\n{\"type\":\"assistant.message\",\"data\":{\"messageId\":\"a2\",\"model\":\"gpt-4.1\",\"content\":\"All tests pass now.\",\"toolRequests\":[]}}\n{\"type\":\"assistant.turn_end\",\"data\":{\"turnId\":\"7\"}}\n"
+      }
+    },
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "edit",
+      "toolArgs": {
+        "path": "<REPO>/src/a.js",
+        "old_str": "a",
+        "new_str": "b"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "sessionId": "m-cc-1",
+          "timestamp": 1792965442376,
+          "cwd": "<REPO>",
+          "transcriptPath": "<REPO>/transcript/events.jsonl",
+          "stopReason": "end_turn",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "values": {
+            "decision": "block"
+          },
+          "match": {
+            "reason": "The final message states \"All tests pass\""
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "measured: a multi-line catch with a body, a Python marker in JS and a commented-out it.only are not flagged",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "payload": {
+      "sessionId": "m-cc-1",
+      "timestamp": 1792965442376,
+      "cwd": "<REPO>",
+      "toolName": "create",
+      "toolArgs": {
+        "path": "<REPO>/tests/clean.test.js",
+        "file_text": "// it.only was used while debugging\nit('x', () => {\n  try {\n    run();\n  } catch (e) {\n    log(e); // see # noqa in python\n  }\n});\n"
+      }
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "edits.findings": 0
+      }
     }
   }
 ]

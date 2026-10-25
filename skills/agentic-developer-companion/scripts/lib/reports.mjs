@@ -136,10 +136,11 @@ export const isTestPath = (p) => TEST_PATH_RE.test(toPosix(String(p || '')));
 
 /** Location of the failing frame in a failure body: last frame for Python tracebacks, first otherwise. */
 export function failureLocation(body) {
-  const text = String(body || '');
+  // Capped: failure bodies can be large, and the generic pattern scans every position.
+  const text = String(body || '').slice(0, 8000);
   const py = [...text.matchAll(/^([^\s:]+\.py):(\d+):(?: in \S+| \w+)?/gm)];
   if (py.length) return { file: toPosix(py[py.length - 1][1]), line: Number(py[py.length - 1][2]) };
-  const generic = /(?:at\s+(?:[^\n(]*\()?|❯\s+|^#?\s*)((?:file:\/\/)?[^\s()'"`]+?\.(?:[cm]?[jt]sx?|rb|go|rs|cs|java|kt|py)):(\d+)/m.exec(text);
+  const generic = /(?:at\s+(?:[^\n(]*\()?|❯\s+|^#?[ \t]*)((?:file:\/\/)?[^\s()'"`]+?\.(?:[cm]?[jt]sx?|rb|go|rs|cs|java|kt|py)):(\d+)/m.exec(text);
   if (generic) return { file: toPosix(generic[1].replace(/^file:\/\//, '')), line: Number(generic[2]) };
   return null;
 }
@@ -228,12 +229,25 @@ function result(tests, extra = {}) {
 
 const looksLikePath = (s) => /[/\\]/.test(s) || /\.(?:[cm]?[jt]sx?|py|rb|go|rs|cs|java|kt|php)$/i.test(s);
 
-function junitCase(tc, suiteName, opts) {
+/** Test id for a JUnit case; `chain` is the enclosing <testsuite> names (node:test describe blocks). */
+function junitId(name, classname, file, chain, opts) {
+  // node:test writes classname="test" (top level) or the dotted describe chain, and the path in
+  // `file`: without the file, same-named tests in different files would share an id (and collapse
+  // as reruns).
+  const nodeStyle = classname === 'test' || (chain.length > 0 && classname === chain.join('.') && !looksLikePath(classname));
+  if (file && (!classname || nodeStyle)) {
+    if (name === file || normalizeReportPath(name, opts) === file) return file;
+    return `${file}::${[...(nodeStyle ? chain : []), name].join(' > ')}`;
+  }
+  return classname && classname !== name ? `${normalizeReportPath(classname, opts)}::${name}` : name;
+}
+
+function junitCase(tc, suiteName, opts, chain = []) {
   const a = tc.attrs;
   const name = a.name || '';
   const classname = a.classname || a.class || '';
   const file = normalizeReportPath(a.file || a.filepath || (looksLikePath(classname) ? classname : ''), opts);
-  const id = classname && classname !== name ? `${normalizeReportPath(classname, opts)}::${name}` : name;
+  const id = junitId(name, classname, file, chain, opts);
   const failure = kid(tc, 'failure');
   const error = kid(tc, 'error');
   const skipped = kid(tc, 'skipped');
@@ -267,11 +281,11 @@ function junitCase(tc, suiteName, opts) {
 function parseJunit(text, opts) {
   const root = parseXml(text);
   const tests = [];
-  const visit = (node, suiteName) => {
+  const visit = (node, suiteName, chain) => {
     // Test cases directly under this node form one attempt group (rerun semantics within a suite).
     const own = [];
     for (const c of node.children) {
-      if (c.name === 'testcase') own.push(junitCase(c, suiteName, opts));
+      if (c.name === 'testcase') own.push(junitCase(c, suiteName, opts, chain));
     }
     tests.push(...groupCollapse(own, (e) => e.id, opts.duplicates || 'rerun'));
     if (node.name === 'testsuite') {
@@ -284,11 +298,13 @@ function parseJunit(text, opts) {
       }
     }
     for (const c of node.children) {
-      if (c.name === 'testsuite' || c.name === 'testsuites') visit(c, c.attrs.name || suiteName || '');
+      if (c.name === 'testsuite' || c.name === 'testsuites') {
+        visit(c, c.attrs.name || suiteName || '', c.name === 'testsuite' && c.attrs.name ? [...chain, c.attrs.name] : chain);
+      }
     }
   };
   if (root.name === 'testcase') tests.push(junitCase(root, '', opts));
-  else visit(root, root.name === 'testsuite' ? (root.attrs.name || '') : '');
+  else visit(root, root.name === 'testsuite' ? (root.attrs.name || '') : '', root.name === 'testsuite' && root.attrs.name ? [root.attrs.name] : []);
   if (!tests.length) {
     // Some writers emit only aggregate attributes; use them rather than report "nothing ran".
     const suites = root.name === 'testsuite' ? [root] : [...walk(root, 'testsuite')];
@@ -778,6 +794,8 @@ export function parseCoverage(format, text, opts = {}) {
 // Runner summary lines in console output (post-shell hook: observed runs, never evidence)
 
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
+// Line-anchored patterns below use [ \t] rather than \s: with the m flag, `^\s*` spans newlines and
+// makes a long run of blank lines quadratic (tool output can be megabytes).
 
 function words(s, map) {
   const out = {};
@@ -807,26 +825,26 @@ const lastMatch = (text, re) => {
 
 const SUMMARY_DETECTORS = [
   ['pytest', (t) => {
-    const m = lastMatch(t, /^(?:=+ )?((?:\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun|subtests? passed|subtests? failed)(?:, )?)+) in [\d.]+s(?: \([^)]*\))?(?: =+)?\s*$/gm);
+    const m = lastMatch(t, /^(?:=+ )?((?:\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun|subtests? passed|subtests? failed)(?:, )?)+) in [\d.]+s(?: \([^)]*\))?(?: =+)?[ \t]*$/gm);
     if (!m) return /^=+ no tests ran in [\d.]+s =+$/m.test(t) ? { passed: 0, failed: 0, skipped: 0 } : null;
     const w = words(m[1], { failed: 'failed', passed: 'passed', skipped: 'skipped', xfailed: 'skipped', xpassed: 'passed', error: 'errors', errors: 'errors', rerun: 'reruns' });
     return { passed: w.passed || 0, failed: w.failed || 0, skipped: w.skipped || 0, errors: w.errors || 0, ...(w.reruns ? { reruns: w.reruns } : {}) };
   }],
   ['jest', (t) => {
     if (!/^Test Suites:/m.test(t)) return null;
-    const m = lastMatch(t, /^Tests:\s+(.+)$/gm);
+    const m = lastMatch(t, /^Tests:[ \t]+(.+)$/gm);
     if (!m) return null;
     const w = words(m[1], { failed: 'failed', passed: 'passed', skipped: 'skipped', todo: 'skipped', pending: 'skipped', total: 'total' });
     return { passed: w.passed || 0, failed: w.failed || 0, skipped: w.skipped || 0, total: w.total };
   }],
   ['vitest', (t) => {
-    const m = lastMatch(t, /^\s*Tests\s+((?:\d+ (?:failed|passed|skipped|todo|expected fail)\s*\|?\s*)+)\(\d+\)\s*$/gm);
+    const m = lastMatch(t, /^[ \t]*Tests[ \t]+((?:\d+ (?:failed|passed|skipped|todo|expected fail)[ \t]*(?:\|[ \t]*)?)+)\(\d+\)[ \t]*$/gm);
     if (!m) return null;
     const w = words(m[1], { failed: 'failed', passed: 'passed', skipped: 'skipped', todo: 'skipped', 'expected fail': 'passed' });
     return { passed: w.passed || 0, failed: w.failed || 0, skipped: w.skipped || 0 };
   }],
   ['nextest', (t) => {
-    const m = lastMatch(t, /^\s*Summary \[[^\]]*\]\s+(\d+) tests? run: (.+)$/gm);
+    const m = lastMatch(t, /^[ \t]*Summary \[[^\]]*\][ \t]+(\d+) tests? run: (.+)$/gm);
     if (!m) return null;
     const w = words(m[2], { passed: 'passed', failed: 'failed', skipped: 'skipped', flaky: 'flaky', 'timed out': 'failed' });
     return { passed: w.passed || 0, failed: w.failed || 0, skipped: w.skipped || 0, flaky: w.flaky || 0, total: Number(m[1]) };
@@ -838,7 +856,7 @@ const SUMMARY_DETECTORS = [
   }],
   ['go', (t) => {
     const results = new Map();
-    for (const m of t.matchAll(/^\s*--- (PASS|FAIL|SKIP): (\S+)/gm)) results.set(m[2], m[1]);
+    for (const m of t.matchAll(/^[ \t]*--- (PASS|FAIL|SKIP): (\S+)/gm)) results.set(m[2], m[1]);
     const okPkgs = (t.match(/^ok\s+\S+\s+(?:[\d.]+s|\(cached\))/gm) || []).length;
     const failPkgs = (t.match(/^FAIL\s+\S+\s+(?:[\d.]+s|\[[^\]]+\])/gm) || []).length;
     if (!results.size && !okPkgs && !failPkgs) return null;
@@ -893,13 +911,13 @@ const SUMMARY_DETECTORS = [
     return { passed: total - f - s, failed: f, skipped: s, total };
   }],
   ['mocha', (t) => {
-    const p = lastMatch(t, /^\s*(\d+) passing \(/gm);
+    const p = lastMatch(t, /^[ \t]*(\d+) passing \(/gm);
     if (!p) return null;
-    const f = lastMatch(t, /^\s*(\d+) failing\s*$/gm); const s = lastMatch(t, /^\s*(\d+) pending\s*$/gm);
+    const f = lastMatch(t, /^[ \t]*(\d+) failing[ \t]*$/gm); const s = lastMatch(t, /^[ \t]*(\d+) pending[ \t]*$/gm);
     return { passed: Number(p[1]), failed: f ? Number(f[1]) : 0, skipped: s ? Number(s[1]) : 0 };
   }],
   ['node-test', (t) => {
-    const get = (k) => { const m = lastMatch(t, new RegExp(`^(?:ℹ|#) ${k} (\\d+)\\s*$`, 'gm')); return m ? Number(m[1]) : null; };
+    const get = (k) => { const m = lastMatch(t, new RegExp(`^(?:ℹ|#) ${k} (\\d+)[ \\t]*$`, 'gm')); return m ? Number(m[1]) : null; };
     const pass = get('pass'); const fail = get('fail');
     if (pass == null || fail == null) return null;
     return { passed: pass, failed: fail + (get('cancelled') || 0), skipped: (get('skipped') || 0) + (get('todo') || 0), total: get('tests') ?? undefined };
@@ -907,12 +925,12 @@ const SUMMARY_DETECTORS = [
   ['bun', (t) => {
     const ran = lastMatch(t, /^Ran (\d+) tests? across \d+ files?/gm);
     if (!ran) return null;
-    const g = (k) => { const m = lastMatch(t, new RegExp(`^\\s*(\\d+) ${k}\\s*$`, 'gm')); return m ? Number(m[1]) : 0; };
+    const g = (k) => { const m = lastMatch(t, new RegExp(`^[ \\t]*(\\d+) ${k}[ \\t]*$`, 'gm')); return m ? Number(m[1]) : 0; };
     return { passed: g('pass'), failed: g('fail'), skipped: g('skip') + g('todo'), total: Number(ran[1]) };
   }],
   ['playwright', (t) => {
-    if (!/^\s+\d+ (?:passed|failed) ?(?:\([\d.]+m?s\))?\s*$/m.test(t)) return null;
-    const g = (k) => { const m = lastMatch(t, new RegExp(`^\\s+(\\d+) ${k}(?: \\([\\d.]+m?s\\))?\\s*$`, 'gm')); return m ? Number(m[1]) : 0; };
+    if (!/^[ \t]+\d+ (?:passed|failed) ?(?:\([\d.]+m?s\))?[ \t]*$/m.test(t)) return null;
+    const g = (k) => { const m = lastMatch(t, new RegExp(`^[ \\t]+(\\d+) ${k}(?: \\([\\d.]+m?s\\))?[ \\t]*$`, 'gm')); return m ? Number(m[1]) : 0; };
     return { passed: g('passed'), failed: g('failed') + g('interrupted'), skipped: g('skipped') + g('did not run'), flaky: g('flaky') };
   }],
   ['phpunit', (t) => {

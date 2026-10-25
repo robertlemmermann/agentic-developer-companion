@@ -1,5 +1,5 @@
 {
-  "description": "diff-scope scenarios (plan §13 Diff checks + Evasion matrix). Each scenario is applied to `base` in a temp git repo, committed on a feature branch and uncommitted/untracked on main. `expect` lists the severities of non-info findings per check; checks not listed must have none. {{AWS_KEY}} is replaced at runtime by a value built from parts.",
+  "description": "diff-scope scenarios (plan §13 Diff checks + Evasion matrix). Each scenario is applied to `base` (merged with the scenario's own `base`, if any) in a temp git repo. `scenarios` and `evasion` run committed on a feature branch and uncommitted/untracked on main; `ecosystems` (per-language catalog coverage) and `benign` (false-positive guards: ordinary changes that must stay quiet) run once each, rotating committed, uncommitted and staged-but-uncommitted. `expect` lists the severities of non-info findings per check; checks not listed must have none. `deps_expect` does the same for deps-check (offline, resolved through `registry`). {{AWS_KEY}}, {{GH}} and {{PK}} are replaced at runtime by values built from parts.",
   "registry": {
     "adc-nonexistent-pkg-zz9": false,
     "lodahs": true,
@@ -845,6 +845,2061 @@
       },
       "clean_run": "not applicable",
       "deep": "not needed"
+    }
+  ],
+  "ecosystems": [
+    {
+      "name": "vitest exclude added",
+      "base": {
+        "vitest.config.ts": "import { defineConfig } from 'vitest/config';\n\nexport default defineConfig({\n  test: {\n    include: ['tests/**/*.test.ts'],\n  },\n});\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "vitest.config.ts",
+          "find": "include: ['tests/**/*.test.ts'],",
+          "replace": "include: ['tests/**/*.test.ts'],\n    exclude: ['tests/slow/**'],"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "new conftest collect_ignore",
+      "ops": [
+        {
+          "op": "write",
+          "path": "tests/conftest.py",
+          "content": "collect_ignore = [\"test_service.py\"]\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "conftest edited collection hook",
+      "base": {
+        "tests/conftest.py": "import pytest\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/conftest.py",
+          "find": "import pytest\n",
+          "replace": "import pytest\n\n\ndef pytest_collection_modifyitems(config, items):\n    items[:] = [i for i in items if \"total\" not in i.name]\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "mocharc spec narrowed",
+      "base": {
+        ".mocharc.yml": "spec: 'test/**/*.spec.js'\ntimeout: 2000\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".mocharc.yml",
+          "find": "spec: 'test/**/*.spec.js'",
+          "replace": "spec: 'test/unit/only.spec.js'"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "cargo autotests off",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/Cargo.toml",
+          "find": "edition = \"2021\"\n",
+          "replace": "edition = \"2021\"\nautotests = false\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "cargo [[test]] harness off",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/Cargo.toml",
+          "find": "[dependencies]\n",
+          "replace": "[[test]]\nname = \"integration\"\nharness = false\n\n[dependencies]\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "csproj Compile Remove",
+      "base": {
+        "tests/App.Tests/App.Tests.csproj": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n    <IsTestProject>true</IsTestProject>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include=\"xunit\" Version=\"2.9.0\" />\n  </ItemGroup>\n</Project>\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/App.Tests/App.Tests.csproj",
+          "find": "  <ItemGroup>\n",
+          "replace": "  <ItemGroup>\n    <Compile Remove=\"SlowTests.cs\" />\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "Makefile test target narrowed",
+      "base": {
+        "Makefile": "build:\n\tgo build ./...\n\ntest:\n\tpython -m pytest\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "Makefile",
+          "find": "\tpython -m pytest\n",
+          "replace": "\tpython -m pytest tests/test_one.py\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "Makefile test target verbose (not narrowing)",
+      "base": {
+        "Makefile": "build:\n\tgo build ./...\n\ntest:\n\tpython -m pytest\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "Makefile",
+          "find": "\tpython -m pytest\n",
+          "replace": "\tpython -m pytest -v\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "Makefile build target changed (irrelevant)",
+      "base": {
+        "Makefile": "build:\n\tgo build ./...\n\ntest:\n\tpython -m pytest\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "Makefile",
+          "find": "\tgo build ./...\n",
+          "replace": "\tgo build -v ./...\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI test command narrowed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "npm test -- --ci",
+          "replace": "npm test -- --ci tests/math.test.js"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI test command extra flag",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "python -m pytest",
+          "replace": "python -m pytest -q"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "playwright testIgnore",
+      "base": {
+        "playwright.config.ts": "import { defineConfig } from '@playwright/test';\n\nexport default defineConfig({\n  testDir: './e2e',\n  retries: 0,\n});\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "playwright.config.ts",
+          "find": "  testDir: './e2e',\n",
+          "replace": "  testDir: './e2e',\n  testIgnore: '**/checkout.spec.ts',\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "playwright retries raised",
+      "base": {
+        "playwright.config.ts": "import { defineConfig } from '@playwright/test';\n\nexport default defineConfig({\n  testDir: './e2e',\n  retries: 0,\n});\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "playwright.config.ts",
+          "find": "  retries: 0,\n",
+          "replace": "  retries: 2,\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "pyproject pytest addopts -k",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pyproject.toml",
+          "find": "[tool.ruff]\n",
+          "replace": "[tool.pytest.ini_options]\naddopts = \"-ra -k 'not total'\"\n\n[tool.ruff]\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "pom surefire skipTests",
+      "base": {
+        "pom.xml": "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <build>\n    <plugins>\n      <plugin>\n        <groupId>org.apache.maven.plugins</groupId>\n        <artifactId>maven-surefire-plugin</artifactId>\n      </plugin>\n    </plugins>\n  </build>\n</project>\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pom.xml",
+          "find": "        <artifactId>maven-surefire-plugin</artifactId>\n",
+          "replace": "        <artifactId>maven-surefire-plugin</artifactId>\n        <configuration>\n          <skipTests>true</skipTests>\n        </configuration>\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "gradle test exclude",
+      "base": {
+        "build.gradle": "plugins {\n    id 'java'\n}\n\ntest {\n    useJUnitPlatform()\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "build.gradle",
+          "find": "    useJUnitPlatform()\n",
+          "replace": "    useJUnitPlatform()\n    exclude '**/SlowTest*'\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "package.json jest ignore added",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "package.json",
+          "find": "  \"dependencies\": {",
+          "replace": "  \"jest\": {\n    \"testPathIgnorePatterns\": [\"/tests/math\"]\n  },\n  \"dependencies\": {"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "jest coverageThreshold added",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "  testEnvironment: 'node',\n",
+          "replace": "  testEnvironment: 'node',\n  coverageThreshold: { global: { lines: 50 } },\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "@ts-nocheck",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/util.ts",
+          "find": "export function",
+          "replace": "// @ts-nocheck\nexport function"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "tsconfig strict off",
+      "base": {
+        "tsconfig.json": "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"target\": \"es2022\"\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tsconfig.json",
+          "find": "\"strict\": true",
+          "replace": "\"strict\": false"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "golangci disable item",
+      "base": {
+        ".golangci.yml": "linters:\n  enable:\n    - govet\n  disable:\n    - lll\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".golangci.yml",
+          "find": "  disable:\n    - lll\n",
+          "replace": "  disable:\n    - lll\n    - errcheck\n"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "mypy ignore_errors",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pyproject.toml",
+          "find": "[tool.ruff]\n",
+          "replace": "[tool.mypy]\nignore_errors = true\n\n[tool.ruff]\n"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "editorconfig severity none",
+      "base": {
+        ".editorconfig": "root = true\n\n[*.cs]\ndotnet_diagnostic.CA1062.severity = warning\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".editorconfig",
+          "find": "severity = warning",
+          "replace": "severity = none"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "eslint flat rule off",
+      "base": {
+        "eslint.config.js": "export default [\n  {\n    rules: {\n      'no-console': 'error',\n    },\n  },\n];\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "eslint.config.js",
+          "find": "'no-console': 'error'",
+          "replace": "'no-console': 'off'"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "eslint rule downgraded to warn",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".eslintrc.json",
+          "find": "\"no-unused-vars\": \"error\"",
+          "replace": "\"no-unused-vars\": \"warn\""
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "go nolint",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "func Add(a, b int) int {",
+          "replace": "func Add(a, b int) int { //nolint:revive"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "rust allow",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "pub fn double",
+          "replace": "#[allow(dead_code)]\npub fn double"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "python type ignore",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "app/service.py",
+          "find": "def total(items):",
+          "replace": "def total(items):  # type: ignore"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "existing suppression moved",
+      "base": {
+        "src/legacy.js": "function a() {\n  // eslint-disable-next-line no-console\n  console.log('a');\n}\n\nfunction b() {\n  return 1;\n}\n\nmodule.exports = { a, b };\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/legacy.js",
+          "find": "function a() {\n  // eslint-disable-next-line no-console\n  console.log('a');\n}\n\nfunction b() {\n  return 1;\n}\n",
+          "replace": "function b() {\n  return 1;\n}\n\nfunction a() {\n  // eslint-disable-next-line no-console\n  console.log('a');\n}\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI set +e",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: python -m pytest",
+          "replace": "      - run: |\n          set +e\n          python -m pytest"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI if false",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: python -m pytest",
+          "replace": "      - run: python -m pytest\n        if: false"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI skipTests",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: npm ci\n",
+          "replace": "      - run: npm ci\n      - run: mvn -B -DskipTests verify\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI threshold lowered",
+      "base": {
+        ".github/workflows/ci.yml": "name: ci\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm ci\n      - run: npm test -- --ci\n      - run: python -m pytest --cov=app --cov-fail-under=90\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "--cov-fail-under=90",
+          "replace": "--cov-fail-under=50"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI workflow deleted",
+      "ops": [
+        {
+          "op": "delete",
+          "path": ".github/workflows/ci.yml"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "CI paths-ignore",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "  pull_request:\n",
+          "replace": "  pull_request:\n    paths-ignore:\n      - \"src/**\"\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "gitlab allow_failure",
+      "base": {
+        ".gitlab-ci.yml": "test:\n  image: python:3.12\n  script: pytest\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".gitlab-ci.yml",
+          "find": "  script: pytest\n",
+          "replace": "  script: pytest\n  allow_failure: true\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "go blank error",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "package calc\n",
+          "replace": "package calc\n\nimport \"os\"\n\nfunc Clean() {\n\t_ = os.Remove(\"x\")\n}\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "go empty err",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "package calc\n",
+          "replace": "package calc\n\nimport \"os\"\n\nfunc Clean() {\n\tif err := os.Remove(\"x\"); err != nil {\n\t}\n}\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "rust Err(_) => {}",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "pub fn double",
+          "replace": "pub fn parse(s: &str) -> i32 {\n    match s.parse::<i32>() {\n        Ok(v) => v,\n        Err(_) => {}\n    }\n}\n\npub fn double"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "ruby rescue nil",
+      "ops": [
+        {
+          "op": "write",
+          "path": "lib/x.rb",
+          "content": "def load\n  JSON.parse(File.read('x')) rescue nil\nend\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "throw replaced by log",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/math.js",
+          "find": "    throw new Error('division by zero');",
+          "replace": "    console.error('division by zero');\n    return NaN;"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "promise catch noop",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/logger.js",
+          "find": "module.exports",
+          "replace": "function ping(p) {\n  return p.then((r) => r).catch(() => {});\n}\n\nmodule.exports"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "python broad except returns None",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "app/service.py",
+          "find": "    except ValueError as exc:\n        raise RuntimeError(\"invalid payload\") from exc\n",
+          "replace": "    except Exception:\n        return None\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "java empty catch",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/main/java/x/A.java",
+          "content": "package x;\n\nclass A {\n  void f() {\n    try {\n      g();\n    } catch (Exception e) {\n    }\n  }\n}\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "python except re-raise (fine)",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "app/service.py",
+          "find": "    except ValueError as exc:\n        raise RuntimeError(\"invalid payload\") from exc\n",
+          "replace": "    except Exception as exc:\n        log(exc)\n        raise\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "github token in yaml",
+      "ops": [
+        {
+          "op": "write",
+          "path": "config/app.yml",
+          "content": "token: {{GH}}\n"
+        }
+      ],
+      "expect": {
+        "CK-SECRETS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "private key file",
+      "ops": [
+        {
+          "op": "write",
+          "path": "certs/server.txt",
+          "content": "{{PK}}\nMIIB\n"
+        }
+      ],
+      "expect": {
+        "CK-SECRETS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": ".env file added",
+      "ops": [
+        {
+          "op": "write",
+          "path": ".env.production",
+          "content": "DEBUG=1\n"
+        }
+      ],
+      "expect": {
+        "CK-SECRETS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "secret present in base unchanged",
+      "base": {
+        "src/aws2.js": "module.exports = { k: '{{AWS_KEY}}' };\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/aws2.js",
+          "find": "module.exports",
+          "replace": "// note\nmodule.exports"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "jvm @Disabled",
+      "base": {
+        "src/test/java/x/CalcTest.java": "package x;\n\nclass CalcTest {\n  @Test\n  void adds() {\n    assertEquals(3, 1 + 2);\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/test/java/x/CalcTest.java",
+          "find": "  @Test\n",
+          "replace": "  @Test\n  @Disabled(\"later\")\n"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "csharp Fact Skip",
+      "base": {
+        "tests/App.Tests/CalcTests.cs": "public class CalcTests\n{\n    [Fact]\n    public void Adds()\n    {\n        Assert.Equal(3, 1 + 2);\n    }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/App.Tests/CalcTests.cs",
+          "find": "    [Fact]\n",
+          "replace": "    [Fact(Skip = \"later\")]\n"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "ruby xit",
+      "base": {
+        "spec/calc_spec.rb": "RSpec.describe 'calc' do\n  it 'adds' do\n    expect(1 + 2).to eq(3)\n  end\nend\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "spec/calc_spec.rb",
+          "find": "  it 'adds' do",
+          "replace": "  xit 'adds' do"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "php markTestSkipped",
+      "base": {
+        "tests/CalcTest.php": "<?php\nclass CalcTest extends TestCase\n{\n    public function testAdds()\n    {\n        $this->assertSame(3, 1 + 2);\n    }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/CalcTest.php",
+          "find": "    public function testAdds()\n    {\n",
+          "replace": "    public function testAdds()\n    {\n        $this->markTestSkipped(\"later\");\n"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "test.todo",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "});\n",
+          "replace": "  it.todo('rounds');\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "describe.skip",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "describe('math'",
+          "replace": "describe.skip('math'"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "fit focus",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "  it('adds', () => {",
+          "replace": "  fit('adds', () => {"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "skip in non-test file",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/math.js",
+          "find": "module.exports",
+          "replace": "const q = { skip: 1 };\nfunction it() {}\nit.skip = () => q;\nmodule.exports"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "pre-existing skip reindented",
+      "base": {
+        "tests/test_skip.py": "import pytest\n\n\n@pytest.mark.skip(reason=\"x\")\ndef test_a():\n    assert 1\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_skip.py",
+          "find": "@pytest.mark.skip(reason=\"x\")\ndef test_a():\n    assert 1\n",
+          "replace": "class TestA:\n    @pytest.mark.skip(reason=\"x\")\n    def test_a(self):\n        assert 1\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "tautology",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "});\n",
+          "replace": "  it('works', () => {\n    expect(true).toBe(true);\n  });\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "new test file without assertions",
+      "ops": [
+        {
+          "op": "write",
+          "path": "tests/smoke.test.js",
+          "content": "const m = require('../src/math');\n\nit('runs', () => {\n  m.add(1, 2);\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "python assertion removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_service.py",
+          "find": "    assert load('{\"a\": 1}') == {\"a\": 1}\n",
+          "replace": "    load('{\"a\": 1}')\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "go assertion removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc_test.go",
+          "find": "\tif got := Add(2, 3); got != 5 {\n\t\tt.Errorf(\"Add(2, 3) = %d, want 5\", got)\n\t}\n",
+          "replace": "\t_ = Add(2, 3)\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "snapshot deleted",
+      "base": {
+        "tests/__snapshots__/math.test.js.snap": "// Jest Snapshot v1\n\nexports[`x 1`] = `1`;\n"
+      },
+      "ops": [
+        {
+          "op": "delete",
+          "path": "tests/__snapshots__/math.test.js.snap"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "try-wrapped assertion with logging catch (js)",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "    expect(add(1, 2)).toBe(3);\n",
+          "replace": "    try {\n      expect(add(1, 2)).toBe(3);\n    } catch (e) {\n      console.log(e);\n    }\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "try-wrapped assertion broad except (py)",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_service.py",
+          "find": "    assert total([{\"price\": 2}, {\"price\": 3}]) == 5\n",
+          "replace": "    try:\n        assert total([{\"price\": 2}, {\"price\": 3}]) == 5\n    except Exception as e:\n        print(e)\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "go test func removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc_test.go",
+          "find": "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Errorf(\"Add(2, 3) = %d, want 5\", got)\n\t}\n}\n",
+          "replace": ""
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "rust test fn removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "    #[test]\n    fn doubles() {\n        assert_eq!(double(2), 4);\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "go test renamed out of discovery",
+      "ops": [
+        {
+          "op": "rename",
+          "from": "calc/calc_test.go",
+          "to": "calc/calc_checks.go"
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "test case renamed in place",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "it('adds', () => {",
+          "replace": "it('sums', () => {"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "tests dir deleted",
+      "ops": [
+        {
+          "op": "delete",
+          "path": "tests/math.test.js"
+        },
+        {
+          "op": "delete",
+          "path": "tests/test_service.py"
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail",
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "mocha this.retries",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "describe('math', () => {\n",
+          "replace": "describe('math', function () {\n  this.retries(2);\n"
+        }
+      ],
+      "expect": {
+        "CK-RETRY": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "playwright describe.configure retries",
+      "ops": [
+        {
+          "op": "write",
+          "path": "e2e/a.spec.ts",
+          "content": "import { test, expect } from '@playwright/test';\n\ntest.describe.configure({ retries: 2 });\n\ntest('x', async ({ page }) => {\n  await expect(page).toHaveTitle('x');\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-RETRY": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "jest per-test retry option",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "  it('adds', () => {",
+          "replace": "  it('adds', { retry: 3 }, () => {"
+        }
+      ],
+      "expect": {
+        "CK-RETRY": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "jvm RetryingTest",
+      "base": {
+        "src/test/java/x/CalcTest.java": "package x;\n\nclass CalcTest {\n  @Test\n  void adds() {\n    assertEquals(3, 1 + 2);\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/test/java/x/CalcTest.java",
+          "find": "  @Test\n",
+          "replace": "  @RetryingTest(3)\n"
+        }
+      ],
+      "expect": {
+        "CK-RETRY": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "cargo dep added without lock",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/Cargo.toml",
+          "find": "[dependencies]\n",
+          "replace": "[dependencies]\nserde = \"1\"\n"
+        }
+      ],
+      "expect": {
+        "CK-LOCK": [
+          "fail"
+        ]
+      },
+      "deps_expect": {
+        "CK-LOCK": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "go require added without go.sum",
+      "base": {
+        "go.sum": ""
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "go.mod",
+          "find": "go 1.22\n",
+          "replace": "go 1.22\n\nrequire github.com/stretchr/testfy v1.9.0\n"
+        }
+      ],
+      "expect": {
+        "CK-LOCK": [
+          "fail"
+        ]
+      },
+      "deps_expect": {
+        "CK-DEPS": [
+          "finding"
+        ],
+        "CK-LOCK": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "lockfile deleted",
+      "ops": [
+        {
+          "op": "delete",
+          "path": "package-lock.json"
+        }
+      ],
+      "expect": {
+        "CK-LOCK": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "conflict markers in lockfile",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "package-lock.json",
+          "find": "      \"license\": \"WTFPL\"\n",
+          "replace": "<<<<<<< HEAD\n      \"license\": \"WTFPL\"\n=======\n      \"license\": \"MIT\"\n>>>>>>> other\n"
+        }
+      ],
+      "expect": {
+        "CK-LOCK": [
+          "fail",
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "python fake dep requirements",
+      "ops": [
+        {
+          "op": "write",
+          "path": "requirements.txt",
+          "content": "adc-nonexistent-pkg-zz9==1.0\n"
+        }
+      ],
+      "expect": {},
+      "deps_expect": {
+        "CK-DEPS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "pypi look-alike",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pyproject.toml",
+          "find": "dependencies = [\"requests>=2.31\"]",
+          "replace": "dependencies = [\"requests>=2.31\", \"reqeusts>=2\"]"
+        }
+      ],
+      "expect": {},
+      "deps_expect": {
+        "CK-DEPS": [
+          "finding"
+        ]
+      },
+      "registry": {
+        "reqeusts": true
+      }
+    },
+    {
+      "name": "go undeclared import",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "package calc\n",
+          "replace": "package calc\n\nimport _ \"github.com/acme/hidden\"\n"
+        }
+      ],
+      "expect": {},
+      "deps_expect": {
+        "CK-DEPS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "npm alias to look-alike",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "package.json",
+          "find": "\"left-pad\": \"^1.3.0\"",
+          "replace": "\"left-pad\": \"^1.3.0\",\n    \"lodash\": \"npm:lodahs@^4\""
+        }
+      ],
+      "expect": {
+        "CK-LOCK": [
+          "fail"
+        ]
+      },
+      "deps_expect": {
+        "CK-DEPS": [
+          "finding"
+        ],
+        "CK-LOCK": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "code generated header",
+      "ops": [
+        {
+          "op": "write",
+          "path": "api/types.go",
+          "content": "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage api\n"
+        }
+      ],
+      "expect": {
+        "CK-SCOPE": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "formatting only",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/math.js",
+          "find": "function add(a, b) {\n  return a + b;\n}",
+          "replace": "function add(a, b) {\n    return a + b;\n}"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "rust test module removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn doubles() {\n        assert_eq!(double(2), 4);\n    }\n}\n",
+          "replace": ""
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "jest config moved into package.json",
+      "ops": [
+        {
+          "op": "delete",
+          "path": "jest.config.js"
+        },
+        {
+          "op": "edit",
+          "path": "package.json",
+          "find": "  \"dependencies\": {",
+          "replace": "  \"jest\": {\n    \"testEnvironment\": \"node\",\n    \"testMatch\": [\"**/tests/**/*.test.js\"]\n  },\n  \"dependencies\": {"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail",
+          "finding"
+        ]
+      }
+    }
+  ],
+  "benign": [
+    {
+      "name": "refactor with tests updated",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/math.js",
+          "find": "function add(a, b) {\n  return a + b;\n}",
+          "replace": "function add(a, b) {\n  const sum = a + b;\n  return sum;\n}"
+        },
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "expect(add(1, 2)).toBe(3);",
+          "replace": "expect(add(1, 2)).toEqual(3);"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "new test file with assertions",
+      "ops": [
+        {
+          "op": "write",
+          "path": "tests/extra.test.js",
+          "content": "const { add } = require('../src/math');\n\ndescribe('extra', () => {\n  it('adds zero', () => {\n    expect(add(0, 0)).toBe(0);\n  });\n});\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "proper dependency added with lock",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "package.json",
+          "find": "\"left-pad\": \"^1.3.0\"",
+          "replace": "\"left-pad\": \"^1.3.0\",\n    \"lodash\": \"^4.17.21\""
+        },
+        {
+          "op": "edit",
+          "path": "package-lock.json",
+          "find": "        \"left-pad\": \"^1.3.0\"",
+          "replace": "        \"left-pad\": \"^1.3.0\",\n        \"lodash\": \"^4.17.21\""
+        },
+        {
+          "op": "edit",
+          "path": "package-lock.json",
+          "find": "    \"node_modules/left-pad\": {",
+          "replace": "    \"node_modules/lodash\": {\n      \"version\": \"4.17.21\",\n      \"resolved\": \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\"\n    },\n    \"node_modules/left-pad\": {"
+        }
+      ],
+      "expect": {},
+      "deps_expect": {}
+    },
+    {
+      "name": "python module and test added",
+      "ops": [
+        {
+          "op": "write",
+          "path": "app/prices.py",
+          "content": "def discount(p, pct):\n    return round(p * (1 - pct / 100), 2)\n"
+        },
+        {
+          "op": "write",
+          "path": "tests/test_prices.py",
+          "content": "from app.prices import discount\n\n\ndef test_discount():\n    assert discount(100, 10) == 90\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI lint step added",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: npm ci\n",
+          "replace": "      - run: npm ci\n      - run: npm run lint\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI action bumped",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "actions/checkout@v4",
+          "replace": "actions/checkout@v5"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "jest testEnvironment changed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "testEnvironment: 'node'",
+          "replace": "testEnvironment: 'jsdom'"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "jest testTimeout added",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "  testEnvironment: 'node',\n",
+          "replace": "  testEnvironment: 'node',\n  testTimeout: 10000,\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "jest ignore node_modules",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "  testEnvironment: 'node',\n",
+          "replace": "  testEnvironment: 'node',\n  testPathIgnorePatterns: ['/node_modules/'],\n"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "pytest markers registered",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pytest.ini",
+          "find": "addopts = -ra",
+          "replace": "addopts = -ra\nmarkers =\n    slow: slow tests"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "pytest addopts verbose",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pytest.ini",
+          "find": "addopts = -ra",
+          "replace": "addopts = -ra -v"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "assertion value updated",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "expect(divide(6, 3)).toBe(2);",
+          "replace": "expect(divide(6, 2)).toBe(3);"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "assert style converted",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_service.py",
+          "find": "    assert total([{\"price\": 2}, {\"price\": 3}]) == 5\n",
+          "replace": "    result = total([{\"price\": 2}, {\"price\": 3}])\n    assert result == 5\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "test split in two",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "  it('divides', () => {\n    expect(divide(6, 3)).toBe(2);\n    expect(() => divide(1, 0)).toThrow('division by zero');\n  });\n",
+          "replace": "  it('divides', () => {\n    expect(divide(6, 3)).toBe(2);\n  });\n\n  it('rejects zero', () => {\n    expect(() => divide(1, 0)).toThrow('division by zero');\n  });\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "test moved to another dir",
+      "ops": [
+        {
+          "op": "rename",
+          "from": "tests/math.test.js",
+          "to": "test/unit/math.test.js"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "dead code with empty catch removed",
+      "base": {
+        "src/legacy.js": "function old() {\n  try {\n    return JSON.parse('x');\n  } catch (e) {\n  }\n}\n\nmodule.exports = {};\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/legacy.js",
+          "find": "function old() {\n  try {\n    return JSON.parse('x');\n  } catch (e) {\n  }\n}\n\n",
+          "replace": ""
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "go blank identifier without call",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "func Add(a, b int) int {\n\treturn a + b\n}",
+          "replace": "func Add(a, b int) int {\n\tsum := a + b\n\t_ = sum\n\treturn a + b\n}"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "js catch forwards to logger",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/logger.js",
+          "find": "module.exports",
+          "replace": "function ping(p) {\n  return p.catch(console.error);\n}\n\nmodule.exports"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "python narrow except returns default",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "app/service.py",
+          "find": "def total(items):",
+          "replace": "def price(d):\n    try:\n        return d[\"price\"]\n    except KeyError:\n        return 0\n\n\ndef total(items):"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "raise replaced by a logged return",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "app/service.py",
+          "find": "    except ValueError as exc:\n        raise RuntimeError(\"invalid payload\") from exc\n",
+          "replace": "    except Exception:\n        logger.exception(\"invalid payload\")\n        return None\n"
+        }
+      ],
+      "expect": {
+        "CK-SWALLOW": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "java checked exception rethrown",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/main/java/x/B.java",
+          "content": "package x;\n\nclass B {\n  void f() {\n    try {\n      g();\n    } catch (Exception e) {\n      throw new IllegalStateException(e);\n    }\n  }\n}\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "env-based secrets",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/config.js",
+          "content": "module.exports = { password: process.env.DB_PASSWORD, apiKey: process.env.API_KEY };\n"
+        },
+        {
+          "op": "write",
+          "path": "app/settings.py",
+          "content": "import os\nPASSWORD = os.environ[\"DB_PASSWORD\"]\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "uuid and hashes",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/ids.js",
+          "content": "module.exports = { id: '123e4567-e89b-12d3-a456-426614174000', sha: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' };\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "README mentions it.only",
+      "ops": [
+        {
+          "op": "write",
+          "path": "docs/testing.md",
+          "content": "Never commit `it.only(...)` or `@pytest.mark.skip`.\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "string containing it.only in a test",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "});\n",
+          "replace": "  it('reports focused tests', () => {\n    const src = \"it.only('x', () => {})\";\n    expect(src.includes('only')).toBe(true);\n  });\n});\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "test moved between describe blocks",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "  it('adds negatives', () => {\n    expect(add(-1, -2)).toBe(-3);\n  });\n\n",
+          "replace": ""
+        },
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "});\n",
+          "replace": "\ndescribe('negatives', () => {\n  it('adds negatives', () => {\n    expect(add(-1, -2)).toBe(-3);\n  });\n});\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI node matrix change",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "    runs-on: ubuntu-latest\n",
+          "replace": "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: [20, 22]\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "CI test command gets maxWorkers",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "npm test -- --ci",
+          "replace": "npm test -- --ci --maxWorkers=2"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "package version bump",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "package.json",
+          "find": "\"version\": \"1.0.0\"",
+          "replace": "\"version\": \"1.0.1\""
+        }
+      ],
+      "expect": {},
+      "deps_expect": {}
+    },
+    {
+      "name": "eslint new error rule",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".eslintrc.json",
+          "find": "\"no-console\": \"warn\"",
+          "replace": "\"no-console\": \"warn\",\n    \"eqeqeq\": \"error\""
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "tsconfig skipLibCheck",
+      "base": {
+        "tsconfig.json": "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"target\": \"es2022\"\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tsconfig.json",
+          "find": "\"target\": \"es2022\"",
+          "replace": "\"target\": \"es2022\",\n    \"skipLibCheck\": true"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "ruff select extended",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "pyproject.toml",
+          "find": "line-length = 100\n",
+          "replace": "line-length = 100\nselect = [\"E\", \"F\", \"B\"]\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "jest coverage threshold raised",
+      "base": {
+        "jest.config.js": "module.exports = {\n  testEnvironment: 'node',\n  coverageThreshold: { global: { lines: 80 } },\n  testMatch: ['**/tests/**/*.test.js'],\n};\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "lines: 80",
+          "replace": "lines: 90"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "jest coverage threshold lowered (cfg)",
+      "base": {
+        "jest.config.js": "module.exports = {\n  testEnvironment: 'node',\n  coverageThreshold: { global: { lines: 80 } },\n  testMatch: ['**/tests/**/*.test.js'],\n};\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "jest.config.js",
+          "find": "lines: 80",
+          "replace": "lines: 50"
+        }
+      ],
+      "expect": {
+        "CK-TEST-CFG": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "cargo dep added with lock",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/Cargo.toml",
+          "find": "[dependencies]\n",
+          "replace": "[dependencies]\nitoa = \"1\"\n"
+        },
+        {
+          "op": "edit",
+          "path": "rust/Cargo.lock",
+          "find": "[[package]]\nname = \"fixture-rs\"\nversion = \"0.1.0\"\n",
+          "replace": "[[package]]\nname = \"fixture-rs\"\nversion = \"0.1.0\"\ndependencies = [\n \"itoa\",\n]\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b\"\n"
+        }
+      ],
+      "expect": {},
+      "deps_expect": {}
+    },
+    {
+      "name": "feature and its tests removed together",
+      "ops": [
+        {
+          "op": "delete",
+          "path": "src/logger.js"
+        },
+        {
+          "op": "delete",
+          "path": "tests/test_service.py"
+        }
+      ],
+      "expect": {
+        "CK-TEST-DEL": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "ts-expect-error in test",
+      "ops": [
+        {
+          "op": "write",
+          "path": "tests/types.test.ts",
+          "content": "import { parsePort } from '../src/util';\n\nit('rejects numbers', () => {\n  // @ts-expect-error passing a number on purpose\n  expect(parsePort(8080)).toBe(8080);\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "ruby rescue with class (fine)",
+      "ops": [
+        {
+          "op": "write",
+          "path": "lib/y.rb",
+          "content": "def load\n  JSON.parse(File.read('x'))\nrescue Errno::ENOENT\n  {}\nend\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "go if err return err",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc.go",
+          "find": "package calc\n",
+          "replace": "package calc\n\nimport \"os\"\n\nfunc Clean() error {\n\tif err := os.Remove(\"x\"); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "rust test module only change",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "        assert_eq!(double(2), 4);\n",
+          "replace": "        assert_eq!(double(2), 4);\n        assert_eq!(double(3), 6);\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "rust prod code debug_assert removed",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "rust/src/lib.rs",
+          "find": "pub fn double(x: i32) -> i32 {\n    x * 2\n}",
+          "replace": "pub fn double(x: i32) -> i32 {\n    x * 2\n}\n\npub fn half(x: i32) -> i32 {\n    x / 2\n}"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "windows CRLF edit",
+      "base": {
+        "src/crlf.js": "// x\r\nmodule.exports = 1;\r\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "src/crlf.js",
+          "find": "module.exports = 1;\r\n",
+          "replace": "module.exports = 2;\r\n"
+        }
+      ],
+      "expect": {}
     }
   ]
 }

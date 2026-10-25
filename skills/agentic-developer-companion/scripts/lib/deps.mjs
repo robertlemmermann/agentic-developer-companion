@@ -547,6 +547,13 @@ export function lockFor(manifest, treeFiles) {
   }
 }
 
+/** Modules a parsed go.mod requires that need go.sum entries (local `replace` targets need none). */
+export function goSumNeeded(parsed) {
+  if (!parsed || parsed.ecosystem !== 'go') return [];
+  const local = new Set((parsed.replaces || []).filter((r) => r.local).map((r) => r.from));
+  return parsed.deps.filter((d) => !local.has(d.name));
+}
+
 /** Manager that owns a lockfile name. */
 export function lockManager(lock) {
   const b = path.posix.basename(toPosix(lock)).toLowerCase();
@@ -853,16 +860,24 @@ export function lookalikeOf(ecosystem, name, siblings = []) {
 
 const home = () => os.homedir();
 
-function npmRegistries(root, env) {
+function npmRegistries(root, env, { scoped = false } = {}) {
   const regs = [];
   if (env.npm_config_registry) regs.push(env.npm_config_registry);
   for (const rc of [root && path.join(root, '.npmrc'), path.join(home(), '.npmrc')]) {
     const text = rc ? readText(rc) : null;
     const m = text && /^\s*registry\s*=\s*(\S+)/m.exec(text);
     if (m) regs.push(m[1]);
+    if (scoped && text) for (const s of text.matchAll(/^\s*@[\w.-]+:registry\s*=\s*(\S+)/gm)) regs.push(s[1]);
   }
   regs.push('https://registry.npmjs.org/');
   return [...new Set(regs.map((r) => (r.endsWith('/') ? r : `${r}/`)))];
+}
+
+/** Hosts npm is configured to install from (default, project and user .npmrc, scoped registries). */
+export function npmRegistryHosts(root, env = process.env) {
+  const hosts = new Set(['registry.npmjs.org', 'registry.yarnpkg.com']);
+  for (const r of npmRegistries(root, env, { scoped: true })) { try { hosts.add(new URL(r).host); } catch { /* not a URL */ } }
+  return hosts;
 }
 
 function npmCacheDirs(env) {
@@ -1108,11 +1123,14 @@ function liveSecrets(env) {
 /**
  * deps-check. `resolver(ecosystem, name, { spec, root })` may replace registry calls (tests,
  * air-gapped mirrors); it returns { exists, source? } or a boolean, or null for "unknown".
+ * `offline` defaults to defaultOffline(env) (the Codex sandbox, ADC_OFFLINE).
  * Returns { base, tree_digest, offline, manifests, new_deps, lock_status, findings, counts, checks }.
  */
-export async function depsCheck({ target, offline = false, resolver = null, tools = true, env = process.env,
+export async function depsCheck({ target, offline = null, resolver = null, tools = true, env = process.env,
   timeoutMs = TOOL_TIMEOUT_MS, maxLookups = MAX_LOOKUPS } = {}) {
   const started = Date.now();
+  // Callers that do not decide (verify passes its flag through) get the sandbox-aware default.
+  if (offline == null) offline = defaultOffline(env);
   const root = target.root;
   const from = target.base.sha || emptyTree(root);
   const to = target.snapshot.commit;
@@ -1250,15 +1268,22 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
     }
   }
 
-  // 3. Existence (lockfile => cache => resolver/registry) and look-alikes.
+  // 3. Existence (lockfile => cache => resolver/registry) and look-alikes. A lock entry that
+  // already existed at the base is proof enough; one added by this change may be hand-written
+  // (a fabricated package plus a fabricated lock entry), so it only counts after the cache or
+  // the registry confirms the name.
   let lookups = 0;
   const lockCache = new Map();
   const lockFor2 = (manifest) => {
     const lock = lockFor(manifest, headFiles);
     if (!lock) return null;
-    if (!lockCache.has(lock)) lockCache.set(lock, lockIndex(lock, read(to, lock)));
-    return { lock, idx: lockCache.get(lock) };
+    if (!lockCache.has(lock)) {
+      lockCache.set(lock, { head: lockIndex(lock, read(to, lock)), base: baseFiles.has(lock) ? lockIndex(lock, read(from, lock)) : null });
+    }
+    const c = lockCache.get(lock);
+    return { lock, idx: c.head, baseIdx: c.base };
   };
+  const registryHosts = npmRegistryHosts(root, env);
   for (const d of newDeps) {
     d.lookalike_of = lookalikeOf(d.ecosystem, d.name, d.siblings || []);
     delete d.siblings;
@@ -1266,13 +1291,15 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
     if (['local', 'git', 'url'].includes(d.kind)) { d.source = d.kind; continue; }
     const lk = lockFor2(d.manifest);
     const importer = lk ? (path.posix.relative(path.posix.dirname(lk.lock) === '.' ? '' : path.posix.dirname(lk.lock), path.posix.dirname(d.manifest)) || '.') : '.';
-    if (lk && lk.idx.ok && lockHas(lk.idx, d.ecosystem, { name: d.name, spec: d.spec && d.ecosystem === 'go' ? d.spec : '*' }, { importer })) {
+    const probe = { name: d.name, spec: d.spec && d.ecosystem === 'go' ? d.spec : '*' };
+    if (lk && lk.idx.ok && lockHas(lk.idx, d.ecosystem, probe, { importer })) {
       const entry = lk.idx.names.get(normName(d.ecosystem, d.name))?.[0] || {};
       if (entry.link || entry.local) { d.source = 'workspace'; continue; }
-      d.exists = true;
-      d.source = `lockfile:${lk.lock}`;
-      if (entry.resolved && /^https?:/.test(entry.resolved)) d.resolved_host = new URL(entry.resolved).host;
-      continue;
+      if (entry.resolved && /^https?:/.test(entry.resolved)) { try { d.resolved_host = new URL(entry.resolved).host; } catch { /* not a URL */ } }
+      const baseHas = Boolean(lk.baseIdx && lk.baseIdx.ok && lk.baseIdx.names.has(normName(d.ecosystem, d.name)));
+      if (baseHas) { d.exists = true; d.source = `lockfile:${lk.lock}`; continue; }
+      d.lock_entry = 'new';
+      if (d.ecosystem === 'npm' && d.resolved_host && !registryHosts.has(d.resolved_host)) d.unexpected_host = true;
     }
     const cached = cacheLookup(d.ecosystem, d.name, { root, env });
     if (cached) { d.exists = true; d.source = cached.source; continue; }
@@ -1283,7 +1310,7 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
       d.source = norm.source || 'resolver';
       continue;
     }
-    if (offline) { d.source = 'offline'; continue; }
+    if (offline) { d.source = d.lock_entry ? `offline (new entry in ${lk.lock})` : 'offline'; continue; }
     if (lookups >= maxLookups) { d.source = 'lookup-cap'; continue; }
     lookups++;
     const r = registryLookup(d.ecosystem, d.name, { root, env });
@@ -1295,7 +1322,8 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
   for (const d of newDeps) {
     const where = d.imported_at || d.manifest;
     const [file, line] = d.imported_at ? [d.imported_at.replace(/:\d+$/, ''), Number(d.imported_at.split(':').pop())] : [d.manifest, null];
-    if (d.exists === false) finding('CK-DEPS', 'fail', file, line, `${d.ecosystem} package "${d.name}" does not exist (${d.source})${d.lookalike_of ? `; it looks like "${d.lookalike_of}"` : ''}`, `${d.name}${d.spec ? ` ${d.spec}` : ''}`, 'deps.nonexistent');
+    if (d.exists === false) finding('CK-DEPS', 'fail', file, line, `${d.ecosystem} package "${d.name}" does not exist (${d.source})${d.lock_entry ? ' although the change added it to the lockfile' : ''}${d.lookalike_of ? `; it looks like "${d.lookalike_of}"` : ''}`, `${d.name}${d.spec ? ` ${d.spec}` : ''}`, 'deps.nonexistent');
+    if (d.unexpected_host) finding('CK-DEPS', 'finding', file, line, `new lockfile entry for "${d.name}" resolves from ${d.resolved_host}, which is not a configured npm registry`, `${d.name} -> ${d.resolved_host}`, 'deps.unexpected-host');
     else if (d.lookalike_of) finding('CK-DEPS', 'finding', file, line, `new ${d.ecosystem} dependency "${d.name}" looks like "${d.lookalike_of}"; confirm it is the intended package`, d.name, 'deps.lookalike');
     if (!d.declared && d.exists !== false) finding('CK-DEPS', 'finding', file, line, `imports ${d.ecosystem} package "${d.name}" that ${d.ecosystem === 'go' ? 'go.mod does not require' : `${d.manifest} does not declare`}`, where, 'deps.undeclared-import');
     if (d.declared && ['local', 'git', 'url'].includes(d.kind)) finding('CK-DEPS', 'finding', file, line, `new dependency "${d.name}" comes from a ${d.kind} source (${d.spec}), not the registry`, `${d.name} ${d.spec}`, 'deps.non-registry');
@@ -1312,7 +1340,13 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
       else {
         const parsed = parseManifest(c.path, read(to, c.path));
         const registryDeps = (parsed?.deps || []).filter((d) => d.kind === 'registry' || d.kind === 'alias');
-        if (parsed?.ecosystem === 'npm' && registryDeps.length) {
+        const needs = goSumNeeded(parsed);
+        if (needs.length) {
+          // Go refuses to build without checksums: a go.mod with requirements needs its go.sum.
+          const dir = path.posix.dirname(c.path);
+          const lock = dir === '.' ? 'go.sum' : `${dir}/go.sum`;
+          projects.set(lock, { lock, manifests: new Set([c.path]), absent: needs.map((d) => `${d.name}@${d.spec}`) });
+        } else if (parsed?.ecosystem === 'npm' && registryDeps.length) {
           finding('CK-LOCK', 'info', c.path, null, `${c.path} declares ${registryDeps.length} registry dependencies but the project has no lockfile; installs are not reproducible`, '', 'lock.missing');
         }
       }
@@ -1325,12 +1359,16 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
   let baseWorktree = null;
   const wtRoot = path.join(tmpRoot(root), `deps-${String(target.snapshot.tree).slice(0, 12)}`);
   try {
-    for (const { lock, manifests: ms } of projects.values()) {
+    for (const { lock, manifests: ms, absent } of projects.values()) {
       const manager = lockManager(lock);
       const dir = path.posix.dirname(lock);
-      const idx = lockCache.get(lock) || lockIndex(lock, read(to, lock));
+      const idx = lockCache.get(lock)?.head || lockIndex(lock, read(to, lock));
       const report = { path: toPosix(lock), manager, project: dir, changed: changed.has(lock), static: { status: 'unknown', missing: [], mismatched: [] }, tool: null, status: 'unknown' };
-      if (/\.lockb$/.test(lock)) {
+      if (absent) {
+        report.static.status = 'inconsistent';
+        report.static.missing = absent;
+        report.absent = true;
+      } else if (/\.lockb$/.test(lock)) {
         report.static.status = 'unsupported';
       } else if (!idx.ok) {
         report.static.status = read(to, lock) == null ? 'unknown' : 'unparsable';
@@ -1386,8 +1424,9 @@ export async function depsCheck({ target, offline = false, resolver = null, tool
         const preexisting = report.tool?.base_status === 'inconsistent' && report.static.status !== 'inconsistent';
         const detail = [...report.static.missing.map((m) => `missing ${m}`), ...report.static.mismatched, report.tool?.status === 'inconsistent' ? report.tool.detail : ''].filter(Boolean).join('; ');
         finding('CK-LOCK', preexisting ? 'finding' : 'fail', lock, null,
-          preexisting ? `${lock} was already inconsistent at the base (${manager}); not caused by this change` : `${lock} is not consistent with its manifest (${manager})`,
-          detail, preexisting ? 'lock.preexisting' : 'lock.inconsistent');
+          report.absent ? `${lock} is missing although ${[...ms][0]} requires ${report.static.missing.length} module(s)`
+            : preexisting ? `${lock} was already inconsistent at the base (${manager}); not caused by this change` : `${lock} is not consistent with its manifest (${manager})`,
+          detail, report.absent ? 'lock.missing' : preexisting ? 'lock.preexisting' : 'lock.inconsistent');
       }
       lockReports.push(report);
     }
