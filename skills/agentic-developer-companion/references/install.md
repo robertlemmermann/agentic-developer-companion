@@ -171,13 +171,15 @@ which needs no shell and no Git Bash on Windows. Project scope is written to
 `.claude/settings.local.json` (git-excluded) as single shell strings with `--dialect auto`,
 because Copilot also reads that file in a trusted folder and starts exec-form handlers
 without their `args` (measured: the handler fails, and a failing `preToolUse` would deny every
-tool call). Copilot does not read `~/.claude/settings.json`. The guard's Bash handlers use
-`"if": "Bash(git *)"` (it also matches `cd x && git push -f`), `"if": "Bash(*.adc*)"`
-(`cat .adc/.env.live`) and `"if": "Bash(*.env.live*)"` (`cat .env.live` after `cd .adc`; Claude's
-Bash keeps its working directory), so other shell commands never start it; Claude's Windows `PowerShell`
-tool (used when Git Bash is absent) has its own entry; `Read`, `Grep`, `Glob` and the edit tools
-are covered by a further matcher. Add the printed `permissions.deny` rules
-(`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
+tool call). Copilot does not read `~/.claude/settings.json`. At user scope the guard's Bash
+handlers use `"if": "Bash(git *)"` (it also matches `cd x && git push -f`), `"if": "Bash(*.adc*)"`
+(`cat .adc/.env.live`), `"if": "Bash(*.env.live*)"` (`cat .env.live` after `cd .adc`; Claude's
+Bash keeps its working directory) and `"if": "Bash(rm *)"` (test deletions), so other shell
+commands never start it. Copilot ignores `if` (measured), so at project scope these become one
+handler that runs for every Bash call. Claude's Windows `PowerShell` tool (used when Git Bash is
+absent) has its own entry; `Read`, `Grep`, `Glob` and the edit tools are covered by a further
+matcher. Under `claude -p` an `ask` cannot be answered: the call does not run. Add the printed
+`permissions.deny` rules (`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
 
 **Codex.** `command` and `commandWindows` are the same bare `node "<SKILL>/scripts/adc.mjs" hook-run …`
 string, valid under cmd.exe, Windows PowerShell and pwsh. Codex rejects unknown output fields,

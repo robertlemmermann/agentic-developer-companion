@@ -831,25 +831,31 @@ const LINT_SECTION_FILES = {
   'cargo.toml': /^(?:workspace\.)?lints(?:\.\w+)?$/,
 };
 
-function lintConfigChanges(S, f) {
-  const file = f.path;
-  const base = path.posix.basename(file).toLowerCase();
+/** For a lint/type configuration (or a manifest with lint sections): `inScope(lines, x)` for its lint lines, else null. */
+function lintScopeOf(f) {
+  const base = path.posix.basename(f.path).toLowerCase();
   const isDedicated = f.class.lintConfig;
   const sectionRe = LINT_SECTION_FILES[base];
   const isMsbuild = /^directory\.build\.(?:props|targets)$|\.(?:cs|fs|vb)proj$/.test(base);
   const isPkg = base === 'package.json';
-  if (!isDedicated && !sectionRe && !isMsbuild && !isPkg) return 0;
-  const headL = sideLines(S, f, 'head');
-  const baseL = f.status === 'A' ? [] : sideLines(S, f, 'base');
-  let n = 0;
-  const severity = f.status === 'A' ? 'finding' : 'fail';
-  const inScope = (lines, x) => {
+  if (!isDedicated && !sectionRe && !isMsbuild && !isPkg) return null;
+  return (lines, x) => {
     if (isDedicated || isMsbuild) return true;
     const { keys, section } = keyPath(lines, x.line - 1);
     if (sectionRe) return sectionRe.test((section || '').toLowerCase());
     if (isPkg) return keys.some((k) => k === 'eslintConfig' || k === 'rules' || k === 'stylelint');
     return false;
   };
+}
+
+function lintConfigChanges(S, f) {
+  const file = f.path;
+  const inScope = lintScopeOf(f);
+  if (!inScope) return 0;
+  const headL = sideLines(S, f, 'head');
+  const baseL = f.status === 'A' ? [] : sideLines(S, f, 'base');
+  let n = 0;
+  const severity = f.status === 'A' ? 'finding' : 'fail';
   const addedHits = M.scanText(headL, M.LINT_CONFIG_WEAKENING, { lines: lineSet(f.added) }).filter((h) => inScope(headL, h));
   const removedHits = M.scanText(baseL, M.LINT_CONFIG_WEAKENING, { lines: lineSet(f.removed) }).filter((h) => inScope(baseL, h));
   const fresh = multisetSubtract(addedHits, removedHits, (h) => `${h.id}|${norm(h.text)}`);
@@ -889,6 +895,88 @@ function lintConfigChanges(S, f) {
   return n;
 }
 
+const IGNORE_FILE = /^\.(?:eslint|stylelint|markdownlint|semgrep|gitleaks)ignore$/;
+const listItems = (t) => [...String(t).matchAll(/["']([^"'\s,]+)["']/g)].map((m) => m[1]);
+const bareItem = (t) => norm(t).replace(/^-\s*/, '').replace(/,$/, '').replace(/^["']|["']$/g, '');
+const ownKey = (t) => /^\s*(?:-\s+)?["']?([\w$@./-]+)["']?\s*[:=]/.exec(t)?.[1] ?? /^\s*<([\w.:-]+)>/.exec(t)?.[1] ?? null;
+
+/**
+ * Lint configuration that loses checks without an "off" value: entries added to ignore files and
+ * scanner allowlists, strictness settings removed, rules or linters removed from enable lists, and
+ * deleted lint configurations. A setting moved to another lint file in the same change is not lost.
+ */
+function lintConfigRemovals(S) {
+  let n = 0;
+  const addedAnywhere = new Set();
+  for (const f of S.files) if (f.status !== 'D' && lintScopeOf(f)) for (const x of f.added) addedAnywhere.add(norm(x.text).replace(/,$/, ''));
+  for (const f of S.files) {
+    const inScope = lintScopeOf(f);
+    if (!inScope || f.binary) continue;
+    const file = f.status === 'D' ? f.old_path : f.path;
+    const base = path.posix.basename(file).toLowerCase();
+    if (IGNORE_FILE.test(base)) {
+      if (f.status === 'D') continue;
+      const before = new Set(f.removed.map((x) => norm(x.text)));
+      for (const x of f.added) {
+        const t = x.text.trim();
+        if (!t || t.startsWith('#') || t.startsWith('!') || before.has(norm(t)) || benignExclusion(`x=${t}`)) continue;
+        S.add('CK-SUPPRESS', 'finding', file, x.line, base === '.gitleaksignore' ? `secret-scanner ignore entry added to ${file}` : `"${t}" added to ${file}; the tool no longer checks it`,
+          t, { rule: 'lintcfg.ignore-file' });
+        n++;
+      }
+      continue;
+    }
+    if (base === '.gitleaks.toml' && f.status !== 'D') {
+      const headL = sideLines(S, f, 'head');
+      for (const x of f.added) {
+        if (!x.text.trim() || /^\s*#/.test(x.text) || !/allowlist/i.test(keyPath(headL, x.line - 1).section || '')) continue;
+        S.add('CK-SUPPRESS', 'finding', file, x.line, `secret-scanner allowlist extended in ${file}`, x.text, { rule: 'lintcfg.secret-allowlist' });
+        n++;
+      }
+    }
+    if (f.status === 'A') continue;
+    const baseL = sideLines(S, f, 'base');
+    const removed = f.status === 'D' ? baseL.map((text, i) => ({ line: i + 1, text })) : f.removed;
+    if (!removed.length) continue;
+    const addedKeys = new Set(f.added.map((x) => ownKey(x.text)).filter(Boolean));
+    const addsExtends = addedKeys.has('extends');
+    for (const h of M.scanText(baseL, M.STRICTNESS_ON, { lines: lineSet(removed) }).filter((h) => inScope(baseL, h))) {
+      // A new value for the same key is judged by the added-line rules (`"strict": false` fails there).
+      if (addedAnywhere.has(norm(h.text).replace(/,$/, '')) || addedKeys.has(ownKey(h.text))) continue;
+      S.add('CK-SUPPRESS', addsExtends ? 'finding' : 'fail', file, h.line,
+        `strictness setting removed from ${file}; the check falls back to its laxer default${addsExtends ? ' (a new "extends" may restore it)' : ''}`,
+        h.text, { rule: 'lintcfg.strictness-removed', scope: 'config', side: 'base' });
+      n++;
+    }
+    for (const x of removed) {
+      if (!inScope(baseL, x)) continue;
+      const own = ownKey(x.text);
+      if (own && M.LINT_ENABLE_KEYS.test(own)) {
+        const valueOf = (t) => t.slice(t.indexOf(own) + own.length);
+        const before = listItems(valueOf(x.text));
+        if (!before.length) continue;
+        const after = new Set(f.added.filter((a) => ownKey(a.text) === own).flatMap((a) => listItems(valueOf(a.text))));
+        const gone = before.filter((i) => !after.has(i) && !addedAnywhere.has(i));
+        if (!gone.length) continue;
+        S.add('CK-SUPPRESS', 'finding', file, x.line, `${gone.length} item${gone.length === 1 ? '' : 's'} removed from "${own}" in ${file}: ${gone.slice(0, 6).join(', ')}`, x.text, { rule: 'lintcfg.enable-removed', side: 'base' });
+        n++;
+      } else if (!own && /^\s*(?:-\s+)?["']?[\w@./*:-]+["']?\s*,?\s*$/.test(x.text)) {
+        const parent = keyPath(baseL, x.line - 1).keys[0];
+        if (!parent || !M.LINT_ENABLE_KEYS.test(parent)) continue;
+        const item = bareItem(x.text);
+        if (f.added.some((a) => bareItem(a.text) === item)) continue;
+        S.add('CK-SUPPRESS', 'finding', file, x.line, `"${item}" removed from ${parent} in ${file}`, x.text, { rule: 'lintcfg.enable-removed', side: 'base' });
+        n++;
+      }
+    }
+    if (f.status === 'D' && f.class.lintConfig) {
+      S.add('CK-SUPPRESS', 'finding', file, null, `lint/type configuration deleted: ${file}`, '', { rule: 'lintcfg.deleted', side: 'base' });
+      n++;
+    }
+  }
+  return n;
+}
+
 function checkSuppressions(S) {
   let added = 0;
   let removed = 0;
@@ -907,6 +995,7 @@ function checkSuppressions(S) {
       S.add('CK-SUPPRESS', 'finding', f.path, h.line, `${h.scope === 'file' ? 'file-wide ' : ''}suppression directive added`, h.text, { rule: h.id, ...(h.scope ? { scope: h.scope } : {}) });
     }
   }
+  configChanges += lintConfigRemovals(S);
   S.counts.suppressions = { added_lines: added, removed_lines: removed, net: added - removed, config_changes: configChanges, scope: 'added/removed lines (unchanged lines are equal on both sides)' };
   S.summaries['CK-SUPPRESS'] = `suppressions on changed lines: +${added} / -${removed} (net ${added - removed}); ${configChanges} lint-config weakening(s)`;
 }
