@@ -150,3 +150,23 @@ test('adc.mjs: unknown command exits 2; hook-run with garbage prints {} and exit
     assert.ok(/^\{.*\}\n$/s.test(r.stdout), `one JSON object for ${JSON.stringify(input)}: ${r.stdout}`);
   }
 });
+
+test('snapshot works once .adc/ is ignored through info/exclude', () => {
+  const { dir } = makeRepo({ 'a.txt': 'x\n' });
+  state.prepareStateDir({ cwd: dir });
+  fs.writeFileSync(path.join(dir, '.adc', 'evidence.json'), '{}');
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'new\n');
+  const snap = git.createSnapshot(dir, { exclude: ['.adc'] });
+  assert.deepEqual(git.lsTree(dir, snap.tree).sort(), ['a.txt', 'b.txt']);
+});
+
+test('snapshot sees a same-size edit made right after the index was written (racy git)', () => {
+  for (let i = 0; i < 20; i++) {
+    const { dir, g } = makeRepo({ 'f.txt': 'aaaa\n' });
+    fs.writeFileSync(path.join(dir, 'f.txt'), 'bbbb\n');
+    g('add', 'f.txt');
+    fs.writeFileSync(path.join(dir, 'f.txt'), 'cccc\n');
+    const snap = git.createSnapshot(dir);
+    assert.equal(git.showFile(dir, snap.commit, 'f.txt'), 'cccc\n', `iteration ${i}`);
+  }
+});

@@ -135,9 +135,19 @@ export function createSnapshot(root, { exclude = ['.adc'] } = {}) {
   const env = { GIT_INDEX_FILE: tmpIndex };
   try {
     const realIndex = gitPath(root, 'index');
-    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tmpIndex);
-    else if (head) git(root, ['read-tree', 'HEAD'], { env });
-    const pathspec = ['.', ...exclude.filter(Boolean).map((p) => `:(top,exclude)${toPosix(p).replace(/\/+$/, '')}`)];
+    if (fs.existsSync(realIndex)) {
+      fs.copyFileSync(realIndex, tmpIndex);
+      // Racy-git guard: the copy gets a fresh mtime, which would make git trust stale stat
+      // data for files edited in the same tick as the last real index write. Backdating the
+      // copy makes git re-hash every recently modified file.
+      const t = new Date(fs.statSync(realIndex).mtimeMs - 2000);
+      fs.utimesSync(tmpIndex, t, t);
+    } else if (head) git(root, ['read-tree', 'HEAD'], { env });
+    // Naming an already-ignored path in a pathspec makes `git add` exit 1, so only paths git
+    // would otherwise pick up are excluded explicitly; the rm below covers the rest.
+    const excluded = exclude.filter(Boolean).map((p) => toPosix(p).replace(/\/+$/, ''))
+      .filter((p) => !checkIgnore(root, p) && !checkIgnore(root, `${p}/`));
+    const pathspec = ['.', ...excluded.map((p) => `:(top,exclude)${p}`)];
     git(root, ['add', '-A', '--', ...pathspec], { env, timeoutMs: 600_000 });
     // Make sure nothing under an excluded path survives from the seeded index.
     for (const p of exclude.filter(Boolean)) {
