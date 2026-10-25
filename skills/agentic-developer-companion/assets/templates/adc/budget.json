@@ -1,0 +1,9 @@
+{
+  "schema": "adc-budget/1",
+  "unit": "credits",
+  "max_per_session": 2500,
+  "max_per_day": 2500,
+  "warn_at": 2000,
+  "days": {},
+  "sessions": {}
+}
