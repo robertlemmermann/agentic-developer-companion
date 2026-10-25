@@ -8,8 +8,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import {
-  SKILL_DIR, ensureDir, matchAny, nowIso, readJson, readText, relPosix, run, sha256, tmpRoot, toPosix, truncate,
-  writeJsonAtomic,
+  SKILL_DIR, ensureDir, globToRegExp, matchAny, nowIso, readJson, readText, redactLiterals, relPosix, run, sha256, tmpRoot, toPosix,
+  truncate, writeJsonAtomic,
 } from './core.mjs';
 import { STATE_DIR_NAME, hookLog, readSession, setOwnerOnly, statePaths, updateSession } from './state.mjs';
 import {
@@ -271,15 +271,19 @@ function fallbackClassify(file) {
   };
 }
 
+// Source files whose comments and code the marker catalogs are written for (markers.isCodeFile fallback).
+const FALLBACK_CODE_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|py|pyi|go|rs|java|kt|kts|scala|groovy|cs|fs|vb|rb|rake|php|swift|dart|c|cc|cpp|cxx|h|hpp|m|mm|sh|bash|zsh|ps1|psm1|lua|ex|exs)$/i;
+
 let markersCache;
 async function loadMarkers() {
   if (markersCache !== undefined) return markersCache;
-  const m = { classifyPath: fallbackClassify, scanSecrets: null, scanText: null, source: 'fallback', ...FALLBACK };
+  const m = { classifyPath: fallbackClassify, scanSecrets: null, scanText: null, isCodeFile: (f) => FALLBACK_CODE_FILE.test(f), source: 'fallback', ...FALLBACK };
   try {
     const mod = await import('./markers.mjs');
     if (typeof mod.classifyPath === 'function') m.classifyPath = mod.classifyPath;
     if (typeof mod.scanSecrets === 'function') m.scanSecrets = mod.scanSecrets;
     if (typeof mod.scanText === 'function') m.scanText = mod.scanText;
+    if (typeof mod.isCodeFile === 'function') m.isCodeFile = mod.isCodeFile;
     for (const k of Object.keys(FALLBACK)) if (Array.isArray(mod[k]) && mod[k].length) m[k] = mod[k];
     m.source = 'markers.mjs';
   } catch {}
@@ -432,6 +436,9 @@ function classify(markers, rel, detectCache) {
   return out;
 }
 
+// A manifest or runner-config line that is about running tests (scripts.test, addopts, test tasks).
+const TEST_COMMAND_LINE = /(?:^|[^\w-])(?:tests?|spec|jest|vitest|mocha|ava|karma|playwright|cypress|pytest|addopts|tox|nox|rspec|phpunit|nextest|ctest|check)(?:[^\w-]|$)/i;
+
 const CLASS_LABEL = { test: 'test file', runnerConfig: 'runner config', ci: 'CI', lockfile: 'lockfile', lintConfig: 'lint/type config', manifest: 'manifest', generated: 'generated' };
 const classNames = (c) => Object.keys(CLASS_LABEL).filter((k) => c[k]);
 
@@ -473,9 +480,10 @@ function underState(rel, abs, st) {
   return false;
 }
 
+// Case-insensitive: `.ADC/.env.live` is the same file on Windows and macOS volumes.
 const mentionsState = (token, st) => {
   const t = toPosix(token);
-  return [STATE_DIR_NAME, st.rel].filter(Boolean).some((n) => new RegExp(`(^|[/=:'"])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(/|$)`).test(t));
+  return [STATE_DIR_NAME, st.rel].filter(Boolean).some((n) => new RegExp(`(^|[/=:'"])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(/|$)`, 'i').test(t));
 };
 
 // ---------------------------------------------------------------------------
@@ -543,10 +551,54 @@ function simpleCommands(cmd, depth = 0) {
 function gitParts(toks) {
   if (exeName(toks[0]) !== 'git') return null;
   let i = 1;
+  const dirs = [];
   while (i < toks.length && toks[i].startsWith('-')) {
+    if (toks[i] === '-C' && toks[i + 1] != null) dirs.push(toks[i + 1]);
     i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'].includes(toks[i]) ? 2 : 1;
   }
-  return i < toks.length ? { sub: toks[i], args: toks.slice(i + 1) } : null;
+  return i < toks.length ? { sub: toks[i], args: toks.slice(i + 1), dirs } : null;
+}
+
+/**
+ * Would `git add --force <args>` pick up the state dir? True for `-A`/`--all` without a pathspec,
+ * a glob pathspec, and a pathspec naming the state dir or a directory that contains it.
+ */
+function forceAddCoversState(h, g) {
+  if (!h.st.insideRepo || !fs.existsSync(h.st.dir)) return false;
+  const afterDd = g.args.indexOf('--');
+  const specs = g.args.filter((a, i) => (afterDd >= 0 && i > afterDd) || (!a.startsWith('-') && a !== '--'));
+  const all = g.args.some((a, i) => (afterDd < 0 || i < afterDd) && (a === '--all' || a === '--no-ignore-removal' || /^-[A-Za-z]*A[A-Za-z]*$/.test(a)));
+  if (!specs.length) return all;
+  const base = g.dirs.reduce((d, c) => path.resolve(d, c), h.norm.cwd || h.root);
+  return specs.some((s) => {
+    if (/[*?[]/.test(s)) return true;
+    const top = /^:(?:\/|\(top\))/.exec(s);
+    const target = top ? path.resolve(h.root, s.slice(top[0].length) || '.') : path.resolve(base, s);
+    const r = path.relative(canonical(target), h.st.canonicalDir || h.st.dir);
+    return r === '' || (!r.startsWith('..') && !path.isAbsolute(r));
+  });
+}
+
+// Commands that read or copy a whole directory tree (a state dir argument exposes `.env.live`).
+const TREE_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'tar', 'zip', '7z', '7za', 'cp', 'rsync', 'scp',
+  'select-string', 'sls', 'copy-item', 'cpi', 'copy', 'compress-archive', 'robocopy', 'xcopy', 'strings']);
+const readsTree = (exe, toks) => TREE_READERS.has(exe) || (exe === 'find' && toks.some((t) => /^-(?:exec|execdir|ok|okdir)$/.test(t)));
+
+/** Does a shell token reach `.env.live`: the name itself, or a glob under the state dir that matches it? */
+function tokenReachesEnvLive(token, st) {
+  const t = toPosix(token);
+  if (/\.env\.live\b/i.test(t)) return true;
+  const rest = stateRemainder(t, st);
+  return rest != null && /[*?[]/.test(rest) && globToRegExp(rest.replace(/^\/+/, '') || '*').test('.env.live');
+}
+
+/** The part of a token after the state dir component (`''` for the dir itself), or null when it names none. */
+function stateRemainder(t, st) {
+  for (const n of [STATE_DIR_NAME, st.rel].filter(Boolean)) {
+    const m = new RegExp(`(?:^|[/=:'"])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(/.*)?$`, 'i').exec(t);
+    if (m) return m[1] || '';
+  }
+  return null;
 }
 
 // Command classes for observed runs (post-shell), tested on a normalized simple command.
@@ -741,7 +793,7 @@ async function sessionStart(h) {
   if (typeof summary === 'string' && summary.trim()) lines.push(`Detected stack (cached): ${truncate(summary.trim(), 200)}.`);
   const led = newestLedger(h.st.paths.evidence);
   lines.push(led
-    ? `Newest verification ledger: .adc/evidence/${led.file}, verdict ${led.verdict || 'none yet'}, ${led.ts}.`
+    ? `Newest verification ledger: ${h.st.rel ? `${h.st.rel}/evidence` : toPosix(h.st.paths.evidence)}/${led.file}, verdict ${led.verdict || 'none yet'}, ${led.ts}.`
     : 'No verification ledger exists in this repository yet.');
   if (h.level !== 'advise') lines.push(h.level === 'guard'
     ? 'Hook level guard: completion is gated on a current ledger; force-push, history rewrites and access to .adc/ are denied.'
@@ -777,14 +829,19 @@ async function postEdit(h) {
   let findings = 0;
   let stateEdits = 0;
   let codeEdits = 0;
+  let outside = 0;
   for (const p of paths) {
     const abs = absPath(h, p);
-    const rel = relPosix(h.root, abs) || toPosix(p);
+    const inRepo = relPosix(h.root, abs);
+    const rel = inRepo || toPosix(p);
     if (underState(rel, abs, h.st)) {
       stateEdits++;
       notes.push(`- ${rel}: companion state under ${h.st.rel || STATE_DIR_NAME}/ (evidence, budget, credentials); evidence finalize re-checks ledger entry hashes.`);
       continue;
     }
+    // Files outside the repository (the host's plan and memory files, scratch files in the temp dir)
+    // are not part of the change verify checks: no notes, and they do not arm the stop gate.
+    if (inRepo == null || inRepo === '.') { outside++; continue; }
     codeEdits++;
     const c = classify(markers, rel, detect);
     const names = classNames(c);
@@ -795,13 +852,24 @@ async function postEdit(h) {
     const text = content ? content.text : '';
     const lineMap = content && content.lines ? content.lines : content && content.fragment ? [] : null;
     const hits = [];
-    const scan = (catalog) => scanEdit(markers, text, catalog, rel, lineMap);
-    if (c.test) {
+    // Notebook cells are scanned as Python; the code catalogs never run on prose, data or config
+    // files (a README that quotes `eslint-disable` is not a suppression), the same rule diff-scope uses.
+    const scanName = /\.ipynb$/i.test(rel) ? rel.replace(/\.ipynb$/i, '.py') : rel;
+    let code = false;
+    try { code = Boolean(markers.isCodeFile(scanName)); } catch { code = FALLBACK_CODE_FILE.test(scanName); }
+    const scan = (catalog) => scanEdit(markers, text, catalog, scanName, lineMap);
+    if (c.test && code) {
       for (const x of scan(markers.SKIP_MARKERS)) hits.push(`adds a skip/focus marker (${x.id}) ${at(x)}: ${x.text}`);
       for (const x of scan(markers.IN_SOURCE_RETRIES)) hits.push(`adds an in-source retry (${x.id}) ${at(x)}`);
     }
     if (c.ci) for (const x of scan(markers.CI_WEAKENING)) hits.push(`weakens a CI step (${x.id}) ${at(x)}: ${x.text}`);
-    if (!c.generated) {
+    else if (c.manifest || c.runnerConfig) {
+      // A manifest test script or runner config that turns a failing run green (`"test": "jest --passWithNoTests"`, `|| true`).
+      for (const x of scan(markers.CI_WEAKENING)) {
+        if (/pass-?with-?no-?tests|no-tests/i.test(x.id) || TEST_COMMAND_LINE.test(x.text)) hits.push(`weakens a test command (${x.id}) ${at(x)}: ${x.text}`);
+      }
+    }
+    if (!c.generated && code) {
       for (const x of scan(markers.SUPPRESSIONS)) hits.push(`adds a lint/type suppression (${x.id}) ${at(x)}`);
       for (const x of scan(markers.SWALLOW_PATTERNS)) hits.push(`adds an exception-swallowing pattern (${x.id}) ${at(x)}`);
     }
@@ -837,9 +905,26 @@ async function postEdit(h) {
       e.state_dir_edits = (e.state_dir_edits || 0) + stateEdits;
     });
   }
-  log(h, { tool: norm.tool_name, files: paths.length, classes, findings, keys: norm.keys, bytes: h.bytes, ms: Date.now() - h.t0, markers: markers.source }, true);
+  log(h, { tool: norm.tool_name, files: paths.length, outside, classes, findings, keys: norm.keys, bytes: h.bytes, ms: Date.now() - h.t0, markers: markers.source }, true);
   if (!notes.length) return {};
   return { context: truncate(`agentic-developer-companion notes on this edit (notes, not verdicts; verify records evidence):\n${notes.join('\n')}`, 2000) };
+}
+
+/**
+ * Tool output with the live-test token removed: the `ADC_LIVE_TOKEN=<value>` shape (§10.3.1), its
+ * JSON/YAML form, the `Get-ChildItem Env:` table row, and the literal value when the host passed
+ * ADC_LIVE_TOKEN in the hook's environment (an exported variable is what `echo $ADC_LIVE_TOKEN` prints).
+ */
+export function redactToken(text, env = {}) {
+  let out = String(text)
+    .replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, TOKEN_REDACTED)
+    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:\s*)(["'])[^"'\r\n]*\2/g, '$1$2[REDACTED]$2')
+    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:[ \t]*)(?!["'\s[]|(?:set|unset)\b)[^\s,}]+/g, '$1[REDACTED]')
+    .replace(/^(\s*ADC_LIVE_TOKEN[ \t]{2,})\S.*$/gm, '$1[REDACTED]');
+  // Short values would mangle ordinary words in the output; real tokens are long.
+  const value = env && typeof env.ADC_LIVE_TOKEN === 'string' ? env.ADC_LIVE_TOKEN.trim() : '';
+  if (value.length >= 8) out = redactLiterals(out, [{ name: 'ADC_LIVE_TOKEN', value }]);
+  return out;
 }
 
 async function postShell(h) {
@@ -850,11 +935,13 @@ async function postShell(h) {
   const decision = {};
   const notes = [];
   // Copilot can rewrite the tool result the model sees (§10.3.1); Claude and Codex cannot.
-  const tokenShape = /ADC_LIVE_TOKEN\s*=\s*\S+/g;
-  if (h.dialect === 'copilot' && text && tokenShape.test(text)) {
-    decision.modifiedResult = { text: text.replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, TOKEN_REDACTED), resultType: norm.tool_result_type || 'success' };
-    notes.push('The tool output contained an ADC_LIVE_TOKEN assignment; it was redacted from the result.');
-    log(h, { condition: 'TOKEN_IN_OUTPUT', redacted: true });
+  if (h.dialect === 'copilot' && text) {
+    const redacted = redactToken(text, h.env);
+    if (redacted !== text) {
+      decision.modifiedResult = { text: redacted, resultType: norm.tool_result_type || 'success' };
+      notes.push('The tool output contained the ADC_LIVE_TOKEN credential; it was redacted from the result.');
+      log(h, { condition: 'TOKEN_IN_OUTPUT', redacted: true });
+    }
   }
   if (/\.env\.live\b/.test(cmd)) notes.push('This command referenced .adc/.env.live; that file holds the live-test credential and only `adc.mjs live run` reads it.');
   const markers = await loadMarkers();
@@ -958,8 +1045,8 @@ function guardShell(h, cmd) {
       if (sub === 'reset' && args.includes('--hard')) return { deny: `${GUARD_PREFIX} \`git reset --hard\` discards commits and working-tree changes; the guard level denies it.`, rule: 'reset-hard' };
       if (sub === 'commit' && args.includes('--amend')) return { deny: `${GUARD_PREFIX} \`git commit --amend\` rewrites the last commit; the guard level denies it (make a new commit instead).`, rule: 'amend' };
       if (sub === 'filter-branch' || sub === 'filter-repo') return { deny: `${GUARD_PREFIX} \`git ${sub}\` rewrites history; the guard level denies it.`, rule: 'filter-branch' };
-      if (sub === 'add' && (flags.includes('--force') || shortHas('f')) && args.some((a) => mentionsState(a, h.st))) {
-        return { deny: `${GUARD_PREFIX} \`git add -f\` of ${h.st.rel || STATE_DIR_NAME}/ would commit companion state (credentials, budget, evidence); it stays git-ignored.`, rule: 'force-add-state' };
+      if (sub === 'add' && (flags.includes('--force') || shortHas('f')) && (args.some((a) => mentionsState(a, h.st)) || forceAddCoversState(h, g))) {
+        return { deny: `${GUARD_PREFIX} \`git add -f\` of ${h.st.rel || STATE_DIR_NAME}/ would commit companion state (credentials, budget, evidence); it stays git-ignored. Force-add the intended paths by name instead.`, rule: 'force-add-state' };
       }
       if (sub === 'commit' || sub === 'push') {
         const tracked = trackedState(h.st, h.repo);
@@ -975,8 +1062,10 @@ function guardShell(h, cmd) {
       if (['check-ignore', 'ls-files', 'status'].includes(sub)) continue;
     }
     const exe = exeName(toks[0]);
-    const envLive = toks.slice(1).some((t) => /\.env\.live\b/.test(t) || /(^|[/\\'"=])\.adc[/\\]+(?:\.env|\.?\*)/.test(t));
-    if (envLive && !(g && ['check-ignore', 'ls-files', 'status'].includes(g.sub))) {
+    const envLive = toks.slice(1).some((t) => tokenReachesEnvLive(t, h.st)) ||
+      (readsTree(exe, toks) && toks.slice(1).some((t) => { const r = stateRemainder(toPosix(t), h.st); return r === '' || r === '/'; }));
+    // Untracking (`git rm --cached`, the remedy for a tracked state dir) and ignore checks only touch the index.
+    if (envLive && !(g && (['check-ignore', 'ls-files', 'status'].includes(g.sub) || (g.sub === 'rm' && g.args.includes('--cached'))))) {
       return { deny: `${GUARD_PREFIX} .adc/.env.live holds the live-test credential; only \`adc.mjs live run\` reads it, and host tools are denied access under the guard level.`, rule: 'env-live' };
     }
     if (['rm', 'del', 'erase', 'unlink', 'rmdir', 'rd', 'remove-item', 'ri'].includes(exe)) {
@@ -1031,9 +1120,11 @@ async function preGuard(h) {
   }
   if (!verdict) return {};
   await record(h, (s) => {
+    // Claude starts one handler per matching `if` rule (`cat .adc/.env.live` matches two); count the call once.
+    if (norm.tool_use_id && s.guard.last && s.guard.last.tool_use_id === norm.tool_use_id) return;
     if (verdict.deny) s.guard.denials = (s.guard.denials || 0) + 1;
     else s.guard.asks = (s.guard.asks || 0) + 1;
-    s.guard.last = { ts: nowIso(), rule: verdict.rule, decision: verdict.deny ? 'deny' : 'ask' };
+    s.guard.last = { ts: nowIso(), rule: verdict.rule, decision: verdict.deny ? 'deny' : 'ask', ...(norm.tool_use_id ? { tool_use_id: norm.tool_use_id } : {}) };
   });
   log(h, { decision: verdict.deny ? 'deny' : 'ask', rule: verdict.rule, tool: norm.tool_name });
   return verdict.deny ? { deny: verdict.deny } : { ask: verdict.ask };

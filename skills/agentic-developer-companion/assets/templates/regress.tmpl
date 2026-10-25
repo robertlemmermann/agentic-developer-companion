@@ -1,0 +1,309 @@
+# regress scaffolds (plan §10.1): one failing regression test per bug, named test_<issue>_<behavior>,
+# tagged regression and linked to the issue, plus reproduction notes in the state dir (.adc/repro/).
+# Rendered by scripts/lib/scaffold.mjs. Attributes: lang, when=<feature>, scope=state (path relative
+# to the state dir, never committed). The placeholder failure keeps an unedited skeleton red.
+
+@@@ file: {{file_name}} lang=ts|js @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+// ADAPT: import the code under test, e.g. import { parse } from '../../src/parse';
+
+// Regression test for {{issue_ref}}: {{behavior}}.
+// Issue: {{issue_link}}
+// Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+// It must fail with an assertion before the fix and pass after it. Prove both with
+//   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+describe('@regression {{issue_ref}}', () => {
+  it('{{test_name}}', () => {
+    // Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+    // Act and assert: the behavior the issue expects. Replace this placeholder failure:
+    assert.fail('not reproduced yet: call the code under test and assert that {{behavior}}');
+  });
+});
+
+@@@ file: {{characterize_name}}.characterization.test.ts lang=ts when=characterize @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Characterization (golden master) test: it records what the code does TODAY, before you change
+// it, so a fix or refactor cannot change other behavior unnoticed. The first local run writes the
+// golden file; review it (it captures current behavior, bugs included) and commit it.
+const GOLDEN = path.resolve(process.cwd(), '{{golden_dir}}', '{{characterize_name}}.json');
+
+// ADAPT: a family of inputs around {{issue_ref}} (edge cases, the bug's input, normal cases).
+const INPUTS: unknown[] = [];
+
+// ADAPT: call the code under test and return plain data (no dates, ids or paths that change).
+function subject(input: unknown): unknown {
+  return input;
+}
+
+describe('characterization: {{behavior}}', () => {
+  it('current behavior is unchanged', () => {
+    assert.ok(INPUTS.length > 0, 'add the inputs to characterize (INPUTS)');
+    const actual = JSON.stringify(INPUTS.map((input) => ({ input, output: subject(input) })), null, 2) + '\n';
+    if (process.env.UPDATE_GOLDEN === '1' || (!fs.existsSync(GOLDEN) && !process.env.CI)) {
+      fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
+      fs.writeFileSync(GOLDEN, actual);
+      return;
+    }
+    assert.equal(actual, fs.readFileSync(GOLDEN, 'utf8').replace(/\r\n/g, '\n'), 'behavior changed; review the diff, then UPDATE_GOLDEN=1 accepts it');
+  });
+});
+
+@@@ file: {{characterize_name}}.characterization.test.mjs lang=js when=characterize @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Characterization (golden master) test: it records what the code does TODAY, before you change
+// it, so a fix or refactor cannot change other behavior unnoticed. The first local run writes the
+// golden file; review it (it captures current behavior, bugs included) and commit it.
+const GOLDEN = path.resolve(process.cwd(), '{{golden_dir}}', '{{characterize_name}}.json');
+
+// ADAPT: a family of inputs around {{issue_ref}} (edge cases, the bug's input, normal cases).
+const INPUTS = [];
+
+// ADAPT: call the code under test and return plain data (no dates, ids or paths that change).
+function subject(input) {
+  return input;
+}
+
+describe('characterization: {{behavior}}', () => {
+  it('current behavior is unchanged', () => {
+    assert.ok(INPUTS.length > 0, 'add the inputs to characterize (INPUTS)');
+    const actual = JSON.stringify(INPUTS.map((input) => ({ input, output: subject(input) })), null, 2) + '\n';
+    if (process.env.UPDATE_GOLDEN === '1' || (!fs.existsSync(GOLDEN) && !process.env.CI)) {
+      fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
+      fs.writeFileSync(GOLDEN, actual);
+      return;
+    }
+    assert.equal(actual, fs.readFileSync(GOLDEN, 'utf8').replace(/\r\n/g, '\n'), 'behavior changed; review the diff, then UPDATE_GOLDEN=1 accepts it');
+  });
+});
+
+@@@ file: {{file_name}} lang=python @@@
+"""Regression test for {{issue_ref}}: {{behavior}}.
+
+Issue: {{issue_link}}
+Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+It must fail with an assertion before the fix and pass after it. Prove both with
+    node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+"""
+
+import pytest
+
+# ADAPT: import the code under test, e.g. from mypackage.parser import parse
+
+pytestmark = pytest.mark.regression
+
+
+def {{py_test_name}}():
+    # Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+    # Act and assert: the behavior the issue expects. Replace this placeholder failure:
+    pytest.fail("not reproduced yet: call the code under test and assert that {{behavior}}")
+
+@@@ file: conftest.py lang=python @@@
+"""Registers the regression marker (safe with --strict-markers). Scaffolded by {{generated_by}}."""
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "regression: pins down a fixed bug (test_<issue>_<behavior>, linked to the issue)")
+
+@@@ file: test_{{characterize_name}}_characterization.py lang=python when=characterize @@@
+"""Characterization (golden master) test: it records what the code does TODAY, before you change
+it, so a fix or refactor cannot change other behavior unnoticed. The first local run writes the
+golden file; review it (it captures current behavior, bugs included) and commit it. syrupy
+(`assert value == snapshot`) is the library alternative when the project already uses it."""
+
+import json
+import os
+from pathlib import Path
+
+GOLDEN = Path(__file__).parent / "__golden__" / "{{characterize_name}}.json"
+
+# ADAPT: a family of inputs around {{issue_ref}} (edge cases, the bug's input, normal cases).
+INPUTS = []
+
+
+def subject(value):
+    # ADAPT: call the code under test and return plain data (no dates, ids or paths that change).
+    return value
+
+
+def test_current_behavior_is_unchanged():
+    assert INPUTS, "add the inputs to characterize (INPUTS)"
+    actual = json.dumps([{"input": i, "output": subject(i)} for i in INPUTS], indent=2) + "\n"
+    if os.environ.get("UPDATE_GOLDEN") == "1" or (not GOLDEN.exists() and not os.environ.get("CI")):
+        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN.write_text(actual, encoding="utf-8", newline="\n")
+        return
+    assert actual == GOLDEN.read_text(encoding="utf-8").replace("\r\n", "\n"), "behavior changed; review the diff, then UPDATE_GOLDEN=1 accepts it"
+
+@@@ file: {{file_name}} lang=go @@@
+// Regression test for {{issue_ref}}: {{behavior}}. Tag: regression.
+// Issue: {{issue_link}}
+// Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+// It must fail before the fix and pass after it. Prove both with
+//   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+package {{go_package}}
+
+import "testing"
+
+func {{go_test_name}}(t *testing.T) {
+	// Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+	// Act and assert: the behavior the issue expects. Replace this placeholder failure:
+	t.Fatal("not reproduced yet: call the code under test and assert that {{behavior}}")
+}
+
+@@@ file: {{file_name}} lang=rust @@@
+//! Regression test for {{issue_ref}}: {{behavior}}. Tag: regression.
+//! Issue: {{issue_link}}
+//! Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+//! It must fail before the fix and pass after it. Prove both with
+//!   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+
+// ADAPT: use the crate under test, e.g. use my_crate::parse;
+
+#[test]
+fn {{test_name}}() {
+    // Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+    // Act and assert: the behavior the issue expects. Replace this placeholder failure:
+    panic!("not reproduced yet: call the code under test and assert that {{behavior}}");
+}
+
+@@@ file: {{file_name}} lang=java @@@
+package {{java_package}};
+
+import static org.junit.jupiter.api.Assertions.fail;
+
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Regression test for {{issue_ref}}: {{behavior}}.
+ * Issue: {{issue_link}}
+ * Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+ * It must fail before the fix and pass after it. Prove both with
+ * node &lt;skill&gt;/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+ */
+@Tag("regression")
+class {{class_name}} {
+  @Test
+  void {{test_name}}() {
+    // Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+    // Act and assert: the behavior the issue expects. Replace this placeholder failure:
+    fail("not reproduced yet: call the code under test and assert that {{behavior}}");
+  }
+}
+
+@@@ file: {{file_name}} lang=dotnet @@@
+// Regression test for {{issue_ref}}: {{behavior}}.
+// Issue: {{issue_link}}
+// Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+// It must fail before the fix and pass after it. Prove both with
+//   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+using Xunit;
+
+namespace {{dotnet_ns}};
+
+[Trait("Category", "regression")]
+public class {{class_name}}
+{
+    [Fact]
+    public void {{test_name}}()
+    {
+        // Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+        // Act and assert: the behavior the issue expects. Replace this placeholder failure:
+        Assert.Fail("not reproduced yet: call the code under test and assert that {{behavior}}");
+    }
+}
+
+@@@ file: {{file_name}} lang=ruby @@@
+# Regression test for {{issue_ref}}: {{behavior}}.
+# Issue: {{issue_link}}
+# Level: {{level}} (the lowest level that reproduces the bug; never mock the unit under test).
+# It must fail before the fix and pass after it. Prove both with
+#   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+
+RSpec.describe "regression {{issue_ref}}", :regression do
+  it "{{test_name}}" do
+    # Arrange: the smallest input that reproduces the bug (.adc/repro/{{slug}}/repro.md).
+    # Act and assert: the behavior the issue expects. Replace this placeholder failure:
+    raise RSpec::Expectations::ExpectationNotMetError, "not reproduced yet: call the code under test and assert that {{behavior}}"
+  end
+end
+
+@@@ file: repro/{{slug}}/repro.md scope=state @@@
+# Reproduction: {{issue_ref}}
+
+- Issue: {{issue_link}}
+- Expected behavior: {{behavior}}
+- Regression test: `{{test_path}}` (`{{test_name}}`)
+- Created {{date}} by {{generated_by}}. This folder lives in the state dir and is never committed.
+
+## 1. Reproduce first
+
+The command that shows the bug (one line, valid in sh and cmd.exe):
+
+    TODO
+
+Observed output (trimmed) and exit code:
+
+    TODO
+
+If the bug does not reproduce: stop, say so, and write no speculative test.
+
+## 2. Level
+
+Chosen level: **{{level}}**. Unit when the behavior is isolatable, else integration, else e2e; never
+mock the thing under test. Why this level:
+
+TODO
+
+## 3. Red-green evidence
+
+    node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
+
+- Base worktree (red, an assertion failure, not a collection or compile error): TODO
+- Snapshot worktree (green, same test id): TODO
+
+## 4. Hygiene
+
+Delete or replace an older test only when its behavior was removed, its coverage is duplicated at a
+lower level, or this test is strictly stronger; write the reason into the PR description.
+
+@@@ file: repro/{{slug}}/repro.mjs lang=ts|js scope=state @@@
+// Minimal reproduction for {{issue_ref}}: exits 1 while the bug is present and 0 once it is fixed.
+// Run it from the project root: node <path to this file>
+// Keep it small; its core becomes the regression test in {{test_path}}.
+// ADAPT: import the code under test with a path relative to this file or an absolute file URL.
+
+const reproduced = true; // ADAPT: evaluate the buggy behavior here
+
+if (reproduced) {
+  console.error('{{issue_ref}} reproduced: {{behavior}} does not hold');
+  process.exit(1);
+}
+console.log('{{issue_ref}} not reproduced');
+
+@@@ file: repro/{{slug}}/repro.py lang=python scope=state @@@
+"""Minimal reproduction for {{issue_ref}}: exits 1 while the bug is present and 0 once it is fixed.
+
+Run it from the project root: python <path to this file>
+Keep it small; its core becomes the regression test in {{test_path}}.
+"""
+
+import sys
+
+# ADAPT: import the code under test.
+
+reproduced = True  # ADAPT: evaluate the buggy behavior here
+
+if reproduced:
+    print("{{issue_ref}} reproduced: {{behavior}} does not hold", file=sys.stderr)
+    sys.exit(1)
+print("{{issue_ref}} not reproduced")

@@ -27,6 +27,7 @@ const BASH = core.IS_WINDOWS ? null : core.which('bash');
 const NODE_OLD = ['/opt/node22/bin/node', '/opt/node20/bin/node'].find((p) => fs.existsSync(p)) || null;
 const AWS_KEY = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
 const TOKEN = ['hunter', '2abc', 'Zq9x'].join('');
+const ENV_TOKEN = ['opaque', 'Env7', 'Value3'].join(''); // a second, environment-only value (leak matrix, plan §13)
 const UPDATE = process.env.UPDATE_SNAPSHOTS === '1';
 const POOL = Math.max(1, Math.min(4, os.availableParallelism ? os.availableParallelism() : os.cpus().length));
 const cleanup = [];
@@ -499,6 +500,88 @@ test('hookRunCommand in-process: an injected stream yields the same decision', a
   assert.deepEqual(await hookRun.hookRunCommand(['nope'], { stdin: Readable.from([]), env: baseEnv() }), {});
 });
 
+/** One in-process hook call with a JSON payload; returns the decision object. */
+const inproc = (argv, payload, env = {}) =>
+  hookRun.hookRunCommand(argv, { stdin: Readable.from([Buffer.from(JSON.stringify(payload))]), env: baseEnv(env) });
+const claudeBash = (repo, command, extra = {}) => ({ session_id: 'g', cwd: repo, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, ...extra });
+const decisionOf = (out) => (out.hookSpecificOutput ? out.hookSpecificOutput.permissionDecision : out.permissionDecision) || null;
+
+test('post-edit scans code files only, and flags a manifest test script or runner config that cannot fail', async () => {
+  const repo = makeRepo();
+  const edit = (file, content, tool = 'Write') => inproc(['post-edit', '--dialect', 'claude'],
+    { session_id: 'pe', cwd: repo, hook_event_name: 'PostToolUse', tool_name: tool, tool_input: tool === 'Write' ? { file_path: `${repo}/${file}`, content } : { file_path: `${repo}/${file}`, old_string: 'x', new_string: content }, tool_response: {} });
+  // Prose and data that quote markers are not suppressions, swallowed errors or skipped tests.
+  assert.deepEqual(await edit('README.md', 'Never add `// eslint-disable-next-line`; `try { x() } catch {}` hides errors; no it.only(\n'), {});
+  assert.deepEqual(await edit('tests/fixtures/sample.json', '{"code": "it.only(\'x\', () => {}) // @ts-ignore"}\n'), {});
+  const code = await edit('src/a.js', '// eslint-disable-next-line\ntry { x() } catch {}\n');
+  assert.match(code.hookSpecificOutput.additionalContext, /src\/a\.js: adds a lint\/type suppression \(\S+\) at line 1; adds an exception-swallowing pattern \(\S+\) at line 2/);
+  const pkg = await edit('package.json', '"test": "jest --passWithNoTests",\n"postinstall": "husky || true"', 'Edit');
+  assert.match(pkg.hookSpecificOutput.additionalContext, /package\.json \([^)]*manifest[^)]*\): weakens a test command \(\S*pass-with-no-tests\) in an added line/);
+  assert.doesNotMatch(pkg.hookSpecificOutput.additionalContext, /husky/, 'a non-test script with || true is not a test weakening');
+  const cfg = await edit('pytest.ini', '[pytest]\naddopts = -q || true\n');
+  assert.match(cfg.hookSpecificOutput.additionalContext, /pytest\.ini \(runner config\): weakens a test command \(\S*or-true\) at line 2/);
+  const sessionFile = state.sessionFile(path.join(repo, '.adc'), 'pe');
+  const before = core.readJson(sessionFile).edits.count;
+  // The host's own plan or memory files and temp files are outside the change: no note, no gate epoch.
+  const outside = fs.realpathSync(tmp('adc-outside-'));
+  const planFile = { session_id: 'pe', cwd: repo, hook_event_name: 'PostToolUse', tool_name: 'Write', tool_input: { file_path: `${outside}/plans/x.test.js`, content: "it.only('x', () => {})\n" }, tool_response: {} };
+  assert.deepEqual(await inproc(['post-edit', '--dialect', 'claude'], planFile), {});
+  assert.equal(core.readJson(sessionFile).edits.count, before);
+});
+
+test('guard: `git add -f` of a pathspec, glob or -A that covers .adc/ is denied once .adc/ exists', async () => {
+  const repo = makeRepo();
+  const guard = async (command, cwd = repo) => decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(cwd, command)));
+  assert.equal(await guard('git add -f .'), null, 'nothing to pick up before .adc/ exists');
+  fs.mkdirSync(path.join(repo, '.adc'));
+  fs.mkdirSync(path.join(repo, 'sub'));
+  for (const c of ['git add -f .', 'git add -fA', 'git add --force --all', 'git add -f -- :/', 'git add -f "*.json"', 'git add --force .adc/budget.json', 'git -C . add -f .']) {
+    assert.equal(await guard(c), 'deny', c);
+  }
+  assert.equal(await guard('git add -f ..', path.join(repo, 'sub')), 'deny', 'a parent of the state dir, from a subdirectory');
+  for (const c of ['git add -f build/out.js', 'git add -f src', 'git add -A', 'git add .', 'git -C sub add -f .']) assert.equal(await guard(c), null, c);
+  assert.equal(await guard('git add -f .', path.join(repo, 'sub')), null, '. in a subdirectory does not contain .adc/');
+});
+
+test('guard: shell access to .env.live by glob, other letter case or a recursive read of .adc/ is denied; untracking stays allowed', async () => {
+  const repo = makeRepo();
+  const guard = async (command) => decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(repo, command)));
+  for (const c of ['cat .adc/.e*', 'cat ./.adc/*', 'cat .ADC/.ENV.LIVE', 'type .adc\\.env.live', 'grep -r TOKEN .adc', 'rg --hidden TOKEN ./.adc/',
+    'cp -r .adc /tmp/backup', 'tar czf s.tgz .adc', 'find .adc -type f -exec cat {} +', 'Select-String -Path .adc/* -Pattern TOKEN', 'cat .env.live']) {
+    assert.equal(await guard(c), 'deny', c);
+  }
+  for (const c of ['cat .adc/budget.json', 'cat .adc/*.json', 'ls -la .adc', 'find .adc -name "*.json"', 'grep -r TOKEN .adc/evidence',
+    'git rm -r --cached .adc', 'git rm --cached .adc/.env.live', 'git check-ignore -q .adc/.env.live', 'node scripts/adc.mjs doctor --state-dir .adc']) {
+    assert.equal(await guard(c), null, c);
+  }
+});
+
+test('guard: a call that starts two Claude handlers (two matching `if` rules) is counted once', async () => {
+  const repo = makeRepo();
+  const p = claudeBash(repo, 'cat .adc/.env.live', { session_id: 'dup', tool_use_id: 'toolu_dup1' });
+  // The session lock serializes the two handler processes; in-process the calls run one after the other.
+  for (let i = 0; i < 2; i++) assert.equal(decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], p)), 'deny');
+  await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], { ...p, tool_use_id: 'toolu_dup2' });
+  assert.equal(core.readJson(state.sessionFile(path.join(repo, '.adc'), 'dup')).guard.denials, 2);
+});
+
+test('Copilot post-shell redacts the live token in every printed form, including the literal value of an exported ADC_LIVE_TOKEN', async () => {
+  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN=${TOKEN}\n`), 'ADC_LIVE_TOKEN=[REDACTED]\n');
+  assert.equal(hookRun.redactToken(`{"ADC_LIVE_TOKEN": "${TOKEN} x"}`), '{"ADC_LIVE_TOKEN": "[REDACTED]"}');
+  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN: ${TOKEN}`), 'ADC_LIVE_TOKEN: [REDACTED]');
+  assert.equal(hookRun.redactToken('ADC_LIVE_TOKEN: set (source: .adc/.env.live)'), 'ADC_LIVE_TOKEN: set (source: .adc/.env.live)', 'doctor output stays readable');
+  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN                 ${TOKEN}\nPATH  /bin`), 'ADC_LIVE_TOKEN                 [REDACTED]\nPATH  /bin');
+  assert.equal(hookRun.redactToken(`printed ${ENV_TOKEN}.`, { ADC_LIVE_TOKEN: ENV_TOKEN }), 'printed [REDACTED:ADC_LIVE_TOKEN].');
+  assert.equal(hookRun.redactToken('a test run', { ADC_LIVE_TOKEN: 'test' }), 'a test run', 'short values are not treated as tokens');
+  const repo = makeRepo();
+  const shell = (text, env) => inproc(['post-shell', '--dialect', 'copilot'],
+    { sessionId: 'rs', timestamp: 1761400000000, cwd: repo, toolName: 'bash', toolArgs: { command: 'echo $ADC_LIVE_TOKEN' }, toolResult: { resultType: 'success', textResultForLlm: text } }, env);
+  const out = await shell(`${ENV_TOKEN}\n<shellId: 1 completed with exit code 0>`, { ADC_LIVE_TOKEN: ENV_TOKEN });
+  assert.equal(out.modifiedResult.textResultForLlm, '[REDACTED:ADC_LIVE_TOKEN]\n<shellId: 1 completed with exit code 0>');
+  assert.ok(!JSON.stringify(out).includes(ENV_TOKEN));
+  assert.deepEqual(await shell('plain output\n', { ADC_LIVE_TOKEN: ENV_TOKEN }), {}, 'nothing to redact, no decision');
+});
+
 // ---------------------------------------------------------------------------
 // Fixture cases through adc.mjs hook-run
 
@@ -889,12 +972,14 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
       { call: 'grep', args: { pattern: 'TOKEN', paths: `${repo}/.adc` } },
       { call: 'bash', args: { command: 'git push --force origin main', description: 'push' } },
       { call: 'bash', args: { command: `echo ADC_LIVE_TOKEN=${TOKEN}`, description: 'echo' } },
+      // An exported token printed bare: no shape to match, so the hook redacts the literal value it inherits.
+      { call: 'bash', args: { command: 'printf "%s\\n" "$ADC_LIVE_TOKEN"', description: 'print' } },
       { text: 'All tests pass now.' },
     ]);
     try {
       const res = await spawnAsync(HOST_BIN.copilot, ['-p', 'run the scripted task', '--allow-all', '--no-ask-user'], {
         cwd: repo, timeoutMs: 80_000,
-        env: { ...env, COPILOT_OFFLINE: 'true', COPILOT_PROVIDER_BASE_URL: `${model.url}/v1`, COPILOT_PROVIDER_API_KEY: 'fake', COPILOT_MODEL: 'gpt-4.1', COPILOT_AUTO_UPDATE: 'false', COPILOT_CLI_DIST_DIR: COPILOT_DIST },
+        env: { ...env, ADC_LIVE_TOKEN: ENV_TOKEN, COPILOT_OFFLINE: 'true', COPILOT_PROVIDER_BASE_URL: `${model.url}/v1`, COPILOT_PROVIDER_API_KEY: 'fake', COPILOT_MODEL: 'gpt-4.1', COPILOT_AUTO_UPDATE: 'false', COPILOT_CLI_DIST_DIR: COPILOT_DIST },
       });
       assert.equal(res.code, 0, `copilot exit ${res.code}: ${res.stderr.slice(-800)}`);
       const { body, session } = hostResult(model, repo);
@@ -904,6 +989,7 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
       assert.match(ch.tool, /tests\/e2e\.test\.js \(test file\): adds a skip\/focus marker/, 'post-edit note reached the model');
       assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 3, 'view, grep and force-push denied');
       assert.ok(ch.tool.includes('ADC_LIVE_TOKEN=[REDACTED]') && !ch.tool.includes(TOKEN), 'modifiedResult redacted the token in the result');
+      assert.ok(ch.tool.includes('[REDACTED:ADC_LIVE_TOKEN]') && !ch.tool.includes(ENV_TOKEN), 'the exported token value is redacted literally');
       assert.equal(count(ch.user, 'agentic-developer-companion completion gate'), 1, 'stop gate blocked once');
       assert.equal(session.dialect, 'copilot');
       assert.equal(session.tool, 'copilot-cli');
@@ -916,7 +1002,7 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     } finally { await model.close(); }
   });
 
-  test('Claude Code: brief and note as system context, Read and shell .env.live denied, stop feedback', {
+  test('Claude Code: brief and note as system context, Read and shell .env.live denied, test deletion asked, stop feedback', {
     skip: hostSkip('claude'), timeout: 90_000,
   }, async () => {
     const repo = makeRepo();
@@ -929,6 +1015,10 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
       { call: 'Read', args: { file_path: `${repo}/.adc/.env.live` } },
       { call: 'Bash', args: { command: 'cat .adc/.env.live', description: 'creds' } },
       { call: 'Bash', args: { command: 'git push --force origin main', description: 'push' } },
+      // Claude's Bash keeps its cwd: the second command names no `.adc`, only `.env.live`.
+      { call: 'Bash', args: { command: 'cd .adc', description: 'cd' } },
+      { call: 'Bash', args: { command: 'cat .env.live', description: 'creds' } },
+      { call: 'Bash', args: { command: 'cd .. && rm tests/e2e.test.js', description: 'delete' } },
       { text: 'All tests pass now.' },
     ]);
     try {
@@ -942,12 +1032,15 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
       // Claude Code passes hook context as system messages and stop feedback as a user message.
       assert.ok(ch.system.includes('agentic-developer-companion is installed'), 'session brief');
       assert.match(ch.system, /agentic-developer-companion notes on this edit[\s\S]*tests\/e2e\.test\.js \(test file\)/, 'post-edit note');
-      assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 3, 'Read, cat .adc/.env.live and force-push denied');
+      assert.equal(count(ch.tool, 'agentic-developer-companion guard:'), 5, 'Read, cat .adc/.env.live, force-push and cat .env.live (inside .adc/) denied; rm of a test file asked');
+      // Under -p an `ask` cannot be answered: the call does not run and the reason reaches the model.
+      assert.ok(fs.existsSync(path.join(repo, 'tests', 'e2e.test.js')), 'the asked deletion did not run');
       assert.match(ch.user, /completion gate[\s\S]*The final message states "All tests pass/, 'stop gate with the claim');
       assert.equal(session.dialect, 'claude');
       assert.equal(session.edits.count, 1);
       assert.equal(session.observed_runs[0].class, 'test');
-      assert.equal(session.guard.denials, 3);
+      assert.equal(session.guard.denials, 4);
+      assert.equal(session.guard.asks, 1, '`if: Bash(rm *)` started the guard for `cd .. && rm tests/e2e.test.js`');
     } finally { await model.close(); }
   });
 
@@ -1228,6 +1321,14 @@ test('Claude project scope writes settings.local.json, keeps it git-ignored and 
   const h = JSON.parse(fs.readFileSync(path.join(root, '.claude', 'settings.local.json'), 'utf8')).hooks.Stop[0].hooks[0];
   assert.equal(h.args, undefined);
   assert.match(h.command, /^node ".*\/scripts\/adc\.mjs" hook-run stop --dialect auto --level gate$/);
+  // Copilot runs this file too and ignores `if` (measured): the guard's Bash handlers collapse into one.
+  const g = hooksRender.renderHooks({ host: 'claude', scope: 'project', level: 'guard', skillDir: SKILL, home, env, root }).config.hooks.PreToolUse;
+  const bash = g.find((x) => x.matcher === 'Bash');
+  assert.equal(bash.hooks.length, 1);
+  assert.equal(bash.hooks[0].if, undefined);
+  assert.match(bash.hooks[0].command, /hook-run pre-guard --dialect auto --level guard$/);
+  const user = hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SKILL, home, env }).config.hooks.PreToolUse.find((x) => x.matcher === 'Bash');
+  assert.deepEqual(user.hooks.map((x) => x.if), ['Bash(git *)', 'Bash(*.adc*)', 'Bash(*.env.live*)', 'Bash(rm *)']);
 });
 
 test('listRegisteredHooks reports host, scope, level and drift; removeHooks deletes exactly our entries', () => {

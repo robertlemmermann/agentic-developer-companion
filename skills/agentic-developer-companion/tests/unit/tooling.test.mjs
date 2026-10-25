@@ -18,6 +18,10 @@ const T = await import('../../scripts/lib/tooling.mjs');
 const { which } = await import('../../scripts/lib/core.mjs');
 const LINT_AVAILABLE = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'tooling-lint.mjs'));
 const CLAUDE = which('claude');
+// Real host CLIs run their free load checks when they are on PATH (nothing is installed or spent).
+const COPILOT = which('copilot');
+const CODEX = which('codex');
+const TL = LINT_AVAILABLE ? await import('../../scripts/lib/tooling-lint.mjs') : null;
 
 const dirs = [];
 after(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); });
@@ -48,7 +52,12 @@ function commitAll(dir) {
 }
 
 function adc(cwd, ...args) {
-  const res = spawnSync(process.execPath, [ADC, ...args, '--json', '--cwd', cwd], { encoding: 'utf8', timeout: 120_000 });
+  return adcEnv(null, cwd, ...args);
+}
+
+/** adc.mjs with extra environment variables (e.g. ADC_COPILOT_CLI pointing at a fake host CLI). */
+function adcEnv(env, cwd, ...args) {
+  const res = spawnSync(process.execPath, [ADC, ...args, '--json', '--cwd', cwd], { encoding: 'utf8', timeout: 120_000, env: env ? { ...process.env, ...env } : process.env });
   let json = null;
   try { json = JSON.parse(res.stdout); } catch {}
   return { exit: res.status, json, stdout: res.stdout, stderr: res.stderr };
@@ -101,6 +110,56 @@ for (const s of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
 }
 if (share) fs.writeFileSync(share, lines.join('\\n'));
 process.stdout.write(JSON.stringify({ type: 'assistant.message', content: 'ok' }) + '\\n');
+`;
+
+// Host CLIs for the free load checks and rendered-context snapshots. The Copilot fake answers
+// `--plugin-dir <d> skill list --json` and `instruction list --json`; the Codex fake keeps its
+// marketplace and installs in CODEX_HOME and renders `debug prompt-input` from them.
+const FAKE_COPILOT_LIST = `import fs from 'node:fs'; import path from 'node:path';
+const argv = process.argv.slice(2);
+const out = (o) => process.stdout.write(JSON.stringify(o, null, 2) + '\\n');
+if (argv.includes('instruction')) {
+  const rows = fs.existsSync('AGENTS.md') ? [{ id: 'model-agents-md', label: 'AGENTS.md', location: 'repository', type: 'model', sourcePath: 'AGENTS.md', bytes: fs.statSync('AGENTS.md').size }] : [];
+  out(rows); process.exit(0);
+}
+const k = argv.indexOf('--plugin-dir');
+const rows = [{ name: 'builtin-thing', source: 'builtin', path: '/x', enabled: true }];
+if (k >= 0 && process.env.FAKE_EMPTY !== '1') {
+  const d = argv[k + 1];
+  for (const s of fs.existsSync(path.join(d, 'skills')) ? fs.readdirSync(path.join(d, 'skills')) : []) rows.push({ name: s, description: 'd', source: 'plugin', path: path.join(d, 'skills', s), enabled: true });
+}
+process.stderr.write('warning: not signed in\\n');
+out(rows);
+`;
+const FAKE_CODEX_HOST = `import fs from 'node:fs'; import path from 'node:path';
+const argv = process.argv.slice(2);
+const home = process.env.CODEX_HOME;
+const state = path.join(home, 'fake.json');
+const st = fs.existsSync(state) ? JSON.parse(fs.readFileSync(state, 'utf8')) : { mkts: {}, installed: [] };
+const save = () => fs.writeFileSync(state, JSON.stringify(st));
+if (argv[0] === 'plugin' && argv[1] === 'marketplace' && argv[2] === 'add') {
+  const root = path.resolve(argv[3]);
+  const f = ['.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json'].map((x) => path.join(root, x)).find((x) => fs.existsSync(x));
+  if (!f) { process.stderr.write('no marketplace\\n'); process.exit(1); }
+  const m = JSON.parse(fs.readFileSync(f, 'utf8'));
+  st.mkts[m.name] = { root, plugins: m.plugins }; save();
+  process.stdout.write('Added marketplace \\u0060' + m.name + '\\u0060 from ' + root + '.\\n'); process.exit(0);
+}
+if (argv[0] === 'plugin' && argv[1] === 'add') {
+  const [n, m] = argv[2].split('@');
+  const e = st.mkts[m] && st.mkts[m].plugins.find((p) => p.name === n);
+  if (!e) { process.stderr.write('plugin not found\\n'); process.exit(1); }
+  st.installed.push({ name: n, dir: path.resolve(st.mkts[m].root, typeof e.source === 'string' ? e.source : e.source.path) }); save(); process.exit(0);
+}
+if (argv[0] === 'debug' && argv[1] === 'prompt-input') {
+  const lines = ['<skills_instructions>', '## Skills'];
+  for (const p of st.installed) for (const s of fs.existsSync(path.join(p.dir, 'skills')) ? fs.readdirSync(path.join(p.dir, 'skills')) : []) lines.push('- ' + p.name + ':' + s + ': d (file: r1/' + s + '/SKILL.md)');
+  const texts = [{ type: 'input_text', text: lines.join('\\n') + '\\n</skills_instructions>' }];
+  if (fs.existsSync('AGENTS.md')) texts.push({ type: 'input_text', text: '# AGENTS.md instructions for ' + process.cwd() + '\\n\\n<INSTRUCTIONS>\\n' + fs.readFileSync('AGENTS.md', 'utf8') + '</INSTRUCTIONS>' });
+  texts.push({ type: 'input_text', text: '<environment_context><current_date>' + new Date().toISOString() + '</current_date></environment_context>' });
+  process.stdout.write(JSON.stringify([{ type: 'message', role: 'user', content: texts }], null, 2) + '\\n'); process.exit(0);
+}
+process.stderr.write('unsupported\\n'); process.exit(2);
 `;
 
 function fakeCli(dir, name, src) {
@@ -301,6 +360,11 @@ describe('tooling port', () => {
     // idempotent: the same port again changes nothing
     const again = await P.port({ path: 'AGENTS.md', root: d2, to: 'claude' });
     assert.equal(again.written[0].action, 'unchanged');
+    // A hand-written CLAUDE.md that already imports AGENTS.md is left alone (no second import).
+    const d3 = tmpRepo({ 'AGENTS.md': '# Shared\n', 'CLAUDE.md': '@AGENTS.md\n\n- Claude-only note.\n' });
+    const own = await P.port({ path: 'AGENTS.md', root: d3, to: 'claude' });
+    assert.deepEqual([own.written[0].action, own.skipped.length], ['unchanged', 0]);
+    assert.ok(r.manual_steps.some((m) => /load twice in Copilot/.test(m)), 'AGENTS.md generated from copilot-instructions.md duplicates rules in Copilot');
   });
 
   test('scoped rules: applyTo <-> paths round trip; Codex gets directory AGENTS.md sections', async () => {
@@ -442,6 +506,12 @@ describe('tooling cost', () => {
     assert.ok(r.findings.some((x) => x.id === 'STALE_COMMAND' && /lockfile belongs to npm/.test(x.message)));
     assert.ok(r.findings.some((x) => x.id === 'STALE_COMMAND' && /does not define/.test(x.message)));
     assert.ok(r.findings.some((x) => x.id === 'STALE_PATH' && x.evidence === 'docs/missing.md'));
+    // No STALE_PATH for state files, ignored build output, directories or reference documentation.
+    write(dir, '.gitignore', 'dist/\n');
+    write(dir, 'AGENTS.md', '- Read `.adc/detect.json`, `dist/bundle.js` and `docs/`.\n');
+    write(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Formats release notes. Use for release notes.'));
+    write(dir, '.claude/skills/notes/references/more.md', '- Example: `src/example/file.ts`\n');
+    assert.deepEqual(T.toolingCost({ root: dir }).findings.filter((x) => x.id === 'STALE_PATH'), []);
   });
 
   test('CLI: --max-tokens turns an over-budget host into exit 1', () => {
@@ -517,6 +587,35 @@ describe('tooling scaffold', () => {
     assert.ok(fs.existsSync(forced.backups[0]));
   });
 
+  test('scaffolds lint clean; skill-creator evals.json, excludeAgent and skill preloads', async () => {
+    const dir = tmpRepo({ 'package.json': { name: 'lint-app', scripts: { test: 'node --test' } } });
+    const desc = 'Formats release notes from merged pull requests. Use when the user asks for release notes. Not for code changes.';
+    for (const kind of ['instructions', 'skill', 'agent', 'prompt', 'hooks', 'mcp']) {
+      for (const host of ['copilot', 'claude', 'codex', 'all']) {
+        const out = path.join(dir, `lint-${kind}-${host}`);
+        const res = await T.scaffoldTooling(kind, { values: { for: host, name: `demo-${kind}`, description: desc, out, write: true, cwd: dir } });
+        if (!TL) continue;
+        const files = res.written.map((w) => path.join(out, ...w.path.split('/'))).filter((f) => !f.endsWith('.mjs'));
+        const r = await TL.lintPaths(files, { host: 'all', root: out });
+        const errors = r.files.flatMap((f) => f.host_results.flatMap((h) => h.errors.map((e) => `${h.host} ${f.path} ${e.rule}: ${e.message}`)));
+        assert.deepEqual(errors, [], `${kind}/${host}`);
+        assert.deepEqual(r.security.filter((x) => x.severity === 'error'), [], `${kind}/${host} security`);
+      }
+    }
+    await T.scaffoldTooling('skill', { values: { for: 'claude', name: 'notes', description: desc, write: true, cwd: dir } });
+    const ev = JSON.parse(read(dir, '.claude/skills/notes/evals/evals.json'));
+    assert.equal(ev.skill_name, 'notes');
+    assert.ok(Array.isArray(ev.evals) && ev.evals[0].prompt && Array.isArray(ev.evals[0].expectations));
+    assert.ok(has(dir, '.claude/skills/notes/evals/notes-basic/prompt.md'), 'claude plugin eval case next to it');
+    await T.scaffoldTooling('instructions', { values: { for: 'copilot', topic: 'api', 'apply-to': 'src/api/**', 'exclude-agent': 'code-review', write: true, cwd: dir } });
+    const fm = P.readFrontmatter(read(dir, '.github/instructions/api.instructions.md'));
+    assert.deepEqual([fm.data.applyTo, fm.data.excludeAgent], ['src/api/**', 'code-review']);
+    await assert.rejects(T.scaffoldTooling('instructions', { values: { for: 'copilot', 'exclude-agent': 'everyone', cwd: dir } }), /exclude-agent/);
+    await T.scaffoldTooling('agent', { values: { for: 'copilot,claude', name: 'triage', description: desc, skills: 'notes', write: true, cwd: dir } });
+    assert.deepEqual(P.readFrontmatter(read(dir, '.github/agents/triage.agent.md')).data.skills, ['notes']);
+    assert.deepEqual(P.readFrontmatter(read(dir, '.claude/agents/triage.md')).data.skills, ['notes']);
+  });
+
   test('the generated hook handler passes its own fixture tests', async () => {
     const dir = tmpRepo({});
     await T.scaffoldTooling('hooks', { values: { for: 'all', name: 'edit-guard', events: 'PostToolUse,PreToolUse,Stop', write: true, cwd: dir } });
@@ -530,6 +629,14 @@ describe('tooling scaffold', () => {
     assert.match(cp.hooks.preToolUse[0].bash, /^command -v node >\/dev\/null 2>&1 && node /, 'preToolUse is fail-closed in Copilot: guard it');
     assert.match(cp.hooks.preToolUse[0].powershell, /Get-Command node/);
     assert.equal(cp.hooks.agentStop.length, 1);
+    // A host that never closes stdin still gets exactly {} within the handler's time limit.
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, [path.join(dir, 'scripts', 'hooks', 'edit-guard.mjs'), '--dialect', 'copilot', '--event', 'postToolUse'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    const code = await new Promise((resolve) => child.on('close', resolve));
+    assert.equal(code, 0);
+    assert.equal(out, '{}\n');
   });
 
   test('CLI: scaffold kinds, name validation and plugin delegation', () => {
@@ -590,12 +697,17 @@ describe('tooling trigger-set', () => {
     assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake).exit, 2, 'TODO queries are refused');
     assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', 'no-such-cli-xyz').exit, 2);
     write(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
+    const dry = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--dry-run');
+    assert.deepEqual([dry.exit, dry.json.suite_score, has(dir, '.adc')], [0, null, false], '--dry-run never runs (paid) nor writes');
+    assert.ok(dry.json.warnings.some((w) => /dry run/.test(w)));
     const run = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4');
     assert.equal(run.exit, 0, run.stderr);
     assert.equal(run.json.suite_score, 1);
     assert.equal(run.json.results.length, 20);
     assert.ok(run.json.results.every((r) => r.runs.length === 3));
+    // 30 positive runs stop at the Skill call (no result event): priced at the mean of the 30 others.
     assert.equal(run.json.cost_usd, 0.06);
+    assert.deepEqual([run.json.cost.measured_runs, run.json.cost.estimated_runs, run.json.cost.measured_usd], [30, 30, 0.03]);
     assert.ok(has(dir, run.json.results_path));
     assert.match(read(dir, '.adc/metrics.jsonl'), /tooling-trigger-set/);
     assert.equal(git(dir, ['status', '--porcelain', '--', '.adc']).stdout, '', '.adc stays excluded');
@@ -625,6 +737,7 @@ describe('tooling trigger-set', () => {
     const codex = await T.triggerSet({ ctx: { cwd: dir, dryRun: false, stateDirOption: null }, root: dir, skillPath: '.claude/skills/notes', host: 'codex', runIt: true, runs: 1, cli: fakeCli(dir, 'codex', FAKE_CODEX), concurrency: 4 });
     assert.equal(codex.suite_score, 1);
     assert.equal(codex.confidence, 'medium');
+    assert.equal(codex.cost_usd, null, 'Codex reports no per-run cost');
     const copilot = await T.triggerSet({ ctx: { cwd: dir, dryRun: false, stateDirOption: null }, root: dir, skillPath: '.claude/skills/notes', host: 'copilot', runIt: true, runs: 1, cli: fakeCli(dir, 'copilot', FAKE_COPILOT), concurrency: 4 });
     assert.equal(copilot.suite_score, 1);
     assert.equal(copilot.confidence, 'unconfirmed');
@@ -683,6 +796,8 @@ describe('tooling modify', () => {
 
   test('token increases need a change note; instructions use the same loop', async () => {
     const dir = tmpRepo({ 'AGENTS.md': '# Rules\n\n- Run the whole suite.\n' });
+    const dryBase = adc(dir, 'tooling', 'modify', 'baseline', 'AGENTS.md', '--dry-run');
+    assert.deepEqual([dryBase.exit, dryBase.json.baseline_dir, has(dir, '.adc')], [0, null, false], 'a dry-run baseline stores nothing');
     assert.equal(adc(dir, 'tooling', 'modify', 'baseline', 'AGENTS.md').exit, 0);
     write(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Also run the linter before every commit, and the type checker.\n');
     const noNote = adc(dir, 'tooling', 'modify', 'compare', 'AGENTS.md');
@@ -699,6 +814,23 @@ describe('tooling modify', () => {
     assert.equal(restored.exit, 0);
     assert.equal(read(dir, 'AGENTS.md'), '# Rules\n\n- Run the whole suite.\n');
     assert.equal(adc(dir, 'tooling', 'modify', 'compare', 'CLAUDE.md').exit, 2, 'missing artifact');
+  });
+
+  test('--external snapshots the host-rendered context and diffs it (fake Copilot and Codex CLIs)', () => {
+    const dir = tmpRepo({ 'AGENTS.md': '# Rules\n\n- Run the whole suite.\n' });
+    const env = { ADC_COPILOT_CLI: fakeCli(dir, 'copilot-list', FAKE_COPILOT_LIST), ADC_CODEX_CLI: fakeCli(dir, 'codex-host', FAKE_CODEX_HOST), CODEX_HOME: path.join(dir, '.fake', 'codex-home') };
+    fs.mkdirSync(env.CODEX_HOME, { recursive: true });
+    const b = adcEnv(env, dir, 'tooling', 'modify', 'baseline', 'AGENTS.md', '--external');
+    assert.equal(b.exit, 0, b.stderr);
+    assert.deepEqual(b.json.external.map((e) => [e.name, e.exit]), [['copilot instruction list --json', 0], ['codex debug prompt-input (skills and AGENTS.md)', 0]]);
+    const saved = fs.readFileSync(path.join(dir, b.json.baseline_dir, 'external-1.txt'), 'utf8');
+    assert.match(saved, /# AGENTS\.md instructions for <repo>/, 'machine paths are scrubbed');
+    assert.ok(!/current_date/.test(saved), 'only the skills and AGENTS.md parts are kept');
+    write(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Run the linter.\n');
+    const c = adcEnv(env, dir, 'tooling', 'modify', 'compare', 'AGENTS.md', '--external', '--note', 'adds the lint rule');
+    assert.equal(c.json.verdict, 'accept');
+    const d = c.json.deltas.external['codex debug prompt-input (skills and AGENTS.md)'];
+    assert.deepEqual([d.added, d.removed, d.sample], [1, 0, ['+ - Run the linter.']]);
   });
 
   test('compareMeasurements: lint, outcome and portability rules', () => {
@@ -793,6 +925,12 @@ describe('tooling plugin', () => {
       const evalLoad = check.json.validators.find((x) => x.name.startsWith('claude plugin eval'));
       assert.equal(evalLoad.status, 'pass', JSON.stringify(evalLoad));
     }
+    for (const [cli, prefix] of [[COPILOT, 'copilot --plugin-dir'], [CODEX, 'codex plugin marketplace add']]) {
+      const v = check.json.validators.find((x) => x.name.startsWith(prefix));
+      assert.ok(v, prefix);
+      if (cli) assert.deepEqual([v.status, v.loaded_skills], ['pass', ['notes']], JSON.stringify(v));
+      else assert.equal(v.status, 'skipped');
+    }
     const t = adc(dir, 'tooling', 'plugin', 'test', 'plugins/demo-tools', '--run');
     assert.equal(t.exit, 0, t.stderr);
     assert.ok(t.json.local_test_commands.some((c) => c.host === 'copilot' && c.cost === 'paid' && /COPILOT_PLUGIN_DIR_ONLY=true copilot --plugin-dir/.test(c.bash) && /\$env:COPILOT_PLUGIN_DIR_ONLY/.test(c.powershell)));
@@ -810,6 +948,47 @@ describe('tooling plugin', () => {
     assert.match(read(dir, rel.json.sha256sums.path), /^[0-9a-f]{64} {2}plugin\.json$/m);
     assert.equal(JSON.parse(read(dir, 'plugins/demo-tools/.claude-plugin/plugin.json')).version, '0.2.0');
     assert.ok(rel.json.tags.some((x) => x.name === 'demo-tools--v0.2.0'));
+  });
+
+  test('host load checks run in throwaway homes (fake Copilot and Codex CLIs) and fail on missing skills', async () => {
+    const dir = tmpRepo({ '.agents/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes from merged pull requests. Use for release notes.') });
+    const env = { ADC_COPILOT_CLI: fakeCli(dir, 'copilot-list', FAKE_COPILOT_LIST), ADC_CODEX_CLI: fakeCli(dir, 'codex-host', FAKE_CODEX_HOST), ADC_CLAUDE_CLI: path.join(dir, 'no-claude.mjs') };
+    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--for', 'copilot,codex', '--name', 'kit', '--write').exit, 0);
+    const homeBefore = fs.readdirSync(os.tmpdir()).filter((n) => /^adc-(copilot|codex)-/.test(n)).length;
+    const ok = adcEnv(env, dir, 'tooling', 'plugin', 'check', 'plugins/kit');
+    assert.equal(ok.exit, 0, JSON.stringify(ok.json?.findings));
+    const by = Object.fromEntries(ok.json.validators.map((v) => [v.name.split(' ')[0], v]));
+    assert.deepEqual([by.copilot.status, by.copilot.loaded_skills], ['pass', ['notes']]);
+    assert.deepEqual([by.codex.status, by.codex.loaded_skills, by.codex.marketplace], ['pass', ['notes'], 'kit-marketplace']);
+    assert.equal(fs.readdirSync(os.tmpdir()).filter((n) => /^adc-(copilot|codex)-/.test(n)).length, homeBefore, 'throwaway homes are removed');
+    const bad = adcEnv({ ...env, FAKE_EMPTY: '1' }, dir, 'tooling', 'plugin', 'check', 'plugins/kit');
+    assert.equal(bad.exit, 1);
+    assert.ok(bad.json.findings.some((f) => f.rule === 'COPILOT_LOAD' && /notes/.test(f.message)));
+    const t = adcEnv(env, dir, 'tooling', 'plugin', 'test', 'plugins/kit');
+    assert.deepEqual(t.json.ran, [], 'without --run nothing is executed');
+    const tr = adcEnv(env, dir, 'tooling', 'plugin', 'test', 'plugins/kit', '--run');
+    assert.deepEqual(tr.json.ran.map((r) => r.status), ['pass', 'pass']);
+    assert.ok(tr.json.local_test_commands.some((c) => c.host === 'copilot' && /copilot plugin marketplace add \. && copilot plugin install kit@kit-marketplace/.test(c.bash) && /if \(\$LASTEXITCODE -eq 0\)/.test(c.powershell)));
+  });
+
+  test('init moves a skill\'s own plugin-eval cases to the plugin evals/ and keeps Codex-only skills out of shared plugins', async () => {
+    const dir = tmpRepo({
+      '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes from merged pull requests. Use for release notes.'),
+      '.claude/skills/notes/evals/real-case/prompt.md': '---\nmax_turns: 5\n---\n\nWrite release notes for v2.\n',
+      '.claude/skills/notes/evals/real-case/graders/used.md': '---\ntype: tool_used\ntool: Skill\n---\n',
+      '.claude/skills/notes/evals/trigger-set.json': triggerSetFile('notes'),
+      '.codex/skills/reviewer/SKILL.md': SKILL_MD('reviewer', 'Reviews diffs for missing tests. Use for reviews.'),
+    });
+    const r = adc(dir, 'tooling', 'plugin', 'init', '--for', 'all', '--name', 'kit');
+    assert.equal(r.exit, 0, r.stderr);
+    assert.ok(r.json.files.includes('plugins/kit/evals/real-case/prompt.md'));
+    assert.ok(r.json.files.includes('plugins/kit/evals/real-case/graders/used.md'));
+    assert.ok(!r.json.files.some((f) => /skills\/notes\/evals\//.test(f)), 'skill evals are not shipped inside the skill');
+    assert.ok(!r.json.files.some((f) => /notes-basic/.test(f)), 'no TODO template when real cases exist');
+    assert.ok(!r.json.files.some((f) => /skills\/reviewer\//.test(f)), '.codex/skills joins only Codex plugins by default');
+    const cx = adc(dir, 'tooling', 'plugin', 'init', '--for', 'codex', '--name', 'kit');
+    assert.ok(cx.json.files.includes('plugins/kit/skills/reviewer/SKILL.md'));
+    assert.ok(!cx.json.files.some((f) => /\/evals\//.test(f)), 'plugin-eval cases are Claude Code only');
   });
 
   test('check reports broken manifests', async () => {

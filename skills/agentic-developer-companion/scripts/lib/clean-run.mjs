@@ -9,11 +9,11 @@ import path from 'node:path';
 import {
   EXIT, AdcError, usageError, defineCommand, readJson, readText, writeFileAtomic, writeJsonAtomic,
   ensureDir, sha256, nonce, nowIso, toPosix, relPosix, quoteArg, tmpRoot, which, IS_WINDOWS,
-  redactLiterals, run, truncate,
+  redactLiterals, run, truncate, stamp,
 } from './core.mjs';
 import { worktreeAdd, worktreeRemove, diffNameStatus, emptyTree, showFile, gitTry } from './git.mjs';
 import { prepareTarget } from './state.mjs';
-import { parseReport, parseSummaryText, normalizeFormat, detectReportFormat, rootVariants, isTestPath } from './reports.mjs';
+import { parseReport, parseSummaryText, normalizeFormat, detectReportFormat, rootVariants } from './reports.mjs';
 
 const FM_CLEANRUN = ['FM-02', 'FM-13'];
 const FM_REDGREEN = ['FM-03'];
@@ -179,6 +179,16 @@ export function redactSync(text) {
   return out;
 }
 
+/** redactSync over every string in a JSON-like value (command results print project command lines). */
+export function redactDeep(value, depth = 0) {
+  if (typeof value === 'string') return redactSync(value);
+  if (!value || typeof value !== 'object' || depth > 12) return value;
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) out[k] = redactDeep(v, depth + 1);
+  return out;
+}
+
 /** Async form of redactSync that makes sure the secret catalog is loaded first. */
 export async function redactText(text) {
   await loadMarkers();
@@ -302,6 +312,19 @@ export function runEnv(extra = {}) {
   for (const k of Object.keys(env)) {
     const live = /^ADC_LIVE_/.test(k) || k === 'ADC_TEST_RUN_ID' || k === 'ADC_PROBE_RESULT' || k === 'ADC_PROBE_ID';
     if (SCRUB_ENV.includes(k) || live) { delete env[k]; removed.add(live ? 'ADC_LIVE_*' : k); }
+  }
+  // An inherited NODE_OPTIONS=--test-shard=2/2 silently narrows node --test in base and snapshot
+  // alike; its other options (CA certificates, memory limits) are kept.
+  if (env.NODE_OPTIONS && /(?:^|\s)--test-/.test(env.NODE_OPTIONS)) {
+    const tokens = env.NODE_OPTIONS.trim().split(/\s+/);
+    const kept = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (!/^--test-/.test(tokens[i])) { kept.push(tokens[i]); continue; }
+      if (!tokens[i].includes('=') && NODE_VALUE_OPTS.has(tokens[i]) && tokens[i + 1] && !tokens[i + 1].startsWith('-')) i++;
+    }
+    if (kept.length) env.NODE_OPTIONS = kept.join(' ');
+    else delete env.NODE_OPTIONS;
+    removed.add('NODE_OPTIONS --test-*');
   }
   // npm_config_yes=false: with CI set, `npx <tool>` would otherwise download an unpinned tool when
   // the project does not have it installed, and the clean run would test with the wrong version.
@@ -740,10 +763,17 @@ export function selectionArgs(runner, { files = [], names = [] }, dir) {
     }
     case 'cargo': {
       const bins = files.filter((f) => /^tests\/[^/]+\.rs$/.test(toPosix(f))).map((f) => path.posix.basename(toPosix(f), '.rs'));
-      const mods = files.filter((f) => /^src\//.test(toPosix(f))).map((f) => toPosix(f).replace(/^src\//, '').replace(/(?:\/mod)?\.rs$/, '').replace(/\//g, '::')).filter((m) => m && m !== 'lib' && m !== 'main');
+      const src = files.filter((f) => /^src\//.test(toPosix(f)));
+      // Unit tests in src/main.rs or src/bin/* belong to binary targets (`--lib` fails on a bin-only crate).
+      const binSrc = src.filter((f) => /^src\/(?:main\.rs$|bin\/)/.test(toPosix(f)));
+      const hasLib = fs.existsSync(path.join(dir, 'src', 'lib.rs'));
+      const mods = src.filter((f) => !binSrc.includes(f)).map((f) => toPosix(f).replace(/^src\//, '').replace(/(?:\/mod)?\.rs$/, '').replace(/\//g, '::')).filter((m) => m && m !== 'lib');
       const args = [...bins.flatMap((b) => ['--test', q(b)])];
-      const filters = [...names, ...mods.map((m) => `${m}::`)];
-      if (!bins.length && files.some((f) => /^src\//.test(toPosix(f)))) args.push('--lib');
+      const filters = [...names, ...(binSrc.length ? [] : mods.map((m) => `${m}::`))];
+      if (!bins.length && src.length) {
+        if (hasLib && src.length > binSrc.length) args.push('--lib');
+        if (binSrc.length || !hasLib) args.push('--bins');
+      }
       if (filters.length) args.push('--', ...filters.map(q));
       return { args, describe: `targets: ${bins.join(', ') || 'lib'}; filters: ${filters.join(', ') || 'none'}` };
     }
@@ -838,16 +868,26 @@ export async function runProject(wt, project, runner, { outDir, noInstall = fals
   fs.writeFileSync(logFile, '');
   const dir = projectDir(wt, project);
   const install = await installProject(wt, project, { noInstall, timeoutMs, logFile });
-  const built = buildRunCommand(runner, { dir, outDir, select, seed, coverage });
-  const base = { cmd: built.cmd, install, applied: built.applied, report_path: null, log_path: logFile, dir, coverageFile: built.coverageFile, coverageDir: built.coverageDir };
+  let built = buildRunCommand(runner, { dir, outDir, select, seed, coverage });
+  const base = { cmd: built.cmd, install, applied: built.applied, report_path: null, log_path: logFile, dir, coverageFile: built.coverageFile, coverageDir: built.coverageDir, retries_off: runner.retries_off || null };
   if (install.cmd && install.exit !== 0) {
     return { ...base, exit: null, ms: 0, counts: null, tests: [], source: 'none', status: 'unverified', reason: install.timedOut ? 'INSTALL_TIMEOUT' : 'INSTALL_FAILED' };
   }
-  clearStaleReport(built.report, [wt.dir, outDir]);
-  const { env, removed, set } = runEnv(built.env);
-  log(`run: ${built.cmd} (in ${toPosix(dir)})`);
-  fs.appendFileSync(logFile, `$ ${built.cmd}\n`);
-  const res = await runStep(built.cmd, { cwd: dir, env, timeoutMs, logFile, captureFile: built.report && built.report.stdout ? built.report.stdout : null });
+  const exec = async () => {
+    clearStaleReport(built.report, [wt.dir, outDir]);
+    log(`run: ${built.cmd} (in ${toPosix(dir)})`);
+    fs.appendFileSync(logFile, `$ ${built.cmd}\n`);
+    return runStep(built.cmd, { cwd: dir, env: runEnv(built.env).env, timeoutMs, logFile, captureFile: built.report && built.report.stdout ? built.report.stdout : null });
+  };
+  const { removed, set } = runEnv(built.env);
+  let res = await exec();
+  const fallback = pytestRerunsFallback(runner, built, res);
+  if (fallback) {
+    runner = fallback;
+    built = buildRunCommand(runner, { dir, outDir, select, seed, coverage });
+    Object.assign(base, { cmd: built.cmd, applied: built.applied, retries_off: runner.retries_off });
+    res = await exec();
+  }
   const parsed = parseRunOutput(built.report, res.stdout, res.stderr, [dir, wt.dir]);
   const reportPath = built.report ? (built.report.stdout || built.report.path || built.report.dir || null) : null;
   const missing = !parsed.counts && res.exit !== 0 && runnerMissing(`${res.stderr}\n${res.stdout}`.slice(-20_000));
@@ -859,15 +899,57 @@ export async function runProject(wt, project, runner, { outDir, noInstall = fals
   };
 }
 
+/**
+ * pytest with pytest-rerunfailures configured in addopts (`--reruns 2`) or `flaky` markers under
+ * --strict-markers rejects `-p no:rerunfailures` with a usage error. Retries are then turned off
+ * with `--reruns 0`, which wins over addopts; `@pytest.mark.flaky(reruns=n)` still applies, so the
+ * coverage is partial (reruns stay visible in the report as flaky).
+ */
+function pytestRerunsFallback(runner, built, res) {
+  if (runner.name !== 'pytest' || built.applied.retries !== '-p no:rerunfailures' || res.exit === 0) return null;
+  const out = `${res.stderr}\n${res.stdout}`.slice(-50_000);
+  if (!/unrecognized arguments:.*--(?:reruns|only-rerun|rerun-except|force-reruns)\b|'flaky' not found in `markers` configuration option/.test(out)) return null;
+  return { ...runner, retries_off: { mechanism: '--reruns 0', coverage: 'partial', note: 'pytest-rerunfailures is configured, so it cannot be disabled; @pytest.mark.flaky(reruns=n) still reruns' } };
+}
+
 const truncateTail = (s, n) => (s && s.length > n ? '...' + s.slice(-n) : s || '');
 
 // ---------------------------------------------------------------------------
-// Artifacts: redacted copies under .adc/cache/runs/<tree12>/<slug>/
+// Artifacts: redacted copies under .adc/cache/runs/<tree12>/<slug>/<run-id>/
+
+// One folder per target (one CLI invocation; verify shares its target across steps): a ledger
+// hashes its artifacts when a check is added, so a later run of the same tree (audit-tests after
+// verify, a repeated clean-run) must never overwrite them.
+export const runIdOf = (target) => target.adcRunId || (target.adcRunId = `${stamp()}-${nonce().slice(0, 6)}`);
+const RUN_DIR_RE = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/;
+const KEEP_RUNS = 20;
+const KEEP_TREES = 50;
+const pruned = new Set();
+
+/** Keep the newest run folders per tree/project and the newest tree folders (old trees are stale anyway). */
+function pruneRuns(runsDir, treeDir, slugDir, runId) {
+  if (pruned.has(`${slugDir}\0${runId}`)) return;
+  pruned.add(`${slugDir}\0${runId}`);
+  const newest = (dir, keep, filter) => {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && filter(e.name))
+        .map((e) => ({ full: path.join(dir, e.name), t: fs.statSync(path.join(dir, e.name)).mtimeMs })).sort((a, b) => b.t - a.t);
+      return entries.slice(keep).map((e) => e.full);
+    } catch { return []; }
+  };
+  const old = [...newest(slugDir, KEEP_RUNS, (n) => RUN_DIR_RE.test(n) && n !== runId),
+    ...newest(runsDir, KEEP_TREES, (n) => path.join(runsDir, n) !== treeDir)];
+  for (const d of old) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+}
 
 /** Copy a run's report and log into the state dir (redacted); returns posix artifact paths and the log hash. */
 export async function storeArtifacts(target, tree, slug, runRec, { prefix = '' } = {}) {
-  const dir = path.join(target.state.paths.cache, 'runs', String(tree).slice(0, 12), slug);
+  const runsDir = path.join(target.state.paths.cache, 'runs');
+  const treeDir = path.join(runsDir, String(tree).slice(0, 12));
+  const runId = runIdOf(target);
+  const dir = path.join(treeDir, slug, runId);
   ensureDir(dir);
+  pruneRuns(runsDir, treeDir, path.join(treeDir, slug), runId);
   const artifacts = [];
   let logHash = null;
   let logStored = null;
@@ -927,7 +1009,7 @@ function readCountsCache(state, sha, slug, runnerName) {
 
 function writeCountsCache(state, sha, slug, rec) {
   try {
-    writeJsonAtomic(countsFile(state, sha, slug), { schema: 'adc-counts/1', base_sha: sha, project: rec.project, runner: rec.runner, cmd: rec.cmd, ...pickCounts(rec.counts), tests: (rec.tests || []).slice(0, MAX_CACHED_IDS).map((t) => ({ id: t.id, status: t.status, ...(t.file ? { file: t.file } : {}) })), created_at: nowIso() });
+    writeJsonAtomic(countsFile(state, sha, slug), { schema: 'adc-counts/1', base_sha: sha, project: rec.project, runner: rec.runner, cmd: redactSync(rec.cmd), ...pickCounts(rec.counts), tests: (rec.tests || []).slice(0, MAX_CACHED_IDS).map((t) => ({ id: t.id, status: t.status, ...(t.file ? { file: t.file } : {}) })), created_at: nowIso() });
   } catch (err) {
     log(`could not write the counts cache: ${err.message}`);
   }
@@ -1128,7 +1210,7 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
   prow.log_path = stored.log_path;
   prow.run = {
     runner: runner.name, cmd: runRec.cmd, exit: runRec.exit, ms: runRec.ms, ...(runRec.counts || { executed: null, passed: null, failed: null, errors: null, skipped: null, flaky: null }),
-    retries_disabled: runner.retries_off.coverage || 'unknown', mechanism: runner.retries_off.mechanism || null, count_source: runRec.source, report_format: runRec.format || null,
+    retries_disabled: (runRec.retries_off || runner.retries_off).coverage || 'unknown', mechanism: (runRec.retries_off || runner.retries_off).mechanism || null, count_source: runRec.source, report_format: runRec.format || null,
     env: runRec.env, ...(runRec.timedOut ? { timed_out: true } : {}),
   };
   if (others.length) prow.other_runners = others;
@@ -1184,7 +1266,8 @@ async function cleanRunProject({ target, project, runnerOpt, noInstall, baseCoun
     id: 'CK-CLEANRUN', fm: FM_CLEANRUN, project: prow.root, status: verdict.status, reason: verdict.reason,
     command: [runRec.install && runRec.install.cmd, runRec.cmd].filter(Boolean).join(' && '), cwd: toPosix(runRec.dir), exit_code: runRec.exit,
     duration_ms: (runRec.install && runRec.install.ms || 0) + (runRec.ms || 0), summary: prow.summary, output_sha256: stored.output_sha256,
-    artifacts: stored.artifacts, findings,
+    // The base run's report and log back the base counts the outcome depends on.
+    artifacts: [...stored.artifacts, ...((base && base.source === 'run' && base.artifacts) || [])], findings,
     data: { runner: runner.name, run: prow.run, install: prow.install, base_counts: prow.base_counts, delta: prow.delta, worktree: keep ? prow.worktree : null, kept: Boolean(keep), shortfall_explained: explained },
   });
   return prow;
@@ -1475,14 +1558,14 @@ export async function typecheck({ target, detectResult = null, strict = false, r
     const storedBase = base.log_path ? await storeArtifacts(target, tree, slug, { log_path: base.log_path }, { prefix: `typecheck-${c.name}-base-` }) : { artifacts: [] };
     if (!keep) fs.rmSync(outRoot, { recursive: true, force: true });
     const fresh = newErrors(base.errors || [], head.errors);
-    // A base check that could not run (failed install, missing checker, timeout, or only an
-    // unparseable crash while the snapshot has real errors) is no baseline: comparing against it
-    // would report every pre-existing error as new.
+    // A base check that could not run (failed install, missing checker, timeout, or an unparseable
+    // crash the snapshot does not repeat) is no baseline: comparing against it would report every
+    // pre-existing error as new.
     const synthetic = (e) => /^exit-/.test(String(e.code || ''));
     const baseProblem = base.absent ? null
       : base.failed || (base.timedOut && 'TIMEOUT') || ((base.missing || base.error === 'ENOENT' || base.exit === 127 || (IS_WINDOWS && base.exit === 9009)) && 'CHECKER_NOT_FOUND')
         || (base.error && 'SPAWN_FAILED')
-        || (base.errors.length && base.errors.every(synthetic) && fresh.some((e) => !synthetic(e)) && 'UNPARSEABLE_FAILURE') || null;
+        || (base.errors.length && base.errors.every(synthetic) && fresh.length && 'UNPARSEABLE_FAILURE') || null;
     let status;
     let reason = null;
     if (head.timedOut) { status = 'unverified'; reason = 'TIMEOUT'; }
@@ -1493,7 +1576,10 @@ export async function typecheck({ target, detectResult = null, strict = false, r
     else if (baseProblem) { status = 'unverified'; reason = 'BASE_UNAVAILABLE'; }
     else if (fresh.length) { status = 'fail'; reason = 'NEW_ERRORS'; }
     else { status = 'pass-with-baseline'; reason = 'PRE_EXISTING_ERRORS'; }
-    const baseText = base.absent ? 'no base' : baseProblem ? `the base check did not run (${baseProblem}${baseProblem === 'INSTALL_FAILED' ? '; re-run with --no-install' : ''})` : `${base.errors.length} in the base`;
+    const notLinked = base.install && Array.isArray(base.install.not_linked) && base.install.not_linked[0];
+    const hint = baseProblem === 'INSTALL_FAILED' ? '; without network access re-run with --no-install'
+      : notLinked ? `; --no-install could not link ${notLinked.path} into the base: ${notLinked.reason}` : '';
+    const baseText = base.absent ? 'no base' : baseProblem ? `the base check did not run (${baseProblem}${hint})` : `${base.errors.length} in the base`;
     const summary = `${c.name}: ${head.errors.length} error(s) in the snapshot, ${baseText}, ${reason === 'BASE_UNAVAILABLE' ? 'new errors unknown' : `${fresh.length} new`}${strict ? ' (strict)' : ''}`;
     const known = reason === 'BASE_UNAVAILABLE' ? [] : fresh;
     const rec = { name: c.name, project: prel, cmd, base: { exit: base.exit ?? null, errors: (base.errors || []).length, ...(baseProblem ? { problem: baseProblem } : {}) }, head: { exit: head.exit, errors: head.errors.length }, new_errors: known, status, reason };
@@ -1523,6 +1609,30 @@ const COMMON = {
   timeout: { type: 'string' }, refresh: { type: 'boolean' },
 };
 
+/**
+ * `--red-green` / `--tests` entries (`path` or `path::name`, comma-separated) as repo-relative paths:
+ * a path that exists relative to `--cwd` is taken from there, anything else is repo-relative.
+ */
+export function repoRelativeEntries(values, cwd, root) {
+  if (!values) return null;
+  return (Array.isArray(values) ? values : [values]).flatMap((v) => String(v || '').split(',')).map((v) => v.trim()).filter(Boolean).map((v) => {
+    const i = v.indexOf('::');
+    const file = i === -1 ? v : v.slice(0, i);
+    const fromCwd = path.resolve(cwd, file);
+    const rel = cwd !== root && fs.existsSync(fromCwd) ? relPosix(root, fromCwd) : null;
+    return rel && rel !== '.' ? rel + (i === -1 ? '' : v.slice(i)) : toPosix(v);
+  });
+}
+
+/** A positive number option (`--timeout 600`), the default when absent; a usage error (exit 2) otherwise. */
+export function numberOption(values, name, def, { integer = false } = {}) {
+  const raw = values[name];
+  if (raw == null || raw === '') return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || (integer && !Number.isInteger(n))) throw usageError(`--${name} must be a positive ${integer ? 'integer' : 'number'} (got "${raw}")`);
+  return n;
+}
+
 export const cleanRunCommand = defineCommand({
   name: 'clean-run',
   usage: [
@@ -1534,17 +1644,18 @@ export const cleanRunCommand = defineCommand({
   ].join('\n'),
   options: { ...COMMON, 'all-projects': { type: 'boolean' }, 'base-counts': { type: 'string' }, 'no-base': { type: 'boolean' }, 'red-green': { type: 'string', multiple: true } },
   async run(ctx, values) {
+    const timeoutS = numberOption(values, 'timeout', DEFAULT_TIMEOUT_S);
     const target = await prepareTarget(ctx, { base: values.base || null, createState: !ctx.dryRun });
     const detectResult = await loadDetect(target.root, ctx.dryRun ? null : target.state, { refresh: Boolean(values.refresh) });
     const res = await cleanRun({
       target, detectResult, noInstall: Boolean(values['no-install']), runner: values.runner || null, allProjects: Boolean(values['all-projects']),
       baseCountsFile: values['base-counts'] ? path.resolve(ctx.cwd, values['base-counts']) : null, noBase: Boolean(values['no-base']), keep: Boolean(values.keep),
-      redGreen: values['red-green'] ? values['red-green'] : null, timeoutS: values.timeout ? Number(values.timeout) : DEFAULT_TIMEOUT_S, dryRun: ctx.dryRun,
+      redGreen: repoRelativeEntries(values['red-green'], ctx.cwd, target.root), timeoutS, dryRun: ctx.dryRun,
     });
     const summary = res.projects.length
       ? res.projects.map((p) => `${p.root}: ${p.status}${p.reason ? ` (${p.reason})` : ''}`).join('; ') + (res.red_green ? `; red-green: ${res.red_green.status}` : '')
       : (res.checks[0] && res.checks[0].summary) || res.status;
-    return { result: res, exit: exitFor(res.status, res.checks), summary: `${res.status.toUpperCase()} - ${summary}` };
+    return { result: redactDeep(res), exit: exitFor(res.status, res.checks), summary: redactSync(`${res.status.toUpperCase()} - ${summary}`) };
   },
 });
 
@@ -1556,6 +1667,7 @@ export const typecheckCommand = defineCommand({
   ].join('\n'),
   options: { ...COMMON, strict: { type: 'boolean' } },
   async run(ctx, values) {
+    const timeoutS = numberOption(values, 'timeout', DEFAULT_TIMEOUT_S);
     const target = await prepareTarget(ctx, { base: values.base || null, createState: !ctx.dryRun });
     const detectResult = await loadDetect(target.root, ctx.dryRun ? null : target.state, { refresh: Boolean(values.refresh) });
     const opt = values.runner ? String(values.runner).trim() : null;
@@ -1564,8 +1676,8 @@ export const typecheckCommand = defineCommand({
       const names = checkersFor(detectResult, null, null).map((c) => c.name);
       if (!names.includes(opt)) throw usageError(`--runner "${opt}" is not a detected type checker (${names.join(', ') || 'none'}); pass a command line instead`);
     }
-    const res = await typecheck({ target, detectResult, strict: Boolean(values.strict), runner: isCmd ? null : opt, checkerCmd: isCmd ? opt : null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: values.timeout ? Number(values.timeout) : DEFAULT_TIMEOUT_S, dryRun: ctx.dryRun });
+    const res = await typecheck({ target, detectResult, strict: Boolean(values.strict), runner: isCmd ? null : opt, checkerCmd: isCmd ? opt : null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS, dryRun: ctx.dryRun });
     const summary = res.checks.map((c) => c.summary).join('; ');
-    return { result: res, exit: exitFor(res.status === 'pass-with-baseline' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${summary}` };
+    return { result: redactDeep(res), exit: exitFor(res.status === 'pass-with-baseline' ? 'pass' : res.status, res.checks), summary: redactSync(`${res.status.toUpperCase()} - ${summary}`) };
   },
 });

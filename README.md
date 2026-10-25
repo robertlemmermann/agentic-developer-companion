@@ -86,8 +86,8 @@ A plain-text version of both diagrams is in
 | OpenAI Codex | ✅ | `$agentic-developer-companion <mode>` |
 | Windows, macOS, Linux | ✅ one zero-dependency Node runtime, no shell scripts, no symlinks | — |
 
-Status of 0.1.0: the self-test and the host CLIs (Copilot CLI 1.0.103, Claude Code 2.1.310,
-Codex 0.164.0, gh 2.99.0) were exercised on Linux; the Windows and macOS rows of the
+Status of 0.1.0: the unit suites and the host CLIs (Copilot CLI 1.0.103, Claude Code 2.1.310,
+Codex 0.164.0, gh 2.99.0) were exercised in a Linux container; the Windows and macOS rows of the
 [manual matrix](skills/agentic-developer-companion/tests/manual-matrix.md) are still open.
 Per-host details and known gaps:
 [host notes](skills/agentic-developer-companion/references/host-notes.md).
@@ -98,6 +98,10 @@ You need **Git 2.31+**, **a supported host** from the table above, and **Node.js
 `PATH` for the scripts and hooks (without Node the skill still works in guidance-only mode).
 Everything else is optional and has a fallback:
 [PREREQUISITES.md](skills/agentic-developer-companion/PREREQUISITES.md).
+
+| Host minimums | Copilot CLI | VS Code | Claude Code | Codex | GitHub CLI (`gh skill`) |
+|---|---|---|---|---|---|
+| Version | 1.0.88 | 1.109 | 2.1.269 (`claude plugin eval`; 2.1.295 for hook `onFailure`) | 0.124.0 (stable hooks; 0.164.0 for `/presets`) | 2.90.0 |
 
 The `gh skill` commands below (GitHub CLI 2.90.0+, `gh skill` is in public preview) are
 identical in bash, PowerShell and cmd. Run project-scope commands in the repository root.
@@ -431,9 +435,11 @@ and its SHA, and check it against the release with
   (offline-first; `--offline` turns it off and is the default inside the Codex sandbox);
   `clean-run` runs your project's own frozen install; `live run` calls the endpoints your
   probes name; `doctor --verify-vendored` fetches the release it compares a vendored copy with.
-- **What it writes:** `.adc/` in your project (git-excluded), temp worktrees under the OS temp
-  directory (pruned unless `--keep`), and hook configs or scaffolds only after you pass
-  `--write` (merged, with a backup). It never commits, pushes or edits your index.
+- **What it writes:** `.adc/` in your project (git-excluded) and temp worktrees under the OS
+  temp directory (pruned unless `--keep`). Files in your repository or home directory only
+  when you ask: hook configs and scaffolds with `--write` (hook configs are merged, with a
+  backup), `tooling port` output, `tooling modify --accept` (CHANGELOG entry and version
+  bump); `--dry-run` previews each. It never commits, pushes or edits your Git index.
 - **Supply chain:** zero runtime dependencies (Node built-ins only), no `allowed-tools`
   grant in the frontmatter, the skill `name` never changes, Apache-2.0. Pin by tag and SHA.
 - **Secrets:** findings and ledgers redact secret-shaped values; the repository contains no

@@ -120,18 +120,16 @@ async function makeState(target, detectResult, env) {
   S.add = (check, severity, file, line, message, evidence = '', extra = {}) => {
     S.findings.push({
       id: check, severity, file: file ? toPosix(file) : null, line: line ?? null,
-      message: redactLiterals(message, secrets), evidence: redactEvidence(evidence, secrets), ...extra,
+      // Messages quote config values and commands, so they get the same masking as excerpts.
+      message: redactText(message, secrets), evidence: truncate(redactText(evidence, secrets).trim(), 240), ...extra,
     });
   };
   return S;
 }
 
-/** Evidence excerpts never carry secrets: shape-masked and literal-redacted, then truncated. */
-function redactEvidence(text, secrets) {
-  let out = String(text ?? '');
-  const hits = M.scanSecrets(out);
-  if (hits.length) out = hits.map((h) => h.redacted).join(' | ');
-  return truncate(redactLiterals(out, secrets).trim(), 240);
+/** Text that may quote changed lines: secret shapes masked in place, live-token literals redacted. */
+function redactText(text, secrets) {
+  return redactLiterals(M.redactSecrets(String(text ?? '')), secrets);
 }
 
 function multisetSubtract(items, removeItems, keyFn) {
@@ -188,7 +186,12 @@ function newHits(S, f, catalogs, { context = false, fileFilter = null } = {}) {
   if (!headHits.length) return [];
   const base = f.old_path && f.removed.length ? sideLines(S, f, 'base') : null;
   const baseHits = base ? M.scanText(base, catalogs, { file: f.old_path, lines: lineSet(f.removed) }) : [];
-  const key = (side, lines, file) => (h) => `${h.id}|${norm(h.text)}|${context ? caseContext(S, side, file, lines, h.line) : ''}`;
+  const key = (side, lines, file) => (h) => {
+    const ctx = context ? caseContext(S, side, file, lines, h.line) : '';
+    // Inside a known test case the marker itself identifies the occurrence: editing the rest of a
+    // line that already carried it (a skip reason, an assertion on the same line) adds nothing.
+    return `${h.id}|${ctx ? norm(h.match ?? h.text) : norm(h.text)}|${ctx}`;
+  };
   const headKey = key('head', head, f.path);
   const baseKey = key('base', base || [], f.old_path);
   const baseKeys = baseHits.map((h) => ({ k: baseKey(h) }));
@@ -219,9 +222,21 @@ function namingRequired(oldNaming, newPath) {
 
 const caseKey = (c, lines) => c.name || `unnamed:${norm(lines?.[c.line - 1] || '')}`;
 
+/** Assertion lines inside each case's range (from its declaration to the next one), aligned with `cases`. */
+function caseAssertionCounts(cases, lines, file) {
+  const counts = cases.map(() => 0);
+  if (!lines || !cases.length) return counts;
+  let ci = 0;
+  for (const h of M.scanText(lines, M.ASSERTION_LINE, { file })) {
+    while (ci + 1 < cases.length && cases[ci + 1].line <= h.line) ci++;
+    if (h.line >= cases[ci].line) counts[ci]++;
+  }
+  return counts;
+}
+
 function checkTestDeletion(S) {
   const perFile = [];
-  const addedPool = new Map(); // case key -> [{file}]
+  const addedPool = new Map(); // case key -> [{ file, line, assertions }]
   let filesDeleted = 0;
   let filesRenamedOut = 0;
   let casesBase = 0;
@@ -240,13 +255,15 @@ function checkTestDeletion(S) {
     const headCases = headSide ? S.cases('head', f.path) : [];
     casesBase += baseCases.length;
     casesHead += headCases.length;
-    const entry = { f, oldTest, newTest, headSide, baseCases, headCases, baseL, headL };
+    const baseCounts = caseAssertionCounts(baseCases, baseL, f.old_path);
+    const headCounts = caseAssertionCounts(headCases, headL, f.path);
+    const entry = { f, oldTest, newTest, headSide, baseCases, headCases, baseL, headL, baseCounts };
     perFile.push(entry);
     const added = multisetSubtract(headCases, baseCases.map((c) => ({ k: caseKey(c, baseL) })), (c) => (c.k !== undefined ? c.k : caseKey(c, headL)));
     for (const c of added) {
       const k = caseKey(c, headL);
       if (!addedPool.has(k)) addedPool.set(k, []);
-      addedPool.get(k).push({ file: f.path });
+      addedPool.get(k).push({ file: f.path, line: c.line, assertions: headCounts[headCases.indexOf(c)] });
     }
   }
   const takeMoved = (k, file) => {
@@ -254,23 +271,33 @@ function checkTestDeletion(S) {
     if (!list) return null;
     const i = list.findIndex((x) => x.file !== file);
     if (i === -1) return null;
-    return list.splice(i, 1)[0].file;
+    return list.splice(i, 1)[0];
   };
+  // A case that moves to another file must take its assertions along (an emptied copy is a removal).
+  const weakenedMoves = (from, moves) => {
+    const weak = moves.filter((x) => x.to.assertions < x.before);
+    if (!weak.length) return;
+    const lostA = weak.reduce((n, x) => n + x.before - x.to.assertions, 0);
+    S.add('CK-ASSERT', 'fail', weak[0].to.file, weak[0].to.line,
+      `${weak.length} test case${weak.length === 1 ? '' : 's'} moved from ${from} with fewer assertions (${lostA} assertion line${lostA === 1 ? '' : 's'} lost): ${weak.slice(0, 5).map((x) => `${x.c.name || `line ${x.c.line}`} (${x.before} -> ${x.to.assertions}, now in ${x.to.file})`).join(', ')}`,
+      (S.headLines(weak[0].to.file) || [])[weak[0].to.line - 1] || '', { rule: 'assert.moved-weakened' });
+  };
+  // Base line ranges of cases reported as removed or moved: their assertions are accounted for
+  // here, so CK-ASSERT does not count them again. Renamed cases stay with CK-ASSERT.
   S.removedCaseRanges = new Map();
-  const assertionCount = (lines, file) => (lines ? M.scanText(lines, M.ASSERTION_LINE, { file }).length : 0);
+  const rangeOf = (e, c) => {
+    const idx = e.baseCases.indexOf(c);
+    return [c.line, idx + 1 < e.baseCases.length ? e.baseCases[idx + 1].line - 1 : (e.baseL ? e.baseL.length : c.line)];
+  };
+  const accounted = (e, list) => {
+    if (!list.length || !e.f.old_path) return;
+    const ranges = S.removedCaseRanges.get(e.f.old_path) || [];
+    for (const c of list) ranges.push(rangeOf(e, c));
+    S.removedCaseRanges.set(e.f.old_path, ranges);
+  };
   for (const e of perFile) {
-    const { f, oldTest, newTest, headSide, baseCases, headCases, baseL } = e;
+    const { f, oldTest, newTest, headSide, baseCases, headCases, baseL, baseCounts } = e;
     const removed = multisetSubtract(baseCases, headCases.map((c) => ({ k: caseKey(c, e.headL) })), (c) => (c.k !== undefined ? c.k : caseKey(c, baseL)));
-    // Remember which base line ranges belong to removed cases (their assertions count here, not in CK-ASSERT).
-    if (removed.length && f.old_path) {
-      const ranges = [];
-      for (const c of removed) {
-        const idx = baseCases.indexOf(c);
-        const end = idx + 1 < baseCases.length ? baseCases[idx + 1].line - 1 : (baseL ? baseL.length : c.line);
-        ranges.push([c.line, end]);
-      }
-      S.removedCaseRanges.set(f.old_path, ranges);
-    }
     if (f.status === 'D' && oldTest) {
       filesDeleted++;
       const named = M.testNaming(f.old_path);
@@ -278,16 +305,17 @@ function checkTestDeletion(S) {
         S.add('CK-TEST-DEL', 'info', f.old_path, null, `test support file deleted: ${f.old_path}`, '');
         continue;
       }
-      const moved = baseCases.map((c) => takeMoved(caseKey(c, baseL), f.old_path)).filter(Boolean);
-      const dest = [...new Set(moved)];
-      const destAssertions = dest.reduce((n, p) => n + assertionCount(S.headLines(p), p), 0);
-      if (baseCases.length && moved.length === baseCases.length && destAssertions >= assertionCount(baseL, f.old_path)) {
+      const moves = [];
+      baseCases.forEach((c, i) => { const to = takeMoved(caseKey(c, baseL), f.old_path); if (to) moves.push({ c, to, before: baseCounts[i] }); });
+      const dest = [...new Set(moves.map((x) => x.to.file))];
+      if (baseCases.length && moves.length === baseCases.length) {
         S.add('CK-TEST-DEL', 'info', f.old_path, null, `test file deleted; all ${baseCases.length} case(s) reappear in ${dest.join(', ')}`, '');
       } else {
         S.add('CK-TEST-DEL', 'fail', f.old_path, null,
-          `test file deleted: ${f.old_path} (${baseCases.length} test case${baseCases.length === 1 ? '' : 's'}${moved.length ? `, ${moved.length} reappear elsewhere` : ''})`,
+          `test file deleted: ${f.old_path} (${baseCases.length} test case${baseCases.length === 1 ? '' : 's'}${moves.length ? `, ${moves.length} reappear elsewhere` : ''})`,
           baseCases.slice(0, 5).map((c) => c.name || `line ${c.line}`).join(', '), { side: 'base' });
       }
+      weakenedMoves(f.old_path, moves);
       continue;
     }
     if (f.status === 'R' && oldTest && !newTest) {
@@ -304,21 +332,24 @@ function checkTestDeletion(S) {
       }
       S.add('CK-TEST-DEL', 'info', f.path, null, `test file renamed: ${f.old_path} -> ${f.path}`, '');
     }
-    if (!oldTest || !headSide || !baseCases.length) continue;
-    const netLoss = baseCases.length - headCases.length;
-    if (netLoss <= 0) continue;
+    if (!oldTest || !headSide || !baseCases.length || !removed.length) continue;
     const notMoved = [];
-    let movedCount = 0;
+    const moves = [];
     for (const c of removed) {
-      if (takeMoved(caseKey(c, baseL), f.path)) movedCount++;
+      const to = takeMoved(caseKey(c, baseL), f.path);
+      if (to) moves.push({ c, to, before: baseCounts[baseCases.indexOf(c)] });
       else notMoved.push(c);
     }
-    const effective = Math.min(netLoss - movedCount, notMoved.length);
+    accounted(e, moves.map((x) => x.c));
+    weakenedMoves(f.path, moves);
+    const netLoss = baseCases.length - headCases.length;
+    const effective = Math.min(netLoss - moves.length, notMoved.length);
     if (effective <= 0) {
-      S.add('CK-TEST-DEL', 'info', f.path, null, `${movedCount} test case(s) moved from ${f.path} to other test files`, '');
+      if (moves.length) S.add('CK-TEST-DEL', 'info', f.path, null, `${moves.length} test case(s) moved from ${f.path} to other test files`, '');
       continue;
     }
     const lost = notMoved.slice(0, effective);
+    accounted(e, lost);
     S.add('CK-TEST-DEL', 'fail', f.path, lost[0].line,
       `${effective} test case${effective === 1 ? '' : 's'} removed from ${f.path} (base ${baseCases.length} -> head ${headCases.length}): ${lost.slice(0, 5).map((c) => c.name || `line ${c.line}`).join(', ')}`,
       baseL ? baseL[lost[0].line - 1] : '', { side: 'base' });
@@ -343,8 +374,10 @@ function checkSkips(S) {
     if (baseL) base += M.scanText(baseL, M.SKIP_MARKERS, { file: f.old_path }).length;
     for (const h of hits) {
       fresh++;
-      const severity = h.kind === 'todo' ? 'finding' : 'fail';
-      const what = { focus: 'focus marker (other tests stop running)', skip: 'skip marker', xfail: 'expected-failure marker', todo: 'todo placeholder' }[h.kind] || 'skip marker';
+      // A build constraint is how integration tests are kept out of the default run, so it is a finding.
+      const severity = h.kind === 'todo' || h.kind === 'constraint' ? 'finding' : 'fail';
+      const what = { focus: 'focus marker (other tests stop running)', skip: 'skip marker', xfail: 'expected-failure marker', todo: 'todo placeholder',
+        constraint: 'build constraint (the default `go test ./...` no longer runs this file)' }[h.kind] || 'skip marker';
       S.add('CK-SKIP', severity, f.path, h.line, `${what} added in a test file`, h.text, { rule: h.id });
     }
   }
@@ -381,7 +414,8 @@ function checkAssertions(S) {
     const inTest = (side, file) => (h) => S.testLine(side, file, h.line);
     const headAll = M.scanText(headL, M.ASSERTION_LINE, { file: f.path }).filter(inTest('head', f.path));
     head += headAll.length;
-    for (const h of newHits(S, f, M.TAUTOLOGIES).filter(inTest('head', f.path))) {
+    const tautologies = newHits(S, f, M.TAUTOLOGIES, { context: true }).filter(inTest('head', f.path));
+    for (const h of tautologies) {
       S.add('CK-ASSERT', 'finding', f.path, h.line, 'assertion that can never fail', h.text, { rule: h.id });
     }
     const swallowLines = new Set();
@@ -405,18 +439,23 @@ function checkAssertions(S) {
     const ranges = S.removedCaseRanges?.get(f.old_path);
     const removedA = M.scanText(baseL, M.ASSERTION_LINE, { file: f.old_path, lines: lineSet(f.removed) })
       .filter((h) => !inRanges(h.line, ranges)).filter(inTest('base', f.old_path));
-    const addedA = M.scanText(headL, M.ASSERTION_LINE, { file: f.path, lines: added }).filter(inTest('head', f.path));
+    // An assertion that can never fail is no replacement for one that could.
+    const tautLines = new Set(tautologies.map((h) => h.line));
+    const addedA = M.scanText(headL, M.ASSERTION_LINE, { file: f.path, lines: added }).filter(inTest('head', f.path))
+      .filter((h) => !tautLines.has(h.line));
     const net = removedA.length - addedA.length;
     if (net > 0) {
       const gone = multisetSubtract(removedA, addedA, (h) => norm(h.text));
       const first = gone[0] || removedA[0];
       S.add('CK-ASSERT', 'fail', f.path, first.line,
-        `${net} assertion${net === 1 ? '' : 's'} removed from ${f.path} without a replacement`, first.text, { side: 'base' });
+        `${net} assertion${net === 1 ? '' : 's'} removed from ${f.path} without a replacement${tautLines.size ? ' (an assertion that can never fail does not count)' : ''}`,
+        first.text, { side: 'base' });
     }
     const weakRe = M.WEAK_ASSERTIONS;
     const removedStrong = removedA.filter((h) => !M.scanText([baseL[h.line - 1] || ''], weakRe, { file: f.old_path }).length);
     if (removedStrong.length) {
       for (const h of M.scanText(headL, weakRe, { file: f.path, lines: added })) {
+        if (tautLines.has(h.line)) continue;
         S.add('CK-ASSERT', 'finding', f.path, h.line, 'assertion weakened to a truthiness/existence check', h.text, { rule: h.id });
       }
     }
@@ -1050,7 +1089,7 @@ function checkSecrets(S, { scanner = null } = {}) {
   let external = null;
   if (chosen === 'gitleaks') external = runGitleaks(S);
   else if (chosen === 'trufflehog') external = runTrufflehog(S, added);
-  if (external && !external.ok) { S.data.scanner_error = external.error; chosen = 'builtin'; }
+  if (external && !external.ok) { S.data.scanner_error = redactText(external.error, S.secrets); chosen = 'builtin'; }
   let count = 0;
   if (chosen !== 'builtin') {
     for (const i of external.items) {
@@ -1320,7 +1359,7 @@ export async function diffScope({ target, detectResult = null, specPaths = null,
   ];
   for (const [id, fn] of steps) {
     try { fn(); } catch (err) {
-      S.unverified[id] = { code: err.code || 'STEP_ERROR', message: truncate(redactLiterals(err.message || String(err), S.secrets), 200) };
+      S.unverified[id] = { code: err.code || 'STEP_ERROR', message: truncate(redactText(err.message || String(err), S.secrets), 200) };
     }
   }
   // --allow: in scope, and soft findings on those paths are dropped (failures and secrets stay).

@@ -9,7 +9,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   defineCommand, defineGroup, makeContext, usageError, envError, EXIT, readText, readJson, writeFileAtomic, writeJsonAtomic,
-  ensureDir, toPosix, relPosix, sha256, nowIso, stamp, today, which, run, quoteArg, loadBundle, selectSections, renderString,
+  ensureDir, toPosix, relPosix, sha256, nowIso, today, which, run, quoteArg, loadBundle, selectSections, renderString,
   generatedBy, listFiles, truncate, nonce, SKILL_DIR, ADC_SCRIPT, ASSETS_DIR, IS_WINDOWS,
 } from './core.mjs';
 import { repoRoot, gitTry } from './git.mjs';
@@ -343,12 +343,15 @@ function staleReferences(root, files) {
         m = /^just\s+([A-Za-z0-9_-]+)/.exec(seg);
         if (m && justRecipes && !justRecipes.has(m[1])) findings.push({ id: 'STALE_COMMAND', severity: 'finding', file: f.path, line: s.line, message: `\`${seg}\`: the justfile has no recipe "${m[1]}"`, evidence: truncate(seg, 120) });
       }
-      if (s.fenced) continue;
+      // Paths: only in files the host loads as instructions (reference files are documentation
+      // full of example paths), only file-like paths, and never state, ignored or generated files.
+      if (s.fenced || f.kind === 'skill-file') continue;
       const p = s.text;
-      if (/^(?:\.{1,2}\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\/?$/.test(p) && !/^[a-z]+:\/\//i.test(p) && /\.[A-Za-z0-9]{1,8}$|\/$/.test(p) && !/[<>*?{}$]/.test(p)) {
+      if (/^(?:\.{1,2}\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(p) && !/^[a-z]+:\/\//i.test(p) && /\.[A-Za-z0-9]{1,8}$/.test(p) && !/[<>*?{}$]/.test(p)
+        && !/^(?:\.\/)?\.adc\//.test(p)) {
         const candidates = [path.resolve(path.dirname(abs), p), path.resolve(root, p)];
-        if (f.kind === 'skill' || f.kind === 'skill-file') candidates.push(path.resolve(path.dirname(abs), '..', p));
-        if (!candidates.some((c) => fs.existsSync(c))) {
+        if (f.kind === 'skill') candidates.push(path.resolve(path.dirname(abs), '..', p));
+        if (!candidates.some((c) => fs.existsSync(c)) && gitTry(root, ['check-ignore', '-q', '--no-index', p]) === null) {
           findings.push({ id: 'STALE_PATH', severity: 'finding', file: f.path, line: s.line, message: `\`${p}\` does not exist in the repository`, evidence: p });
         }
       }
@@ -724,7 +727,13 @@ export async function scaffoldTooling(kind, opts = {}) {
 
 const scaffoldCommand = defineCommand({
   name: 'tooling scaffold',
-  usage: 'tooling scaffold <instructions|skill|agent|prompt|hooks|mcp|plugin> [--for copilot|claude|codex|all] [--name n] [--description d] [--out dir] [--write] [--force]',
+  usage: [
+    'tooling scaffold <instructions|skill|agent|prompt|hooks|mcp|plugin> [--for copilot|claude|codex|all] [--out dir] [--write] [--force]',
+    '  instructions: [--topic t] [--apply-to "glob,glob"] [--exclude-agent code-review|cloud-agent]',
+    '  skill | prompt: --name n --description d [--license l] [--skill-root dir]   agent: --name n --description d [--skills a,b]',
+    '  hooks: [--name n] [--events PostToolUse,PreToolUse,SessionStart,SessionEnd,Stop,UserPromptSubmit] [--hooks-dir scripts/hooks]',
+    '  mcp: [--server n] (--command c [--args a,b] | --url https://...) [--env VAR,VAR]   plugin: see tooling plugin init',
+  ].join('\n'),
   options: TOOLING_SCAFFOLD_OPTIONS,
   async run(ctx, values, positionals) {
     const kind = positionals[0];
@@ -1077,8 +1086,8 @@ function latestResults(stateDir, slug, { host = null, descriptionSha = null } = 
  * Generate, validate and (with `run`, paid) execute a skill's trigger set headless.
  * Returns `{ queries[], results[], per_query_pass_rate, suite_score, ... }`.
  */
-export async function triggerSet({ ctx, root, skillPath, setPath = null, init = false, host = null, runIt = false, runs = 3, threshold = 0.8,
-  queryThreshold = 0.5, split = 'all', cli = null, model = null, maxCostUsd = null, timeoutS = 180, concurrency = 1, resultsFile = null, force = false } = {}) {
+export async function triggerSet({ ctx, root, skillPath, setPath = null, init = false, host = null, runIt = false, runs = null, threshold = null,
+  queryThreshold = null, split = 'all', cli = null, model = null, maxCostUsd = null, timeoutS = 180, concurrency = 1, resultsFile = null, force = false } = {}) {
   await loadFrontmatterLib();
   const skill = skillInfo(root, ctx.cwd, skillPath);
   const setAbs = setPath ? path.resolve(ctx.cwd, setPath) : path.join(skill.dir, 'evals', 'trigger-set.json');
@@ -1095,12 +1104,20 @@ export async function triggerSet({ ctx, root, skillPath, setPath = null, init = 
     throw usageError(`no trigger set at ${setRel}; create one with: tooling trigger-set ${skill.rel} --init`);
   }
   const set = loadTriggerSet(setAbs);
+  // Flags win; otherwise the set's own runs / query_threshold / suite_threshold; then 3, 0.5, 0.8.
   runs = Number(runs || set.doc.runs || 3);
+  threshold = Number(threshold ?? set.doc.suite_threshold ?? 0.8);
+  queryThreshold = Number(queryThreshold ?? set.doc.query_threshold ?? 0.5);
+  if (!(threshold >= 0 && threshold <= 1) || !(queryThreshold >= 0 && queryThreshold < 1)) throw usageError('thresholds must be between 0 and 1');
   if (!Number.isInteger(runs) || runs < 1 || runs > 10) throw usageError('--runs must be an integer from 1 to 10');
   const queries = split === 'all' ? set.queries : set.queries.filter((q) => q.split === split);
   Object.assign(out, { set_sha256: set.sha256, ready: set.todo.length === 0, todo: set.todo, warnings: [...set.warnings], queries,
     runs, query_threshold: queryThreshold, threshold, split });
-  const state = runIt || resultsFile ? openState(ctx, root) : null;
+  if (runIt && ctx.dryRun) {
+    out.warnings.push('dry run: nothing was run (trigger runs are paid and write results)');
+    runIt = false;
+  }
+  let state = null;
   let runsById = null;
   if (resultsFile) {
     const prev = readJson(path.resolve(ctx.cwd, resultsFile));
@@ -1113,6 +1130,8 @@ export async function triggerSet({ ctx, root, skillPath, setPath = null, init = 
     if (!host) throw usageError('--run needs --host claude|copilot|codex');
     if (!out.ready) throw usageError(`the trigger set still has TODO queries (${set.todo.slice(0, 5).join(', ')}); write real queries first`);
     const cliInfo = resolveCli(host, cli);
+    // The state dir is created only for a run that really starts (results and metrics go there).
+    state = openState(ctx, root);
     const slug = artifactSlug(skill.rel);
     const prior = latestResults(state.dir, slug, { host });
     out.iteration = prior.count + 1;
@@ -1159,8 +1178,8 @@ const triggerSetCommand = defineCommand({
     const split = values.split || 'all';
     if (!['all', 'train', 'validation'].includes(split)) throw usageError('--split must be all, train or validation');
     const res = await triggerSet({ ctx, root, skillPath: positionals[0] || '.', setPath: values.set || null, init: Boolean(values.init), host: values.host || null,
-      runIt: Boolean(values.run), runs: values.runs ? Number(values.runs) : null, threshold: num(values.threshold, 0.8, 'threshold'),
-      queryThreshold: num(values['query-threshold'], 0.5, 'query-threshold'), split, cli: values.cli || null, model: values.model || null,
+      runIt: Boolean(values.run), runs: values.runs ? Number(values.runs) : null, threshold: num(values.threshold, null, 'threshold'),
+      queryThreshold: num(values['query-threshold'], null, 'query-threshold'), split, cli: values.cli || null, model: values.model || null,
       maxCostUsd: num(values['max-cost-usd'], null, 'max-cost-usd'), timeoutS: num(values['timeout-s'], 180, 'timeout-s'),
       concurrency: num(values.concurrency, 1, 'concurrency'), resultsFile: values.results || null, force: Boolean(values.force) });
     let exit = EXIT.OK;
@@ -1570,12 +1589,13 @@ async function modifyRun(ctx, verb, values, p) {
     return report;
   }
   const rel = resolveArtifactRel(root, ctx.cwd, p);
-  const state = openState(ctx, root);
+  // --dry-run measures and compares, but writes nothing (not even under .adc/).
+  const state = ctx.dryRun ? checkState(ctx, root) : openState(ctx, root);
   if (verb === 'baseline') {
-    const m = await measureArtifact({ ctx, root, rel, state, ...common });
-    const dir = saveBaseline(root, state.dir, rel, m);
+    const m = await measureArtifact({ ctx, root, rel, state, ...common, runTriggers: common.runTriggers && !ctx.dryRun });
+    const dir = ctx.dryRun ? null : saveBaseline(root, state.dir, rel, m);
     const { context, ...rest } = m;
-    return { ...rest, baseline_dir: toPosix(relPosix(root, dir) ?? dir), context_lines: lineCount(context || ''),
+    return { ...rest, dry_run: ctx.dryRun, baseline_dir: dir ? toPosix(relPosix(root, dir) ?? dir) : null, context_lines: lineCount(context || ''),
       next_steps: [m.kind === 'skill' && m.trigger.status !== 'measured' ? `Measure triggering before the change (${PAID_NOTE}): tooling trigger-set ${rel} --host claude --run` : null,
         `Change the artifact (one intent per change; see references/tooling-practices.md), then run: tooling modify compare ${rel}`].filter(Boolean) };
   }
@@ -1598,7 +1618,7 @@ async function modifyRun(ctx, verb, values, p) {
       next_steps: extra.length ? [`These files were added after the baseline and were left in place: ${extra.join(', ')}`] : [] };
   }
   // compare
-  const after = await measureArtifact({ ctx, root, rel, state, ...common });
+  const after = await measureArtifact({ ctx, root, rel, state, ...common, runTriggers: common.runTriggers && !ctx.dryRun });
   if (after.trigger?.status !== 'measured' && base.doc.trigger?.status === 'measured' && after.description_sha256 && after.description_sha256 === base.doc.description_sha256) {
     after.trigger = { ...base.doc.trigger, reused: 'name and description unchanged, so the baseline trigger score still applies' };
   }
@@ -1609,9 +1629,10 @@ async function modifyRun(ctx, verb, values, p) {
   const out = { artifact: rel, baseline_dir: toPosix(relPosix(root, base.dir) ?? base.dir), unchanged: after.content_sha256 === base.doc.content_sha256,
     before: summarizeMeasurement(base.doc), after: summarizeMeasurement(afterRest), deltas: cmp.deltas, verdict: cmp.verdict, failing: cmp.failing, unverified: cmp.unverified,
     changelog_entry: entry, recorded: null, restored: null };
-  const file = path.join(path.dirname(base.dir), '..', `compare-${tsId()}.json`);
-  writeJsonAtomic(path.resolve(file), out);
-  appendMetrics(state.dir, { kind: 'tooling-modify', artifact: rel, verdict: cmp.verdict, tokens: cmp.deltas.tokens.per_host, trigger: cmp.deltas.trigger, outcome: cmp.deltas.outcome });
+  if (!ctx.dryRun) {
+    writeJsonAtomic(path.resolve(path.dirname(base.dir), '..', `compare-${tsId()}.json`), out);
+    appendMetrics(state.dir, { kind: 'tooling-modify', artifact: rel, verdict: cmp.verdict, tokens: cmp.deltas.tokens.per_host, trigger: cmp.deltas.trigger, outcome: cmp.deltas.outcome });
+  }
   if (values.accept) {
     if (cmp.verdict !== 'accept') {
       out.recorded = { refused: `verdict is ${cmp.verdict}: ${[...cmp.failing, ...cmp.unverified].join('; ')}` };
@@ -1691,7 +1712,7 @@ const modifyCommand = defineCommand({
     let exit = EXIT.OK;
     if (verb === 'compare' || verb === 'migrate') exit = res.verdict === 'reject' ? EXIT.FINDINGS : res.verdict === 'unverified' ? EXIT.UNVERIFIABLE : EXIT.OK;
     if (values.accept && res.recorded && res.recorded.refused) exit = EXIT.FINDINGS;
-    const summary = verb === 'baseline' ? `baseline of ${res.artifact} stored in ${res.baseline_dir}`
+    const summary = verb === 'baseline' ? (res.baseline_dir ? `baseline of ${res.artifact} stored in ${res.baseline_dir}` : `baseline of ${res.artifact} measured (dry run: not stored)`)
       : verb === 'restore' ? `restored ${res.restored.length} file(s) of ${res.artifact}`
         : `${verb} ${res.artifact || res.migration}: ${res.verdict}${res.failing?.length ? ` (${res.failing.join('; ')})` : ''}`;
     return { result: res, exit, summary };

@@ -88,6 +88,36 @@
             ],
             "timeout": 10,
             "if": "Bash(*.adc*)"
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "<SKILL>/scripts/adc.mjs",
+              "hook-run",
+              "pre-guard",
+              "--dialect",
+              "claude",
+              "--level",
+              "guard"
+            ],
+            "timeout": 10,
+            "if": "Bash(*.env.live*)"
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "<SKILL>/scripts/adc.mjs",
+              "hook-run",
+              "pre-guard",
+              "--dialect",
+              "claude",
+              "--level",
+              "guard"
+            ],
+            "timeout": 10,
+            "if": "Bash(rm *)"
           }
         ]
       },

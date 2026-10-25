@@ -118,7 +118,10 @@ function stripLineComment(line, lang) {
 
 // Blank string literals so brace counting and keyword checks ignore their contents.
 const STRING_LITERAL = /(["'`])(?:\\.|(?!\1).)*\1/g;
-const blankStrings = (line) => String(line ?? '').replace(STRING_LITERAL, (s) => s[0] + ' '.repeat(Math.max(0, s.length - 2)) + s[0]);
+const blankLiteral = (s) => s[0] + ' '.repeat(Math.max(0, s.length - 2)) + s[0];
+const blankStrings = (line) => String(line ?? '').replace(STRING_LITERAL, blankLiteral);
+// Like blankStrings, but keeps a literal used as a property index (`describe['skip']`).
+const blankNonIndex = (line) => String(line ?? '').replace(STRING_LITERAL, (s, _q, at, all) => (/\[\s*$/.test(all.slice(0, at)) ? s : blankLiteral(s)));
 const indentOf = (line) => line.length - line.trimStart().length;
 
 /**
@@ -181,7 +184,9 @@ function handlerBody(masked, i, lang) {
 //  - langs: language families the entry applies to (absent = any file)
 //  - code: match against comment-masked text (directive catalogs match raw text)
 //  - next: for multi-line constructs, the next non-blank code line must match `next`
-//  - blank: also blank string literals first (a marker inside a string is not a marker)
+//  - blank: also blank string literals first (a marker inside a string is not a marker); the
+//    unblanked line must match too, so back-references still compare real values. 'index'
+//    keeps literals used as a property index (`describe['skip']`).
 //  - bodyNot: the handler block opened on the line must be non-empty and must not match
 
 /** Skip, focus, xfail and todo markers (plan Appendix A FM-01); applied to test files only. */
@@ -192,7 +197,7 @@ export const SKIP_MARKERS = [
   { id: 'skip.js-skip', langs: ['js'], code: true, blank: true, kind: 'skip', re: /\b(?:it|test|describe|context|suite|specify)(?:\.(?:concurrent|sequential|serial|parallel|describe|each|step))*\.(?:skip|skipIf|runIf|fixme)\b/ },
   { id: 'skip.js-todo', langs: ['js'], code: true, blank: true, kind: 'todo', re: /\b(?:it|test|describe)(?:\.(?:concurrent|describe))*\.todo\b/ },
   { id: 'skip.js-failing', langs: ['js'], code: true, blank: true, kind: 'xfail', re: /\b(?:it|test)(?:\.(?:concurrent))*\.(?:failing|fails)\b/ },
-  { id: 'skip.js-bracket', langs: ['js'], code: true, kind: 'skip', re: /\b(?:it|test|describe)\s*\[\s*['"](?:only|skip)['"]\s*\]/ },
+  { id: 'skip.js-bracket', langs: ['js'], code: true, blank: 'index', kind: 'skip', re: /\b(?:it|test|describe)\s*\[\s*['"](?:only|skip)['"]\s*\]/ },
   { id: 'skip.js-this-skip', langs: ['js'], code: true, blank: true, kind: 'skip', re: /\bthis\.skip\s*\(/ },
   { id: 'skip.js-pending', langs: ['js'], code: true, blank: true, kind: 'skip', re: /(?<![\w$.])pending\s*\(\s*\)/ },
   { id: 'skip.py-mark', langs: ['py'], code: true, kind: 'skip', re: /\bpytest\.mark\.(?:skip|skipif|xfail)\b/ },
@@ -200,6 +205,8 @@ export const SKIP_MARKERS = [
   { id: 'skip.py-unittest', langs: ['py'], code: true, kind: 'skip', re: /@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b|\bself\.skipTest\s*\(|\braise\s+(?:unittest\.)?SkipTest\b/ },
   { id: 'skip.go', langs: ['go'], code: true, kind: 'skip', re: /\b[tbf]\.(?:Skip|Skipf|SkipNow)\s*\(/ },
   { id: 'skip.go-build-ignore', langs: ['go'], kind: 'skip', re: /^\s*\/\/\s*(?:go:build|\+build)\s+ignore\b/ },
+  // Any other build constraint drops the file from a plain `go test ./...` unless the tag is passed.
+  { id: 'skip.go-build-tag', langs: ['go'], kind: 'constraint', re: /^\s*\/\/\s*(?:go:build|\+build)\s+(?!ignore\b)\S/ },
   { id: 'skip.rs-ignore', langs: ['rs'], code: true, kind: 'skip', re: /#\[ignore(?:\s*=\s*"[^"]*")?\s*\]/ },
   { id: 'skip.jvm', langs: ['jvm'], code: true, kind: 'skip', re: /@(?:Disabled\w*|Ignore)\b|@Test\s*\([^)]*\benabled\s*=\s*false/ },
   { id: 'skip.cs', langs: ['cs'], code: true, kind: 'skip', re: /\[\s*(?:\w+\s*,\s*)*Ignore\b|\[\s*(?:Fact|Theory|SkippableFact|SkippableTheory)\s*\([^)]*\bSkip\s*=|\bAssert\.(?:Ignore|Inconclusive)\s*\(/ },
@@ -255,7 +262,7 @@ export const WEAK_ASSERTIONS = [
 
 /** Assertions that can never fail. */
 export const TAUTOLOGIES = [
-  { id: 'tautology.js', langs: ['js'], code: true, re: /\bexpect\s*\(\s*(true|false|null|\d+|'[^']*'|"[^"]*")\s*\)\s*\.(?:toBe|toEqual|toStrictEqual)\s*\(\s*\1\s*\)|\bexpect\s*\(\s*true\s*\)\s*\.toBeTruthy\s*\(\s*\)|\bassert(?:\.ok)?\s*\(\s*true\s*\)/ },
+  { id: 'tautology.js', langs: ['js'], code: true, blank: true, re: /\bexpect\s*\(\s*(true|false|null|\d+|'[^']*'|"[^"]*")\s*\)\s*\.(?:toBe|toEqual|toStrictEqual)\s*\(\s*\1\s*\)|\bexpect\s*\(\s*true\s*\)\s*\.toBeTruthy\s*\(\s*\)|\bassert(?:\.ok)?\s*\(\s*true\s*\)/ },
   { id: 'tautology.py', langs: ['py'], code: true, re: /^\s*assert\s+(?:True|1|(\d+)\s*==\s*\1)\s*$|\bself\.assertTrue\s*\(\s*True\s*\)|\bself\.assertEqual\s*\(\s*(\d+|True)\s*,\s*\2\s*\)/ },
   { id: 'tautology.rs', langs: ['rs'], code: true, re: /\bassert!\s*\(\s*true\s*\)|\bassert_eq!\s*\(\s*(\d+|true)\s*,\s*\1\s*\)/ },
   { id: 'tautology.jvm', langs: ['jvm', 'cs'], code: true, re: /\bassert(?:True|That)\s*\(\s*true\s*\)|\bAssert\.(?:IsTrue|True)\s*\(\s*true\s*\)|\bassertEquals\s*\(\s*(\d+)\s*,\s*\1\s*\)/ },
@@ -299,7 +306,13 @@ export const SUPPRESSIONS = [
   { id: 'suppress.c', langs: ['c'], re: /\/\/\s*NOLINT(?:NEXTLINE|BEGIN)?\b|#pragma\s+(?:GCC|clang)\s+diagnostic\s+ignored\b/ },
   { id: 'suppress.sh', langs: ['sh'], re: /#\s*shellcheck\s+disable=/ },
   { id: 'suppress.sonar', re: /\bNOSONAR\b/ },
+  // Inline allow directives hide a line from the secret scanners that honor them (gitleaks,
+  // trufflehog, detect-secrets); diff-scope still scans such lines with the built-in patterns.
+  { id: 'suppress.secret-allow', re: /\bgitleaks:allow\b|\btrufflehog:ignore\b|\bpragma:\s*allowlist\s+secret\b/ },
 ];
+
+/** Inline directives that make a secret scanner skip a line (see suppress.secret-allow). */
+export const SECRET_ALLOW = /\bgitleaks:allow\b|\btrufflehog:ignore\b|\bpragma:\s*allowlist\s+secret\b/;
 
 /**
  * Lint/type configuration that turns a rule or check off (applied to lint-config files and
@@ -310,7 +323,7 @@ export const LINT_CONFIG_WEAKENING = [
   { id: 'lintcfg.rule-allow', re: /^\s*["']?[\w:-]+["']?\s*=\s*(?:["']allow["']|\{\s*level\s*=\s*["']allow["'])/ },
   { id: 'lintcfg.ts-strict-off', re: /["'](?:strict\w*|noImplicit\w+|noUnused\w+|noFallthroughCasesInSwitch|exactOptionalPropertyTypes|checkJs|alwaysStrict|useUnknownInCatchVariables)["']\s*:\s*false\b/ },
   { id: 'lintcfg.mypy-off', re: /^\s*(?:ignore_errors|ignore_missing_imports|allow_untyped_defs|allow_untyped_calls|allow_any_generics)\s*=\s*(?:true|True)\b|^\s*(?:strict|check_untyped_defs|disallow_untyped_defs|warn_unused_ignores|warn_return_any|strict_optional)\s*=\s*(?:false|False)\b|^\s*disable_error_code\s*=/ },
-  { id: 'lintcfg.ignore-list', re: /^\s*["']?(?:ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|disable|disabled|per-file-ignores|per_file_ignores|extend-per-file-ignores|unfixable|exclude_rules|skip|globalIgnores)["']?\s*[:=]/ },
+  { id: 'lintcfg.ignore-list', re: /^\s*["']?(?:ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|disable|disabled|per-file-ignores|per_file_ignores|extend-per-file-ignores|unfixable|exclude_rules|skip|globalIgnores|exclude|extend-exclude|extend_exclude|skip-dirs|skip-files|exclude-dirs|exclude-files)["']?\s*[:=]/ },
   { id: 'lintcfg.disable-all', re: /^\s*["']?(?:disable-all|disable_all)["']?\s*[:=]\s*true\b|^\s*["']?(?:recommended|all|enable-all)["']?\s*[:=]\s*false\b/ },
   { id: 'lintcfg.severity-none', re: /\bdotnet_diagnostic\.\w+\.severity\s*=\s*(?:none|silent|suggestion)\b|^\s*dotnet_analyzer_diagnostic\.[\w.]*severity\s*=\s*(?:none|silent)\b/ },
   { id: 'lintcfg.msbuild-off', re: /<NoWarn>|<TreatWarningsAsErrors>\s*false\s*</i },
@@ -318,6 +331,21 @@ export const LINT_CONFIG_WEAKENING = [
   { id: 'lintcfg.msbuild-nullable-off', re: /<Nullable>\s*disable\s*</i },
   { id: 'lintcfg.rubocop-off', re: /^\s*Enabled\s*:\s*false\b/ },
 ];
+
+/**
+ * Lint/type settings that turn a check on: removing one (without adding it back anywhere in the
+ * change) falls back to the tool's laxer default, the same as turning the check off.
+ */
+export const STRICTNESS_ON = [
+  { id: 'strict.ts', re: /["'](?:strict\w*|noImplicit\w+|noUnused\w+|noFallthroughCasesInSwitch|exactOptionalPropertyTypes|checkJs|alwaysStrict|useUnknownInCatchVariables|noUncheckedIndexedAccess|noPropertyAccessFromIndexSignature)["']\s*:\s*true\b/ },
+  { id: 'strict.mypy', re: /^\s*(?:strict|check_untyped_defs|disallow_\w+|warn_unused_ignores|warn_return_any|warn_redundant_casts|strict_optional|no_implicit_optional|strict_equality)\s*=\s*(?:true|True)\b/ },
+  { id: 'strict.pyright', re: /["']?typeCheckingMode["']?\s*[:=]\s*["']strict["']/ },
+  { id: 'strict.msbuild', re: /<(?:TreatWarningsAsErrors|EnforceCodeStyleInBuild|RunAnalyzers|RunAnalyzersDuringBuild|EnableNETAnalyzers)>\s*true\s*<|<Nullable>\s*enable\s*<|<WarningsAsErrors>[^<]+</i },
+  { id: 'strict.all', re: /^\s*["']?(?:enable-all|enable_all)["']?\s*[:=]\s*true\b/ },
+];
+
+/** Keys whose list items enable rules or linters (an item removed from them turns a check off). */
+export const LINT_ENABLE_KEYS = /^(?:select|extend-select|extend_select|enable|enabled|presets|extends)$/i;
 
 /** Keys whose list items are exclusions (an added item under them turns a check off or narrows it). */
 export const LINT_EXCLUSION_KEYS = /^(?:ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|exclude|extend-exclude|extend_exclude|per-file-ignores|per_file_ignores|disable|disabled|skip-dirs|skip-files|skip_dirs|skip_files|exclude-dirs|exclude-files|exclude_dirs|exclude_files|exclude_rules|unfixable|globalIgnores)$/i;
@@ -434,6 +462,42 @@ export function maskSecret(value) {
   return `${v.slice(0, keep)}...[REDACTED]`;
 }
 
+/** Secret values detected on one line: [{ id, severity, value }] (a specific rule wins over the generic one). */
+function secretHits(line) {
+  if (!line || line.length > 20_000) return [];
+  const hits = [];
+  for (const p of SECRET_GLOBAL) {
+    const re = p.g;
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(line))) {
+      const value = m[1] || m[2] || m[0];
+      if (m[0].length === 0) re.lastIndex++;
+      if (p.generic && !plausibleGeneric(value, line)) continue;
+      if (p.id === 'secret.url-credentials' && !plausibleUrlCredential(m[1], m[2])) continue;
+      hits.push({ id: p.id, severity: p.severity, value });
+    }
+  }
+  if (!hits.length) return hits;
+  const specific = new Set(hits.filter((h) => !h.id.startsWith('secret.generic')).map((h) => h.value));
+  return hits.filter((h) => !(h.id.startsWith('secret.generic') && [...specific].some((v) => v.includes(h.value) || h.value.includes(v))));
+}
+
+function maskValues(line, hits) {
+  let out = line;
+  for (const h of [...hits].sort((a, b) => b.value.length - a.value.length)) out = out.split(h.value).join(maskSecret(h.value));
+  return out;
+}
+
+/** `text` with every detected secret value masked in place (for messages and excerpts). */
+export function redactSecrets(text) {
+  if (text == null) return text;
+  return String(text).split(/(\r?\n)/).map((part) => {
+    const hits = secretHits(part);
+    return hits.length ? maskValues(part, hits) : part;
+  }).join('');
+}
+
 /**
  * Built-in secret scan. Returns [{ id, line, severity, redacted }] where `redacted` is the
  * line with every detected value masked. The raw value is never returned.
@@ -443,26 +507,9 @@ export function scanSecrets(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (!line || line.length > 20_000) continue;
-    const hits = [];
-    for (const p of SECRET_GLOBAL) {
-      const re = p.g;
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(line))) {
-        const value = m[1] || m[2] || m[0];
-        if (p.generic && !plausibleGeneric(value, line)) continue;
-        if (p.id === 'secret.url-credentials' && !plausibleUrlCredential(m[1], m[2])) continue;
-        hits.push({ id: p.id, severity: p.severity, value, index: m.index + m[0].indexOf(value) });
-        if (m[0].length === 0) re.lastIndex++;
-      }
-    }
-    if (!hits.length) continue;
-    // A specific rule wins over the generic one for the same value.
-    const specific = new Set(hits.filter((h) => !h.id.startsWith('secret.generic')).map((h) => h.value));
-    const kept = hits.filter((h) => !(h.id.startsWith('secret.generic') && [...specific].some((v) => v.includes(h.value) || h.value.includes(v))));
-    let redacted = line;
-    for (const h of [...kept].sort((a, b) => b.value.length - a.value.length)) redacted = redacted.split(h.value).join(maskSecret(h.value));
+    const kept = secretHits(line);
+    if (!kept.length) continue;
+    const redacted = maskValues(line, kept);
     const seen = new Set();
     for (const h of kept) {
       const key = `${h.id}:${h.value}`;
@@ -484,7 +531,10 @@ function plausibleGeneric(value, line) {
 function plausibleUrlCredential(userPass, host) {
   const [user, pass] = String(userPass).split(':');
   if (!pass || PLACEHOLDER.test(pass) || PLACEHOLDER.test(user) || /^\$|^%|^\{/.test(pass)) return false;
-  if (/^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|db|postgres|mysql|redis|mongo|example\.\w+)(?::\d+)?$/i.test(String(host).split('/')[0])) return false;
+  const h = String(host).split('/')[0].replace(/:\d+$/, '');
+  if (/^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|db|postgres|mysql|redis|mongo)$/i.test(h)) return false;
+  // RFC 2606 / 6761 names never resolve to a real service: documentation and test fixtures.
+  if (/(?:^|\.)(?:example\.(?:com|net|org)|example|test|invalid|localhost)$/i.test(h)) return false;
   return pass !== user;
 }
 
@@ -528,8 +578,11 @@ export function scanText(text, catalogs, opts = {}) {
     const seen = new Set();
     for (const e of entries) {
       if (seen.has(e.id)) continue;
-      const subject = e.code ? (e.blank ? blankStrings(getMasked()[i]) : getMasked()[i]) : raw[i];
-      if (!subject || !e.re.test(subject)) continue;
+      const code = e.code ? getMasked()[i] : raw[i];
+      const subject = e.blank === 'index' ? blankNonIndex(code) : e.blank ? blankStrings(code) : code;
+      if (!subject) continue;
+      const m = e.re.exec(subject);
+      if (!m || (e.blank && !e.re.test(code))) continue;
       if (e.next) {
         const src = e.code ? getMasked() : raw;
         let j = i + 1;
@@ -542,7 +595,8 @@ export function scanText(text, catalogs, opts = {}) {
         if (!block || /^(?:\s|pass\b|\.\.\.|continue\b|;)*$/.test(block.body) || e.bodyNot.test(blankStrings(block.body))) continue;
       }
       seen.add(e.id);
-      const hit = { id: e.id, line: i + 1, text: raw[i].trim().slice(0, 240) };
+      // `match` is the marker itself (string contents taken from the real line), for ratchet keys.
+      const hit = { id: e.id, line: i + 1, text: raw[i].trim().slice(0, 240), match: code.slice(m.index, m.index + m[0].length) };
       if (e.kind) hit.kind = e.kind;
       if (e.severity) hit.severity = e.severity;
       if (e.scope) hit.scope = e.scope;
@@ -689,7 +743,7 @@ export function testNaming(file) {
 const RUNNER_CONFIG_BASE = /^(?:jest\.config\.[cm]?[jt]s(?:on)?|vitest\.(?:config|workspace|projects)\.[cm]?[jt]s|vite\.config\.[cm]?[jt]s|playwright(?:-ct)?\.config\.[cm]?[jt]s|cypress\.config\.[cm]?[jt]s|cypress\.json|\.mocharc(?:\.[cm]?js|\.json|\.jsonc|\.ya?ml)?|karma\.conf\.[cm]?[jt]s|ava\.config\.[cm]?js|wdio\.conf\.[cm]?[jt]s|\.c8rc(?:\.json)?|\.nycrc(?:\.json|\.ya?ml)?|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|conftest\.py|noxfile\.py|\.coveragerc|nextest\.toml|cargo\.toml|.+\.runsettings|.+\.testsettings|directory\.build\.(?:props|targets)|.+\.(?:cs|fs|vb)proj|pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|\.rspec|\.simplecov|rakefile|phpunit\.xml(?:\.dist)?|makefile|gnumakefile|.+\.mk|justfile|\.justfile|taskfile\.ya?ml|package\.json|codecov\.ya?ml|\.codecov\.ya?ml|deno\.jsonc?)$/;
 const LOCKFILE_BASE = /^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|poetry\.lock|uv\.lock|pipfile\.lock|pdm\.lock|go\.sum|cargo\.lock|packages\.lock\.json|gemfile\.lock|composer\.lock|gradle\.lockfile|package\.resolved|pubspec\.lock|mix\.lock|flake\.lock|deno\.lock)$/;
 const MANIFEST_BASE = /^(?:package\.json|pyproject\.toml|setup\.py|setup\.cfg|requirements(?:[-_.][\w.-]+)?\.(?:txt|in)|constraints\.txt|pipfile|go\.mod|cargo\.toml|.+\.(?:cs|fs|vb)proj|directory\.packages\.props|packages\.config|pom\.xml|build\.gradle(?:\.kts)?|gemfile|.+\.gemspec|composer\.json|deno\.jsonc?|package\.swift|pubspec\.yaml|mix\.exs)$/;
-const LINT_CONFIG_BASE = /^(?:\.eslintrc(?:\.[cm]?js|\.json|\.ya?ml)?|eslint\.config\.[cm]?[jt]s|\.eslintignore|biome\.jsonc?|\.oxlintrc\.json|tsconfig(?:\.[\w-]+)?\.json|jsconfig\.json|\.flake8|ruff\.toml|\.ruff\.toml|mypy\.ini|\.mypy\.ini|pyrightconfig\.json|\.pylintrc|pylintrc|\.golangci\.(?:ya?ml|toml|json)|clippy\.toml|\.clippy\.toml|\.stylelintrc(?:\.\w+)?|\.markdownlint(?:\.\w+)?|\.yamllint(?:\.ya?ml)?|\.rubocop(?:_todo)?\.ya?ml|\.standard\.yml|phpstan\.neon(?:\.dist)?|psalm\.xml|\.?phpcs\.xml(?:\.dist)?|\.swiftlint\.ya?ml|detekt\.ya?ml|checkstyle[\w-]*\.xml|pmd[\w-]*\.xml|spotbugs[\w-]*\.xml|\.clang-tidy|\.editorconfig|\.globalconfig|.+\.ruleset|stylecop\.json|\.pre-commit-config\.ya?ml|\.semgrepignore|\.deepsource\.toml|sonar-project\.properties)$/;
+const LINT_CONFIG_BASE = /^(?:\.eslintrc(?:\.[cm]?js|\.json|\.ya?ml)?|eslint\.config\.[cm]?[jt]s|\.(?:eslint|stylelint|markdownlint|semgrep|gitleaks)ignore|\.gitleaks\.toml|biome\.jsonc?|\.oxlintrc\.json|tsconfig(?:\.[\w-]+)?\.json|jsconfig\.json|\.flake8|ruff\.toml|\.ruff\.toml|mypy\.ini|\.mypy\.ini|pyrightconfig\.json|\.pylintrc|pylintrc|\.golangci\.(?:ya?ml|toml|json)|clippy\.toml|\.clippy\.toml|\.stylelintrc(?:\.\w+)?|\.markdownlint(?:\.\w+)?|\.yamllint(?:\.ya?ml)?|\.rubocop(?:_todo)?\.ya?ml|\.standard\.yml|phpstan\.neon(?:\.dist)?|psalm\.xml|\.?phpcs\.xml(?:\.dist)?|\.swiftlint\.ya?ml|detekt\.ya?ml|checkstyle[\w-]*\.xml|pmd[\w-]*\.xml|spotbugs[\w-]*\.xml|\.clang-tidy|\.editorconfig|\.globalconfig|.+\.ruleset|stylecop\.json|\.pre-commit-config\.ya?ml|\.deepsource\.toml|sonar-project\.properties)$/;
 const GENERATED_DIRS = new Set(['dist', 'target', 'node_modules', 'vendor', '__generated__', 'generated', '.next', '.nuxt',
   '.svelte-kit', 'coverage', 'htmlcov', '__pycache__', 'site-packages', '.gradle', 'obj', '.turbo', '.parcel-cache']);
 const GENERATED_BASE = /(?:\.min\.(?:js|css|mjs)|\.(?:js|css)\.map|\.pb\.go|_pb2(?:_grpc)?\.pyi?|\.pb\.(?:cc|h)|\.g\.(?:dart|cs)|\.designer\.cs|\.generated\.\w+|_generated\.go|^zz_generated[\w.]*\.go|\.pyc)$/;

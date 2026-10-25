@@ -179,6 +179,9 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
   `--output-dir` and `--report` point elsewhere. In the default two-arm mode a `tool_used:
   Skill` grader only counts with `arm: both` (or under `--ablation none`).
 - **`skills-ref validate`** (`uvx --from 'git+https://github.com/agentskills/agentskills#subdirectory=skills-ref' skills-ref validate <skill>`) passes.
+- **`npx skills add … -a github-copilot -a claude-code -a codex --copy`** (skills 1.7.4)
+  writes byte-identical real folders to `.agents/skills/` (Copilot and Codex) and
+  `.claude/skills/`, no symlinks, plus a `skills-lock.json` in the project root.
 - Claude Code: `MultiEdit` is no longer a tool (C23; kept in matchers, harmless).
 
 ## 9. Open items
@@ -196,7 +199,7 @@ Status as of 2026-10-25 (C numbers refer to the build plan's Appendix C).
 | C6 | `copilot -p --output-format json` skill-load events; granular `--allow-tool` sufficiency; CI token (`COPILOT_GITHUB_TOKEN` reported) | open |
 | C9 | VS Code behavior with non-spec frontmatter keys | open (this skill uses none) |
 | C11 | Codex project-root markers for the upward walk; a TOML agent format | partly measured: `.codex/skills/` is read without trust |
-| C12 | `npx skills add --copy` on Windows without symlink privileges | open |
+| C12 | `npx skills add --copy` on Windows without symlink privileges | partly measured: `--copy` writes real folders (Linux, §8); Windows open |
 | C13 | Copilot's related-files listing for a skill with `tests/` and `evals/` | open; the footprint gate keeps ≤100 files |
 | C14 | Codex `config.toml` `[mcp_servers.<name>]` table for the `mcp` scaffold | open |
 | C15 | Waza `copilot-sdk` executor authentication in a Business tenant | open |

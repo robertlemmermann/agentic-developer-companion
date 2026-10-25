@@ -253,6 +253,12 @@ export function renderHooks({ host, scope = null, level = 'advise', nodePath = n
             hd.command = `${node.portable} ${plainQuote(script)} ${args.join(' ')}`;
             hd.commandWindows = `${node.windows} ${plainQuote(script)} ${args.join(' ')}`;
           }
+          // Copilot also runs this project file and ignores `if` (measured, CLI 1.0.103): handlers that
+          // differ only in `if` would all start for every Bash call there, so they become one
+          // unconditional handler (Claude then runs the guard on every Bash call, as Codex does).
+          const { if: _cond, ...rest } = hd;
+          const twin = shellForm ? handlers.find((x) => { const { if: _c, ...r } = x; return JSON.stringify(r) === JSON.stringify(rest); }) : null;
+          if (twin) { delete twin.if; continue; }
           handlers.push(hd);
           events.push({ host_event: ev, event: spec.event, matcher: group.matcher || null });
         }

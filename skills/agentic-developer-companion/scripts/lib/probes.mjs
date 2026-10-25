@@ -5,13 +5,14 @@
 import { randomInt } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { defineCommand, usageError, readJson, readText, writeFileAtomic, ensureDir, nonce, toPosix, quoteArg, tmpRoot, which, IS_WINDOWS, truncate, matchAny } from './core.mjs';
+import { defineCommand, usageError, readJson, readText, writeFileAtomic, ensureDir, nonce, toPosix, relPosix, quoteArg, tmpRoot, which, IS_WINDOWS, truncate, matchAny } from './core.mjs';
 import { diffLines, emptyTree, diffNameStatus, git } from './git.mjs';
 import { prepareTarget } from './state.mjs';
 import { parseCoverage, detectCoverageFormat, isTestPath, rootVariants } from './reports.mjs';
 import {
   loadDetect, resolveRunner, projectOf, acquireWorktree, releaseWorktrees, runProject, storeArtifacts, makeCheck, projectSlug,
-  worstStatus, exitFor, isCodeFile, testMatchesFile, runStep, runEnv, installProject, artifactPath, redactText, loadMarkers,
+  exitFor, isCodeFile, testMatchesFile, runStep, runEnv, installProject, artifactPath, loadMarkers, numberOption, repoRelativeEntries,
+  redactDeep,
 } from './clean-run.mjs';
 
 const FM_COVERAGE = ['FM-03'];
@@ -72,6 +73,22 @@ function toRepoPath(p, project, wtDir) {
     return s;
   }
   return project && project.root && project.root !== '.' ? `${toPosix(project.root)}/${s}` : s;
+}
+
+/**
+ * Repo path for a path from a provided coverage report: as is, relative to the project that holds
+ * the report (`packages/a/coverage/lcov.info` lists `src/x.ts`), or, for an absolute path from
+ * another checkout (a CI runner), the changed file it ends with.
+ */
+function mapProvidedPath(p, changed, ownerRoot) {
+  if (changed.has(p)) return p;
+  if (ownerRoot && changed.has(`${ownerRoot}/${p}`)) return `${ownerRoot}/${p}`;
+  if (/^(?:\/|[A-Za-z]:\/)/.test(p)) {
+    let best = null;
+    for (const f of changed) if (p.endsWith(`/${f}`) && (!best || f.length > best.length)) best = f;
+    if (best) return best;
+  }
+  return p;
 }
 
 const textOfDeps = (dir) => ['package.json', 'pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'dev-requirements.txt', 'setup.cfg', 'uv.lock', 'poetry.lock', 'Pipfile', 'Pipfile.lock', 'tox.ini']
@@ -192,15 +209,24 @@ export async function coverageDelta({ target, detectResult = null, failUnder = n
   if (report) {
     const files = (Array.isArray(report) ? report : String(report).split(',')).map((f) => f.trim()).filter(Boolean);
     const tools = [];
+    const changedSet = new Set(changed.map((c) => c.file));
     for (const f of files) {
       const abs = path.resolve(target.cwd || root, f);
       const text = readText(abs, null);
       if (text == null) throw usageError(`--report: cannot read ${toPosix(abs)}`);
       const fmt = detectCoverageFormat(text);
       if (!fmt) throw usageError(`--report: unknown coverage format in ${toPosix(abs)} (expected LCOV, Cobertura XML, Istanbul JSON or a Go cover profile)`);
-      const goModule = goModuleFor(root, '.');
-      const parsed = parseCoverage(fmt, text, { root: [root], goModule });
-      for (const [p, d] of Object.entries(parsed.files)) coverageByFile[toRepoPath(p, null, root)] = d;
+      const rel = relPosix(root, abs);
+      const owner = rel && rel !== '.' ? projectOf(rel, det.projects || []) : null;
+      const ownerRoot = owner && owner.root && owner.root !== '.' ? toPosix(owner.root) : null;
+      const goModule = (ownerRoot && goModuleFor(path.join(root, ownerRoot), ownerRoot)) || goModuleFor(root, '.');
+      let parsed;
+      try {
+        parsed = parseCoverage(fmt, text, { root: [root, ...(ownerRoot ? [path.join(root, ownerRoot)] : [])], goModule });
+      } catch (err) {
+        throw usageError(`--report: ${toPosix(abs)} could not be parsed as ${fmt} (${truncate(err.message, 120)})`);
+      }
+      for (const [p, d] of Object.entries(parsed.files)) coverageByFile[mapProvidedPath(toRepoPath(p, null, root), changedSet, ownerRoot)] = d;
       tools.push(fmt);
     }
     out.tool = `provided (${[...new Set(tools)].join(', ')})`;
@@ -239,7 +265,14 @@ export async function coverageDelta({ target, detectResult = null, failUnder = n
         extra.exit_code = extra.exit_code ?? runRec.exit;
         extra.duration_ms = (extra.duration_ms || 0) + (runRec.ms || 0);
         if (!produced) { reasons.push(`${prel}: the coverage run wrote no report (exit ${runRec.exit})`); out.projects.push({ root: prel, runner: r.name, status: 'unverified', reason: runRec.status === 'unverified' ? runRec.reason : runRec.runnerMissing ? 'RUNNER_NOT_FOUND' : runRec.timedOut ? 'TIMEOUT' : 'NO_COVERAGE_REPORT', cmd: runRec.cmd, exit: runRec.exit }); continue; }
-        const parsed = parseCoverage(cv.format, readText(produced, ''), { root: [pdir], goModule: goModuleFor(pdir, '.') });
+        let parsed;
+        try {
+          parsed = parseCoverage(cv.format, readText(produced, ''), { root: [pdir], goModule: goModuleFor(pdir, '.') });
+        } catch (err) {
+          reasons.push(`${prel}: the coverage report could not be parsed (${truncate(err.message, 120)})`);
+          out.projects.push({ root: prel, runner: r.name, status: 'unverified', reason: 'COVERAGE_UNPARSEABLE', cmd: runRec.cmd, exit: runRec.exit });
+          continue;
+        }
         files = {};
         for (const [p, d] of Object.entries(parsed.files)) files[toRepoPath(p, project, wt.dir)] = d;
         try { writeFileAtomic(cacheFile, JSON.stringify({ schema: 'adc-coverage-map/1', runner: r.name, format: cv.format, tree, files }) + '\n'); } catch {}
@@ -640,7 +673,7 @@ async function setup(ctx, values) {
   return { target, detectResult };
 }
 
-const timeoutOf = (values) => (values.timeout ? Math.max(1, Number(values.timeout) || DEFAULT_TIMEOUT_S) : DEFAULT_TIMEOUT_S);
+const timeoutOf = (values) => numberOption(values, 'timeout', DEFAULT_TIMEOUT_S);
 
 export const coverageDeltaCommand = defineCommand({
   name: 'coverage-delta',
@@ -651,9 +684,12 @@ export const coverageDeltaCommand = defineCommand({
   ].join('\n'),
   options: { ...COMMON, 'fail-under': { type: 'string' }, report: { type: 'string' } },
   async run(ctx, values) {
+    const timeoutS = timeoutOf(values);
+    const failUnder = values['fail-under'] ?? null;
+    if (failUnder != null && !(Number(failUnder) >= 0 && Number(failUnder) <= 100)) throw usageError('--fail-under must be a number between 0 and 100');
     const { target, detectResult } = await setup(ctx, values);
-    const res = await coverageDelta({ target, detectResult, failUnder: values['fail-under'] ?? null, report: values.report || null, runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: timeoutOf(values), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    const res = await coverageDelta({ target, detectResult, failUnder, report: values.report || null, runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS, dryRun: ctx.dryRun });
+    return { result: redactDeep(res), exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 
@@ -666,9 +702,10 @@ export const mutationScopeCommand = defineCommand({
   ].join('\n'),
   options: { base: COMMON.base, budget: { type: 'string' }, 'no-install': COMMON['no-install'], keep: COMMON.keep, refresh: COMMON.refresh },
   async run(ctx, values) {
+    const budgetMin = numberOption(values, 'budget', DEFAULT_BUDGET_MIN);
     const { target, detectResult } = await setup(ctx, values);
-    const res = await mutationScope({ target, detectResult, budgetMin: values.budget ? Number(values.budget) : DEFAULT_BUDGET_MIN, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    const res = await mutationScope({ target, detectResult, budgetMin, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), dryRun: ctx.dryRun });
+    return { result: redactDeep(res), exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 
@@ -680,9 +717,11 @@ export const flakeProbeCommand = defineCommand({
   ].join('\n'),
   options: { ...COMMON, times: { type: 'string' }, tests: { type: 'string', multiple: true } },
   async run(ctx, values) {
+    const times = numberOption(values, 'times', DEFAULT_TIMES, { integer: true });
+    const timeoutS = timeoutOf(values);
     const { target, detectResult } = await setup(ctx, values);
-    const res = await flakeProbe({ target, detectResult, times: values.times ? Number(values.times) : DEFAULT_TIMES, tests: values.tests ? values.tests.flatMap((t) => t.split(',')) : null, runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS: timeoutOf(values), dryRun: ctx.dryRun });
-    return { result: res, exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
+    const res = await flakeProbe({ target, detectResult, times, tests: repoRelativeEntries(values.tests, ctx.cwd, target.root), runner: values.runner || null, noInstall: Boolean(values['no-install']), keep: Boolean(values.keep), timeoutS, dryRun: ctx.dryRun });
+    return { result: redactDeep(res), exit: exitFor(res.status === 'skipped' ? 'pass' : res.status, res.checks), summary: `${res.status.toUpperCase()} - ${res.checks[0].summary}` };
   },
 });
 

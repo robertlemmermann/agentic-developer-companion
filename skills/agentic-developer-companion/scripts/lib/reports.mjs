@@ -136,8 +136,10 @@ export const isTestPath = (p) => TEST_PATH_RE.test(toPosix(String(p || '')));
 
 /** Location of the failing frame in a failure body: last frame for Python tracebacks, first otherwise. */
 export function failureLocation(body) {
-  // Capped: failure bodies can be large, and the generic pattern scans every position.
-  const text = String(body || '').slice(0, 8000);
+  // Capped (head and tail: the first frame for most runners, the last for Python tracebacks):
+  // failure bodies can be large, and the generic pattern scans every position.
+  const raw = String(body || '');
+  const text = raw.length > 8000 ? `${raw.slice(0, 4000)}\n${raw.slice(-4000)}` : raw;
   const py = [...text.matchAll(/^([^\s:]+\.py):(\d+):(?: in \S+| \w+)?/gm)];
   if (py.length) return { file: toPosix(py[py.length - 1][1]), line: Number(py[py.length - 1][2]) };
   const generic = /(?:at\s+(?:[^\n(]*\()?|❯\s+|^#?[ \t]*)((?:file:\/\/)?[^\s()'"`]+?\.(?:[cm]?[jt]sx?|rb|go|rs|cs|java|kt|py)):(\d+)/m.exec(text);

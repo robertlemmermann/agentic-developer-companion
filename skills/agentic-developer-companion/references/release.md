@@ -81,7 +81,7 @@ git ls-files "$S" | wc -l                                      # at most 100
 git ls-files --eol "$S" | grep -v 'w/lf' | grep -v 'w/none'    # no output (LF only)
 grep -rnE -e '[$]ARGUMENTS' -e '[$][{]CLAUDE_SKILL_DIR[}]' "$S/SKILL.md" "$S/references"   # no output
 wc -l "$S"/references/*.md                                     # each at most 300
-git ls-files "$S" | grep -i '[.]env'                           # only assets/templates/adc/env.live.example
+find "$S" -name '.env*'                                       # no output (no .env file in the tree)
 ```
 
 ## 3. External validators (free)

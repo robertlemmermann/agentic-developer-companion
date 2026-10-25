@@ -106,7 +106,7 @@ skill, so registration is an explicit, confirmed step.
 |---|---|---|
 | `advise` (default) | session brief, post-edit notes, observed test runs, a notice when edits are newer than the last ledger (it reaches the agent in Claude Code; Copilot drops `agentStop` context and Codex shows it to you only) | everyone |
 | `gate` | blocks completion **once per edit epoch** until a ledger newer than the last edit exists | teams that require `verify` |
-| `guard` | `gate` plus a pre-tool policy: denies force-push and history rewrites, `git add -f .adc`, commit/push while `.adc/` is tracked, host read/search/edit tools under `.adc/`, shell commands naming `.adc/.env.live`; asks on CI edits and test deletions | high-trust repositories |
+| `guard` | `gate` plus a pre-tool policy: denies force-push and history rewrites, `git add -f` of `.adc/` (by name, `.`, `-A` or a glob), commit/push while `.adc/` is tracked, host read/search/edit tools under `.adc/`, shell commands naming `.env.live` (or a glob under `.adc/` that matches it, or a recursive read or copy of `.adc/`); asks on CI edits and test deletions | high-trust repositories |
 
 1. Render and show the config (prints only; default scope `user`, level `advise`):
    `node <skill>/scripts/adc.mjs setup hooks --host copilot|copilot-cloud|claude|codex [--scope user|project] [--level advise|gate|guard] --json`
@@ -172,8 +172,9 @@ which needs no shell and no Git Bash on Windows. Project scope is written to
 because Copilot also reads that file in a trusted folder and starts exec-form handlers
 without their `args` (measured: the handler fails, and a failing `preToolUse` would deny every
 tool call). Copilot does not read `~/.claude/settings.json`. The guard's Bash handlers use
-`"if": "Bash(git *)"` (it also matches `cd x && git push -f`) and `"if": "Bash(*.adc*)"`
-(`cat .adc/.env.live`), so other shell commands never start it; Claude's Windows `PowerShell`
+`"if": "Bash(git *)"` (it also matches `cd x && git push -f`), `"if": "Bash(*.adc*)"`
+(`cat .adc/.env.live`) and `"if": "Bash(*.env.live*)"` (`cat .env.live` after `cd .adc`; Claude's
+Bash keeps its working directory), so other shell commands never start it; Claude's Windows `PowerShell`
 tool (used when Git Bash is absent) has its own entry; `Read`, `Grep`, `Glob` and the edit tools
 are covered by a further matcher. Add the printed `permissions.deny` rules
 (`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
@@ -203,7 +204,10 @@ and write `.adc/sessions/<id>.json` (edit counts and classes, observed runs as a
 plus counts, gate and guard bookkeeping, the ended flag). The state directory is created the
 first time there is something to record, after `/.adc/` is added to `.git/info/exclude`.
 `hooks.log` holds metadata only (event, tool, key names, sizes, timings; with `ADC_DEBUG=1`
-for every call), never payload bodies. While `.adc/` is tracked by git the session brief says
+for every call), never payload bodies. On Copilot the post-shell hook rewrites a shell result
+that shows the live-test token (`ADC_LIVE_TOKEN=…`, its JSON/YAML form, a `Get-ChildItem Env:`
+row, or the literal value of an `ADC_LIVE_TOKEN` exported into the session) before the model
+sees it; Claude Code and Codex rely on the guard denials. While `.adc/` is tracked by git the session brief says
 so and every other hook prints `{}` and writes nothing; the guard still denies commit and push.
 `ADC_HOME` or `--state-dir` relocate the directory.
 
@@ -237,8 +241,11 @@ Fallback for the two Mermaid diagrams in the README.
 
 ## 9. Windows notes
 
-- Copilot CLI and Codex run hook strings under PowerShell: install PowerShell 7
+- Copilot CLI runs the `powershell` strings under PowerShell: install PowerShell 7
   (`winget install Microsoft.PowerShell`); Windows PowerShell 5.1 works as a fallback.
+  Codex runs `commandWindows` through `%COMSPEC% /C` per its source (a PowerShell session shell
+  is also reported); the bare `node "<SKILL>/…"` form is valid in both, so keep Node on the
+  plain PATH.
 - Hook output is ASCII-only JSON, so console code pages cannot damage it; the handler always
   exits 0 (PowerShell `-Command` collapses other exit codes, Codex issue #54072).
 - `node.exe` must be a real executable on the launcher's PATH. Version managers that expose

@@ -189,6 +189,7 @@ export function normalizePayload(payload, dialect, event) {
     reason: typeof p.reason === 'string' ? p.reason : (typeof p.stopReason === 'string' ? p.stopReason : null),
     permission_mode: typeof p.permission_mode === 'string' ? p.permission_mode : null,
     agent_id: p.agent_id ?? p.agentId ?? null,
+    tool_use_id: typeof p.tool_use_id === 'string' && p.tool_use_id ? p.tool_use_id : null,
     keys: Object.keys(p).sort(),
   };
 }

@@ -1,0 +1,1732 @@
+# e2e scaffolds (plan §10.2): Playwright web projects, HTTP API tests and spawn-based CLI harnesses.
+# Rendered by scripts/lib/scaffold.mjs. Section attributes: kind=web|api|cli, lang, when=<feature>,
+# scope=repo (path relative to the repository root, else to --out), mode=lines (additive merge),
+# part=fragment name=<id> (inserted into other sections, never written on its own).
+# GitHub expressions pass through untouched; {{var}} placeholders must all be provided.
+
+@@@ file: package.json kind=web lang=ts @@@
+{
+  "name": "{{package_name}}",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests (Playwright). Scaffolded by {{generated_by}}.",
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @smoke",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report",
+    "browsers": "playwright install --with-deps"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.0.0"
+  }
+}
+
+@@@ file: playwright.config.ts kind=web lang=ts @@@
+// Playwright configuration. Scaffolded by {{generated_by}}; adapt it to this repository.
+// Environment: E2E_BASE_URL (default {{base_url}}), E2E_USERNAME / E2E_PASSWORD (optional login),
+// CI (set by every CI system: retries with failOnFlakyTests, one worker, blob report for shards).
+import { defineConfig, devices, type ReporterDescription } from '@playwright/test';
+
+const isCI = !!process.env.CI;
+export const baseURL = process.env.E2E_BASE_URL || '{{base_url}}';
+
+const reporter: ReporterDescription[] = [
+  ['list'],
+  ['html', { open: 'never', outputFolder: 'playwright-report' }],
+  ['junit', { outputFile: 'test-results/junit.xml' }],
+];
+// Sharded CI runs write blob reports that the workflow merges into one HTML and JUnit report.
+if (isCI) reporter.push(['blob', { outputDir: 'blob-report' }]);
+
+export default defineConfig({
+  testDir: './tests',
+  outputDir: './test-results',
+  fullyParallel: true,
+  // test.only must never reach CI.
+  forbidOnly: isCI,
+  // Retries only in CI, and a test that passes on a retry is reported as flaky and fails the run.
+  retries: isCI ? 2 : 0,
+  failOnFlakyTests: isCI,
+  workers: isCI ? 1 : undefined,
+  timeout: 30_000,
+  globalTimeout: isCI ? 45 * 60_000 : undefined,
+  expect: { timeout: 5_000 },
+  reporter,
+  use: {
+    baseURL,
+    testIdAttribute: 'data-testid',
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  projects: [
+    { name: 'setup', testMatch: /global\.setup\.ts/ },
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] }, dependencies: ['setup'] },
+    { name: 'firefox', use: { ...devices['Desktop Firefox'] }, dependencies: ['setup'] },
+    { name: 'webkit', use: { ...devices['Desktop Safari'] }, dependencies: ['setup'] },
+  ],
+{{web_server}}
+});
+
+@@@ file: fragment/web-server part=fragment name=web-server kind=web lang=ts @@@
+  // Starts the app unless E2E_BASE_URL points at one that is already running.
+  webServer: process.env.E2E_BASE_URL ? undefined : {
+    command: '{{server_cmd}}',
+    cwd: '{{server_cwd}}',
+    url: baseURL,
+    reuseExistingServer: !isCI,
+    timeout: 120_000,
+  },
+
+@@@ file: fixtures.ts kind=web lang=ts @@@
+// Shared fixtures. Specs import { test, expect } from '../fixtures' instead of '@playwright/test'.
+// - homePage: page object for the start page
+// - one login per parallel worker (storageState per worker) when E2E_USERNAME is set; "{worker}"
+//   in E2E_USERNAME gives every worker its own account, so tests that change data never collide
+// - third-party calls (analytics, chat widgets) are stubbed at the network boundary
+import fs from 'node:fs';
+import path from 'node:path';
+import { test as base, expect } from '@playwright/test';
+import { HomePage } from './pages/home.page';
+
+type Fixtures = { homePage: HomePage; stubThirdParty: void };
+type WorkerFixtures = { workerStorageState: string | undefined };
+
+const THIRD_PARTY = /(google-analytics|googletagmanager|doubleclick|segment\.io|hotjar|intercom)\./;
+
+export const test = base.extend<Fixtures, WorkerFixtures>({
+  homePage: async ({ page }, use) => {
+    await use(new HomePage(page));
+  },
+
+  stubThirdParty: [async ({ page }, use) => {
+    await page.route(THIRD_PARTY, (route) => route.fulfill({ status: 204, body: '' }));
+    await use();
+  }, { auto: true }],
+
+  storageState: async ({ workerStorageState }, use) => {
+    await use(workerStorageState);
+  },
+
+  workerStorageState: [async ({ browser }, use, workerInfo) => {
+    const username = process.env.E2E_USERNAME;
+    if (!username) {
+      await use(undefined);
+      return;
+    }
+    const id = workerInfo.parallelIndex;
+    const file = path.join(workerInfo.project.outputDir, '.auth', `${id}.json`);
+    if (!fs.existsSync(file)) {
+      const page = await browser.newPage({ storageState: undefined, baseURL: workerInfo.project.use.baseURL });
+      // ADAPT: the login form of this application.
+      await page.goto('/login');
+      await page.getByLabel(/user|e-?mail/i).fill(username.replace('{worker}', String(id)));
+      await page.getByLabel(/password/i).fill(process.env.E2E_PASSWORD ?? '');
+      await page.getByRole('button', { name: /sign in|log in/i }).click();
+      // ADAPT: wait for something only signed-in users see.
+      await page.waitForURL((url) => !url.pathname.startsWith('/login'));
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      await page.context().storageState({ path: file });
+      await page.close();
+    }
+    await use(file);
+  }, { scope: 'worker' }],
+});
+
+export { expect };
+
+@@@ file: pages/home.page.ts kind=web lang=ts @@@
+import type { Locator, Page } from '@playwright/test';
+
+/** Page object for the start page. Prefer role, label and test-id locators over CSS or XPath. */
+export class HomePage {
+  readonly page: Page;
+  readonly main: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+    this.main = page.locator('main, [role="main"], body').first();
+  }
+
+  async goto(): Promise<void> {
+    await this.page.goto('/');
+  }
+}
+
+@@@ file: tests/global.setup.ts kind=web lang=ts @@@
+// Setup project (playwright.config.ts): runs once before the browser projects and fails fast with
+// a clear message when the app is unreachable, instead of every test timing out. Seed shared test
+// data here when the suite needs it.
+import { test as setup, expect } from '@playwright/test';
+
+setup('the app is reachable', async ({ request, baseURL }) => {
+  const res = await request.get('/');
+  expect(res.status(), `GET ${baseURL}/ answered ${res.status()}`).toBeLessThan(500);
+});
+
+@@@ file: tests/smoke.spec.ts kind=web lang=ts @@@
+import { test, expect } from '../fixtures';
+
+// A fixed clock makes date-dependent rendering deterministic.
+const FIXED_NOW = new Date('2026-01-15T10:00:00Z');
+
+test.describe('smoke', { tag: '@smoke' }, () => {
+  test('the start page renders without uncaught errors', async ({ page, homePage }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+    await page.clock.setFixedTime(FIXED_NOW);
+    await homePage.goto();
+    await expect(page).toHaveTitle(/\S/);
+    await expect(homePage.main).toBeVisible();
+    expect(errors, 'uncaught errors on the page').toEqual([]);
+  });
+});
+
+@@@ file: fragment/journey part=fragment name=journey kind=web lang=ts @@@
+import { test, expect } from '../fixtures';
+
+// Journey: {{journey}}. Implement the steps, then remove test.fixme. Until then the run reports
+// it as skipped and `verify` lists it under CK-SKIP, so it cannot pass unnoticed.
+test.describe({{journey_js}}, { tag: '@regression' }, () => {
+  test.fixme({{journey_js}}, async ({ page }) => {
+    await test.step('open the start page', async () => {
+      await page.goto('/');
+    });
+    await test.step('ADAPT: perform the journey', async () => {
+      // e.g. await page.getByRole('link', { name: 'Sign up' }).click();
+    });
+    await test.step('ADAPT: assert what the user sees at the end', async () => {
+      await expect(page).toHaveURL(/./);
+    });
+  });
+});
+
+@@@ file: .gitignore kind=web lang=ts mode=lines @@@
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+all-blob-reports/
+playwright/.cache/
+playwright/.auth/
+
+@@@ file: README.md kind=web lang=ts @@@
+# End-to-end tests (Playwright)
+
+Scaffolded by {{generated_by}}.
+
+| Task | Command (from `{{out}}/`) |
+|---|---|
+| Install | `npm ci` (first time: `npm install`, commit `package-lock.json`), then `npx playwright install --with-deps` |
+| Run everything | `npx playwright test` |
+| Smoke subset | `npx playwright test --grep @smoke` |
+| One browser | `npx playwright test --project=chromium` |
+| Debug a failure | `npx playwright show-report` (traces are kept for failed tests) |
+
+- `E2E_BASE_URL` selects the app under test (default `{{base_url}}`); without it the configured
+  `webServer` starts the app.
+- `E2E_USERNAME` / `E2E_PASSWORD` enable the per-worker login in `fixtures.ts`.
+- Locators: `getByRole` and `getByLabel` first, then `getByTestId` (`data-testid`); never CSS
+  structure or XPath. Waits: web-first assertions, never `waitForTimeout`.
+- Determinism: `page.clock` for time, `page.route` / `page.routeFromHAR` for third-party calls.
+- CI (`.github/workflows/e2e-web.yml`): 4 shards, retries only in CI with `failOnFlakyTests`,
+  blob reports merged into one HTML report and `junit.xml`.
+
+@@@ file: .github/workflows/e2e-web.yml kind=web lang=ts scope=repo @@@
+{{header}}
+# Playwright end-to-end tests in 4 shards; the report job merges the blob reports into one HTML
+# report and one JUnit file. Edit freely: a later `verify` reports weakening edits as findings.
+name: e2e-web
+
+on:
+  pull_request:
+  push:
+    branches: [{{default_branch}}]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: e2e (shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2, 3, 4]
+        shardTotal: [4]
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{out}}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: {{out}}/package-lock.json
+{{app_install}}
+      - name: Install the e2e project
+        run: npm ci
+      - name: Install browsers (not cached, as Playwright recommends)
+        run: npx playwright install --with-deps
+      - name: Run the shard
+        run: npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL }}
+          E2E_USERNAME: ${{ vars.E2E_USERNAME }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: blob-report-${{ matrix.shardIndex }}
+          path: {{out}}/blob-report
+          retention-days: 1
+
+  report:
+    name: e2e report
+    if: ${{ !cancelled() }}
+    needs: [test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{out}}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: {{out}}/package-lock.json
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          path: {{out}}/all-blob-reports
+          pattern: blob-report-*
+          merge-multiple: true
+      - name: Merge the shard reports into HTML and JUnit
+        run: npx playwright merge-reports --reporter html,junit ./all-blob-reports
+        env:
+          PLAYWRIGHT_JUNIT_OUTPUT_NAME: junit.xml
+      - uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            {{out}}/playwright-report
+            {{out}}/junit.xml
+          retention-days: 14
+
+@@@ file: fragment/app-install part=fragment name=app-install kind=web lang=ts @@@
+      - name: Install the app under test
+        working-directory: {{project_root}}
+        run: {{install_cmd}}
+
+@@@ file: requirements-e2e.txt kind=web lang=python @@@
+# End-to-end test dependencies (pytest-playwright brings pytest, playwright and pytest-base-url).
+pytest-playwright>=0.7
+pytest-xdist>=3.6
+
+@@@ file: conftest.py kind=web lang=python @@@
+"""Fixtures for the Playwright end-to-end tests (pytest-playwright). Scaffolded by {{generated_by}}.
+
+Environment: E2E_BASE_URL (default {{base_url}}), E2E_USERNAME / E2E_PASSWORD (optional login;
+"{worker}" in E2E_USERNAME gives every pytest-xdist worker its own account).
+Run: python -m pytest {{out}} --browser chromium --tracing retain-on-failure \
+     --screenshot only-on-failure --video retain-on-failure --output test-results
+"""
+
+import os
+import re
+
+import pytest
+
+BASE_URL = os.environ.get("E2E_BASE_URL") or "{{base_url}}"
+THIRD_PARTY = re.compile(r"(google-analytics|googletagmanager|doubleclick|segment\.io|hotjar|intercom)\.")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "smoke: fast checks that the app is up")
+    config.addinivalue_line("markers", "regression: user journeys and fixed bugs")
+
+
+@pytest.fixture(scope="session")
+def base_url():
+    return BASE_URL
+
+
+@pytest.fixture(scope="session")
+def storage_state_path(browser, base_url, tmp_path_factory):
+    """One login per worker; None when E2E_USERNAME is unset (the app needs no login)."""
+    username = os.environ.get("E2E_USERNAME")
+    if not username:
+        return None
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    path = tmp_path_factory.mktemp("auth") / f"{worker}.json"
+    context = browser.new_context(base_url=base_url)
+    page = context.new_page()
+    # ADAPT: the login form of this application.
+    page.goto("/login")
+    page.get_by_label(re.compile("user|e-?mail", re.I)).fill(username.replace("{worker}", worker))
+    page.get_by_label(re.compile("password", re.I)).fill(os.environ.get("E2E_PASSWORD", ""))
+    page.get_by_role("button", name=re.compile("sign in|log in", re.I)).click()
+    # ADAPT: wait for something only signed-in users see.
+    page.wait_for_url(lambda url: "/login" not in url)
+    context.storage_state(path=str(path))
+    context.close()
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def browser_context_args(browser_context_args, base_url, storage_state_path):
+    args = {**browser_context_args, "base_url": base_url}
+    if storage_state_path:
+        args["storage_state"] = storage_state_path
+    return args
+
+
+@pytest.fixture(autouse=True)
+def stub_third_party(page):
+    """Third-party calls (analytics, chat widgets) are stubbed at the network boundary."""
+    page.route(THIRD_PARTY, lambda route: route.fulfill(status=204, body=""))
+    yield
+
+@@@ file: web_pages.py kind=web lang=python @@@
+"""Page objects. Prefer role, label and test-id locators over CSS structure or XPath."""
+
+from playwright.sync_api import Locator, Page
+
+
+class HomePage:
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.main: Locator = page.locator('main, [role="main"], body').first
+
+    def goto(self) -> None:
+        self.page.goto("/")
+
+@@@ file: test_web_smoke.py kind=web lang=python @@@
+import re
+from datetime import datetime, timezone
+
+import pytest
+from playwright.sync_api import Page, expect
+
+from web_pages import HomePage
+
+# A fixed clock makes date-dependent rendering deterministic.
+FIXED_NOW = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.smoke
+def test_start_page_renders_without_uncaught_errors(page: Page) -> None:
+    errors = []
+    page.on("pageerror", lambda err: errors.append(str(err)))
+    page.clock.set_fixed_time(FIXED_NOW)
+    home = HomePage(page)
+    home.goto()
+    expect(page).to_have_title(re.compile(r"\S"))
+    expect(home.main).to_be_visible()
+    assert errors == [], f"uncaught errors on the page: {errors}"
+
+@@@ file: fragment/journey part=fragment name=journey kind=web lang=python @@@
+import re
+
+import pytest
+from playwright.sync_api import Page, expect
+
+# Journey: {{journey}}. Implement the steps, then remove the skip mark. Until then the run reports
+# it as skipped and `verify` lists it under CK-SKIP, so it cannot pass unnoticed.
+
+
+@pytest.mark.regression
+@pytest.mark.skip(reason="journey not implemented yet: " + {{journey_py}})
+def test_{{slug_ident}}(page: Page) -> None:
+    page.goto("/")
+    # ADAPT: perform the journey, e.g. page.get_by_role("link", name="Sign up").click()
+    # ADAPT: assert what the user sees at the end.
+    expect(page).to_have_url(re.compile("."))
+
+@@@ file: .gitignore kind=web lang=python mode=lines @@@
+test-results/
+.pytest_cache/
+
+@@@ file: .github/workflows/e2e-web.yml kind=web lang=python scope=repo @@@
+{{header}}
+# Playwright (pytest-playwright) end-to-end tests. Edit freely: a later `verify` reports weakening
+# edits as findings.
+name: e2e-web
+
+on:
+  pull_request:
+  push:
+    branches: [{{default_branch}}]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -r {{out}}/requirements-e2e.txt
+          python -m playwright install --with-deps chromium
+      - name: Run the e2e tests
+        run: python -m pytest {{out}} -n auto --browser chromium --tracing retain-on-failure --screenshot only-on-failure --video retain-on-failure --output test-results --junit-xml=test-results/junit.xml
+        env:
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL }}
+          E2E_USERNAME: ${{ vars.E2E_USERNAME }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: e2e-test-results
+          path: test-results/
+          retention-days: 14
+
+@@@ file: client.ts kind=api lang=ts @@@
+// HTTP client fixture for API end-to-end tests: base URL and credentials come from the
+// environment, every request carries a test-run tag. Scaffolded by {{generated_by}}.
+export const API_BASE_URL = (process.env.E2E_API_BASE_URL || '{{base_url}}').replace(/\/+$/, '');
+
+export interface ApiResponse {
+  status: number;
+  headers: Headers;
+  body: unknown;
+  text: string;
+}
+
+export interface ApiOptions {
+  body?: unknown;
+  /** null sends no credentials (negative tests); undefined uses E2E_API_TOKEN. */
+  token?: string | null;
+  headers?: Record<string, string>;
+}
+
+export async function api(method: string, urlPath: string, options: ApiOptions = {}): Promise<ApiResponse> {
+  const token = options.token === undefined ? process.env.E2E_API_TOKEN : options.token;
+  const headers: Record<string, string> = {
+    accept: 'application/json',
+    'x-test-run': process.env.E2E_TEST_RUN_ID || 'local',
+    ...options.headers,
+  };
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (options.body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(`${API_BASE_URL}${urlPath}`, {
+    method,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  let body: unknown = text;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    // Not JSON: keep the text.
+  }
+  return { status: res.status, headers: res.headers, body, text };
+}
+
+@@@ file: contract.ts kind=api lang=ts @@@
+// Contract snapshots: the JSON shape of a response (types, not values) is compared with the
+// committed file in contracts/. The first local run writes it; CI (CI=true) never does.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const DIR = path.resolve(process.cwd(), process.env.CONTRACTS_DIR || '{{contracts_dir}}');
+
+/** Types instead of values: contracts ignore data churn but catch renamed or retyped fields. */
+export function shapeOf(value: unknown): unknown {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return value.length ? [shapeOf(value[0])] : [];
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) out[key] = shapeOf(record[key]);
+    return out;
+  }
+  return typeof value;
+}
+
+export function expectContract(name: string, value: unknown): void {
+  const file = path.join(DIR, `${name}.json`);
+  const actual = JSON.stringify(shapeOf(value), null, 2) + '\n';
+  if (process.env.UPDATE_CONTRACTS === '1' || (!fs.existsSync(file) && !process.env.CI)) {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.writeFileSync(file, actual);
+    return;
+  }
+  assert.ok(fs.existsSync(file), `contract ${name}.json is missing: run the tests locally (or with UPDATE_CONTRACTS=1) and commit it`);
+  assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the response shape changed (${name}.json); review it, then UPDATE_CONTRACTS=1 accepts it`);
+}
+
+@@@ file: api.e2e.test.ts kind=api lang=ts @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import { api, API_BASE_URL } from '{{client_import}}';
+import { expectContract } from '{{contract_import}}';
+
+// Black-box API tests against E2E_API_BASE_URL (default {{base_url}}).
+const HEALTH = process.env.E2E_API_HEALTH_PATH || '{{health_path}}';
+// ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b); one negative
+// auth test is generated per path.
+const PROTECTED_PATHS: string[] = (process.env.E2E_API_PROTECTED_PATHS || '').split(',').map((p) => p.trim()).filter(Boolean);
+
+describe(`API ${API_BASE_URL}`, () => {
+  it('the health endpoint answers 2xx/3xx', async () => {
+    const res = await api('GET', HEALTH);
+    assert.ok(res.status >= 200 && res.status < 400, `GET ${HEALTH} -> ${res.status}: ${res.text.slice(0, 200)}`);
+  });
+
+  it('the health response keeps its contract', async () => {
+    const res = await api('GET', HEALTH);
+    expectContract('get-health', res.body);
+  });
+
+  it('an unknown route is a client error, not a server error', async () => {
+    const res = await api('GET', '/__e2e_unknown_route__');
+    assert.ok(res.status >= 400 && res.status < 500, `expected 4xx, got ${res.status}`);
+  });
+
+  for (const protectedPath of PROTECTED_PATHS) {
+    it(`${protectedPath} rejects requests without credentials`, async () => {
+      const res = await api('GET', protectedPath, { token: null });
+      assert.ok([401, 403].includes(res.status), `expected 401/403 without credentials, got ${res.status}`);
+    });
+  }
+});
+
+@@@ file: client.mjs kind=api lang=js @@@
+// HTTP client fixture for API end-to-end tests: base URL and credentials come from the
+// environment, every request carries a test-run tag. Scaffolded by {{generated_by}}.
+export const API_BASE_URL = (process.env.E2E_API_BASE_URL || '{{base_url}}').replace(/\/+$/, '');
+
+/**
+ * One request. `options.token`: null sends no credentials (negative tests), undefined uses
+ * E2E_API_TOKEN. Resolves to { status, headers, body (parsed JSON or text), text }.
+ */
+export async function api(method, urlPath, options = {}) {
+  const token = options.token === undefined ? process.env.E2E_API_TOKEN : options.token;
+  const headers = {
+    accept: 'application/json',
+    'x-test-run': process.env.E2E_TEST_RUN_ID || 'local',
+    ...options.headers,
+  };
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (options.body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(`${API_BASE_URL}${urlPath}`, {
+    method,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  let body = text;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    // Not JSON: keep the text.
+  }
+  return { status: res.status, headers: res.headers, body, text };
+}
+
+@@@ file: contract.mjs kind=api lang=js @@@
+// Contract snapshots: the JSON shape of a response (types, not values) is compared with the
+// committed file in contracts/. The first local run writes it; CI (CI=true) never does.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const DIR = path.resolve(process.cwd(), process.env.CONTRACTS_DIR || '{{contracts_dir}}');
+
+/** Types instead of values: contracts ignore data churn but catch renamed or retyped fields. */
+export function shapeOf(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return value.length ? [shapeOf(value[0])] : [];
+  if (typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = shapeOf(value[key]);
+    return out;
+  }
+  return typeof value;
+}
+
+export function expectContract(name, value) {
+  const file = path.join(DIR, `${name}.json`);
+  const actual = JSON.stringify(shapeOf(value), null, 2) + '\n';
+  if (process.env.UPDATE_CONTRACTS === '1' || (!fs.existsSync(file) && !process.env.CI)) {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.writeFileSync(file, actual);
+    return;
+  }
+  assert.ok(fs.existsSync(file), `contract ${name}.json is missing: run the tests locally (or with UPDATE_CONTRACTS=1) and commit it`);
+  assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the response shape changed (${name}.json); review it, then UPDATE_CONTRACTS=1 accepts it`);
+}
+
+@@@ file: api.e2e.test.mjs kind=api lang=js @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import { api, API_BASE_URL } from '{{client_import}}';
+import { expectContract } from '{{contract_import}}';
+
+// Black-box API tests against E2E_API_BASE_URL (default {{base_url}}).
+const HEALTH = process.env.E2E_API_HEALTH_PATH || '{{health_path}}';
+// ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b); one negative
+// auth test is generated per path.
+const PROTECTED_PATHS = (process.env.E2E_API_PROTECTED_PATHS || '').split(',').map((p) => p.trim()).filter(Boolean);
+
+describe(`API ${API_BASE_URL}`, () => {
+  it('the health endpoint answers 2xx/3xx', async () => {
+    const res = await api('GET', HEALTH);
+    assert.ok(res.status >= 200 && res.status < 400, `GET ${HEALTH} -> ${res.status}: ${res.text.slice(0, 200)}`);
+  });
+
+  it('the health response keeps its contract', async () => {
+    const res = await api('GET', HEALTH);
+    expectContract('get-health', res.body);
+  });
+
+  it('an unknown route is a client error, not a server error', async () => {
+    const res = await api('GET', '/__e2e_unknown_route__');
+    assert.ok(res.status >= 400 && res.status < 500, `expected 4xx, got ${res.status}`);
+  });
+
+  for (const protectedPath of PROTECTED_PATHS) {
+    it(`${protectedPath} rejects requests without credentials`, async () => {
+      const res = await api('GET', protectedPath, { token: null });
+      assert.ok([401, 403].includes(res.status), `expected 401/403 without credentials, got ${res.status}`);
+    });
+  }
+});
+
+@@@ file: pact/{{consumer}}-{{provider}}.pact.test.{{ext}} kind=api lang=ts|js when=pact @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import { PactV3, MatchersV3 } from '@pact-foundation/pact';
+
+// Consumer-driven contract: {{consumer}} expects this from {{provider}}. The pact file lands in
+// ./pacts; the provider verifies it (new Verifier({ providerBaseUrl, pactUrls }).verifyProvider())
+// and deploys are gated with `pact-broker can-i-deploy` + `pact-broker record-deployment`.
+const provider = new PactV3({ consumer: '{{consumer}}', provider: '{{provider}}', dir: 'pacts' });
+
+describe('{{provider}} contract (consumer {{consumer}})', () => {
+  it('answers the health check', async () => {
+    provider
+      .given('the service is up')
+      .uponReceiving('a health check')
+      .withRequest({ method: 'GET', path: '{{health_path}}' })
+      .willRespondWith({ status: 200, body: { status: MatchersV3.like('pass') } });
+    await provider.executeTest(async (mockServer) => {
+      const res = await fetch(`${mockServer.url}{{health_path}}`);
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(typeof body.status, 'string');
+    });
+  });
+});
+
+@@@ file: .github/workflows/api-fuzz.yml kind=api lang=ts|js|python|java|dotnet when=openapi scope=repo @@@
+{{header}}
+# Property-based API fuzzing with Schemathesis against {{openapi}}. It sends real requests that
+# create, change and delete data: dev/staging only, never production, started by hand.
+name: api-fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Base URL of a dev or staging deployment
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  schemathesis:
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Schemathesis (examples and coverage phases; add fuzzing once these pass)
+        env:
+          API_BASE_URL: ${{ inputs.base_url }}
+          API_TOKEN: ${{ secrets.E2E_API_TOKEN }}
+        run: |
+          auth=()
+          if [ -n "$API_TOKEN" ]; then auth=(-H "Authorization: Bearer $API_TOKEN"); fi
+          uvx schemathesis run {{openapi}} --url "$API_BASE_URL" "${auth[@]}" --checks all --phases examples,coverage --rate-limit 100/m --report junit --report-dir schemathesis-report
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: schemathesis-report
+          path: schemathesis-report/
+          retention-days: 7
+
+@@@ file: requirements-e2e.txt kind=api lang=python @@@
+# API end-to-end test dependencies.
+pytest>=8
+httpx>=0.27
+
+@@@ file: conftest.py kind=api lang=python @@@
+"""Fixtures for the API end-to-end tests (httpx + pytest). Scaffolded by {{generated_by}}.
+
+Environment: E2E_API_BASE_URL (default {{base_url}}), E2E_API_TOKEN (optional bearer token),
+E2E_API_PROTECTED_PATHS (comma list; one negative auth test each), E2E_TEST_RUN_ID (request tag).
+"""
+
+import os
+
+import httpx
+import pytest
+
+BASE_URL = (os.environ.get("E2E_API_BASE_URL") or "{{base_url}}").rstrip("/")
+
+
+def _client(token):
+    headers = {"accept": "application/json", "x-test-run": os.environ.get("E2E_TEST_RUN_ID", "local")}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    return httpx.Client(base_url=BASE_URL, headers=headers, timeout=15.0)
+
+
+@pytest.fixture(scope="session")
+def client():
+    with _client(os.environ.get("E2E_API_TOKEN")) as c:
+        yield c
+
+
+@pytest.fixture(scope="session")
+def anonymous_client():
+    with _client(None) as c:
+        yield c
+
+@@@ file: contract.py kind=api lang=python @@@
+"""Contract snapshots: the JSON shape of a response (types, not values) is compared with the
+committed file in contracts/. The first local run writes it; CI (CI=true) never does."""
+
+import json
+import os
+from pathlib import Path
+
+CONTRACTS = Path(os.environ.get("CONTRACTS_DIR") or Path(__file__).parent / "contracts")
+
+
+def shape_of(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return [shape_of(value[0])] if value else []
+    if isinstance(value, dict):
+        return {key: shape_of(value[key]) for key in sorted(value)}
+    return type(value).__name__
+
+
+def expect_contract(name, value):
+    path = CONTRACTS / f"{name}.json"
+    actual = json.dumps(shape_of(value), indent=2) + "\n"
+    if os.environ.get("UPDATE_CONTRACTS") == "1" or (not path.exists() and not os.environ.get("CI")):
+        CONTRACTS.mkdir(parents=True, exist_ok=True)
+        path.write_text(actual, encoding="utf-8", newline="\n")
+        return
+    assert path.exists(), f"contract {name}.json is missing: run the tests locally (or with UPDATE_CONTRACTS=1) and commit it"
+    expected = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert actual == expected, f"the response shape changed ({name}.json); review it, then UPDATE_CONTRACTS=1 accepts it"
+
+@@@ file: test_api_e2e.py kind=api lang=python @@@
+import os
+
+import pytest
+
+from contract import expect_contract
+
+HEALTH = os.environ.get("E2E_API_HEALTH_PATH", "{{health_path}}")
+# ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b).
+PROTECTED_PATHS = [p.strip() for p in os.environ.get("E2E_API_PROTECTED_PATHS", "").split(",") if p.strip()]
+
+
+def test_health_endpoint_answers_success(client):
+    res = client.get(HEALTH)
+    assert 200 <= res.status_code < 400, f"GET {HEALTH} -> {res.status_code}: {res.text[:200]}"
+
+
+def test_health_response_keeps_its_contract(client):
+    res = client.get(HEALTH)
+    expect_contract("get-health", res.json())
+
+
+def test_unknown_route_is_a_client_error(client):
+    res = client.get("/__e2e_unknown_route__")
+    assert 400 <= res.status_code < 500, f"expected 4xx, got {res.status_code}"
+
+
+@pytest.mark.parametrize("protected_path", PROTECTED_PATHS)
+def test_protected_endpoint_rejects_anonymous_requests(anonymous_client, protected_path):
+    res = anonymous_client.get(protected_path)
+    assert res.status_code in (401, 403), f"expected 401/403 without credentials, got {res.status_code}"
+
+@@@ file: ApiE2ETest.java kind=api lang=java @@@
+// API end-to-end tests (JUnit 5 + REST-assured). Scaffolded by {{generated_by}}.
+// Environment: E2E_API_BASE_URL (default {{base_url}}), E2E_API_TOKEN, E2E_API_PROTECTED_PATHS.
+// Contract checks: add a JSON schema per endpoint under src/test/resources and assert
+// body(matchesJsonSchemaInClasspath("health-schema.json")) (io.rest-assured:json-schema-validator).
+package {{java_package}};
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.anyOf;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
+
+import io.restassured.RestAssured;
+import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+@Tag("e2e")
+class ApiE2ETest {
+  private static final String HEALTH = System.getenv().getOrDefault("E2E_API_HEALTH_PATH", "{{health_path}}");
+
+  @BeforeAll
+  static void configure() {
+    RestAssured.baseURI = System.getenv().getOrDefault("E2E_API_BASE_URL", "{{base_url}}");
+  }
+
+  private static RequestSpecification request() {
+    RequestSpecification spec = given().header("X-Test-Run", System.getenv().getOrDefault("E2E_TEST_RUN_ID", "local"));
+    String token = System.getenv("E2E_API_TOKEN");
+    return token == null || token.isEmpty() ? spec : spec.auth().oauth2(token);
+  }
+
+  @Test
+  void healthEndpointAnswersSuccess() {
+    request().when().get(HEALTH).then().statusCode(allOf(greaterThanOrEqualTo(200), lessThan(400)));
+  }
+
+  @Test
+  void unknownRouteIsAClientError() {
+    request().when().get("/__e2e_unknown_route__").then().statusCode(allOf(greaterThanOrEqualTo(400), lessThan(500)));
+  }
+
+  @Test
+  void protectedEndpointsRejectAnonymousRequests() {
+    // ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b).
+    String paths = System.getenv().getOrDefault("E2E_API_PROTECTED_PATHS", "");
+    Assumptions.assumeTrue(!paths.isBlank(), "set E2E_API_PROTECTED_PATHS to paths that need credentials");
+    for (String path : paths.split(",")) {
+      given().when().get(path.trim()).then().statusCode(anyOf(is(401), is(403)));
+    }
+  }
+}
+
+@@@ file: E2E.Api.csproj kind=api lang=dotnet @@@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- API end-to-end tests (xUnit + HttpClient). Scaffolded by {{generated_by}}.
+       Match TargetFramework to the solution's SDK. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+</Project>
+
+@@@ file: ApiE2ETests.cs kind=api lang=dotnet @@@
+// API end-to-end tests (xUnit + HttpClient). Scaffolded by {{generated_by}}.
+// Environment: E2E_API_BASE_URL (default {{base_url}}), E2E_API_TOKEN, E2E_TEST_RUN_ID.
+// Contract checks: snapshot response bodies with Verify (*.verified.json committed,
+// *.received.* ignored); ApprovalTests.Net is unmaintained.
+using System.Net.Http.Headers;
+using Xunit;
+
+namespace {{dotnet_ns}};
+
+public sealed class ApiFixture : IDisposable
+{
+    public HttpClient Client { get; }
+
+    public ApiFixture()
+    {
+        var baseUrl = Environment.GetEnvironmentVariable("E2E_API_BASE_URL") ?? "{{base_url}}";
+        Client = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"), Timeout = TimeSpan.FromSeconds(15) };
+        var token = Environment.GetEnvironmentVariable("E2E_API_TOKEN");
+        if (!string.IsNullOrEmpty(token)) Client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        Client.DefaultRequestHeaders.Add("X-Test-Run", Environment.GetEnvironmentVariable("E2E_TEST_RUN_ID") ?? "local");
+    }
+
+    public void Dispose() => Client.Dispose();
+}
+
+[Trait("Category", "e2e")]
+public class ApiE2ETests : IClassFixture<ApiFixture>
+{
+    private const string HealthPath = "{{health_path}}";
+    private readonly HttpClient _client;
+
+    public ApiE2ETests(ApiFixture fixture) => _client = fixture.Client;
+
+    [Fact]
+    public async Task Health_endpoint_answers_success()
+    {
+        using var res = await _client.GetAsync(HealthPath.TrimStart('/'));
+        var code = (int)res.StatusCode;
+        Assert.True(code >= 200 && code < 400, "GET " + HealthPath + " answered " + code);
+    }
+
+    [Fact]
+    public async Task Unknown_route_is_a_client_error()
+    {
+        using var res = await _client.GetAsync("__e2e_unknown_route__");
+        var code = (int)res.StatusCode;
+        Assert.True(code >= 400 && code < 500, "expected 4xx, got " + code);
+    }
+}
+
+@@@ file: harness.ts kind=cli lang=ts @@@
+// Harness for end-to-end CLI tests: runs the CLI as a real child process and normalizes its output
+// for golden-file comparison. Scaffolded by {{generated_by}}.
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+/** Tests run from the project root (npm test, npx vitest, npx jest, node --test). */
+export const PROJECT_ROOT = process.cwd();
+/** How the CLI under test starts: [executable, ...leading args]. ADAPT when the entry point moves. */
+export const CLI: string[] = {{cli_argv}};
+export const GOLDEN_DIR = path.resolve(PROJECT_ROOT, process.env.GOLDEN_DIR || '{{golden_dir}}');
+
+export interface CliResult {
+  code: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+}
+
+export interface RunOptions {
+  input?: string;
+  env?: Record<string, string>;
+  cwd?: string;
+  timeoutMs?: number;
+}
+
+const winQuote = (a: string): string => (/^[\w./:=@%+,-]+$/.test(a) ? a : `"${a.replace(/"/g, '""')}"`);
+
+/** Run the CLI with `args`; never through a shell except for Windows command shims. */
+export function runCli(args: string[] = [], options: RunOptions = {}): CliResult {
+  const [cmd, ...pre] = CLI;
+  const argv = [...pre, ...args];
+  const opts = {
+    cwd: options.cwd || PROJECT_ROOT,
+    input: options.input,
+    env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0', ...options.env },
+    encoding: 'utf8' as const,
+    timeout: options.timeoutMs ?? 30_000,
+    windowsHide: true,
+  };
+  // Windows: npm shims (.cmd) and bare command names need cmd.exe; real executables do not.
+  const viaShell = process.platform === 'win32' && cmd !== process.execPath && !/\.exe$/i.test(cmd);
+  const res = viaShell
+    ? spawnSync([cmd, ...argv].map(winQuote).join(' '), { ...opts, shell: true })
+    : spawnSync(cmd, argv, opts);
+  if (res.error) throw res.error;
+  return { code: res.status, signal: res.signal, stdout: res.stdout, stderr: res.stderr };
+}
+
+const ESC = String.fromCharCode(27);
+const ANSI = new RegExp(`${ESC}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
+
+/**
+ * Golden-ready text: LF line ends, no colors, known directories masked (<ROOT>, <TMP>, <HOME>, or
+ * your own upper-case labels) with POSIX separators, timestamps and durations masked.
+ */
+export function normalize(text: string, roots: Record<string, string> = {}): string {
+  let out = String(text ?? '').replace(/\r\n?/g, '\n').replace(ANSI, '');
+  const known: Array<[string, string]> = [...Object.entries(roots), ['<ROOT>', PROJECT_ROOT], ['<TMP>', os.tmpdir()], ['<HOME>', os.homedir()]];
+  const variants: Array<[string, string]> = [];
+  for (const [label, dir] of known) {
+    if (!dir || dir.length < 2) continue;
+    for (const v of new Set([dir, dir.replace(/\\/g, '/'), fs.existsSync(dir) ? fs.realpathSync(dir) : dir])) variants.push([label, v]);
+  }
+  variants.sort((a, b) => b[1].length - a[1].length);
+  for (const [label, v] of variants) out = out.split(v).join(label);
+  out = out.replace(/(<[A-Z_]+>)([\\/][^\s'"`:;,)]*)/g, (_m: string, label: string, rest: string) => label + rest.replace(/\\/g, '/'));
+  return out
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<TIMESTAMP>')
+    .replace(/\b\d+(?:\.\d+)?\s?(?:ms|s)\b/g, '<DURATION>')
+    .split('\n').map((l) => l.replace(/\s+$/, '')).join('\n');
+}
+
+/** Compare with golden/<name>.golden. The first local run writes it; CI (CI=true) never does. */
+export function expectGolden(name: string, actual: string): void {
+  const file = path.join(GOLDEN_DIR, `${name}.golden`);
+  if (process.env.UPDATE_GOLDEN === '1' || (!fs.existsSync(file) && !process.env.CI)) {
+    fs.mkdirSync(GOLDEN_DIR, { recursive: true });
+    fs.writeFileSync(file, actual);
+    return;
+  }
+  assert.ok(fs.existsSync(file), `golden file ${name}.golden is missing: run the tests locally (or with UPDATE_GOLDEN=1) and commit it`);
+  assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the output differs from ${name}.golden; review it, then UPDATE_GOLDEN=1 accepts it`);
+}
+
+@@@ file: cli.e2e.test.ts kind=cli lang=ts @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { PROJECT_ROOT, runCli, normalize, expectGolden } from '{{harness_import}}';
+
+// End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output.
+// ADAPT: an invocation the CLI must reject.
+const INVALID_ARGS = ['--definitely-not-an-option'];
+
+describe('{{cli_name}} CLI (end-to-end)', () => {
+  it('--help exits 0 and prints usage on stdout', () => {
+    const r = runCli(['--help']);
+    assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
+    assert.match(r.stdout, /\S/, 'usage text expected on stdout');
+  });
+
+  it('--help output matches golden/help.golden', () => {
+    expectGolden('help', normalize(runCli(['--help']).stdout));
+  });
+
+  it('rejects an invalid invocation with a non-zero exit and a message on stderr', () => {
+    const r = runCli(INVALID_ARGS);
+    assert.notEqual(r.code, 0, 'an invalid invocation must fail');
+    assert.match(r.stderr, /\S/, 'the error message belongs on stderr');
+  });
+
+  it('runs from any working directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-e2e-'));
+    try {
+      const r = runCli(['--help'], { cwd: dir });
+      assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('normalize() masks roots, line endings, timestamps and durations', () => {
+    const sample = `wrote ${path.join(PROJECT_ROOT, 'out', 'a.txt')}\r\nat 2026-01-02T03:04:05.678Z in 12ms\r\n`;
+    assert.equal(normalize(sample), 'wrote <ROOT>/out/a.txt\nat <TIMESTAMP> in <DURATION>\n');
+  });
+});
+
+@@@ file: harness.mjs kind=cli lang=js @@@
+// Harness for end-to-end CLI tests: runs the CLI as a real child process and normalizes its output
+// for golden-file comparison. Scaffolded by {{generated_by}}.
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+/** Tests run from the project root (npm test, npx vitest, npx jest, node --test). */
+export const PROJECT_ROOT = process.cwd();
+/** How the CLI under test starts: [executable, ...leading args]. ADAPT when the entry point moves. */
+export const CLI = {{cli_argv}};
+export const GOLDEN_DIR = path.resolve(PROJECT_ROOT, process.env.GOLDEN_DIR || '{{golden_dir}}');
+
+const winQuote = (a) => (/^[\w./:=@%+,-]+$/.test(a) ? a : `"${a.replace(/"/g, '""')}"`);
+
+/**
+ * Run the CLI with `args` ({ input, env, cwd, timeoutMs }); never through a shell except for
+ * Windows command shims. Returns { code, signal, stdout, stderr }.
+ */
+export function runCli(args = [], options = {}) {
+  const [cmd, ...pre] = CLI;
+  const argv = [...pre, ...args];
+  const opts = {
+    cwd: options.cwd || PROJECT_ROOT,
+    input: options.input,
+    env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0', ...options.env },
+    encoding: 'utf8',
+    timeout: options.timeoutMs ?? 30_000,
+    windowsHide: true,
+  };
+  // Windows: npm shims (.cmd) and bare command names need cmd.exe; real executables do not.
+  const viaShell = process.platform === 'win32' && cmd !== process.execPath && !/\.exe$/i.test(cmd);
+  const res = viaShell
+    ? spawnSync([cmd, ...argv].map(winQuote).join(' '), { ...opts, shell: true })
+    : spawnSync(cmd, argv, opts);
+  if (res.error) throw res.error;
+  return { code: res.status, signal: res.signal, stdout: res.stdout, stderr: res.stderr };
+}
+
+const ESC = String.fromCharCode(27);
+const ANSI = new RegExp(`${ESC}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
+
+/**
+ * Golden-ready text: LF line ends, no colors, known directories masked (<ROOT>, <TMP>, <HOME>, or
+ * your own upper-case labels) with POSIX separators, timestamps and durations masked.
+ */
+export function normalize(text, roots = {}) {
+  let out = String(text ?? '').replace(/\r\n?/g, '\n').replace(ANSI, '');
+  const known = [...Object.entries(roots), ['<ROOT>', PROJECT_ROOT], ['<TMP>', os.tmpdir()], ['<HOME>', os.homedir()]];
+  const variants = [];
+  for (const [label, dir] of known) {
+    if (!dir || dir.length < 2) continue;
+    for (const v of new Set([dir, dir.replace(/\\/g, '/'), fs.existsSync(dir) ? fs.realpathSync(dir) : dir])) variants.push([label, v]);
+  }
+  variants.sort((a, b) => b[1].length - a[1].length);
+  for (const [label, v] of variants) out = out.split(v).join(label);
+  out = out.replace(/(<[A-Z_]+>)([\\/][^\s'"`:;,)]*)/g, (_m, label, rest) => label + rest.replace(/\\/g, '/'));
+  return out
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<TIMESTAMP>')
+    .replace(/\b\d+(?:\.\d+)?\s?(?:ms|s)\b/g, '<DURATION>')
+    .split('\n').map((l) => l.replace(/\s+$/, '')).join('\n');
+}
+
+/** Compare with golden/<name>.golden. The first local run writes it; CI (CI=true) never does. */
+export function expectGolden(name, actual) {
+  const file = path.join(GOLDEN_DIR, `${name}.golden`);
+  if (process.env.UPDATE_GOLDEN === '1' || (!fs.existsSync(file) && !process.env.CI)) {
+    fs.mkdirSync(GOLDEN_DIR, { recursive: true });
+    fs.writeFileSync(file, actual);
+    return;
+  }
+  assert.ok(fs.existsSync(file), `golden file ${name}.golden is missing: run the tests locally (or with UPDATE_GOLDEN=1) and commit it`);
+  assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the output differs from ${name}.golden; review it, then UPDATE_GOLDEN=1 accepts it`);
+}
+
+@@@ file: cli.e2e.test.mjs kind=cli lang=js @@@
+{{test_header}}
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { PROJECT_ROOT, runCli, normalize, expectGolden } from '{{harness_import}}';
+
+// End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output.
+// ADAPT: an invocation the CLI must reject.
+const INVALID_ARGS = ['--definitely-not-an-option'];
+
+describe('{{cli_name}} CLI (end-to-end)', () => {
+  it('--help exits 0 and prints usage on stdout', () => {
+    const r = runCli(['--help']);
+    assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
+    assert.match(r.stdout, /\S/, 'usage text expected on stdout');
+  });
+
+  it('--help output matches golden/help.golden', () => {
+    expectGolden('help', normalize(runCli(['--help']).stdout));
+  });
+
+  it('rejects an invalid invocation with a non-zero exit and a message on stderr', () => {
+    const r = runCli(INVALID_ARGS);
+    assert.notEqual(r.code, 0, 'an invalid invocation must fail');
+    assert.match(r.stderr, /\S/, 'the error message belongs on stderr');
+  });
+
+  it('runs from any working directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-e2e-'));
+    try {
+      const r = runCli(['--help'], { cwd: dir });
+      assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('normalize() masks roots, line endings, timestamps and durations', () => {
+    const sample = `wrote ${path.join(PROJECT_ROOT, 'out', 'a.txt')}\r\nat 2026-01-02T03:04:05.678Z in 12ms\r\n`;
+    assert.equal(normalize(sample), 'wrote <ROOT>/out/a.txt\nat <TIMESTAMP> in <DURATION>\n');
+  });
+});
+
+@@@ file: harness.py kind=cli lang=python @@@
+"""Harness for end-to-end CLI tests: runs the CLI as a real child process and normalizes its output
+for golden-file comparison. Scaffolded by {{generated_by}}."""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+GOLDEN_DIR = Path(os.environ.get("GOLDEN_DIR") or HERE / "golden")
+# How the CLI under test starts: [executable, ...leading args]. ADAPT when the entry point moves.
+CLI = {{cli_argv}}
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+STAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
+DURATION = re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s)\b")
+
+
+def run_cli(args=(), *, cwd=None, input=None, env=None, timeout=30):
+    """Run the CLI without a shell; returns subprocess.CompletedProcess (text mode)."""
+    full_env = {**os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0", **(env or {})}
+    return subprocess.run([*CLI, *args], cwd=cwd or os.getcwd(), input=input, env=full_env,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def normalize(text, roots=None):
+    """LF line ends, no colors, known directories masked with POSIX separators, volatile values masked."""
+    out = ANSI.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n"))
+    known = list((roots or {}).items()) + [("<ROOT>", os.getcwd()), ("<TMP>", tempfile.gettempdir()), ("<HOME>", str(Path.home()))]
+    variants = []
+    for label, directory in known:
+        if not directory or len(directory) < 2:
+            continue
+        for v in {directory, directory.replace("\\", "/"), os.path.realpath(directory)}:
+            variants.append((label, v))
+    for label, v in sorted(variants, key=lambda item: -len(item[1])):
+        out = out.replace(v, label)
+    out = re.sub(r"(<[A-Z_]+>)([\\/][^\s'\"`:;,)]*)", lambda m: m.group(1) + m.group(2).replace("\\", "/"), out)
+    out = DURATION.sub("<DURATION>", STAMP.sub("<TIMESTAMP>", out))
+    return "\n".join(line.rstrip() for line in out.split("\n"))
+
+
+def expect_golden(name, actual):
+    """Compare with golden/<name>.golden. The first local run writes it; CI (CI=true) never does."""
+    path = GOLDEN_DIR / f"{name}.golden"
+    if os.environ.get("UPDATE_GOLDEN") == "1" or (not path.exists() and not os.environ.get("CI")):
+        GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(actual, encoding="utf-8", newline="\n")
+        return
+    assert path.exists(), f"golden file {name}.golden is missing: run the tests locally (or with UPDATE_GOLDEN=1) and commit it"
+    assert actual == path.read_text(encoding="utf-8").replace("\r\n", "\n"), f"the output differs from {name}.golden; review it, then UPDATE_GOLDEN=1 accepts it"
+
+@@@ file: test_cli_e2e.py kind=cli lang=python @@@
+"""End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output."""
+
+import os
+
+from harness import expect_golden, normalize, run_cli
+
+# ADAPT: an invocation the CLI must reject.
+INVALID_ARGS = ["--definitely-not-an-option"]
+
+
+def test_help_exits_zero_and_prints_usage():
+    r = run_cli(["--help"])
+    assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
+    assert r.stdout.strip(), "usage text expected on stdout"
+
+
+def test_help_matches_golden():
+    expect_golden("help", normalize(run_cli(["--help"]).stdout))
+
+
+def test_rejects_invalid_invocation():
+    r = run_cli(INVALID_ARGS)
+    assert r.returncode != 0, "an invalid invocation must fail"
+    assert r.stderr.strip(), "the error message belongs on stderr"
+
+
+def test_runs_from_any_working_directory(tmp_path):
+    r = run_cli(["--help"], cwd=tmp_path)
+    assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
+
+
+def test_normalize_masks_roots_line_endings_and_timestamps():
+    sample = f"wrote {os.path.join(os.getcwd(), 'out', 'a.txt')}\r\nat 2026-01-02T03:04:05.678Z in 12ms\r\n"
+    assert normalize(sample) == "wrote <ROOT>/out/a.txt\nat <TIMESTAMP> in <DURATION>\n"
+
+@@@ file: harness_test.go kind=cli lang=go @@@
+// Harness for end-to-end CLI tests: TestMain builds the CLI once, runCLI starts it as a real
+// process, normalize prepares output for golden files. Scaffolded by {{generated_by}}.
+package {{go_package}}
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// cliPackage is the main package under test, relative to the module root. ADAPT when it moves.
+const cliPackage = {{go_pkg}}
+
+var (
+	update  = flag.Bool("update", os.Getenv("UPDATE_GOLDEN") == "1", "rewrite golden files")
+	cliPath string
+	modRoot string
+)
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	out, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		fmt.Fprintln(os.Stderr, "cannot locate go.mod:", err)
+		os.Exit(1)
+	}
+	modRoot = filepath.Dir(strings.TrimSpace(string(out)))
+	dir, err := os.MkdirTemp("", "cli-e2e-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	name := "cli"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	cliPath = filepath.Join(dir, name)
+	build := exec.Command("go", "build", "-o", cliPath, cliPackage)
+	build.Dir = modRoot
+	if msg, err := build.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go build %s failed: %v\n%s", cliPackage, err, msg)
+		os.Exit(1)
+	}
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+type result struct {
+	code   int
+	stdout string
+	stderr string
+}
+
+func runCLI(t *testing.T, dir string, args ...string) result {
+	t.Helper()
+	cmd := exec.Command(cliPath, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	} else {
+		cmd.Dir = modRoot
+	}
+	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		if err := cmd.Process.Kill(); err != nil {
+			t.Logf("kill: %v", err)
+		}
+		t.Fatal("the CLI did not finish within 30s")
+	}
+	return result{code: cmd.ProcessState.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
+}
+
+var (
+	ansiRe     = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+	stampRe    = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?`)
+	durationRe = regexp.MustCompile(`\b\d+(?:\.\d+)?\s?(?:ms|s)\b`)
+	labelRe    = regexp.MustCompile(`(<[A-Z_]+>)([\\/][^\s'"` + "`" + `:;,)]*)`)
+)
+
+// normalize masks the module root, temp and home directories (POSIX separators), colors,
+// timestamps and durations, and uses LF line ends, so one golden file fits every OS.
+func normalize(text string) string {
+	out := ansiRe.ReplaceAllString(strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n"), "")
+	home, _ := os.UserHomeDir()
+	type root struct{ label, dir string }
+	var roots []root
+	for _, r := range []root{{"<ROOT>", modRoot}, {"<TMP>", os.TempDir()}, {"<HOME>", home}} {
+		if len(r.dir) < 2 {
+			continue
+		}
+		roots = append(roots, r, root{r.label, filepath.ToSlash(r.dir)})
+		if real, err := filepath.EvalSymlinks(r.dir); err == nil {
+			roots = append(roots, root{r.label, real})
+		}
+	}
+	for i := 0; i < len(roots); i++ {
+		for j := i + 1; j < len(roots); j++ {
+			if len(roots[j].dir) > len(roots[i].dir) {
+				roots[i], roots[j] = roots[j], roots[i]
+			}
+		}
+	}
+	for _, r := range roots {
+		out = strings.ReplaceAll(out, r.dir, r.label)
+	}
+	out = labelRe.ReplaceAllStringFunc(out, func(s string) string { return strings.ReplaceAll(s, `\`, "/") })
+	out = durationRe.ReplaceAllString(stampRe.ReplaceAllString(out, "<TIMESTAMP>"), "<DURATION>")
+	lines := strings.Split(out, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// expectGolden compares with testdata/<name>.golden; the first local run (or -update) writes it,
+// CI (CI=true) never does.
+func expectGolden(t *testing.T, name, actual string) {
+	t.Helper()
+	file := filepath.Join("testdata", name+".golden")
+	_, statErr := os.Stat(file)
+	if *update || (os.IsNotExist(statErr) && os.Getenv("CI") == "") {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(actual), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	want, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("golden file %s is missing: run the tests locally (or with -update) and commit it", file)
+	}
+	if got := strings.ReplaceAll(string(want), "\r\n", "\n"); got != actual {
+		t.Fatalf("the output differs from %s; review it, then -update accepts it\n--- want\n%s\n--- got\n%s", file, got, actual)
+	}
+}
+
+@@@ file: cli_e2e_test.go kind=cli lang=go @@@
+// End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output.
+package {{go_package}}
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// invalidArgs is an invocation the CLI must reject. ADAPT it.
+var invalidArgs = []string{"--definitely-not-an-option"}
+
+func TestHelpExitsZeroAndPrintsUsage(t *testing.T) {
+	r := runCLI(t, "", "--help")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	if strings.TrimSpace(r.stdout+r.stderr) == "" {
+		t.Fatal("usage text expected")
+	}
+}
+
+func TestHelpMatchesGolden(t *testing.T) {
+	r := runCLI(t, "", "--help")
+	expectGolden(t, "help", normalize(r.stdout+r.stderr))
+}
+
+func TestRejectsInvalidInvocation(t *testing.T) {
+	r := runCLI(t, "", invalidArgs...)
+	if r.code == 0 {
+		t.Fatal("an invalid invocation must fail")
+	}
+	if strings.TrimSpace(r.stderr) == "" {
+		t.Fatal("the error message belongs on stderr")
+	}
+}
+
+func TestRunsFromAnyWorkingDirectory(t *testing.T) {
+	r := runCLI(t, t.TempDir(), "--help")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+}
+
+func TestNormalizeMasksRootsLineEndingsAndTimestamps(t *testing.T) {
+	sample := "wrote " + filepath.Join(modRoot, "out", "a.txt") + "\r\nat 2026-01-02T03:04:05.678Z in 12ms\r\n"
+	if got, want := normalize(sample), "wrote <ROOT>/out/a.txt\nat <TIMESTAMP> in <DURATION>\n"; got != want {
+		t.Fatalf("normalize() = %q, want %q", got, want)
+	}
+}
+
+@@@ file: cli_e2e.rs kind=cli lang=rust @@@
+//! End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output.
+//! Std only; Cargo builds the binary and exposes it as CARGO_BIN_EXE_{{bin_name}}.
+//! Scaffolded by {{generated_by}}.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// An invocation the CLI must reject. ADAPT it.
+const INVALID_ARGS: &[&str] = &["--definitely-not-an-option"];
+
+fn run(args: &[&str], dir: Option<&Path>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_{{bin_name}}"));
+    cmd.args(args).env("NO_COLOR", "1");
+    cmd.current_dir(dir.map(Path::to_path_buf).unwrap_or_else(manifest_dir));
+    cmd.output().expect("failed to start the CLI")
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// True when `s` starts with an ISO-8601 timestamp (YYYY-MM-DDTHH:MM:SS); returns its length.
+fn timestamp_len(s: &[u8]) -> Option<usize> {
+    let pattern = b"dddd-dd-ddTdd:dd:dd";
+    if s.len() < pattern.len() {
+        return None;
+    }
+    for (i, p) in pattern.iter().enumerate() {
+        let c = s[i];
+        let ok = match *p {
+            b'd' => c.is_ascii_digit(),
+            b'T' => c == b'T' || c == b' ',
+            other => c == other,
+        };
+        if !ok {
+            return None;
+        }
+    }
+    let mut n = pattern.len();
+    if n < s.len() && s[n] == b'.' {
+        n += 1;
+        while n < s.len() && s[n].is_ascii_digit() {
+            n += 1;
+        }
+    }
+    if n < s.len() && s[n] == b'Z' {
+        n += 1;
+    }
+    Some(n)
+}
+
+/// LF line ends, the crate and temp directories masked with POSIX separators, timestamps masked.
+fn normalize(input: &str) -> String {
+    let mut out = input.replace("\r\n", "\n").replace('\r', "\n");
+    let mut roots: Vec<(&str, String)> = Vec::new();
+    for (label, dir) in [("<ROOT>", manifest_dir()), ("<TMP>", env::temp_dir())] {
+        let s = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+        if s.len() > 1 {
+            roots.push((label, s.replace('\\', "/")));
+            roots.push((label, s));
+        }
+    }
+    roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    for (label, dir) in &roots {
+        out = out.replace(dir.as_str(), label);
+    }
+    let bytes = out.as_bytes();
+    let mut result = String::with_capacity(out.len());
+    let mut i = 0;
+    let mut after_label = false;
+    while i < bytes.len() {
+        if let Some(n) = timestamp_len(&bytes[i..]) {
+            result.push_str("<TIMESTAMP>");
+            i += n;
+            continue;
+        }
+        let c = out[i..].chars().next().unwrap();
+        if c == '>' {
+            after_label = result.ends_with("<ROOT") || result.ends_with("<TMP");
+            result.push(c);
+        } else if after_label && c == '\\' {
+            result.push('/');
+        } else {
+            if c.is_whitespace() {
+                after_label = false;
+            }
+            result.push(c);
+        }
+        i += c.len_utf8();
+    }
+    result.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + if result.ends_with('\n') { "\n" } else { "" }
+}
+
+/// Compare with tests/golden/<name>.golden; the first local run (or UPDATE_GOLDEN=1) writes it,
+/// CI (CI=true) never does.
+fn expect_golden(name: &str, actual: &str) {
+    let dir = manifest_dir().join("tests").join("golden");
+    let file = dir.join(format!("{name}.golden"));
+    if env::var("UPDATE_GOLDEN").as_deref() == Ok("1") || (!file.exists() && env::var_os("CI").is_none()) {
+        fs::create_dir_all(&dir).expect("create tests/golden");
+        fs::write(&file, actual).expect("write the golden file");
+        return;
+    }
+    let want = fs::read_to_string(&file)
+        .unwrap_or_else(|_| panic!("golden file {name}.golden is missing: run the tests locally (or with UPDATE_GOLDEN=1) and commit it"))
+        .replace("\r\n", "\n");
+    assert_eq!(want, actual, "the output differs from {name}.golden; review it, then UPDATE_GOLDEN=1 accepts it");
+}
+
+#[test]
+fn help_exits_zero_and_prints_usage() {
+    let out = run(&["--help"], None);
+    assert!(out.status.success(), "exit {:?}: {}", out.status.code(), text(&out.stderr));
+    assert!(!text(&out.stdout).trim().is_empty(), "usage text expected on stdout");
+}
+
+#[test]
+fn help_matches_golden() {
+    let out = run(&["--help"], None);
+    expect_golden("help", &normalize(&text(&out.stdout)));
+}
+
+#[test]
+fn rejects_invalid_invocation() {
+    let out = run(INVALID_ARGS, None);
+    assert!(!out.status.success(), "an invalid invocation must fail");
+    assert!(!text(&out.stderr).trim().is_empty(), "the error message belongs on stderr");
+}
+
+#[test]
+fn runs_from_any_working_directory() {
+    let dir = env::temp_dir();
+    let out = run(&["--help"], Some(&dir));
+    assert!(out.status.success(), "exit {:?}: {}", out.status.code(), text(&out.stderr));
+}
+
+#[test]
+fn normalize_masks_roots_line_endings_and_timestamps() {
+    let path = manifest_dir().join("out").join("a.txt");
+    let sample = format!("wrote {}\r\nat 2026-01-02T03:04:05.678Z\r\n", path.display());
+    assert_eq!(normalize(&sample), "wrote <ROOT>/out/a.txt\nat <TIMESTAMP>\n");
+}

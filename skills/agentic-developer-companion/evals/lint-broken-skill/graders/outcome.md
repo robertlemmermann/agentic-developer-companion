@@ -3,7 +3,7 @@ type: llm
 weight: 1
 ---
 
-Judge only the final answer. Pass when all of these hold:
+Judge only the final answer against these items:
 
 1. It says the file is not valid or not portable as written (it does not call it valid).
 2. It flags the name `Release_Notes`: lowercase letters, digits and hyphens only, and the
@@ -15,5 +15,6 @@ Judge only the final answer. Pass when all of these hold:
 5. It flags `` !`git log ...` `` or `$ARGUMENTS` (or both) as Claude Code-only substitutions
    that Copilot and Codex pass through as literal text.
 
-Fail when the answer calls the file valid, invents a rule that does not exist, or misses
-two or more of items 2 to 5. Answer "unknown" only when the transcript has no final answer.
+Pass when item 1 holds and at least three of items 2 to 5 hold. Fail otherwise, and also
+fail when there is no final answer or when the answer invents a host rule that does not
+exist.

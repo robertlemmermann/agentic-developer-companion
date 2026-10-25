@@ -195,6 +195,33 @@
     }
   },
   {
+    "name": "cloud post-edit without cwd: the hook runs in the repository root",
+    "event": "post-edit",
+    "dialect_arg": "copilot",
+    "env": {
+      "COPILOT_AGENT_PROMPT": "Fix issue 12"
+    },
+    "payload": {
+      "sessionId": "cloud-2",
+      "timestamp": 1761400000000,
+      "toolName": "str_replace_editor",
+      "toolArgs": {
+        "command": "create",
+        "path": "tests/b.test.js",
+        "file_text": "it.only('x', () => {})\n"
+      }
+    },
+    "expect": {
+      "match": {
+        "additionalContext": "tests/b\\.test\\.js \\(test file\\): adds a skip/focus marker"
+      },
+      "session": {
+        "tool": "copilot-cloud",
+        "edits.count": 1
+      }
+    }
+  },
+  {
     "name": "cloud agentStop gate after edits",
     "event": "post-edit",
     "dialect_arg": "copilot",
