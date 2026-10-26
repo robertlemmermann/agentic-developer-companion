@@ -98,7 +98,7 @@ files are not installed with it. Add `--jobs 3` to run the unit files in paralle
 check stays meaningful only on an otherwise idle machine). Pass when it exits 0 with
 `failed: 0`; note every `skipped` case and why in Notes. The paid evals are printed by the
 `evals` area and never run by selftest; run them by hand from the repository root
-(`claude plugin eval . --eval-dir evals ...`, see release).
+(`node tests/run-evals.mjs`, see release).
 
 | OS and launch path | Step | Version | Result | Date | Notes |
 |---|---|---|---|---|---|
