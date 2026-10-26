@@ -1459,3 +1459,26 @@ test('rendered Claude hooks pass Claude Code\'s own hook validation (claude plug
     assert.equal(out.success, true, `${scope}/${level}: ${res.stdout.slice(0, 500)}`);
   }
 });
+
+test('shell edits arm the stop gate; companion runs and temp-dir writes do not', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-shellwrite-'));
+  const g = (...a) => spawnSync('git', a, { cwd: repo, encoding: 'utf8' });
+  g('init', '-q'); g('config', 'user.email', 'a@b'); g('config', 'user.name', 'a');
+  fs.writeFileSync(path.join(repo, 'a.js'), 'x\n'); g('add', '-A'); g('commit', '-qm', 'base');
+  const sid = 'shellwrite-session';
+  const run = (event, payload, level = 'gate') => {
+    const r = spawnSync(process.execPath, [core.ADC_SCRIPT, 'hook-run', event, '--dialect', 'claude', '--level', level], {
+      cwd: repo, encoding: 'utf8', input: JSON.stringify({ session_id: sid, cwd: repo, hook_event_name: event, ...payload }),
+      env: { ...process.env, COPILOT_CLI: '' } });
+    assert.equal(r.status, 0);
+    return JSON.parse(r.stdout);
+  };
+  const shell = (command) => run('post-shell', { tool_name: 'Bash', tool_input: { command }, tool_response: { stdout: '' } });
+  const stop = () => run('stop', { stop_hook_active: false, last_assistant_message: 'Done.' });
+  shell(`node ${core.ADC_SCRIPT} verify --json > ${path.join(os.tmpdir(), 'v.json')} 2>&1`);
+  shell(`cp a.js ${path.join(os.tmpdir(), 'copy.js')}`);
+  shell('echo hi > /dev/null');
+  assert.deepEqual(stop(), {}, 'no edit yet: nothing to gate');
+  shell("sed -i 's/x/y/' a.js");
+  assert.equal(stop().decision, 'block', 'a sed -i edit with no ledger blocks once');
+});

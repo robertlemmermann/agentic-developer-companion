@@ -336,6 +336,78 @@ const RUN_CLASSES = [
   ['build', /^(?:make|just)(?:\s|$)/],
 ];
 
+// Shell commands that change files. Agents often edit through the shell (`sed -i`, `cat >> f`,
+// `git apply`) instead of the host's edit tools, which would otherwise never arm the stop gate.
+// The result is `{ paths, unknown }`: target paths when the command names them, `unknown` when a
+// command writes somewhere we cannot tell (an inline script, a formatter run on the whole tree).
+const WRITE_EXES = {
+  tee: (a) => a.filter((t) => !t.startsWith('-')),
+  touch: (a) => a.filter((t) => !t.startsWith('-')),
+  truncate: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
+  cp: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
+  mv: (a) => a.filter((t) => !t.startsWith('-')),
+  install: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
+  patch: () => null,
+  apply_patch: () => null,
+  'set-content': (a) => psPath(a), 'add-content': (a) => psPath(a), 'out-file': (a) => psPath(a),
+  'new-item': (a) => psPath(a), 'remove-item': (a) => psPath(a), 'move-item': (a) => psPath(a),
+  'copy-item': (a) => psPath(a, '-Destination'), 'rename-item': (a) => psPath(a), 'clear-content': (a) => psPath(a),
+  sc: (a) => psPath(a), ac: (a) => psPath(a), ni: (a) => psPath(a), mi: (a) => psPath(a), ri: (a) => psPath(a),
+  ren: (a) => psPath(a), copy: (a) => a.filter((t) => !t.startsWith('/')).slice(-1),
+  move: (a) => a.filter((t) => !t.startsWith('/')).slice(-1),
+};
+for (const del of DELETERS) WRITE_EXES[del] ??= (a) => a.filter((t) => !t.startsWith('-') && !/^\/[a-z]$/i.test(t));
+/** The value of `-Path`/`-LiteralPath`/`-FilePath` (or `flag`), else the first positional argument. */
+function psPath(args, flag = null) {
+  const names = flag ? [flag.toLowerCase()] : ['-path', '-literalpath', '-filepath', '-destination'];
+  const i = args.findIndex((t) => names.includes(t.toLowerCase()));
+  if (i >= 0 && args[i + 1]) return [args[i + 1]];
+  const pos = args.filter((t, j) => !t.startsWith('-') && !(j > 0 && args[j - 1].startsWith('-')));
+  return pos.slice(0, 1);
+}
+const GIT_WRITES = /^(?:apply|am|checkout|restore|switch|stash|merge|cherry-pick|revert|reset|rebase|pull|mv|rm)$/;
+const PKG_WRITES = new RegExp('^(?:(?:npm|pnpm|yarn|bun)\\s+(?:i|install|add|remove|rm|uninstall|un|update|up|upgrade)'
+  + '|cargo\\s+(?:add|remove|update)|go\\s+(?:get|mod\\s+tidy)|dotnet\\s+(?:add|remove)|poetry\\s+(?:add|remove|lock)'
+  + '|uv\\s+(?:add|remove|lock)|bundle\\s+(?:add|install|update))\\b');
+const FORMAT_WRITES = new RegExp('^(?:(?:npx|pnpm\\s+exec|yarn|bunx)\\s+)?(?:prettier\\s+.*--write|eslint\\s+.*--fix'
+  + '|biome\\s+(?:format|check)\\s+.*--write|ruff\\s+(?:format|check\\s+.*--fix)|black(?!\\s+.*--check)|gofmt\\s+-w'
+  + '|cargo\\s+fmt(?!\\s+.*--check)|dotnet\\s+format(?!\\s+.*--verify-no-changes))\\b');
+const INLINE_WRITE = /writeFile|appendFile|write_text|write_bytes|open\([^)]*['"][wa]b?\+?['"]|WriteAllText|Set-Content/;
+
+/** Files a shell command line writes (best effort; see WRITE_EXES). */
+export function shellWrites(cmd) {
+  const paths = [];
+  let unknown = false;
+  for (const raw of shellSegments(cmd)) {
+    for (let i = 0; i < raw.length; i++) {
+      const m = /^(?:\d*|&)>>?(.*)$/.exec(raw[i]);
+      if (!m || /&[\d-]+$/.test(raw[i])) continue;
+      const target = m[1] || raw[i + 1];
+      if (target) paths.push(target);
+    }
+  }
+  for (const toks of simpleCommands(cmd)) {
+    const exe = exeName(toks[0]);
+    const args = toks.slice(1).filter((t) => !REDIRECT.test(t));
+    const norm = [exe, ...args].join(' ');
+    if ((exe === 'sed' && args.some((t) => /^(?:-[a-zA-Z]*i|--in-place)/.test(t)))
+      || (exe === 'perl' && args.some((t) => /^-[a-zA-Z]*i/.test(t)))) {
+      paths.push(...args.filter((t) => !t.startsWith('-')).slice(1));
+    } else if (WRITE_EXES[exe]) {
+      const t = WRITE_EXES[exe](args);
+      if (t) paths.push(...t); else unknown = true;
+    } else if (exe === 'git') {
+      const g = gitParts(toks);
+      if (g && GIT_WRITES.test(g.sub) && !(g.sub === 'stash' && !/^(?:pop|apply|drop)?$/.test(g.args[0] || ''))) {
+        unknown = true;
+      }
+    } else if (PKG_WRITES.test(norm) || FORMAT_WRITES.test(norm)) unknown = true;
+    else if (/^(?:node|python[0-9.]*|py|deno|bun|ruby|perl|pwsh|powershell)$/.test(exe)
+      && args.some((t) => /^-(?:e|c|p|command)$/i.test(t)) && INLINE_WRITE.test(args.join(' '))) unknown = true;
+  }
+  return { paths, unknown };
+}
+
 const NARROWING = new RegExp('(?:\\s-t\\s|\\s--testNamePattern\\b|\\s--testPathPattern\\b|\\s-k\\s|\\s--grep\\b'
   + '|\\s-run\\s|\\s--filter\\b|\\s--only\\b|\\s--spec\\b|\\s--lf\\b|\\s--last-failed\\b|\\s--onlyChanged\\b'
   + '|\\s--changed\\b|::'
@@ -618,6 +690,34 @@ async function postEdit(h) {
     + ` evidence):\n${notes.join('\n')}`, 2000) };
 }
 
+/**
+ * Count shell writes inside the repository (outside the state dir) as an edit epoch. Targets outside
+ * the repository (the temp dir, /dev/null, the host's own files) are not part of the change.
+ */
+async function recordShellWrites(h, cmd) {
+  const w = shellWrites(cmd);
+  const files = [];
+  for (const p of w.paths) {
+    if (/^(?:nul|\$null)$/i.test(p) || /[$`*?]/.test(p)) continue;
+    const abs = absPath(h, p);
+    const rel = relPosix(h.root, abs);
+    if (rel == null || rel === '.' || underState(rel, abs, h.st)) continue;
+    files.push(rel);
+  }
+  if (!files.length && !w.unknown) return;
+  const now = nowIso();
+  await record(h, (s) => {
+    const e = s.edits;
+    e.count += 1;
+    e.first = e.first || now;
+    e.last = now;
+    e.times = [...(e.times || []), now].slice(-KEEP);
+    e.files = [...(e.files || []).filter((f) => !files.includes(f)), ...files].slice(-KEEP);
+    e.classes.shell = (e.classes.shell || 0) + 1;
+  });
+  log(h, { condition: 'SHELL_WRITE', files: files.length, unknown: w.unknown }, true);
+}
+
 async function postShell(h) {
   const { norm } = h;
   if (norm.tool_kind !== 'shell') return {};
@@ -639,6 +739,9 @@ async function postShell(h) {
       + ' `adc.mjs live run` reads it.');
   }
   const runInfo = cmd ? classifyRun(cmd, (t) => M.scanSecrets(t).length > 0) : null;
+  // The companion's own commands write only its state dir and the temp dir (and maybe a redirect of
+  // their JSON output); they are never edits of the change under verification.
+  if (cmd && runInfo?.class !== 'companion') await recordShellWrites(h, cmd);
   if (runInfo) {
     const counts = text ? parseSummaryText(text) : null;
     const obs = {
