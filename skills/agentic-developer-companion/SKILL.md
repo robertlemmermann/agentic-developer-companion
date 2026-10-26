@@ -5,12 +5,14 @@ description: >-
   verifying, testing, validating or reviewing changes written by Copilot, Claude
   Code or Codex (false "tests pass" claims, deleted or skipped tests, weakened
   assertions, hallucinated packages, scope creep, CI edits), when producing a
-  claim-to-evidence ledger before declaring work done, when creating or hardening
-  e2e, live/synthetic, regression or flake-resistant test suites and CI gates in
-  any repository, and when authoring, linting, optimizing, evaluating or porting
-  custom instructions, skills, agents, prompt files, hooks, plugins or MCP configs
-  across Copilot, Claude Code and Codex. Not for general feature implementation
-  or refactors unrelated to testing or tooling quality.
+  claim-to-evidence ledger before declaring work done, when auditing test quality
+  (mock-only or assertion-free tests), writing a regression test with red-green
+  proof, diagnosing or quarantining flaky tests, or building e2e, live/synthetic
+  test suites and CI gates in any repository, and when authoring, linting,
+  optimizing, evaluating or porting custom instructions, skills, agents, prompt
+  files, hooks, plugins or MCP configs across Copilot, Claude Code and Codex. Not
+  for general feature implementation or refactors unrelated to testing or tooling
+  quality.
 license: Apache-2.0
 compatibility: >-
   Node.js 24+ and Git on PATH for scripts and hooks (guidance-only mode works
