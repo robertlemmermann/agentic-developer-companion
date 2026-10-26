@@ -153,10 +153,11 @@ function skillHomepage() {
 }
 
 /** The companion inside the target repository (vendored), as a repo-relative POSIX path, or null. */
-function vendoredSkill(root, explicit) {
-  const candidates = explicit ? [explicit] : ['.github/skills', '.agents/skills', '.claude/skills'].map((d) => `${d}/${SKILL_NAME}`);
+function vendoredSkill(env, explicit) {
+  const root = env.root;
+  const candidates = explicit ? [path.resolve(env.ctx.cwd, explicit)] : ['.github/skills', '.agents/skills', '.claude/skills'].map((d) => path.join(root, d, SKILL_NAME));
   for (const c of candidates) {
-    const rel = relPosix(root, path.resolve(root, c));
+    const rel = relPosix(root, c);
     if (rel && rel !== '.' && exists(root, `${rel}/scripts/adc.mjs`)) return rel;
   }
   if (explicit) throw usageError(`--skill-path ${explicit}: no scripts/adc.mjs inside the repository at that path`);
@@ -672,15 +673,14 @@ async function buildE2eApi(env) {
   const contractsFromProject = projectRelative(env, contractsDir);
   const vars = commonVars(env, {
     out, base_url: baseUrl, health_path: healthPath, header: CI_HEADER('e2e-api'),
-    contracts_dir: contractsFromProject, contracts_dir_py: cString('contracts'),
+    contracts_dir: contractsFromProject,
     test_header: nodeTestHeader(flavor, cjs), ext: lang === 'ts' ? 'ts' : cjs ? 'cjs' : 'mjs',
     consumer: slugify(path.basename(env.root)), provider: provider || 'provider',
     openapi: openapi || '', java_package: 'e2e', dotnet_ns: 'E2E.Api',
   });
   vars.client_import = nodeImport('./client', lang, flavor, cjs);
   vars.contract_import = nodeImport('./contract', lang, flavor, cjs);
-  const filterLang = ['ts', 'js'].includes(lang) ? lang : lang;
-  const outputs = renderFiles(bundle, { kind: 'api', lang: filterLang }, features, vars, { out, transform: cjs ? (rel, c) => toCommonJs(c) : null });
+  const outputs = renderFiles(bundle, { kind: 'api', lang }, features, vars, { out, transform: cjs ? (rel, c) => toCommonJs(c) : null });
   if (cjs) for (const o of outputs) o.path = o.path.replace(/\.mjs$/, '.cjs');
   const next = [];
   if (['ts', 'js'].includes(lang)) {
@@ -920,7 +920,7 @@ async function buildLive(env) {
   const healthPath = normalizeHttpPath(values['health-path'] || '/health');
   const baseUrl = values['base-url'] || 'https://staging.example.invalid';
   if (!/^https?:\/\/[^\s'"`]+$/.test(baseUrl) || /^https?:\/\/[^/]*@/.test(baseUrl)) throw usageError('--base-url must be an http(s) URL without credentials (the token goes into .adc/.env.live)');
-  const vendored = vendoredSkill(root, values['skill-path']);
+  const vendored = vendoredSkill(env, values['skill-path']);
   const vars = commonVars(env, {
     out, base_url: baseUrl, health_path: healthPath, header: CI_HEADER('live'), cron: cronOf(values),
     package_name: `${slugify(path.basename(root))}-live-probes`, synthetic_cost: cost == null ? 'TODO' : String(cost),
@@ -1138,7 +1138,7 @@ function ecosystemOf(p) {
 
 function ciProjects(env) {
   const projects = env.det && Array.isArray(env.det.projects) ? env.det.projects : [];
-  return projects.filter((p) => unitRunners(p).some((r) => r.cmd) || env.values['test-cmd']);
+  return projects.filter((p) => (p.runners || []).some((r) => r && r.cmd) || env.values['test-cmd']);
 }
 
 function indent(text, n) {
@@ -1169,7 +1169,7 @@ async function buildCiGate(env) {
   const projects = values['test-cmd'] ? [pickProject(env.det, env.outRel) || { root: '.', ecosystems: [], runners: [], managers: [] }] : ciProjects(env);
   if (!projects.length) throw envError('NO_RUNNER', 'no test runner was detected; pass --test-cmd "<the command that runs the whole suite>"');
   const registry = findRegistry(root);
-  const vendored = vendoredSkill(root, values['skill-path']);
+  const vendored = vendoredSkill(env, values['skill-path']);
   const base = commonVars(env, {
     header: CI_HEADER('ci-gate'), header_js: gateHeaderJs(), threshold: String(threshold), max_flaky: String(maxFlaky),
     os_list: os.join(', '), registry: registry || 'tests/quarantine.json', repo_root: root,
@@ -1185,27 +1185,30 @@ async function buildCiGate(env) {
     const slug = proot === '.' ? 'root' : slugify(proot, 30);
     const eco = ecosystemOf(p) || 'node';
     const runner = unitRunners(p).find((r) => r.cmd) || null;
-    const step = ciTestCommand(runner || { name: 'custom', cmd: null }, { testCmd: values['test-cmd'] || null, quarantine: Boolean(registry) });
-    if (!step) continue;
+    const step = runner || values['test-cmd'] ? ciTestCommand(runner || { name: 'custom', cmd: null }, { testCmd: values['test-cmd'] || null, quarantine: Boolean(registry) }) : null;
     const install = (p.managers && p.managers[0] && p.managers[0].install) || '';
     const dir = proot === '.' ? '' : `${proot}/`;
     const v = {
-      ...base, slug, project_root: proot, project_dir: dir,
-      install_cmd: install || `echo "no frozen install command was detected for ${proot}; add one here"`, test_cmd: step.cmd,
-      report_format: step.format, report_path: step.report, report_upload: `${dir}${step.report}`,
-      os_matrix: os.map((o) => `"${o}"`).join(', '), runner_name: step.runner, publisher: publisherFor(step.format),
-      setup: setupFor(p, base),
-      test_env: Object.keys(step.env).length ? `\n        env:\n${Object.entries(step.env).map(([k, val]) => `          ${k}: ${val}`).join('\n')}` : '',
+      ...base, slug, project_root: proot, project_dir: dir, project_label: proot === '.' ? 'repository root' : proot,
+      install_cmd: install || `echo "no frozen install command was detected for ${proot}; add one here"`,
+      os_matrix: os.map((o) => `"${o}"`).join(', '), setup: setupFor(p, base),
     };
-    v.publish = v.publisher ? fragment(bundle, 'publish-junit', {}, v, features) : '';
-    jobs.push(fragment(bundle, 'test-job', {}, v, features));
-    testJobIds.push(`test-${slug}`);
     if (!install) notes.push(`${proot}: no frozen install command was detected; edit the "Install (frozen)" steps`);
-    const cov = values['test-cmd'] ? null : ciCoverage(runner, p, root);
+    if (step) {
+      Object.assign(v, {
+        test_cmd: step.cmd, report_format: step.format, report_path: step.report, report_upload: `${dir}${step.report}`,
+        runner_name: step.runner, publisher: publisherFor(step.format),
+        test_env: Object.keys(step.env).length ? `\n        env:\n${Object.entries(step.env).map(([k, val]) => `          ${k}: ${val}`).join('\n')}` : '',
+      });
+      v.publish = v.publisher ? fragment(bundle, 'publish-junit', {}, v, features) : '';
+      jobs.push(fragment(bundle, 'test-job', {}, v, features));
+      testJobIds.push(`test-${slug}`);
+    }
+    const cov = values['test-cmd'] || !runner ? null : ciCoverage(runner, p, root);
     if (cov) {
       gateJobs.push(`coverage-${slug}`);
       jobs.push(fragment(bundle, cov.tool === 'adc' ? 'coverage-job-adc' : 'coverage-job', {}, { ...v, coverage_cmd: cov.cmd, coverage_report: cov.report }, features));
-    } else if (!values['test-cmd']) notes.push(`${proot}: no changed-line coverage producer is known for ${runner ? runner.name : 'this runner'}; add one (references/ci-gate.md) and a coverage job`);
+    } else if (!values['test-cmd'] && runner) notes.push(`${proot}: no changed-line coverage producer is known for ${runner ? runner.name : 'this runner'}; add one (references/ci-gate.md) and a coverage job`);
     const pw = (p.runners || []).find((r) => r.name === 'playwright');
     if (pw) {
       gateJobs.push(`e2e-${slug}`);
@@ -1214,12 +1217,12 @@ async function buildCiGate(env) {
     const audit = auditCommand(eco, p);
     if (audit) audits.push(fragment(bundle, 'audit-step', {}, { ...v, audit_cmd: audit, audit_name: `${eco} dependency audit (${proot})` }, features));
   }
-  if (!testJobIds.length) throw envError('NO_RUNNER', 'no CI test command could be built for the detected runners; pass --test-cmd "<the command that runs the whole suite>"');
+  if (!testJobIds.length && !gateJobs.length) throw envError('NO_RUNNER', 'no CI test command could be built for the detected runners; pass --test-cmd "<the command that runs the whole suite>"');
   const needs = ['changes', ...testJobIds, ...gateJobs, 'ratchet', 'secrets', ...(registry ? ['quarantine'] : [])];
   const metrics = ['executed', 'passed', 'failed', 'skipped', 'flaky'];
   const vars = {
     ...base, test_jobs: jobs.join('\n\n'), needs_list: needs.join(', '),
-    merge_outputs: metrics.map((k) => `      ${k}: \${{ needs.${testJobIds[0]}.outputs.${k} }}`).join('\n'),
+    merge_outputs: testJobIds.length ? `    outputs:\n${metrics.map((k) => `      ${k}: \${{ needs.${testJobIds[0]}.outputs.${k} }}`).join('\n')}` : '',
     audit_steps: audits.length ? audits.join('\n') : fragment(bundle, 'audit-none', {}, base, features),
     agent_jobs: hosts.map((h) => fragment(bundle, `agent-${h}`, {}, base, features)).join('\n'),
     quarantine_job: registry ? fragment(bundle, 'quarantine-job', {}, base, features) : '',
@@ -1359,6 +1362,10 @@ export async function scaffold({ kind, ctx, values = {} }) {
     if (env.write) {
       const after = liveAfterWrite(env, plan.out);
       Object.assign(result, { state: after.state, gitignore: after.gitignore, findings: after.findings });
+      const runnerGate = checklistGate(path.join(env.root, ...plan.out.split('/'), 'live-checklist.md'));
+      if (result.synthetic && result.synthetic.enabled && !runnerGate.ok) {
+        result.next_steps.unshift(`the runner reads ${plan.out}/live-checklist.md, which still has ${runnerGate.open ?? 'no'} TODO line(s): copy the answered checklist there (or re-run with --force), or synthetic probes stay SYNTHETIC_GATED`);
+      }
       if (after.findings.length) exit = EXIT.FINDINGS;
     } else {
       result.state = { dir: toPosix(env.state.dir), planned: ['exclude entry', 'budget.json', '.env.live (empty, owner-only)'] };

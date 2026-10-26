@@ -9,11 +9,11 @@ import path from 'node:path';
 import { builtinModules } from 'node:module';
 import {
   defineCommand, EXIT, run, runShell, which, quoteArg, sha256, asciiJson, toPosix, truncate,
-  redactLiterals, IS_WINDOWS, tmpRoot, readText,
+  redactLiterals, IS_WINDOWS, tmpRoot, readText, nonce,
 } from './core.mjs';
 import { emptyTree, diffNameStatus, diffLines, showFile, lsTree, worktreeAdd, worktreeRemove } from './git.mjs';
 import { prepareTarget, snapshotExcludes } from './state.mjs';
-import { classifyPath } from './markers.mjs';
+import { classifyPath, redactSecrets } from './markers.mjs';
 
 const MAX_LOOKUPS = 25;
 const TOOL_TIMEOUT_MS = 120_000;
@@ -1090,7 +1090,7 @@ export function runLockTool(manager, dir, { offline = false, env = process.env, 
     ? runShell(tool.line, { cwd: dir, env: { ...env, npm_config_update_notifier: 'false' }, timeoutMs })
     : run(tool.cmd, tool.args, { cwd: dir, env: { ...env, ...(tool.env || {}) }, timeoutMs });
   const cmd = tool.shell ? tool.line : [tool.cmd, ...tool.args].join(' ');
-  const output = redactLiterals(`${res.stdout}\n${res.stderr}`, secrets);
+  const output = redactLiterals(redactSecrets(`${res.stdout}\n${res.stderr}`), secrets);
   let status;
   if (res.exit === 0) status = 'consistent';
   else if (INCONSISTENT.some((re) => re.test(output))) status = 'inconsistent';
@@ -1147,20 +1147,29 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
     return content.get(k);
   };
   const findings = [];
+  // Specs and tool output can carry credentials (`git+https://<token>@host/...`): mask them everywhere.
+  const clean = (text) => redactLiterals(redactSecrets(String(text ?? '')), secrets);
   const finding = (check, severity, file, line, message, evidence = '', rule = undefined) => {
-    findings.push({ id: check, severity, file: file ? toPosix(file) : null, line: line ?? null, message: redactLiterals(message, secrets),
-      evidence: truncate(redactLiterals(String(evidence ?? ''), secrets), 240), ...(rule ? { rule } : {}) });
+    findings.push({ id: check, severity, file: file ? toPosix(file) : null, line: line ?? null, message: clean(message),
+      evidence: truncate(clean(evidence), 240), ...(rule ? { rule } : {}) });
   };
 
   // 1. Manifests and their dependency deltas.
   const manifests = [];
   const newDeps = [];
+  const unparsable = [];
   for (const c of changes) {
     if (c.status === 'D' || !isParsableManifest(c.path)) continue;
     const oldPath = c.oldPath || c.path;
     const before = parseManifest(oldPath, baseFiles.has(oldPath) ? read(from, oldPath) : null);
     const after = parseManifest(c.path, read(to, c.path));
-    if (!after) continue;
+    if (!after) {
+      if (read(to, c.path) != null) {
+        unparsable.push(toPosix(c.path));
+        finding('CK-DEPS', 'finding', c.path, null, `${c.path} could not be parsed, so its dependencies were not checked`, '', 'deps.unparsable-manifest');
+      }
+      continue;
+    }
     const delta = manifestDelta(before, after);
     const eco = after.ecosystem;
     manifests.push({ path: toPosix(c.path), ecosystem: eco, status: c.status, added: delta.added.length, removed: delta.removed.length, changed: delta.changed.length });
@@ -1357,7 +1366,8 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
   const lockReports = [];
   let headWorktree = null;
   let baseWorktree = null;
-  const wtRoot = path.join(tmpRoot(root), `deps-${String(target.snapshot.tree).slice(0, 12)}`);
+  // A nonce keeps concurrent runs on the same snapshot (verify plus a manual deps-check) apart.
+  const wtRoot = path.join(tmpRoot(root), `deps-${String(target.snapshot.tree).slice(0, 12)}-${nonce().slice(0, 8)}`);
   try {
     for (const { lock, manifests: ms, absent } of projects.values()) {
       const manager = lockManager(lock);
@@ -1450,7 +1460,7 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
   const depsFindings = findings.filter((f) => f.id === 'CK-DEPS');
   const unverifiedDeps = newDeps.filter((d) => d.exists === null && d.declared && d.kind === 'registry');
   let depsStatus = depsFindings.some((f) => f.severity === 'fail') ? 'fail'
-    : unverifiedDeps.length ? 'unverified' : depsFindings.some((f) => f.severity === 'finding') ? 'finding' : 'pass';
+    : unverifiedDeps.length || unparsable.length ? 'unverified' : depsFindings.some((f) => f.severity === 'finding') ? 'finding' : 'pass';
   const depsSummary = !newDeps.length ? 'no new dependencies or undeclared imports'
     : `${newDeps.length} new dependenc${newDeps.length === 1 ? 'y' : 'ies'}: ${newDeps.filter((d) => d.exists === true).length} verified, ${newDeps.filter((d) => d.exists === false).length} nonexistent, ${unverifiedDeps.length} unverified${offline ? ' (offline)' : ''}, ${newDeps.filter((d) => d.lookalike_of).length} look-alike`;
   const lockFindings = findings.filter((f) => f.id === 'CK-LOCK');
@@ -1460,7 +1470,7 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
   const lockSummary = lockStatus === 'unchanged' ? 'no manifest or lockfile changes'
     : `${lockReports.length} lockfile(s): ${lockReports.map((r) => `${r.path} ${r.status}${r.tool?.cmd ? ` (${r.manager} ${r.tool.status})` : ''}`).join(', ')}`;
   const checks = [
-    mk('CK-DEPS', DEPS_FM, depsFindings, depsStatus, depsSummary, { offline, new_deps: newDeps.length, lookups }, depsStatus === 'unverified' ? (offline ? 'OFFLINE' : 'REGISTRY_UNVERIFIED') : null),
+    mk('CK-DEPS', DEPS_FM, depsFindings, depsStatus, depsSummary, { offline, new_deps: newDeps.length, lookups }, depsStatus === 'unverified' ? (unparsable.length && !unverifiedDeps.length ? 'MANIFEST_UNPARSABLE' : offline ? 'OFFLINE' : 'REGISTRY_UNVERIFIED') : null),
     mk('CK-LOCK', LOCK_FM, lockFindings, lockCheckStatus, lockSummary, { part: 'consistency', lock_status: lockStatus, lockfiles: lockReports.length },
       lockCheckStatus === 'unverified' ? 'LOCK_UNVERIFIED' : lockCheckStatus === 'skipped' ? 'UNSUPPORTED_LOCKFILE' : null),
   ];
@@ -1469,8 +1479,9 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
     tree_digest: target.snapshot.tree,
     offline,
     manifests,
-    new_deps: newDeps,
-    lock_status: { status: lockStatus, lockfiles: lockReports },
+    new_deps: newDeps.map((d) => ({ ...d, ...(d.spec != null ? { spec: clean(d.spec) } : {}), ...(d.detail ? { detail: clean(d.detail) } : {}) })),
+    lock_status: { status: lockStatus, lockfiles: lockReports.map((r) => ({ ...r, static: { ...r.static, missing: r.static.missing.map(clean), mismatched: r.static.mismatched.map(clean) } })) },
+    ...(unparsable.length ? { unparsable } : {}),
     findings,
     counts: { manifests: manifests.length, new_deps: newDeps.length, registry_lookups: lookups, lockfiles: lockReports.length },
     checks,

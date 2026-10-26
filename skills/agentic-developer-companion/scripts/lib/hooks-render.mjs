@@ -312,6 +312,7 @@ function nextSteps(host, scope, level, target, skill) {
   }
   // Measured 2026-10-25: Copilot CLI 1.0.103 drops agentStop context and Codex 0.164 shows a Stop
   // systemMessage to the user only; Claude Code feeds Stop context back to the agent.
+  if (level === 'advise' && host === 'claude') steps.push('Level advise: Claude Code feeds the end-of-turn notice ("edits are newer than the last ledger") to the agent, which then continues once per edit epoch; the notice never blocks twice.');
   if (level === 'advise' && host !== 'claude') steps.push(`Level advise: the end-of-turn notice ("edits are newer than the last ledger") ${host === 'codex' ? 'is shown to you, not to the agent' : 'is dropped by Copilot at agentStop'}; register --level gate if the agent itself should be stopped once per edit epoch.`);
   if (level === 'gate') steps.push('Level gate: the stop hook blocks completion once per edit epoch until a ledger newer than the last edit exists (`verify`).');
   if (level === 'guard') steps.push('Level guard: also denies force-push, history rewrites and host read/search/edit tools under .adc/; add the printed permission_rules where your host supports them. `ask` decisions become denials in the Copilot cloud agent and CLI autopilot.');

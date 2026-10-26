@@ -105,22 +105,19 @@ Start each host from a `pwsh` 7 window. Copilot CLI and Codex launch hooks throu
 | Copilot CLI | S2 `help` prints the resolved skill path | — | not run | — | |
 | Copilot CLI | S3 `verify` on the sample repo | — | not run | — | |
 | Copilot CLI | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Copilot CLI | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | VS Code (Session Target = Copilot) | S1 install | — | not run | — | |
 | VS Code (Session Target = Copilot) | S2 `help` prints the resolved skill path | — | not run | — | |
 | VS Code (Session Target = Copilot) | S3 `verify` on the sample repo | — | not run | — | |
 | VS Code (Session Target = Copilot) | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| VS Code (Session Target = Copilot) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Claude Code | S1 install | — | not run | — | |
 | Claude Code | S2 `help` prints the resolved skill path | — | not run | — | |
 | Claude Code | S3 `verify` on the sample repo | — | not run | — | |
 | Claude Code | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Claude Code | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Codex | S1 install | — | not run | — | |
 | Codex | S2 `help` prints the resolved skill path | — | not run | — | |
 | Codex | S3 `verify` on the sample repo | — | not run | — | |
 | Codex | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Codex | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
+| any (run once per launch path) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 
 ## Windows 11, Windows PowerShell 5.1
 
@@ -132,22 +129,19 @@ Start each host from `powershell.exe` with no `pwsh` on PATH (rename or remove i
 | Copilot CLI | S2 `help` prints the resolved skill path | — | not run | — | |
 | Copilot CLI | S3 `verify` on the sample repo | — | not run | — | |
 | Copilot CLI | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Copilot CLI | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | VS Code (Session Target = Copilot) | S1 install | — | not run | — | |
 | VS Code (Session Target = Copilot) | S2 `help` prints the resolved skill path | — | not run | — | |
 | VS Code (Session Target = Copilot) | S3 `verify` on the sample repo | — | not run | — | |
 | VS Code (Session Target = Copilot) | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| VS Code (Session Target = Copilot) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Claude Code | S1 install | — | not run | — | |
 | Claude Code | S2 `help` prints the resolved skill path | — | not run | — | |
 | Claude Code | S3 `verify` on the sample repo | — | not run | — | |
 | Claude Code | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Claude Code | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Codex | S1 install | — | not run | — | |
 | Codex | S2 `help` prints the resolved skill path | — | not run | — | |
 | Codex | S3 `verify` on the sample repo | — | not run | — | |
 | Codex | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Codex | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
+| any (run once per launch path) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 
 ## Windows 11, Git Bash
 
@@ -159,22 +153,19 @@ Start each host from Git Bash (`C:\Program Files\Git\bin\bash.exe`). Claude Code
 | Copilot CLI | S2 `help` prints the resolved skill path | — | not run | — | |
 | Copilot CLI | S3 `verify` on the sample repo | — | not run | — | |
 | Copilot CLI | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Copilot CLI | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | VS Code (Session Target = Copilot) | S1 install | — | not run | — | |
 | VS Code (Session Target = Copilot) | S2 `help` prints the resolved skill path | — | not run | — | |
 | VS Code (Session Target = Copilot) | S3 `verify` on the sample repo | — | not run | — | |
 | VS Code (Session Target = Copilot) | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| VS Code (Session Target = Copilot) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Claude Code | S1 install | — | not run | — | |
 | Claude Code | S2 `help` prints the resolved skill path | — | not run | — | |
 | Claude Code | S3 `verify` on the sample repo | — | not run | — | |
 | Claude Code | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Claude Code | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Codex | S1 install | — | not run | — | |
 | Codex | S2 `help` prints the resolved skill path | — | not run | — | |
 | Codex | S3 `verify` on the sample repo | — | not run | — | |
 | Codex | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Codex | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
+| any (run once per launch path) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 
 ## Windows 11, cmd
 
@@ -186,22 +177,19 @@ Start each host from `cmd.exe`. Run the CLI steps with backslash paths (`node .a
 | Copilot CLI | S2 `help` prints the resolved skill path | — | not run | — | |
 | Copilot CLI | S3 `verify` on the sample repo | — | not run | — | |
 | Copilot CLI | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Copilot CLI | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | VS Code (Session Target = Copilot) | S1 install | — | not run | — | |
 | VS Code (Session Target = Copilot) | S2 `help` prints the resolved skill path | — | not run | — | |
 | VS Code (Session Target = Copilot) | S3 `verify` on the sample repo | — | not run | — | |
 | VS Code (Session Target = Copilot) | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| VS Code (Session Target = Copilot) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Claude Code | S1 install | — | not run | — | |
 | Claude Code | S2 `help` prints the resolved skill path | — | not run | — | |
 | Claude Code | S3 `verify` on the sample repo | — | not run | — | |
 | Claude Code | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Claude Code | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 | Codex | S1 install | — | not run | — | |
 | Codex | S2 `help` prints the resolved skill path | — | not run | — | |
 | Codex | S3 `verify` on the sample repo | — | not run | — | |
 | Codex | S4 `setup hooks` + one edit + one stop | — | not run | — | |
-| Codex | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
+| any (run once per launch path) | S5 `.adc/.env.live` ACL check (`doctor`) | — | not run | — | |
 
 ## macOS
 

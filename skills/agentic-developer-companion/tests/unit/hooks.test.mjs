@@ -623,9 +623,15 @@ const claudeOnly = (c) => [c, ...(c.then || [])].every((s) => (s.dialect_arg || 
 const codexOnly = (c) => [c, ...(c.then || [])].every((s) => (s.dialect_arg || c.dialect_arg) === 'codex');
 
 test('fixtures through the rendered Copilot powershell strings (pwsh -NoProfile -Command)', { skip: PWSH ? false : 'pwsh not installed', timeout: 240_000 }, async () => {
+  // Every case already ran through the bash string. Under pwsh (about 0.4 s of CPU per start, the
+  // file's largest cost) every preToolUse case runs, because Copilot treats a failing preToolUse
+  // hook as a denial, plus the first case of each other event.
   let n = 0;
-  for (const f of ['copilot-camel', 'copilot-pascal', 'copilot-cloud']) n += await viaLauncher(f, 'copilot-pwsh', copilotOnly);
-  assert.ok(n > 50);
+  for (const f of ['copilot-camel', 'copilot-pascal', 'copilot-cloud']) {
+    const first = onePerEvent(copilotOnly);
+    n += await viaLauncher(f, 'copilot-pwsh', (c) => (c.event === 'pre-guard' ? copilotOnly(c) : first(c)));
+  }
+  assert.ok(n > 30);
 });
 
 test('fixtures through the rendered Copilot bash strings (bash -c)', { skip: BASH ? false : 'bash not available', timeout: 120_000 }, async () => {

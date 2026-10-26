@@ -329,7 +329,8 @@ jobs:
 @@@ file: fragment/app-install part=fragment name=app-install kind=web lang=ts @@@
       - name: Install the app under test
         working-directory: {{project_root}}
-        run: {{install_cmd}}
+        run: |
+          {{install_cmd}}
 
 @@@ file: requirements-e2e.txt kind=web lang=python @@@
 # End-to-end test dependencies (pytest-playwright brings pytest, playwright and pytest-base-url).

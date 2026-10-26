@@ -104,7 +104,7 @@ skill, so registration is an explicit, confirmed step.
 
 | Level | What it adds | When |
 |---|---|---|
-| `advise` (default) | session brief, post-edit notes, observed test runs, a notice when edits are newer than the last ledger (it reaches the agent in Claude Code; Copilot drops `agentStop` context and Codex shows it to you only) | everyone |
+| `advise` (default) | session brief, post-edit notes, observed test runs, a notice when edits are newer than the last ledger (in Claude Code it reaches the agent, which continues once per edit epoch; Copilot drops `agentStop` context and Codex shows it to you only) | everyone |
 | `gate` | blocks completion **once per edit epoch** until a ledger newer than the last edit exists | teams that require `verify` |
 | `guard` | `gate` plus a pre-tool policy: denies force-push and history rewrites, `git add -f` of `.adc/` (by name, `.`, `-A` or a glob), commit/push while `.adc/` is tracked, host read/search/edit tools under `.adc/`, shell commands naming `.env.live` (or a glob under `.adc/` that matches it, or a recursive read or copy of `.adc/`); asks on CI edits and test deletions | high-trust repositories |
 

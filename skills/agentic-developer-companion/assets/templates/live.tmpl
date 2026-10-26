@@ -438,12 +438,13 @@ jobs:
           ADC_LIVE_TENANT: ${{ vars.ADC_LIVE_TENANT }}
           ADC_LIVE_BUDGET: ${{ vars.ADC_LIVE_BUDGET }}
           LIVE_TESTS_ENABLED: ${{ vars.LIVE_TESTS_ENABLED }}
-        run: node "$ADC" live run --probes 'readonly/*' --json > live-readonly.json
+        run: |
+          node "$ADC" live run --probes 'readonly/*' --json > "$RUNNER_TEMP/live-readonly.json"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: live-readonly
-          path: live-readonly.json
+          path: ${{ runner.temp }}/live-readonly.json
           retention-days: 1
 {{synthetic_job}}
 
@@ -473,26 +474,30 @@ jobs:
           ADC_LIVE_TENANT: ${{ vars.ADC_LIVE_TENANT }}
           ADC_LIVE_BUDGET: ${{ vars.ADC_LIVE_BUDGET }}
           LIVE_TESTS_ENABLED: ${{ vars.LIVE_TESTS_ENABLED }}
-        run: node "$ADC" live run --probes 'synthetic/*' --json > live-synthetic.json
+        run: |
+          node "$ADC" live run --probes 'synthetic/*' --json > "$RUNNER_TEMP/live-synthetic.json"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: live-synthetic
-          path: live-synthetic.json
+          path: ${{ runner.temp }}/live-synthetic.json
           retention-days: 1
 
 @@@ file: fragment/probe-setup part=fragment name=probe-setup lang=ts @@@
       - name: Install the probe project (API probes need no browsers)
         working-directory: {{out}}
-        run: npm ci
+        run: |
+          npm ci
 
 @@@ file: fragment/probe-setup part=fragment name=probe-setup lang=js @@@
       - name: The probe project needs nothing installed (node:test + fetch)
-        run: node --version
+        run: |
+          node --version
 
 @@@ file: fragment/probe-setup part=fragment name=probe-setup lang=python @@@
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install the probe project
-        run: python -m pip install -r {{out}}/requirements-live.txt
+        run: |
+          python -m pip install -r {{out}}/requirements-live.txt

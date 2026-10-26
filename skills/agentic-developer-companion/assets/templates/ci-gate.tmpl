@@ -151,7 +151,6 @@ jobs:
     needs: [{{needs_list}}]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
 {{merge_outputs}}
     steps:
       - name: Every gate job passed (a job skipped by the path filter counts as passed)
@@ -170,7 +169,7 @@ jobs:
 
 @@@ file: fragment/test-job part=fragment name=test-job @@@
   test-{{slug}}:
-    name: Test {{project_root}} (${{ matrix.os }})
+    name: Test {{project_label}} (${{ matrix.os }})
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ${{ matrix.os }}
@@ -224,13 +223,13 @@ jobs:
         uses: dorny/test-reporter@v3
         if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         with:
-          name: Tests {{project_root}} (${{ matrix.os }})
+          name: Tests {{project_label}} (${{ matrix.os }})
           path: {{report_upload}}
           reporter: {{publisher}}
 
 @@@ file: fragment/coverage-job part=fragment name=coverage-job @@@
   coverage-{{slug}}:
-    name: Changed-line coverage {{project_root}}
+    name: Changed-line coverage {{project_label}}
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
@@ -249,6 +248,7 @@ jobs:
           {{install_cmd}}
       - name: Suite with coverage
         run: |
+          mkdir -p coverage reports
           {{coverage_cmd}}
       - name: Changed-line coverage with diff-cover (reported; enforced when ADC_COVERAGE_ENFORCE is true)
         env:
@@ -265,7 +265,7 @@ jobs:
 
 @@@ file: fragment/coverage-job-adc part=fragment name=coverage-job-adc @@@
   coverage-{{slug}}:
-    name: Changed-line coverage {{project_root}}
+    name: Changed-line coverage {{project_label}}
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
@@ -285,6 +285,7 @@ jobs:
           {{install_cmd}}
       - name: Suite with coverage
         run: |
+          mkdir -p coverage reports
           {{coverage_cmd}}
       - name: Changed-line coverage with adc coverage-delta (reported; enforced when ADC_COVERAGE_ENFORCE is true)
         env:
@@ -301,7 +302,7 @@ jobs:
 
 @@@ file: fragment/e2e-job part=fragment name=e2e-job @@@
   e2e-{{slug}}:
-    name: E2E {{project_root}} (Playwright)
+    name: E2E {{project_label}} (Playwright)
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest

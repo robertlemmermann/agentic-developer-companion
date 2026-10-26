@@ -305,19 +305,20 @@ export function unitCases(rel, res, tap, timeoutS) {
   const secs = (res.ms / 1000).toFixed(1);
   const counts = `${tap.tests} test(s): ${tap.pass} pass, ${tap.fail} fail, ${tap.skipped} skipped, ${tap.todo} todo${tap.cancelled ? `, ${tap.cancelled} cancelled` : ''} (${secs} s)`;
   const cases = [];
-  if (res.timedOut) cases.push(fail(rel, `timed out after ${timeoutS} s and was killed; ${counts}`, { ms: res.ms }));
+  const file = { kind: 'unit-file', ms: res.ms, tests: tap.tests };
+  if (res.timedOut) cases.push(fail(rel, `timed out after ${timeoutS} s and was killed; ${counts}`, file));
   else if (res.exit === 0 && tap.fail === 0 && tap.cancelled === 0 && tap.complete) {
-    cases.push(tap.tests > 0 && tap.skipped + tap.todo >= tap.tests ? skip(rel, `every test skipped: ${counts}`, { ms: res.ms }) : pass(rel, counts, { ms: res.ms }));
+    cases.push(tap.tests > 0 && tap.skipped + tap.todo >= tap.tests ? skip(rel, `every test skipped: ${counts}`, file) : pass(rel, counts, file));
   } else {
     const why = !tap.complete ? `incomplete TAP output (exit ${res.exit ?? res.signal ?? '?'}): ${firstLine(res.stderr) || firstLine(res.stdout.split('\n').slice(-5).join('\n')) || 'no output'}`
       : `exit ${res.exit ?? res.signal}`;
-    cases.push(fail(rel, `${why}; ${counts}`, { ms: res.ms }));
+    cases.push(fail(rel, `${why}; ${counts}`, file));
   }
   for (const f of tap.failures.slice(0, 25)) {
     const error = String(f.error || f.failureType || 'failed').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3).join(' | ');
-    cases.push(fail(`${rel} > ${f.path.join(' > ')}`, `${error}${f.location ? ` (${f.location.replace(/^.*\/(tests\/unit\/)/, '$1')})` : ''}`));
+    cases.push(fail(`${rel} > ${f.path.join(' > ')}`, `${error}${f.location ? ` (${f.location.replace(/^.*\/(tests\/unit\/)/, '$1')})` : ''}`, { kind: 'unit-test' }));
   }
-  if (tap.failures.length > 25) cases.push(fail(`${rel} > ...`, `${tap.failures.length - 25} more failing test(s)`));
+  if (tap.failures.length > 25) cases.push(fail(`${rel} > ...`, `${tap.failures.length - 25} more failing test(s)`, { kind: 'unit-test' }));
   return cases;
 }
 
@@ -1693,8 +1694,8 @@ async function runUnits(sx, plan, { jobs, units, progress }) {
   const results = new Map();
   const todo = [];
   for (const u of plan) {
-    if (!units) results.set(u.rel, [skip(u.rel, 'unit files not run (--skip-units)')]);
-    else if (!u.present) results.set(u.rel, [skip(u.rel, `${u.rel} is not present yet`)]);
+    if (!units) results.set(u.rel, [skip(u.rel, 'unit files not run (--skip-units)', { kind: 'unit-file' })]);
+    else if (!u.present) results.set(u.rel, [skip(u.rel, `${u.rel} is not present yet`, { kind: 'unit-file' })]);
     else todo.push(u);
   }
   const onSignal = () => { killAll(); process.exit(130); };
@@ -1721,8 +1722,9 @@ async function runUnits(sx, plan, { jobs, units, progress }) {
 }
 
 /**
- * Run the selected areas against a skill tree (default: this one). Returns
- * `{ schema, skill_dir, version, passed, failed, skipped, areas[], cases[{area, name, status, detail}] }`.
+ * Run the selected areas against a skill tree (default: this one). Returns `{ schema, skill_dir,
+ * version, passed, failed, skipped, unit_tests, areas[], cases[{area, kind, name, status, detail}] }`;
+ * the counts are cases: a direct check, a unit file's summary, or one failing unit test each.
  */
 export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = DEFAULT_TIMEOUT_S, jobs = 1, external = true,
   units = true, keep = false, env = process.env, progress = null } = {}) {
@@ -1757,12 +1759,13 @@ export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = D
   const areaRows = [];
   for (const area of areas) {
     const a = byArea.get(area);
-    const cs = [...a.direct, ...a.units].map((c) => ({ area, ...c }));
+    const cs = [...a.direct.map((c) => ({ kind: 'check', ...c })), ...a.units].map((c) => ({ area, ...c }));
     cases.push(...cs);
     const n = (s) => cs.filter((c) => c.status === s).length;
     areaRows.push({ area, status: n('fail') ? 'fail' : n('pass') ? 'pass' : 'skipped', passed: n('pass'), failed: n('fail'), skipped: n('skipped'), ms: a.ms });
   }
   const count = (s) => cases.filter((c) => c.status === s).length;
+  const unitFiles = cases.filter((c) => c.kind === 'unit-file' && c.status !== 'skipped');
   if (keep && sx.tmpBase) progress?.(`temp repositories kept in ${toPosix(sx.tmpBase)}`);
   return {
     schema: 'adc-selftest/1',
@@ -1777,6 +1780,8 @@ export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = D
     passed: count('pass'),
     failed: count('fail'),
     skipped: count('skipped'),
+    unit_tests: { files: unitFiles.length, tests: unitFiles.reduce((n, c) => n + (c.tests || 0), 0),
+      failing: cases.filter((c) => c.kind === 'unit-test').length },
     areas: areaRows,
     cases,
   };

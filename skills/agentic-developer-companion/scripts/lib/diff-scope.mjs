@@ -132,6 +132,9 @@ function redactText(text, secrets) {
   return redactLiterals(M.redactSecrets(String(text ?? '')), secrets);
 }
 
+/** A quoted value for a message: redacted before it is shortened, so a cut never leaves half a secret. */
+const clip = (S, text, max) => truncate(redactText(text, S.secrets), max);
+
 function multisetSubtract(items, removeItems, keyFn) {
   const counts = new Map();
   for (const r of removeItems) { const k = keyFn(r); counts.set(k, (counts.get(k) || 0) + 1); }
@@ -744,7 +747,7 @@ function checkTestConfig(S) {
       let { severity, why } = settingSeverity(g.key, before, after, base);
       if (MASKING_KEYS.test(g.key) && !g.removed.length && g.added.every((x) => benignExclusion(x.text))) severity = 'finding';
       S.add('CK-TEST-CFG', severity, file, g.added[0]?.line ?? null,
-        `test runner setting "${g.key}" changed in ${file}${before ? `: "${truncate(before, 80)}"` : ''}${after ? ` -> "${truncate(after, 80)}"` : ' (removed)'}${why}`,
+        `test runner setting "${g.key}" changed in ${file}${before ? `: "${clip(S, before, 80)}"` : ''}${after ? ` -> "${clip(S, after, 80)}"` : ' (removed)'}${why}`,
         first.text, { side: g.added[0] ? 'head' : 'base' });
     }
   }
@@ -768,12 +771,12 @@ function packageJsonTestConfig(S, f) {
     if (b === a) continue;
     if (b == null) {
       const why = NARROW_FLAGS.test(a) ? ' and it hides failures or narrows the run' : '';
-      S.add('CK-TEST-CFG', f.status === 'A' || !why ? 'finding' : 'fail', file, lineOf(k), `test script "${k}" added: "${truncate(a, 100)}"${why}`, a);
+      S.add('CK-TEST-CFG', f.status === 'A' || !why ? 'finding' : 'fail', file, lineOf(k), `test script "${k}" added: "${clip(S, a, 100)}"${why}`, a);
       continue;
     }
-    if (a == null) { S.add('CK-TEST-CFG', 'fail', file, null, `test script "${k}" removed (was "${truncate(b, 100)}")`, b, { side: 'base' }); continue; }
+    if (a == null) { S.add('CK-TEST-CFG', 'fail', file, null, `test script "${k}" removed (was "${clip(S, b, 100)}")`, b, { side: 'base' }); continue; }
     const why = narrowsCommand(b, a);
-    S.add('CK-TEST-CFG', why ? 'fail' : 'finding', file, lineOf(k), `test script "${k}" changed: "${truncate(b, 80)}" -> "${truncate(a, 80)}"${why ? ` (${why})` : ''}`, a);
+    S.add('CK-TEST-CFG', why ? 'fail' : 'finding', file, lineOf(k), `test script "${k}" changed: "${clip(S, b, 80)}" -> "${clip(S, a, 80)}"${why ? ` (${why})` : ''}`, a);
   }
   for (const k of ['jest', 'mocha', 'ava', 'c8', 'nyc', 'vitest']) {
     const b = JSON.stringify(before[k] ?? null);
@@ -789,7 +792,7 @@ function packageJsonTestConfig(S, f) {
     const severity = before[k] == null ? (masks && governedBaseTests(S, file) ? 'fail' : 'finding')
       : after[k] == null || !relevant.length || judged.includes('fail') ? 'fail' : 'finding';
     S.add('CK-TEST-CFG', severity, file, lineOf(k),
-      `"${k}" configuration in package.json changed${relevant.length ? ` (${relevant.join(', ')})` : before[k] == null ? ' (added)' : ' (removed)'}`, truncate(a, 160));
+      `"${k}" configuration in package.json changed${relevant.length ? ` (${relevant.join(', ')})` : before[k] == null ? ' (added)' : ' (removed)'}`, clip(S, a, 160));
   }
 }
 
@@ -816,7 +819,7 @@ function ciTestCommands(S, f) {
     const why = narrowsCommand(ciCommand(b), ciCommand(a));
     n++;
     S.add('CK-TEST-CFG', why ? 'fail' : 'finding', f.path, unmatchedAdded[i].line,
-      `CI test command changed: "${truncate(ciCommand(b), 80)}" -> "${truncate(ciCommand(a), 80)}"${why ? ` (${why})` : ''}`, a);
+      `CI test command changed: "${clip(S, ciCommand(b), 80)}" -> "${clip(S, ciCommand(a), 80)}"${why ? ` (${why})` : ''}`, a);
   }
   return n;
 }
@@ -1003,6 +1006,57 @@ function checkSuppressions(S) {
 // ---------------------------------------------------------------------------
 // CK-CI: CI edits that weaken existing test steps
 
+// Steps whose failure a CI weakening hides: test runners plus lint, type, build and scan steps.
+const CHECK_COMMAND = /\b(?:eslint|tsc|biome|oxlint|prettier\s+--check|ruff|mypy|pyright|flake8|pylint|black\s+--check|golangci-lint|go\s+(?:vet|build)|staticcheck|cargo\s+(?:clippy|check|build|fmt\s+--check|audit|deny)|dotnet\s+(?:build|format)|mvnw?|gradlew?|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:lint|typecheck|type-check|check|build|audit)|make|gitleaks|trufflehog|semgrep|codeql|pip-audit|diff-cover|coverage\s+report)\b|\buses:\s*\S*(?:test|cypress|playwright|lint|gitleaks|codeql|golangci)/i;
+// Weakenings that only make sense on a test step.
+const TEST_ONLY_RULES = new Set(['ci.pass-with-no-tests', 'ci.skip-tests', 'ci.ignore-test-failures']);
+const GATING_EVENTS = ['push', 'pull_request', 'pull_request_target', 'merge_group'];
+
+/** Text of the YAML list item or mapping that line `idx` belongs to (a step, or a job for job-level keys). */
+export function ciBlock(lines, idx) {
+  const own = indentOf(lines[idx] || '');
+  let start = -1;
+  if (/^\s*-\s/.test(lines[idx] || '')) start = idx;
+  else {
+    for (let j = idx - 1; j >= 0; j--) {
+      const l = lines[j];
+      if (!l.trim() || /^\s*#/.test(l)) continue;
+      if (indentOf(l) < own) { start = j; break; }
+    }
+  }
+  if (start === -1) return lines.join('\n');
+  const startInd = indentOf(lines[start]);
+  let end = lines.length - 1;
+  for (let j = start + 1; j < lines.length; j++) {
+    const l = lines[j];
+    if (!l.trim() || /^\s*#/.test(l)) continue;
+    if (indentOf(l) <= startInd) { end = j - 1; break; }
+  }
+  return lines.slice(start, end + 1).join('\n');
+}
+
+/** Events a GitHub Actions workflow runs on (the `on:` key), or null when it has none. */
+export function workflowEvents(lines) {
+  const i = lines.findIndex((l) => /^["']?on["']?\s*:/.test(l));
+  if (i === -1) return null;
+  const out = new Set();
+  const inline = lines[i].replace(/^["']?on["']?\s*:\s*/, '').replace(/\s+#.*$/, '').trim();
+  if (inline.startsWith('{')) { for (const m of inline.matchAll(/([\w-]+)\s*:/g)) out.add(m[1]); return out; }
+  if (inline) { for (const t of inline.replace(/^\[|\]$/g, '').split(',')) if (t.trim()) out.add(t.trim().replace(/["']/g, '')); return out; }
+  let child = null;
+  for (let j = i + 1; j < lines.length; j++) {
+    const l = lines[j];
+    if (!l.trim() || /^\s*#/.test(l)) continue;
+    const ind = indentOf(l);
+    if (ind === 0) break;
+    if (child == null) child = ind;
+    if (ind !== child) continue;
+    const m = /^\s*(?:-\s*)?["']?([\w-]+)["']?/.exec(l);
+    if (m) out.add(m[1]);
+  }
+  return out;
+}
+
 function checkCi(S) {
   let files = 0;
   for (const f of S.files) {
@@ -1034,7 +1088,21 @@ function checkCi(S) {
     const addedHits = M.scanText(headL, M.CI_WEAKENING, { lines: lineSet(f.added) });
     const removedHits = M.scanText(baseL, M.CI_WEAKENING, { lines: lineSet(f.removed) });
     for (const h of multisetSubtract(addedHits, removedHits, (x) => `${x.id}|${norm(x.text)}`)) {
-      S.add('CK-CI', h.severity || hardSeverity, f.path, h.line, `CI change can turn a failing step green (${h.id.replace(/^ci\./, '')})`, h.text, { rule: h.id });
+      // `|| true` on a cleanup step or an optional upload hides nothing the gate relies on.
+      const block = ciBlock(headL, h.line - 1);
+      const gating = TEST_ONLY_RULES.has(h.id) || TEST_COMMAND.test(block) || CHECK_COMMAND.test(block);
+      S.add('CK-CI', h.severity || (gating ? hardSeverity : 'finding'), f.path, h.line,
+        `CI change can turn a failing step green (${h.id.replace(/^ci\./, '')})${gating ? '' : ' on a step that runs no test or check'}`, h.text, { rule: h.id });
+    }
+    // Triggers: a workflow that stops running on pushes or pull requests no longer gates them.
+    if (/^\.github\/workflows\//.test(f.path)) {
+      const before = workflowEvents(baseL);
+      const after = workflowEvents(headL);
+      const lost = before && after ? GATING_EVENTS.filter((e) => before.has(e) && !after.has(e)) : [];
+      if (lost.length) {
+        S.add('CK-CI', baseTests ? hardSeverity : 'finding', f.path, headL.findIndex((l) => /^["']?on["']?\s*:/.test(l)) + 1 || null,
+          `workflow no longer runs on ${lost.join(', ')}`, `on: ${[...before].join(', ')} -> ${[...after].join(', ')}`, { rule: 'ci.trigger-removed' });
+      }
     }
     // Test steps removed without a replacement.
     const removedTests = f.removed.filter((x) => TEST_COMMAND.test(x.text));
@@ -1115,12 +1183,14 @@ function checkSwallow(S) {
 // ---------------------------------------------------------------------------
 // CK-SECRETS: gitleaks / trufflehog when installed, built-in regexes otherwise (D7)
 
+/** { name, missing? }: gitleaks, then trufflehog, then the built-in patterns; a forced scanner that is absent says so. */
 function selectScanner(env, forced) {
   const want = forced || env.ADC_SECRETS_SCANNER || 'auto';
-  if (want === 'builtin') return 'builtin';
-  if ((want === 'auto' || want === 'gitleaks') && which('gitleaks', env)) return 'gitleaks';
-  if ((want === 'auto' || want === 'trufflehog') && which('trufflehog', env)) return 'trufflehog';
-  return 'builtin';
+  if (want === 'builtin') return { name: 'builtin' };
+  if ((want === 'auto' || want === 'gitleaks') && which('gitleaks', env)) return { name: 'gitleaks' };
+  if ((want === 'auto' || want === 'trufflehog') && which('trufflehog', env)) return { name: 'trufflehog' };
+  if (want === 'auto') return { name: 'builtin' };
+  return { name: 'builtin', missing: ['gitleaks', 'trufflehog'].includes(want) ? `${want} is not installed` : `unknown scanner "${want}"` };
 }
 
 function addedIndex(S) {
@@ -1141,7 +1211,7 @@ function runGitleaks(S) {
     : ['detect', '--source', S.root, '--log-opts', range, '--redact', '--no-banner', '--report-format', 'json', '--report-path', report, '--exit-code', '1'];
   const res = run('gitleaks', args, { cwd: S.root, env: S.env, timeoutMs: 300_000 });
   try {
-    if (res.exit !== 0 && res.exit !== 1) return { ok: false, error: `gitleaks exited ${res.exit}: ${truncate((res.stderr || '').trim().split('\n').pop(), 160)}`, cmd: `gitleaks ${args.slice(0, 3).join(' ')}` };
+    if (res.exit !== 0 && res.exit !== 1) return { ok: false, error: `gitleaks exited ${res.exit}: ${clip(S, (res.stderr || '').trim().split('\n').pop(), 160)}`, cmd: `gitleaks ${args.slice(0, 3).join(' ')}` };
     const items = JSON.parse(readText(report, '[]') || '[]');
     return { ok: true, exit: res.exit, cmd: `gitleaks ${args.filter((a) => a !== S.root && a !== report).join(' ')}`,
       items: items.map((i) => ({ id: `gitleaks.${i.RuleID}`, file: toPosix(i.File), line: i.StartLine, severity: 'fail', redacted: `${i.RuleID} (value redacted by gitleaks)` })) };
@@ -1174,7 +1244,9 @@ function runTrufflehog(S, added) {
 
 function checkSecrets(S, { scanner = null } = {}) {
   const added = addedIndex(S);
-  let chosen = selectScanner(S.env, scanner);
+  const sel = selectScanner(S.env, scanner);
+  let chosen = sel.name;
+  if (sel.missing) S.data.scanner_error = sel.missing;
   let external = null;
   if (chosen === 'gitleaks') external = runGitleaks(S);
   else if (chosen === 'trufflehog') external = runTrufflehog(S, added);
@@ -1187,6 +1259,21 @@ function checkSecrets(S, { scanner = null } = {}) {
     }
     S.data.scanner_command = external.cmd;
     S.data.scanner_exit = external.exit;
+    // The external scanners know nothing of ADC_LIVE_TOKEN and skip lines carrying their own allow
+    // directives (`gitleaks:allow`), so those lines still get the built-in patterns.
+    const reported = new Set(external.items.map((i) => `${i.file}:${i.line}`));
+    for (const f of S.files) {
+      if (f.status === 'D' || f.binary) continue;
+      for (const a of f.added) {
+        const allowed = M.SECRET_ALLOW.test(a.text);
+        for (const h of M.scanSecrets(a.text)) {
+          if ((!allowed && h.id !== 'secret.adc-live-token') || reported.has(`${f.path}:${a.line}`)) continue;
+          reported.add(`${f.path}:${a.line}`);
+          count++;
+          S.add('CK-SECRETS', h.severity, f.path, a.line, `possible secret (${h.id.replace(/^secret\./, '')}) added${allowed ? ` behind an inline allow directive ${chosen} honors` : ''}`, h.redacted, { rule: h.id });
+        }
+      }
+    }
   } else {
     for (const f of S.files) {
       if (f.status === 'D' || f.binary || !f.added.length) continue;
@@ -1199,11 +1286,13 @@ function checkSecrets(S, { scanner = null } = {}) {
     }
   }
   // The live-test token by value: wherever it was pasted, it must not leave .adc/.
-  if (S.secrets.length) {
+  if (S.secrets.length && S.secrets[0].value.length >= 6) {
     const value = S.secrets[0].value;
+    const b64 = Buffer.from(value).toString('base64');
+    const forms = [...new Set([value, encodeURIComponent(value), b64, b64.replace(/=+$/, ''), Buffer.from(value).toString('base64url')])];
     for (const f of S.files) {
       for (const a of f.added) {
-        if (value.length >= 6 && a.text.includes(value)) {
+        if (forms.some((v) => a.text.includes(v))) {
           count++;
           S.add('CK-SECRETS', 'fail', f.path, a.line, 'the ADC_LIVE_TOKEN value appears in the change', a.text, { rule: 'secret.adc-live-token-value' });
         }
@@ -1495,7 +1584,8 @@ export async function diffScope({ target, detectResult = null, specPaths = null,
 /** File and directory paths (or globs) a spec names, kept only when they exist in a tree. */
 export function extractSpecPaths(text, treeFiles = null) {
   const out = new Set();
-  const tokens = String(text ?? '').match(/[\w.@*{}\/-]*[\w*}](?:\/[\w.@*{},-]+)+\/?|[\w.-]+\.[A-Za-z][\w]{0,7}\b/g) || [];
+  // Windows-style paths (`src\api\users.ts`) name the same files.
+  const tokens = String(text ?? '').replace(/(?<=[\w.])\\(?=[\w.])/g, '/').match(/[\w.@*{}\/-]*[\w*}](?:\/[\w.@*{},-]+)+\/?|[\w.-]+\.[A-Za-z][\w]{0,7}\b/g) || [];
   const files = treeFiles ? [...treeFiles] : null;
   for (const raw of tokens) {
     const t = raw.replace(/^\.\//, '').replace(/[.,:;]+$/, '');

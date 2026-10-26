@@ -12,7 +12,7 @@ import * as core from '../../scripts/lib/core.mjs';
 import * as git from '../../scripts/lib/git.mjs';
 import * as state from '../../scripts/lib/state.mjs';
 import * as M from '../../scripts/lib/markers.mjs';
-import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand } from '../../scripts/lib/diff-scope.mjs';
+import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand, ciBlock, workflowEvents } from '../../scripts/lib/diff-scope.mjs';
 import * as deps from '../../scripts/lib/deps.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
@@ -288,7 +288,7 @@ describe('markers', () => {
       `token: ${GH_TOKEN}`,
       'password = "changeme"',
       'api_key = process.env.API_KEY',
-      `url = "postgres://app:${['s3cr', 'etValue9'].join('')}@db.internal.example.org:5432/app"`,
+      `url = "postgres://app:${['s3cr', 'etValue9'].join('')}@db.internal.acme-corp.io:5432/app"`,
       'url = "postgres://postgres:postgres@localhost:5432/app"',
       `ADC_LIVE_TOKEN=${['live', 'TokenValue1'].join('')}`,
       'ADC_LIVE_TOKEN=',
@@ -300,6 +300,9 @@ describe('markers', () => {
       assert.ok(h.redacted.includes('[REDACTED]'));
     }
     assert.equal(M.scanSecrets('password = "hunter2abc"').length, 0, 'the leak-matrix token matches no regex by design');
+    for (const host of ['api.example.test', 'db.example.com', 'x.invalid', 'svc.localhost:8080']) {
+      assert.equal(M.scanSecrets(`u = "https://bob:${['s3cr', 'etValue9'].join('')}@${host}/v1"`).length, 0, `reserved name ${host}`);
+    }
     assert.equal(M.credentialFileName('config/.env.production'), 'dotenv');
     assert.equal(M.credentialFileName('.env.example'), null);
     assert.equal(M.credentialFileName('keys/id_ed25519'), 'ssh-key');
@@ -323,6 +326,33 @@ describe('markers', () => {
     }
     if (elsewhere.length) t.diagnostic(`secret-shaped literals in other test files (build them from parts): ${elsewhere.join(', ')}`);
     assert.deepEqual(hits, []);
+  });
+
+  test('redactSecrets masks every detected value in place and leaves other text alone', () => {
+    const text = `run: jest --token=${GH_TOKEN}\nplain line\r\nkey ${AWS_KEY} and ${GH_TOKEN}`;
+    const out = M.redactSecrets(text);
+    assert.ok(!out.includes(GH_TOKEN) && !out.includes(AWS_KEY), out);
+    assert.match(out, /^run: jest --token=ghp_\.\.\.\[REDACTED\]\nplain line\r\nkey /);
+    assert.equal(M.redactSecrets('nothing to see'), 'nothing to see');
+    assert.equal(M.redactSecrets(null), null);
+  });
+
+  test('blank modes: index literals survive, back-references compare the real values', () => {
+    const skip = (line) => M.scanText([line], M.SKIP_MARKERS, { file: 'a.test.js' }).map((h) => h.id);
+    assert.deepEqual(skip("assert(hit(\"describe['skip']('x', () => {})\"));"), [], 'bracket marker inside a string literal');
+    const taut = (line) => M.scanText([line], M.TAUTOLOGIES, { file: 'a.test.js' }).map((h) => h.id);
+    assert.deepEqual(taut("expect('a').toBe('a');"), ['tautology.js']);
+    assert.deepEqual(taut("expect('ab').toBe('cd');"), [], 'blanked literals look equal; the real ones are not');
+    assert.deepEqual(taut("nodeTest('x', 'assert.ok(true);')"), [], 'a tautology inside a string is test data');
+    const hit = M.scanText(["  it.skip('later', () => { expect(f()).toBe(1); });"], M.SKIP_MARKERS, { file: 'a.test.js' })[0];
+    assert.equal(hit.match, 'it.skip', 'hits carry the marker itself');
+  });
+
+  test('go build constraints in test files are a softer kind of skip', () => {
+    const kinds = (line) => M.scanText([line], M.SKIP_MARKERS, { file: 'a_test.go' }).map((h) => `${h.id}:${h.kind}`);
+    assert.deepEqual(kinds('//go:build integration'), ['skip.go-build-tag:constraint']);
+    assert.deepEqual(kinds('// +build linux'), ['skip.go-build-tag:constraint']);
+    assert.deepEqual(kinds('//go:build ignore'), ['skip.go-build-ignore:skip']);
   });
 
   test('ADC_LIVE_TOKEN: quoted values and unquoted line-final values count; code identifiers do not', () => {
@@ -501,10 +531,24 @@ describe('diff-scope helpers', () => {
     assert.deepEqual(keyPath(yml, 2).keys, ['disable', 'linters']);
   });
 
+  test('ciBlock scopes a line to its step or job; workflowEvents reads every on: form', () => {
+    const wf = ['on: [push, pull_request]', 'jobs:', '  t:', '    continue-on-error: true', '    steps:', '      - run: docker rm db || true', '      - run: |', '          npm ci', '          npm test || true', '      - uses: codecov/codecov-action@v4', '        continue-on-error: true'];
+    assert.equal(ciBlock(wf, 5), '      - run: docker rm db || true');
+    assert.match(ciBlock(wf, 8), /- run: \|\n\s+npm ci\n\s+npm test \|\| true$/);
+    assert.match(ciBlock(wf, 10), /codecov-action@v4\n\s+continue-on-error: true$/);
+    assert.match(ciBlock(wf, 3), /^  t:[\s\S]*npm test/, 'a job-level key belongs to the whole job');
+    assert.deepEqual([...workflowEvents(wf)], ['push', 'pull_request']);
+    assert.deepEqual([...workflowEvents(['on:', '  pull_request:', '    branches: [main]', '  push:', 'jobs:'])], ['pull_request', 'push']);
+    assert.deepEqual([...workflowEvents(['"on": workflow_dispatch'])], ['workflow_dispatch']);
+    assert.deepEqual([...workflowEvents(['on: { push: { branches: [main] } }'])].includes('push'), true);
+    assert.equal(workflowEvents(['name: x']), null);
+  });
+
   test('extractSpecPaths keeps paths and globs that exist in the tree', () => {
     const tree = new Set(['src/api/users.ts', 'src/api/orders.ts', 'tests/api.test.ts', 'README.md']);
     const got = extractSpecPaths('Change `src/api/users.ts` and the handlers in src/api/. Add tests under tests/**/*.test.ts. See https://x.example/a/b and v1.2.3. Ignore lib/missing.ts.', tree);
     assert.deepEqual(got.sort(), ['src/api', 'src/api/users.ts', 'tests/**/*.test.ts'].sort());
+    assert.deepEqual(extractSpecPaths('Edit src\\api\\orders.ts only.', tree), ['src/api/orders.ts'], 'Windows-style paths');
   });
 });
 
@@ -639,6 +683,51 @@ describe('diff-scope behaviour', () => {
     assert.equal(res.findings.find((f) => f.id === 'CK-SECRETS').rule, 'secret.adc-live-token-value');
   });
 
+  test('finding messages and deps output never quote a secret, even when the setting they report holds one', async () => {
+    const dir = prepare([
+      { op: 'edit', path: 'package.json', find: '"test": "jest"', replace: `"test": "jest --token=${GH_TOKEN}"` },
+      { op: 'edit', path: 'package.json', find: '"left-pad": "^1.3.0"', replace: `"left-pad": "^1.3.0",\n    "private-lib": "git+https://${GH_TOKEN}@github.com/o/r.git"` },
+      { op: 'edit', path: '.github/workflows/ci.yml', find: '      - run: npm test -- --ci\n', replace: `      - run: npm test -- --ci --auth ${GH_TOKEN}\n` },
+    ], 'uncommitted');
+    const target = await targetFor(dir);
+    const res = await diffScope({ target, env: ENV });
+    assert.ok(res.findings.some((f) => f.id === 'CK-TEST-CFG'), 'the changed test script is still reported');
+    assert.ok(res.findings.some((f) => f.id === 'CK-SECRETS'));
+    assert.ok(!JSON.stringify(res).includes(GH_TOKEN), 'no token in messages or evidence');
+    const d = await deps.depsCheck({ target, offline: true, tools: false, env: ENV });
+    assert.equal(d.new_deps.find((x) => x.name === 'private-lib').kind, 'git');
+    assert.ok(!JSON.stringify(d).includes(GH_TOKEN), 'no token in new_deps[].spec, messages or lock details');
+  });
+
+  test('the live token is flagged in its base64 and URL-encoded forms too', async () => {
+    const token = ['zz-live', '/value+77'].join('');
+    const b64 = Buffer.from(token).toString('base64');
+    const dir = prepare([{ op: 'write', path: 'src/blob.js', content: `module.exports = ['${b64}', '${encodeURIComponent(token)}'];\n` }], 'uncommitted');
+    const res = await diffScope({ target: await targetFor(dir), env: { ...ENV, ADC_LIVE_TOKEN: token } });
+    const json = JSON.stringify(res);
+    assert.ok(!json.includes(b64) && !json.includes(encodeURIComponent(token)) && !json.includes(token));
+    assert.deepEqual(res.findings.filter((f) => f.rule === 'secret.adc-live-token-value').map((f) => f.line), [1]);
+  });
+
+  test('a changed manifest that cannot be parsed leaves CK-DEPS unverified, never pass', async () => {
+    const dir = prepare([{ op: 'edit', path: 'package.json', find: '"left-pad": "^1.3.0"', replace: '"left-pad": "^1.3.0",' }], 'uncommitted');
+    const d = await deps.depsCheck({ target: await targetFor(dir), offline: true, tools: false, env: ENV });
+    const c = d.checks.find((x) => x.id === 'CK-DEPS');
+    assert.equal(c.status, 'unverified');
+    assert.equal(c.reason, 'MANIFEST_UNPARSABLE');
+    assert.deepEqual(d.unparsable, ['package.json']);
+  });
+
+  test('a forced secret scanner that is not installed falls back and says so', async () => {
+    const empty = fs.mkdtempSync(path.join(TMP, 'nopath-'));
+    const dir = prepare([{ op: 'write', path: 'src/aws.js', content: "module.exports = '{{AWS_KEY}}';\n" }], 'uncommitted');
+    const res = await diffScope({ target: await targetFor(dir), env: { ...ENV, ADC_SECRETS_SCANNER: 'gitleaks', PATH: empty } });
+    const c = res.checks.find((x) => x.id === 'CK-SECRETS');
+    assert.equal(c.data.scanner, 'builtin');
+    assert.equal(c.data.scanner_error, 'gitleaks is not installed');
+    assert.equal(c.status, 'fail');
+  });
+
   test('unborn repository: everything is new and diffs against the empty tree', async () => {
     const dir = fs.mkdtempSync(path.join(TMP, 'unborn-'));
     sh(dir, 'init', '-q', '-b', 'main');
@@ -727,6 +816,22 @@ for (const file of files) {
     const old = await diffScope({ target: await targetFor(prepare(planted, 'uncommitted')), env: { ...ENV, ADC_SECRETS_SCANNER: 'gitleaks', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: log, FAKE_VERSION: '8.18.4' } });
     assert.equal(JSON.parse(fs.readFileSync(log, 'utf8'))[0], 'detect', 'gitleaks before 8.19 uses `detect --source`');
     assert.equal(old.checks.find((c) => c.id === 'CK-SECRETS').status, 'fail');
+  });
+
+  test('lines the external scanner cannot see still get the built-in patterns (allow directives, ADC_LIVE_TOKEN)', async () => {
+    const bin = fakeBin('gitleaks', GITLEAKS);
+    const live = ['abcd', 'efgh', '1234'].join('-');
+    const ops = [...planted,
+      { op: 'write', path: 'src/allow.js', content: "module.exports = '{{AWS_KEY}}'; // gitleaks:allow\n" },
+      { op: 'write', path: 'deploy/live.sh', content: `export ADC_LIVE_TOKEN=${live}\n` },
+      { op: 'write', path: 'src/plain.js', content: "module.exports = '{{GH}}';\n" }];
+    const env = { ...ENV, ADC_SECRETS_SCANNER: 'gitleaks', PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_LOG: path.join(bin, 'args.json') };
+    const res = await diffScope({ target: await targetFor(prepare(ops, 'uncommitted')), env });
+    const got = res.findings.filter((f) => f.id === 'CK-SECRETS').map((f) => `${f.file}:${f.line}:${f.rule}`).sort();
+    assert.deepEqual(got, ['deploy/live.sh:1:secret.adc-live-token', 'src/allow.js:1:secret.aws-access-key-id', 'src/aws.js:1:gitleaks.aws-access-token'],
+      'src/plain.js is left to gitleaks, which (fake) reports nothing there');
+    assert.ok(res.findings.some((f) => f.id === 'CK-SUPPRESS' && f.rule === 'suppress.secret-allow'));
+    assert.ok(!JSON.stringify(res).includes(live) && !JSON.stringify(res).includes(AWS_KEY));
   });
 
   test('a failing scanner falls back to the built-in regexes and says so', async () => {

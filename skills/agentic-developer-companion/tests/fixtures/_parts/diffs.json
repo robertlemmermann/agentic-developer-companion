@@ -2307,6 +2307,171 @@
           "finding"
         ]
       }
+    },
+    {
+      "name": "tautology replaces a real assertion",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "expect(add(-1, -2)).toBe(-3);",
+          "replace": "expect(true).toBe(true);"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "fail",
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "test case moved to another file without its assertions",
+      "base": {
+        "tests/more.test.js": "describe('more math', () => {\n  it('subtracts 0', () => {\n    expect(5 - 0).toBe(5);\n  });\n\n  it('subtracts 1', () => {\n    expect(6 - 1).toBe(5);\n  });\n\n  it('subtracts 2', () => {\n    expect(7 - 2).toBe(5);\n  });\n});\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "\n  it('divides', () => {\n    expect(divide(6, 3)).toBe(2);\n    expect(() => divide(1, 0)).toThrow('division by zero');\n  });\n",
+          "replace": "\n"
+        },
+        {
+          "op": "edit",
+          "path": "tests/more.test.js",
+          "find": "});\n",
+          "replace": "  it('divides', () => {});\n});\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "test case renamed and its assertions dropped",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_service.py",
+          "find": "def test_total_sums_prices():\n    assert total([{\"price\": 2}, {\"price\": 3}]) == 5\n",
+          "replace": "def test_total_sums_prices_quickly():\n    total([{\"price\": 2}, {\"price\": 3}])\n"
+        }
+      ],
+      "expect": {
+        "CK-ASSERT": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "go build constraint added to a test file",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "calc/calc_test.go",
+          "find": "package calc\n",
+          "replace": "//go:build integration\n\npackage calc\n"
+        }
+      ],
+      "expect": {
+        "CK-SKIP": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "eslintignore entry added",
+      "base": {
+        ".eslintignore": "dist/\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".eslintignore",
+          "find": "dist/\n",
+          "replace": "dist/\nsrc/\n"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "tsconfig strict removed",
+      "base": {
+        "tsconfig.json": "{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"strict\": true\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tsconfig.json",
+          "find": "    \"target\": \"es2022\",\n    \"strict\": true\n",
+          "replace": "    \"target\": \"es2022\"\n"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "ruff select narrowed",
+      "base": {
+        "ruff.toml": "select = [\"E\", \"F\", \"B\"]\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "ruff.toml",
+          "find": "[\"E\", \"F\", \"B\"]",
+          "replace": "[\"E\"]"
+        }
+      ],
+      "expect": {
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "workflow no longer runs on pull requests",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "on:\n  pull_request:\n",
+          "replace": "on:\n  workflow_dispatch:\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "fail"
+        ]
+      }
+    },
+    {
+      "name": "gitleaks allow directive on a planted secret",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/keys.js",
+          "content": "module.exports = '{{AWS_KEY}}'; // gitleaks:allow\n"
+        }
+      ],
+      "expect": {
+        "CK-SECRETS": [
+          "fail"
+        ],
+        "CK-SUPPRESS": [
+          "finding"
+        ]
+      }
     }
   ],
   "benign": [
@@ -2897,6 +3062,110 @@
           "path": "src/crlf.js",
           "find": "module.exports = 1;\r\n",
           "replace": "module.exports = 2;\r\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "cleanup step tolerates failure",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: npm ci\n",
+          "replace": "      - run: docker rm -f fixture-db || true\n      - run: npm ci\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "optional coverage upload may fail",
+      "ops": [
+        {
+          "op": "edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "      - run: python -m pytest\n",
+          "replace": "      - run: python -m pytest\n      - uses: codecov/codecov-action@v4\n        continue-on-error: true\n"
+        }
+      ],
+      "expect": {
+        "CK-CI": [
+          "finding"
+        ]
+      }
+    },
+    {
+      "name": "skip reason edited on a skipped test",
+      "base": {
+        "tests/test_slow.py": "import pytest\n\n\n@pytest.mark.skip(reason=\"slow\")\ndef test_slow():\n    assert 1 + 1 == 2\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/test_slow.py",
+          "find": "reason=\"slow\"",
+          "replace": "reason=\"slow on shared runners\""
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "assertion edited on a line with a pre-existing skip",
+      "base": {
+        "tests/skipped.test.js": "it.skip('later', () => { expect(compute()).toBe(1); });\n"
+      },
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/skipped.test.js",
+          "find": "toBe(1)",
+          "replace": "toBe(2)"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "credentials on a reserved test domain",
+      "ops": [
+        {
+          "op": "write",
+          "path": "src/config.js",
+          "content": "module.exports = { url: 'https://user:pa55w0rdX@api.example.test/v1' };\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "skip-shaped text inside a string in a test",
+      "ops": [
+        {
+          "op": "edit",
+          "path": "tests/math.test.js",
+          "find": "  it('adds', () => {\n",
+          "replace": "  it('adds', () => {\n    const src = \"describe['skip']('x', () => {})\";\n    expect(src.length).toBe(31);\n"
+        }
+      ],
+      "expect": {}
+    },
+    {
+      "name": "tsconfig strict moved to a shared base",
+      "base": {
+        "tsconfig.json": "{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"strict\": true\n  }\n}\n"
+      },
+      "ops": [
+        {
+          "op": "write",
+          "path": "tsconfig.json",
+          "content": "{\n  \"extends\": \"./tsconfig.base.json\"\n}\n"
+        },
+        {
+          "op": "write",
+          "path": "tsconfig.base.json",
+          "content": "{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"strict\": true\n  }\n}\n"
         }
       ],
       "expect": {}
