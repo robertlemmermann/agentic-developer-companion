@@ -19,10 +19,13 @@ const REQ_STATUSES = ['implemented', 'partial', 'missing', 'unknown', 'dismissed
 
 export const MATRIX_INSTRUCTIONS = Object.freeze([
   'For every requirement set status to implemented, partial, missing or unknown (weak candidates may be dismissed).',
-  'List implementing code in evidence[] and the tests that exercise it in tests[], each as "path:line" or "path:start-end" in the snapshot.',
-  'Map each diff hunk in extras[] to a requirement id with "requirement": "R1", or leave it null (it is then reported as extra functionality).',
+  'List implementing code in evidence[] and the tests that exercise it in tests[], each as "path:line" or '
+    + '"path:start-end" in the snapshot.',
+  'Map each diff hunk in extras[] to a requirement id with "requirement": "R1", or leave it null (it is then reported '
+    + 'as extra functionality).',
   'You may append requirements the extractor missed; they count as strong requirements.',
-  'Record the completed file with: evidence add <file> --ledger <ledger>. The script derives CK-TRACE; it never trusts a status without valid citations.',
+  'Record the completed file with: evidence add <file> --ledger <ledger>. The script derives CK-TRACE; it never '
+    + 'trusts a status without valid citations.',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -46,15 +49,19 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
     const m = GH_URL_RE.exec(value);
     const gh = m ? which('gh') : null;
     if (m && gh) {
-      const res = run(gh, [m[3] === 'pull' ? 'pr' : 'issue', 'view', value, '--json', 'title,body'], { timeoutMs: 30_000 });
+      const res = run(gh, [m[3] === 'pull' ? 'pr' : 'issue', 'view', value, '--json', 'title,body'],
+        { timeoutMs: 30_000 });
       if (res.exit === 0) {
         try {
           const doc = JSON.parse(res.stdout);
-          return { ref: value, text: `# ${doc.title || ''}\n\n${doc.body || ''}`.slice(0, MAX_SPEC_BYTES), kind: 'url' };
+          const text = `# ${doc.title || ''}\n\n${doc.body || ''}`;
+          return { ref: value, text: text.slice(0, MAX_SPEC_BYTES), kind: 'url' };
         } catch {}
       }
     }
-    throw usageError(`could not read the spec from ${value}${m ? (gh ? ' with gh' : ' (gh is not installed)') : ''}; save the issue or PR text to a file and pass --spec <file>`);
+    const how = m ? (gh ? ' with gh' : ' (gh is not installed)') : '';
+    throw usageError(`could not read the spec from ${value}${how}; save the issue or PR text to a file and pass `
+      + '--spec <file>');
   }
   const file = path.resolve(cwd, value);
   if (statOrNull(file)?.isFile() === false) throw usageError(`spec is not a file: ${toPosix(file)}`);
@@ -66,8 +73,14 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
 // ---------------------------------------------------------------------------
 // Requirement extraction
 
-const EXCLUDED_SECTION = /\b(steps? to reproduce|reproduc\w*|environment|versions?|logs?|stack ?traces?|screenshots?|background|context|motivation|references?|links?|notes?|alternatives?|out[- ]of[- ]scope|non[- ]?goals?|related|faq|questions?|discussion|changelog|history|appendix)\b/i;
-const REQUIREMENT_SECTION = /\b(acceptance|requirements?|criteria|definition of done|dod|deliverables?|tasks?|to-?dos?|checklist|expected|goals?|user stor(?:y|ies)|specification|spec|behaviou?r|features?|scope|must|should|changes?|proposal|solution)\b/i;
+const words = (list) => new RegExp(`\\b(${list.join('|')})\\b`, 'i');
+const EXCLUDED_SECTION = words(['steps? to reproduce', 'reproduc\\w*', 'environment', 'versions?', 'logs?',
+  'stack ?traces?', 'screenshots?', 'background', 'context', 'motivation', 'references?', 'links?', 'notes?',
+  'alternatives?', 'out[- ]of[- ]scope', 'non[- ]?goals?', 'related', 'faq', 'questions?', 'discussion', 'changelog',
+  'history', 'appendix']);
+const REQUIREMENT_SECTION = words(['acceptance', 'requirements?', 'criteria', 'definition of done', 'dod',
+  'deliverables?', 'tasks?', 'to-?dos?', 'checklist', 'expected', 'goals?', 'user stor(?:y|ies)', 'specification',
+  'spec', 'behaviou?r', 'features?', 'scope', 'must', 'should', 'changes?', 'proposal', 'solution']);
 const STRONG_KEYWORD = /\b(must|shall|required|is required to|are required to)\b/i;
 const SOFT_KEYWORD = /\b(should|needs? to|has to|have to)\b/i;
 const ID_PREFIX = /^(?:\*\*|__)?\[?([A-Z][A-Z0-9]{0,9}-\d{1,5})\]?(?:\*\*|__)?\s*(?:[:.)-]|–|—)?\s+/;
@@ -241,7 +254,8 @@ export function specPaths(text) {
     const t = m[1].trim();
     if (/^[\w@.*{}\-/]+$/.test(t) && (t.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(t))) add(t);
   }
-  for (const m of body.matchAll(/(?:^|[\s(])((?:[\w@.-]+\/)+[\w@.*-]+(?:\.[A-Za-z0-9]{1,8})?)(?=$|[\s),;:])/gm)) add(m[1]);
+  const pathLike = /(?:^|[\s(])((?:[\w@.-]+\/)+[\w@.*-]+(?:\.[A-Za-z0-9]{1,8})?)(?=$|[\s),;:])/gm;
+  for (const m of body.matchAll(pathLike)) add(m[1]);
   const list = [...found].filter((p) => !/^\d+(\.\d+)+$/.test(p)).slice(0, 100);
   return list.length ? list : null;
 }
@@ -249,18 +263,26 @@ export function specPaths(text) {
 // ---------------------------------------------------------------------------
 // Diff hunks
 
+// Blank, bracket-only and import lines: a hunk made only of them is no functionality.
 function isTrivialLine(t) {
   return /^\s*$/.test(t) || /^\s*[{}()[\];,]+\s*$/.test(t)
-    || /^\s*(import\b|from\s+\S+\s+import\b|#include\b|using\s+[\w.]+\s*;|use\s+[\w:{}, ]+;|package\s+[\w.]+\s*;?|require\s*\()/.test(t);
+    || /^\s*(?:import\b|from\s+\S+\s+import\b|#include\b|using\s+[\w.]+\s*;)/.test(t)
+    || /^\s*(?:use\s+[\w:{}, ]+;|package\s+[\w.]+\s*;?|require\s*\()/.test(t);
 }
 
-/** Zero-context hunks between two revisions: [{ key, file, status, kind, start, end, old_start, after_line, added, removed, trivial, preview, text }]. */
+/**
+ * Zero-context hunks between two revisions: [{ key, file, status, kind, start, end, old_start, after_line, added,
+ * removed, trivial, preview, text }].
+ */
 export function diffHunks(root, from, to) {
   const hunks = [];
   for (const f of diffLines(root, from, to)) {
     const file = toPosix(f.path || f.oldPath);
     if (f.binary) {
-      hunks.push({ key: `${file}:binary`, file, status: f.status, kind: 'binary', start: null, end: null, old_start: null, after_line: null, added: 0, removed: 0, trivial: false, preview: '', text: '' });
+      hunks.push({
+        key: `${file}:binary`, file, status: f.status, kind: 'binary', start: null, end: null, old_start: null,
+        after_line: null, added: 0, removed: 0, trivial: false, preview: '', text: '',
+      });
       continue;
     }
     for (const h of f.hunks) {
@@ -286,13 +308,15 @@ export function diffHunks(root, from, to) {
 // ---------------------------------------------------------------------------
 // Hints (requirement <-> hunk word overlap; a suggestion for the model, never evidence)
 
-const STOP = new Set(('this that with from have must should shall will when then given which their there into each also only more '
-  + 'than such used able make sure does what where while after before would could about other some them they been were '
-  + 'being your file files code test tests line lines need needs true false null none like just same very well data value').split(' '));
+const STOP = new Set(('this that with from have must should shall will when then given which their there into each '
+  + 'also only more than such used able make sure does what where while after before would could about other some them '
+  + 'they been were being your file files code test tests line lines need needs true false null none like just same '
+  + 'very well data value').split(' '));
 
 function tokens(s) {
   const spaced = String(s || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
-  return new Set((spaced.match(/[a-z][a-z0-9]{3,}|\d{3,}/g) || []).filter((t) => !STOP.has(t)).map((t) => t.replace(/(?:es|s)$/, '')));
+  const words = (spaced.match(/[a-z][a-z0-9]{3,}|\d{3,}/g) || []).filter((t) => !STOP.has(t));
+  return new Set(words.map((t) => t.replace(/(?:es|s)$/, '')));
 }
 
 function hintsFor(hunk, reqTokens) {
@@ -317,15 +341,20 @@ export function trace({ target, specText, specPath = null }) {
   const from = target.base.sha || emptyTree(target.root);
   const { hunks, truncated } = diffHunks(target.root, from, target.snapshot.commit);
   const reqTokens = requirements.map((r) => [r.id, tokens(r.text)]);
-  const extras = hunks.map(({ text: _t, ...h }) => ({ ...h, preview: redact(h.preview), hint: hintsFor({ ...h, text: _t }, reqTokens), requirement: null }));
+  const extras = hunks.map(({ text: hunkText, ...h }) => ({
+    ...h, preview: redact(h.preview), hint: hintsFor({ ...h, text: hunkText }, reqTokens), requirement: null,
+  }));
   const strong = requirements.filter((r) => r.strength === 'strong').length;
   const summary = requirements.length
-    ? `${requirements.length} requirement candidate(s) (${strong} strong), ${hunks.length} diff hunk(s); the matrix is not completed yet`
-    : `no requirement candidates found in the spec; ${hunks.length} diff hunk(s); add the requirements to the matrix yourself`;
+    ? `${requirements.length} requirement candidate(s) (${strong} strong), ${hunks.length} diff hunk(s); the matrix `
+      + 'is not completed yet'
+    : `no requirement candidates found in the spec; ${hunks.length} diff hunk(s); add the requirements to the matrix `
+      + 'yourself';
   return {
     schema: TRACE_SCHEMA,
     spec: { path: specPath, sha256: sha256(text), lines: text ? text.split(/\r?\n/).length : 0 },
-    base: target.base.sha, base_ref: target.base.ref, tree_digest: target.snapshot.tree, snapshot_commit: target.snapshot.commit,
+    base: target.base.sha, base_ref: target.base.ref, tree_digest: target.snapshot.tree,
+    snapshot_commit: target.snapshot.commit,
     requirements, extras, hunks_total: hunks.length, hunks_truncated: truncated,
     instructions: [...MATRIX_INSTRUCTIONS],
     checks: [makeCheck({
@@ -344,7 +373,8 @@ export function parseCitation(raw) {
   const m = /^(.+?)#L(\d+)(?:-L?(\d+))?$/.exec(s) || /^(.+?):(\d+)(?:-(\d+)|:\d+)?$/.exec(s);
   if (!m) return null;
   const file = toPosix(m[1]).replace(/^\.\//, '');
-  if (!file || file.startsWith('/') || /^[A-Za-z]:/.test(file) || file.split('/').includes('..') || /\s$/.test(file)) return null;
+  if (!file || file.startsWith('/') || /^[A-Za-z]:/.test(file) || file.split('/').includes('..')
+    || /\s$/.test(file)) return null;
   const start = Number(m[2]);
   const end = m[3] ? Number(m[3]) : start;
   if (!(start >= 1) || !(end >= start)) return null;
@@ -382,9 +412,11 @@ function hits(cit, hunk) {
 /**
  * Evaluate a completed matrix against the snapshot: citations must exist, requirements dropped
  * from the skeleton count as unknown, unmapped non-trivial hunks are extra functionality.
- * Returns { requirements, extras, counts, status, reason, summary, findings }.
+ * Returns { requirements, extras, counts, status, reason, summary, findings }, redacted.
  */
-export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = null, isTestFile = (f) => isTestPath(f) }) {
+export function evaluateMatrix({
+  root, base, commit, tree, matrix, skeleton = null, isTestFile = (f) => isTestPath(f),
+}) {
   if (!matrix || typeof matrix !== 'object' || !Array.isArray(matrix.requirements)) {
     throw usageError('a traceability matrix needs a "requirements" array');
   }
@@ -400,13 +432,15 @@ export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = nu
     seen.add(id);
     const sk = skeletonById.get(id);
     const strength = sk ? sk.strength : 'strong';
-    const claimed = REQ_STATUSES.includes(String(raw.status || '').toLowerCase()) ? String(raw.status).toLowerCase() : 'unknown';
+    const given = String(raw.status || '').toLowerCase();
+    const claimed = REQ_STATUSES.includes(given) ? given : 'unknown';
     const valid = [];
     const invalid = [];
     const take = (list, role) => {
       for (const c of toArray(list).slice(0, 50)) {
         const r = check(c);
-        if (r.ok) valid.push({ ...r.citation, raw: String(c), role: role === 'test' || isTestFile(r.citation.file) ? 'test' : 'impl' });
+        const asTest = role === 'test' || (r.ok && isTestFile(r.citation.file));
+        if (r.ok) valid.push({ ...r.citation, raw: String(c), role: asTest ? 'test' : 'impl' });
         else invalid.push({ citation: truncate(String(c), 200), reason: r.reason });
       }
     };
@@ -425,13 +459,15 @@ export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = nu
       id, text: sk ? sk.text : truncate(String(raw.text || ''), 400), strength, kind: sk ? sk.kind : 'model',
       claimed_status: claimed, status, evidence: valid.filter((v) => v.role === 'impl').map((v) => v.raw),
       tests: valid.filter((v) => v.role === 'test').map((v) => v.raw), invalid_citations: invalid,
-      tested: valid.some((v) => v.role === 'test'), hunks: toArray(raw.hunks).map(String).slice(0, 100), note, _valid: valid,
+      tested: valid.some((v) => v.role === 'test'), hunks: toArray(raw.hunks).map(String).slice(0, 100), note,
+      _valid: valid,
     });
   }
   for (const sk of skeletonReqs) {
     if (seen.has(sk.id)) continue;
     reqs.push({
-      id: sk.id, text: sk.text, strength: sk.strength, kind: sk.kind, claimed_status: null, status: 'unknown', evidence: [], tests: [],
+      id: sk.id, text: sk.text, strength: sk.strength, kind: sk.kind, claimed_status: null, status: 'unknown',
+      evidence: [], tests: [],
       invalid_citations: [], tested: false, hunks: [], note: 'missing from the completed matrix', _valid: [],
     });
   }
@@ -439,7 +475,9 @@ export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = nu
   const { hunks } = diffHunks(root, base || emptyTree(root), commit);
   const live = new Set(reqs.filter((r) => r.status === 'implemented' || r.status === 'partial').map((r) => r.id));
   const explicit = new Map();
-  for (const e of toArray(matrix.extras)) if (e && e.key && e.requirement) explicit.set(String(e.key), String(e.requirement));
+  for (const e of toArray(matrix.extras)) {
+    if (e && e.key && e.requirement) explicit.set(String(e.key), String(e.requirement));
+  }
   for (const r of reqs) for (const k of r.hunks) if (!explicit.has(k)) explicit.set(k, r.id);
   // Citations of implemented/partial requirements by file, so each hunk looks at its own file only.
   const cited = new Map();
@@ -454,24 +492,42 @@ export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = nu
     const byCitation = (cited.get(h.file) || []).some((v) => hits(v, h));
     if ((ex && live.has(ex)) || byCitation) { mapped++; continue; }
     if (h.trivial) continue;
-    extras.push({ key: h.key, file: h.file, start: h.start, end: h.end, kind: h.kind, added: h.added, removed: h.removed, preview: h.preview });
+    extras.push({
+      key: h.key, file: h.file, start: h.start, end: h.end, kind: h.kind, added: h.added, removed: h.removed,
+      preview: h.preview,
+    });
   }
 
-  const counts = { requirements: reqs.length, implemented: 0, partial: 0, missing: 0, unknown: 0, dismissed: 0, untested: 0, extras: extras.length, mapped_hunks: mapped, hunks: hunks.length, invalid_citations: 0 };
+  const counts = {
+    requirements: reqs.length, implemented: 0, partial: 0, missing: 0, unknown: 0, dismissed: 0, untested: 0,
+    extras: extras.length, mapped_hunks: mapped, hunks: hunks.length, invalid_citations: 0,
+  };
   const findings = [];
+  const add = (severity, message, evidence = '', where = {}) => findings.push({
+    id: 'CK-TRACE', severity, file: null, line: null, ...where, message, evidence,
+  });
   for (const r of reqs) {
     counts[r.status]++;
     counts.invalid_citations += r.invalid_citations.length;
-    if (r.status === 'missing') findings.push({ id: 'CK-TRACE', severity: 'fail', file: null, line: null, rule: r.id, message: `missing functionality: ${r.id} ${truncate(r.text, 160)}${r.note ? ` (${r.note})` : ''}`, evidence: '' });
-    else if (r.status === 'unknown') findings.push({ id: 'CK-TRACE', severity: 'finding', file: null, line: null, rule: r.id, message: `not judged: ${r.id} ${truncate(r.text, 160)}${r.note ? ` (${r.note})` : ''}`, evidence: '' });
-    else if (r.status === 'partial') findings.push({ id: 'CK-TRACE', severity: 'finding', file: null, line: null, rule: r.id, message: `partially implemented: ${r.id} ${truncate(r.text, 160)}`, evidence: r.evidence.join(', ') });
+    const what = `${r.id} ${truncate(r.text, 160)}`;
+    const note = r.note ? ` (${r.note})` : '';
+    if (r.status === 'missing') add('fail', `missing functionality: ${what}${note}`, '', { rule: r.id });
+    else if (r.status === 'unknown') add('finding', `not judged: ${what}${note}`, '', { rule: r.id });
+    else if (r.status === 'partial') {
+      add('finding', `partially implemented: ${what}`, r.evidence.join(', '), { rule: r.id });
+    }
     if ((r.status === 'implemented' || r.status === 'partial') && !r.tested) {
       counts.untested++;
-      findings.push({ id: 'CK-TRACE', severity: 'info', file: null, line: null, rule: r.id, message: `no test cited for ${r.id}`, evidence: '' });
+      add('info', `no test cited for ${r.id}`, '', { rule: r.id });
     }
-    for (const bad of r.invalid_citations) findings.push({ id: 'CK-TRACE', severity: 'info', file: null, line: null, rule: r.id, message: `invalid citation for ${r.id}: ${bad.reason}`, evidence: bad.citation });
+    for (const bad of r.invalid_citations) {
+      add('info', `invalid citation for ${r.id}: ${bad.reason}`, bad.citation, { rule: r.id });
+    }
   }
-  for (const e of extras) findings.push({ id: 'CK-TRACE', severity: 'finding', file: e.file, line: e.start, message: `extra functionality: hunk ${e.key} is not mapped to any requirement`, evidence: e.preview });
+  for (const e of extras) {
+    add('finding', `extra functionality: hunk ${e.key} is not mapped to any requirement`, e.preview,
+      { file: e.file, line: e.start });
+  }
 
   let status;
   let reason = null;
@@ -480,11 +536,13 @@ export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = nu
   else if (counts.unknown) { status = 'unverified'; reason = 'TRACE_INCOMPLETE'; }
   else if (counts.partial || counts.extras) status = 'finding';
   else status = 'pass';
-  const summary = `${counts.implemented}/${counts.requirements - counts.dismissed} implemented, ${counts.partial} partial, ${counts.missing} missing, `
-    + `${counts.unknown} not judged; ${counts.extras} unmapped hunk(s) of ${counts.hunks}; ${counts.untested} without a cited test`;
-  return {
+  const summary = `${counts.implemented}/${counts.requirements - counts.dismissed} implemented, ${counts.partial} `
+    + `partial, ${counts.missing} missing, ${counts.unknown} not judged; ${counts.extras} unmapped hunk(s) of `
+    + `${counts.hunks}; ${counts.untested} without a cited test`;
+  // Hunk previews and the model's texts are written under .adc/ and printed: redact them (§7.3).
+  return redactDeep({
     requirements: reqs.map(({ _valid, ...r }) => r), extras, counts, status, reason, summary, findings,
-  };
+  }, makeRedactor());
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +556,9 @@ export function renderTraceMarkdown(m) {
   if (m && m.status) out.push(`CK-TRACE: **${m.status}**${m.reason ? ` (${m.reason})` : ''}. ${m.summary || ''}`, '');
   out.push('| Req | Requirement | Status | Implementation | Tests |', '|---|---|---|---|---|');
   for (const r of reqs) {
-    out.push(`| ${mdCell(r.id)}${r.strength === 'weak' ? ' (weak)' : ''} | ${mdCell(r.text)} | ${mdCell(r.status)} | ${mdCell(toArray(r.evidence).join(', '))} | ${mdCell(toArray(r.tests).join(', '))} |`);
+    const cells = [`${mdCell(r.id)}${r.strength === 'weak' ? ' (weak)' : ''}`, mdCell(r.text), mdCell(r.status),
+      mdCell(toArray(r.evidence).join(', ')), mdCell(toArray(r.tests).join(', '))];
+    out.push(`| ${cells.join(' | ')} |`);
   }
   if (!reqs.length) out.push('| - | no requirements | - | - | - |');
   const missing = reqs.filter((r) => r.status === 'missing');
@@ -511,7 +571,10 @@ export function renderTraceMarkdown(m) {
   if (!listed.length) out.push('None.');
   else {
     out.push('| Hunk | Kind | Preview | Hint |', '|---|---|---|---|');
-    for (const e of listed.slice(0, 200)) out.push(`| ${mdCell(e.key)} | ${mdCell(e.kind)} | ${mdCell(e.preview ? `\`${e.preview}\`` : '')} | ${mdCell(toArray(e.hint).join(', '))} |`);
+    for (const e of listed.slice(0, 200)) {
+      const preview = mdCell(e.preview ? `\`${e.preview}\`` : '');
+      out.push(`| ${mdCell(e.key)} | ${mdCell(e.kind)} | ${preview} | ${mdCell(toArray(e.hint).join(', '))} |`);
+    }
     if (listed.length > 200) out.push('', `(${listed.length - 200} more)`);
   }
   out.push('');
@@ -533,7 +596,10 @@ export const traceCommand = defineCommand({
     'or extra functionality, 4 when requirements are not judged). Record it in a ledger with',
     '`evidence add <file>`.',
   ].join('\n'),
-  options: { spec: { type: 'string' }, base: { type: 'string' }, matrix: { type: 'string' }, out: { type: 'string' }, md: { type: 'boolean' } },
+  options: {
+    spec: { type: 'string' }, base: { type: 'string' }, matrix: { type: 'string' }, out: { type: 'string' },
+    md: { type: 'boolean' },
+  },
   positionals: false,
   run: async (ctx, values) => {
     if (!values.spec && !values.matrix) throw usageError('trace needs --spec <file|-|url> or --matrix <file>');
@@ -541,11 +607,14 @@ export const traceCommand = defineCommand({
     if (values.matrix) {
       const matrix = readJsonInput(values.matrix, ctx.cwd, { what: 'matrix file' });
       const target = await prepareTarget(ctx, { base: values.base || matrix.base_ref || null, createState: false });
-      const ev = evaluateMatrix({ root: target.root, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree, matrix });
+      const ev = evaluateMatrix({
+        root: target.root, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree, matrix,
+      });
       const stale = Boolean(matrix.tree_digest && matrix.tree_digest !== target.snapshot.tree);
       const result = { schema: TRACE_SCHEMA, tree_digest: target.snapshot.tree, stale, ...ev };
       const exit = ev.status === 'pass' ? EXIT.OK : ev.status === 'unverified' ? EXIT.UNVERIFIABLE : EXIT.FINDINGS;
-      return { result, exit, human: renderTraceMarkdown(ev), summary: `CK-TRACE ${ev.status}: ${ev.summary}${stale ? ' (working tree changed since the skeleton)' : ''}` };
+      const note = stale ? ' (working tree changed since the skeleton)' : '';
+      return { result, exit, human: renderTraceMarkdown(ev), summary: `CK-TRACE ${ev.status}: ${ev.summary}${note}` };
     }
     const target = await prepareTarget(ctx, { base: values.base || null, createState: false });
     const spec = readSpecInput(values.spec, { cwd: ctx.cwd, root: target.root });

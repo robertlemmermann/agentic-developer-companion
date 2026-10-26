@@ -23,13 +23,15 @@ with the ledger; `trace_matrix` in the output is the copy you fill in, and CK-TR
 Standalone, without a ledger:
 
 ```bash
-node "$ADC" trace --json --spec SPEC.md --out "$TMPDIR/matrix.json"
-node "$ADC" trace --json --matrix "$TMPDIR/matrix.json"
+M="${TMPDIR:-/tmp}/matrix.json"
+node "$ADC" trace --json --spec SPEC.md --out "$M"
+node "$ADC" trace --json --matrix "$M"
 ```
 
 ```powershell
-node "$ADC" trace --json --spec SPEC.md --out "$env:TEMP/matrix.json"
-node "$ADC" trace --json --matrix "$env:TEMP/matrix.json"
+$M = Join-Path ([IO.Path]::GetTempPath()) 'matrix.json'
+node "$ADC" trace --json --spec SPEC.md --out $M
+node "$ADC" trace --json --matrix $M
 ```
 
 `--spec` takes a file, `-` (stdin: paste issue or PR text) or a GitHub issue/PR URL (read
@@ -45,7 +47,7 @@ comments ignored):
 
 | Source | Strength |
 |---|---|
-| Checkboxes `- [ ]` / `- [x]` anywhere | strong |
+| Checkboxes `- [ ]` / `- [x]` outside skipped sections | strong |
 | List items and table rows under headings such as Acceptance criteria, Requirements, Definition of done, Tasks, Expected behavior, Scope, Goals | strong |
 | Sentences or items with must / shall / required | strong |
 | Gherkin `Scenario:` blocks (with their Given/When/Then steps) | strong |
@@ -81,7 +83,9 @@ requirements the extractor missed (any new `id`); they count as strong.
 
 Record it: `node "$ADC" evidence add "<trace_matrix>" --ledger "<ledger>"` (or pipe it with `-`).
 Keep the file under `.adc/evidence/<ledger>/` or outside the repository; a file in the working
-tree changes the snapshot and makes the ledger stale.
+tree changes the snapshot and makes the ledger stale. Fill `trace-matrix.json`, never `trace.json`:
+the script reads requirement strengths from `trace.json` and refuses an edited copy
+(`LEDGER_TAMPERED`).
 
 ## 4. How CK-TRACE is derived
 

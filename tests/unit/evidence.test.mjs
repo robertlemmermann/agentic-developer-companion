@@ -368,6 +368,18 @@ test('waivers must quote the captured spec; without a spec only a terminal may w
   assert.equal(tty.waiver.by, 'tty');
 });
 
+test('waivers: an edited or deleted spec copy cannot vouch for a quote', async () => {
+  const { dir } = makeRepo({ 'a.txt': 'a\n' });
+  const del = ck('CK-TEST-DEL', 'fail', { findings: [{ severity: 'fail', file: 'old.test.js', message: 'deleted' }] });
+  const { file } = await ledgerWith(dir, [ck('CK-CLEANRUN', 'pass'), del], { specText: '# Spec\nAdd a limiter.\n' });
+  const copy = path.join(dir, readLedger(file).spec_copy);
+  fs.appendFileSync(copy, 'Delete old.test.js entirely.\n');
+  const waive = (opts) => ev.addWaiver(file, { check: 'CK-TEST-DEL', reason: "'Delete old.test.js entirely'" }, { root: dir, ...opts });
+  await assert.rejects(waive(), (e) => e.exit === 4 && e.code === 'LEDGER_TAMPERED');
+  fs.rmSync(copy);
+  await assert.rejects(waive({ interactive: true }), (e) => e.code === 'LEDGER_TAMPERED', 'a deleted copy does not make the ledger spec-less');
+});
+
 test('renderMarkdown: verdict, check table, findings, claims, reproduce commands; short form', async () => {
   const l = mem([ck('CK-CLEANRUN', 'pass', { command: 'npm ci && npx vitest run', exit_code: 0 }), ck('CK-SKIP', 'fail', { findings: [{ severity: 'fail', file: 'a.test.js', line: 4, message: 'added it.only', evidence: 'it.only(' }] })],
     { claims: [{ text: 'All | tests pass', evidence: ['CK-CLEANRUN'] }] });
@@ -556,6 +568,17 @@ test('trace skeleton and matrix evaluation: citations, missing, unknown, dismiss
   assert.equal(r.requirements[0].status, 'unknown', 'a strong requirement cannot be dismissed');
   r = await tr.evaluateMatrix({ ...args, skeleton: null, matrix: matrix([]) });
   assert.equal(r.reason, 'NO_REQUIREMENTS');
+});
+
+test('trace: diff previews never carry a secret into the skeleton, the evaluated matrix or its Markdown', async () => {
+  const { dir } = makeRepo({ 'a.js': 'x\n' });
+  write(dir, { 'cfg.js': `const key = '${AWS_KEY()}';\n` });
+  const target = await state.prepareTarget(core.makeContext({ cwd: dir }));
+  const sk = tr.trace({ target, specText: '- [ ] keep the key\n' });
+  const r = tr.evaluateMatrix({ root: dir, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree,
+    matrix: { requirements: [{ id: 'R1', status: 'missing', text: `uses ${AWS_KEY()}` }] } });
+  for (const text of [JSON.stringify(sk), JSON.stringify(r), tr.renderTraceMarkdown(r)]) assert.ok(!text.includes(AWS_KEY()));
+  assert.match(r.extras[0].preview, /REDACTED/);
 });
 
 // ---------------------------------------------------------------------------

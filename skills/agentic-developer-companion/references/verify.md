@@ -36,14 +36,17 @@ Get-Content implementer-summary.txt | node "$ADC" verify --json --spec SPEC.md -
 | `--quick` / `--deep` | `--quick` also skips coverage; `--deep` adds mutation testing and the flake probe |
 | `--finalize` | Seal the ledger now (headless runs: CI, cloud agent, `-p`/`exec`) |
 | `--allow <glob>` | Paths CK-SCOPE accepts outside the spec (repeatable) |
-| `--runner "<cmd>"`, `--no-install`, `--all-projects`, `--no-base`, `--base-counts <f>`, `--keep` | Passed to clean-run and typecheck |
-| `--offline` | No registry lookups in deps-check (default inside the Codex sandbox) |
+| `--no-install`, `--keep` | Every worktree step (typecheck, clean-run, coverage, mutation, flake) |
+| `--runner "<cmd>"` | The test command for typecheck, clean-run, coverage-delta and flake-probe |
+| `--all-projects`, `--no-base`, `--base-counts <f>` | Passed to clean-run |
+| `--offline` | No registry lookups in deps-check (default inside the Codex sandbox or with `ADC_OFFLINE=1`) |
 | `--fail-under <pct>`, `--budget <min>`, `--times <n>` | Coverage gate, mutation budget, flake repetitions |
-| `--session <id>`, `--tool <host>` | Override the session identity and host recorded in the ledger |
+| `--session <id>`, `--tool <host>` | Override the session (letters, digits, `._:-`) and host recorded in the ledger |
 | `--dry-run` | List the steps and which modules are available; run and write nothing |
 
-Output: `{ ledger, markdown, verdict, finalized, needs_human_triage, checks[], claims[], reasons[],
-next_steps[], trace_matrix, steps[], worktree_unchanged, summary_markdown }`. Exit `0` for `PASS`
+Output: `{ ledger, markdown, verdict, finalized, needs_human_triage, tree_digest, base, tool, session_id,
+session_source, checks[], claims[], reasons[], next_steps[], trace_matrix, steps[], worktree_unchanged,
+duration_ms, finalize_error?, summary_markdown }`. Exit `0` for `PASS`
 and `PASS-WITH-FINDINGS`, `1` for `FAIL`, `4` for `UNVERIFIED`, `3` when Git or Node is missing or
 `.adc/` is tracked.
 
@@ -68,7 +71,7 @@ guidance-only mode (§7); `$BASE` and `$SNAP` come from §7.1.
 
 | # | Step (script) | Checks | Effect on the verdict | Manual fallback |
 |---|---|---|---|---|
-| 1 | `detect` | none | dependents `unverified` (`DETECT_UNAVAILABLE`) if it fails | read `package.json` scripts, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.csproj`, CI files for the real test command |
+| 1 | `detect` | none | if it fails, each later step detects on its own (`unverified` when it cannot) | read `package.json` scripts, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.csproj`, CI files for the real test command |
 | 2 | `diff-scope` | CK-SCOPE | finding | `git diff --name-status -M $BASE $SNAP`; compare with the paths the spec names |
 | 3 | `diff-scope` | CK-TEST-DEL, CK-SKIP, CK-ASSERT | **FAIL** unless waived | `git diff --name-status --diff-filter=DR $BASE $SNAP`; skip markers in §7.2; removed `assert`/`expect(` lines in `git diff -U0` |
 | 4 | `diff-scope` | CK-TEST-CFG | **FAIL** unless waived | `git diff $BASE $SNAP -- package.json jest.config.* vitest.config.* pytest.ini pyproject.toml setup.cfg conftest.py .mocharc* Cargo.toml *.csproj Makefile justfile` |
@@ -158,6 +161,8 @@ Record the reviewer's answers; the script computes every aggregate:
   Unconfirmed criticals give `PASS-WITH-FINDINGS` with `needs_human_triage: true`.
 - If the reproduction needs a new test file, write it, then re-run `verify` (the new failing
   test becomes part of the snapshot and fails CK-CLEANRUN).
+- Recorded commands (`--run`, `--repro`) run without the `ADC_LIVE_*` variables and are stopped,
+  with their child processes, after `--timeout <s>` (default 600); a timeout is `unverified`.
 
 ### 4.3 Claims
 
@@ -206,7 +211,7 @@ an artifacts folder of the same name (`spec.txt`, `trace.json`, `trace-matrix.js
   "session_id": "...", "session_source": "session-file", "session_nonce": "<32 hex>",
   "repo": "...", "base": "<sha>", "base_ref": "main", "base_source": "origin/HEAD",
   "tree_digest": "<snapshot tree>", "snapshot_commit": "<sha>", "spec": "SPEC.md",
-  "effective_test_globs": ["**/*.{test,spec}.*"], "budget": null, "steps": [],
+  "effective_test_globs": ["**/*.{test,spec}.*"], "budget": { "spent": 0, "remaining": 2500 }, "steps": [],
   "checks": [ { "id": "CK-CLEANRUN", "fm": ["FM-02", "FM-13"], "project": ".", "status": "pass",
       "reason": null, "command": "npm ci && npx vitest run --retry=0", "exit_code": 0,
       "summary": "...", "output_sha256": "...", "artifacts": [], "findings": [], "data": {},
@@ -222,6 +227,7 @@ an artifacts folder of the same name (`spec.txt`, `trace.json`, `trace-matrix.js
   are hashed too; `finalize` seals the whole ledger.
 - `source` is `verify` (scripted step), `input` (`evidence add` of a file), `run` (a command the
   script ran) or `derived` (CK-CLAIMS). Input entries are shown as `(input)` in the Markdown.
+- `budget` starts from `.adc/budget.json` and follows the newest `live run` recorded in the ledger.
 - `evidence status --json` reports the verdict, `stale`, `integrity.problems[]` and pending steps.
 
 ## 7. Guidance-only mode (no Node)
@@ -236,21 +242,23 @@ Apply §3 to reach the verdict.
 
 ```bash
 BASE=$(git merge-base "$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo main)" HEAD)
-IDX="$(mktemp -u)"; cp "$(git rev-parse --git-path index)" "$IDX"; export GIT_INDEX_FILE="$IDX"
+export GIT_INDEX_FILE="$(mktemp -d)/index"; git read-tree HEAD
 git add -A -- . && git rm -r -q --cached --ignore-unmatch -- .adc
-SNAP=$(git commit-tree "$(git write-tree)" -p HEAD -m snapshot); rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE
+SNAP=$(git -c user.name=adc -c user.email=adc@localhost commit-tree "$(git write-tree)" -p HEAD -m snapshot)
+rm -f "$GIT_INDEX_FILE"; unset GIT_INDEX_FILE
 ```
 
 ```powershell
 $origin = git symbolic-ref -q --short refs/remotes/origin/HEAD; if (-not $origin) { $origin = 'main' }
 $BASE = git merge-base $origin HEAD
-$idx = Join-Path ([IO.Path]::GetTempPath()) ("adc-index-" + [guid]::NewGuid())
-Copy-Item (git rev-parse --git-path index) $idx; $env:GIT_INDEX_FILE = $idx
+$env:GIT_INDEX_FILE = Join-Path ([IO.Path]::GetTempPath()) ("adc-index-" + [guid]::NewGuid()); git read-tree HEAD
 git add -A -- .; git rm -r -q --cached --ignore-unmatch -- .adc
-$SNAP = git commit-tree (git write-tree) -p HEAD -m snapshot; Remove-Item Env:GIT_INDEX_FILE; Remove-Item $idx
+$SNAP = git -c user.name=adc -c user.email=adc@localhost commit-tree (git write-tree) -p HEAD -m snapshot
+Remove-Item $env:GIT_INDEX_FILE; Remove-Item Env:GIT_INDEX_FILE
 ```
 
-The user's index, stash and working tree stay untouched; untracked files are included.
+The user's index, stash and working tree stay untouched; untracked files are included. The
+temporary index starts from `HEAD`, so every file is hashed and no same-second edit is missed.
 
 ### 7.2 Diff patterns (added lines only: `git diff -U0 $BASE $SNAP`)
 
