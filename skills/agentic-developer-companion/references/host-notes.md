@@ -70,7 +70,6 @@ usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4
 | `hooks list` | registered hooks of this skill | — | `{ hooks[{host, scope, file, events[], level}] }` |
 | `hook-run <event>` | the hook handler: stdin payload in, one decision object out, always exit 0 | `--dialect` `--level` | host-specific decision (`{}` for none) |
 | `doctor` | host, OS, Node, Git, host CLIs, prerequisites, installed copies, hooks, launcher probes, state dir | `--init` `--verify-vendored [--against] [--ref]` `--no-probes` | `{ host_guess, os, node, git, hosts[], install_paths[], hooks[], probes[], state, warnings[] }` |
-| `selftest` | the skill's own tests | `--only <areas>` | `{ passed, failed, skipped, cases[{area, name, status, detail}] }` |
 | `version` · `help` | the skill version · the command list | — | plain text |
 
 **Manual fallback** (guidance-only mode, no Node): each playbook lists the Git and runner

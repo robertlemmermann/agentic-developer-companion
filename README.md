@@ -88,7 +88,7 @@ A plain-text version of both diagrams is in
 
 Status of 0.1.0: the unit suites and the host CLIs (Copilot CLI 1.0.103, Claude Code 2.1.310,
 Codex 0.164.0, gh 2.99.0) were exercised in a Linux container; the Windows and macOS rows of the
-[manual matrix](skills/agentic-developer-companion/tests/manual-matrix.md) are still open.
+[manual matrix](tests/manual-matrix.md) are still open.
 Per-host details and known gaps:
 [host notes](skills/agentic-developer-companion/references/host-notes.md).
 
@@ -377,21 +377,25 @@ produced. Format and verdict rules: [verify](skills/agentic-developer-companion/
 
 ## 🧪 Testing the skill itself
 
+The tests, evals and release notes live at the repository root, not in the shipped skill
+folder, so an install carries only what the skill needs to run. From a clone:
+
 ```bash
-node skills/agentic-developer-companion/scripts/adc.mjs selftest
-node skills/agentic-developer-companion/scripts/adc.mjs selftest --only footprint,readme,release
-node --test skills/agentic-developer-companion/tests/unit/
+node tests/selftest.mjs
+node tests/selftest.mjs --only footprint,readme,release
+node --test tests/unit/
 ```
 
 `selftest` covers frontmatter, scripts, hook dialects and rendering, the planted-failure
-diff scenarios and the evasion matrix, detection, the file footprint, `.adc/` handling, this
-README, prerequisites and release consistency, and prints the paid eval commands without
-running them. The OS × host checklist filled per tag is
-[tests/manual-matrix.md](skills/agentic-developer-companion/tests/manual-matrix.md). The
-skill's own evals live in [`evals/`](skills/agentic-developer-companion/evals/trigger-set.json):
-a 20-query trigger set (`node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion`
+diff scenarios and the evasion matrix, detection, the file footprint (including that the
+skill folder carries no development files), `.adc/` handling, this README, prerequisites and
+release consistency, and prints the paid eval commands without running them. The OS × host
+checklist filled per tag is [tests/manual-matrix.md](tests/manual-matrix.md). The skill's own
+evals live in [`evals/`](evals/trigger-set.json): a 20-query trigger set
+(`node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json`
 checks it for free; add `--host claude --run` to run it, which is billed) and two
-`claude plugin eval` cases ([release](skills/agentic-developer-companion/references/release.md#4-evals-paid)).
+`claude plugin eval` cases, run against the repository root
+(`claude plugin eval . --eval-dir evals`; see [release](skills/agentic-developer-companion/references/release.md#4-evals-paid)).
 
 ## 🏢 Using it at work
 
@@ -463,6 +467,6 @@ stay below a 5% false-positive rate, fill the Windows and macOS rows of the manu
 reach a trigger suite score of at least 0.8 in Claude Code and Copilot, publish `SHA256SUMS`
 with every GitHub release, re-verify the host facts every quarter, then tag **v1.0.0**.
 
-**Changelog:** [CHANGELOG.md](skills/agentic-developer-companion/CHANGELOG.md).
+**Changelog:** [CHANGELOG.md](CHANGELOG.md).
 **License:** [Apache-2.0](LICENSE); attributions in
-[THIRD_PARTY_NOTICES.md](skills/agentic-developer-companion/THIRD_PARTY_NOTICES.md).
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
