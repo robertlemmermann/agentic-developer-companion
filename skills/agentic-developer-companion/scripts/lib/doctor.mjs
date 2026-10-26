@@ -9,12 +9,14 @@ import {
   EXIT, AdcError, usageError, unverifiable, defineCommand, readText, readJson, toPosix, relPosix, truncate, isObj,
   uniq, firstLine, lastLine, which, toolVersion, parseVersion, versionGte, nonce, quoteFor, spawnCapture, hostFromEnv,
   hostHomes, samePath, realPath, listFiles, makeTempDir, isAutomation, agentMarkers, runClass as runClassOf, isDir,
-  isAbsolutePath, IS_WINDOWS, SKILL_DIR, SKILL_NAME, ADC_SCRIPT, ASSETS_DIR, skillVersion,
+  isAbsolutePath, isWithin, plural, tryJson, IS_WINDOWS, SKILL_DIR, SKILL_NAME, ADC_SCRIPT, ASSETS_DIR, skillVersion,
 } from './core.mjs';
-import { gitTry, gitRaw, gitVersion, repoRoot, resolveBase, lsFiles, lsTree, readBlobs, gitPath, MIN_GIT } from
-  './git.mjs';
 import {
-  resolveStateDir, statePaths, trackedStateFiles, stateIgnored, credentialStatus, checkOwnerOnly, prepareStateDir,
+  gitTry, gitRaw, gitVersion, repoRoot, resolveBase, revParse, lsFiles, lsTree, readBlobs, gitPath, ignoredPaths,
+  MIN_GIT,
+} from './git.mjs';
+import {
+  resolveStateDir, statePaths, trackedStateFiles, credentialStatus, checkOwnerOnly, prepareStateDir,
   materializeTemplates, newestOpenSession, parseEnvFile, DEFAULT_BUDGET,
 } from './state.mjs';
 import { parseFrontmatter, normalizeSkillFrontmatter } from './frontmatter.mjs';
@@ -62,7 +64,7 @@ export function nodeEol(version, now = new Date()) {
 }
 
 /** Install provenance from parsed frontmatter: `{ local_path, github: {key: value} }` or null. */
-export function provenanceOf(data) {
+function provenanceOf(data) {
   const meta = isObj(data?.metadata) ? data.metadata : {};
   const gh = Object.entries(meta).filter(([k]) => k.startsWith('github-')).map(([k, v]) => [k, v?.toString() ?? null]);
   const local = meta['local-path'] != null ? toPosix(String(meta['local-path'])) : null;
@@ -78,13 +80,13 @@ const PROJECT_DIRS = [
 ];
 
 /** Skill directories each host scans, from the repository (cwd up to the root) and the user's homes. */
-export function discoveryDirs({ root = null, cwd = process.cwd(), env = process.env } = {}) {
+function discoveryDirs({ root = null, cwd = process.cwd(), env = process.env } = {}) {
   const out = [];
   const add = (dir, scope, location, hosts) => {
     const abs = path.resolve(dir);
     if (!out.some((o) => o.dir === abs)) out.push({ dir: abs, scope, location, hosts });
   };
-  for (let d = root && (relPosix(root, cwd) != null ? path.resolve(cwd) : root); d; d = path.dirname(d)) {
+  for (let d = root && (isWithin(root, cwd) ? path.resolve(cwd) : root); d; d = path.dirname(d)) {
     for (const [rel, hosts] of PROJECT_DIRS) add(path.join(d, ...rel.split('/')), 'project', rel, hosts);
     if (relPosix(root, d) === '.' || path.dirname(d) === d) break;
   }
@@ -122,7 +124,7 @@ function describeCopy(dir, { scope, location, hosts, root }) {
 }
 
 /** Every copy of this skill in a directory some host scans, plus the running copy. */
-export function findInstalledCopies({ root = null, cwd = process.cwd(), env = process.env } = {}) {
+function findInstalledCopies({ root = null, cwd = process.cwd(), env = process.env } = {}) {
   const copies = [];
   for (const d of discoveryDirs({ root, cwd, env })) {
     // A registered folder may be the skill itself rather than its parent.
@@ -152,7 +154,7 @@ const LAUNCH = {
 const ORDER = { win32: ['exec', 'cmd', 'pwsh', 'powershell', 'bash'], posix: ['exec', 'sh', 'bash', 'login-shell'] };
 
 /** The launchers a host uses on this platform (all available ones when the host is unknown). */
-export function launchersFor(hosts, { env = process.env, platform = process.platform } = {}) {
+function launchersFor(hosts, { env = process.env, platform = process.platform } = {}) {
   const p = platform === 'win32' ? 'win32' : 'posix';
   const wanted = new Set(hosts?.length ? hosts.flatMap((h) => LAUNCH[p][h] || []) : ORDER[p]);
   const shell = env.SHELL && fs.existsSync(env.SHELL) ? env.SHELL : fs.existsSync('/bin/sh') ? '/bin/sh' : null;
@@ -191,8 +193,7 @@ export async function launcherProbes(hosts, { env = process.env, cwd = process.c
     const r = await spawnCapture(inv.file, inv.args, opts);
     const row = { launcher: l.label, used_by: l.users, ok: false, ms: r.ms, exit: r.exit };
     const out = r.stdout.trim();
-    let parsed = null;
-    try { parsed = JSON.parse(out); } catch {}
+    const parsed = tryJson(out);
     if (parsed?.adc_probe === n) {
       const old = parsed.node && !versionGte(String(parsed.node), MIN_NODE);
       return { ...row, ok: !old, node_version: String(parsed.node || ''), node_path: parsed.exec?.toString() || null,
@@ -291,8 +292,8 @@ function dirFiles(dir) {
 }
 
 /** Files of the skill folder inside a commit: `{ commit, skill_path, files: Map(rel → () => Buffer) }`. */
-export function gitSkillTree(gitDir, commitish, { skillPath = null } = {}) {
-  const commit = gitTry(gitDir, ['rev-parse', '--verify', '--quiet', `${commitish}^{commit}`]);
+function gitSkillTree(gitDir, commitish, { skillPath = null } = {}) {
+  const commit = revParse(gitDir, commitish);
   if (!commit) throw usageError(`"${commitish}" does not name a commit in ${toPosix(gitDir)}`);
   const want = skillPath ? toPosix(skillPath).replace(/\/?SKILL\.md$/i, '').replace(/^\/+|\/+$/g, '') : null;
   const has = (p) => gitRaw(gitDir, ['cat-file', '-e', `${commit}:${p ? `${p}/` : ''}SKILL.md`]).exit === 0;
@@ -355,7 +356,7 @@ export function compareSkillMd(refBuf, copyBuf) {
 }
 
 /** Compare a reference file map with a copy's: `{ status, missing, extra, changed, changed_eol_only, skill_md }`. */
-export function compareSkillTrees(refFiles, copyFiles) {
+function compareSkillTrees(refFiles, copyFiles) {
   const [missing, changed, eolOnly] = [[], [], []];
   let skillMd = { status: 'missing' };
   const lf = (buf) => buf.toString('latin1').replace(/\r\n/g, '\n');
@@ -398,7 +399,7 @@ function referenceFor(copy, { against, ref, cwd }) {
 }
 
 /** Compare each vendored (project-scope) copy with its pinned release: `{ status, copies[] }`. */
-export function verifyVendored(copies, { against = null, ref = null, cwd = process.cwd() } = {}) {
+function verifyVendored(copies, { against = null, ref = null, cwd = process.cwd() } = {}) {
   const vendored = copies.filter((c) => c.scope === 'project');
   if (!vendored.length) return { status: 'none', detail: 'no copy of the skill in a project skill folder', copies: [] };
   const rows = vendored.map((copy) => {
@@ -429,7 +430,10 @@ function stateReport(info, { env, sessionId }) {
     const entries = [`/${info.rel}/`, `/${info.rel}`, `${info.rel}/`];
     if (file) exclude = { file: toPosix(file), entry_present: entries.some((e) => lines.includes(e)) };
   } catch { exclude = { file: null, entry_present: false }; }
-  const envLive = { exists: fs.existsSync(p.envLive), ignored: stateIgnored(info, '.env.live') };
+  // Both ignore checks from one `git check-ignore` (a path outside the repository is never committed).
+  const ignored = info.insideRepo ? ignoredPaths(info.root, [`${info.rel}/.env.live`, `${info.rel}/probe`]) : null;
+  const isIgnored = (sub) => !ignored || ignored.has(`${info.rel}/${sub}`);
+  const envLive = { exists: fs.existsSync(p.envLive), ignored: isIgnored('.env.live') };
   if (envLive.exists) envLive.perms = checkOwnerOnly(p.envLive);
   const { budget: b, ...loaded } = loadBudget(info);
   const cls = runClassOf({}, env);
@@ -439,7 +443,7 @@ function stateReport(info, { env, sessionId }) {
   const view = { sessionId: open?.id || '(next)', identitySource: open?.source || 'generated', caps, runClass: cls };
   return {
     dir: toPosix(info.dir), rel: info.rel, source: info.source, inside_repo: info.insideRepo, exists: isDir(info.dir),
-    tracked: trackedStateFiles(info).slice(0, 20), exclude, ignored: stateIgnored(info, 'probe'), env_live: envLive,
+    tracked: trackedStateFiles(info).slice(0, 20), exclude, ignored: isIgnored('probe'), env_live: envLive,
     credential: credentialStatus(info, env),
     budget: {
       path: loaded.path, exists: loaded.exists, valid: loaded.valid, ...(loaded.valid ? {} : { error: loaded.error }),
@@ -505,7 +509,8 @@ function runtime(env) {
   const node = { version: process.versions.node, path: toPosix(process.execPath), minimum: MIN_NODE,
     ok: versionGte(process.versions.node, MIN_NODE), lts: e.lts, eol: e.eol, ...(e.warning && { warning: e.warning }),
     ...(p ? { on_path: { version: p.version, path: p.path, same: samePath(p.path, process.execPath) } } : {}) };
-  const git = { version: gv, path: which('git', env) && toPosix(which('git', env)), minimum: MIN_GIT,
+  const gitExe = which('git', env);
+  const git = { version: gv, path: gitExe && toPosix(gitExe), minimum: MIN_GIT,
     ok: Boolean(gv && versionGte(gv, MIN_GIT)) };
   const warnings = [
     e.warning, !p && `\`node\` is not on PATH, but hooks run the bare \`node\` command; ${NODE_PATH_HINT}`,
@@ -523,7 +528,7 @@ export async function doctorReport({
   cwd = process.cwd(), env = process.env, stateDirOption = null, probes = true, vendored = null, session = null,
 } = {}) {
   const root = repoRoot(cwd);
-  const info = resolveStateDir({ cwd, stateDirOption, env });
+  const info = resolveStateDir({ cwd, stateDirOption, env, root });
   // The file value is read only to redact it from free text (probe output, CLI errors).
   const fileToken = parseEnvFile(readText(statePaths(info.dir).envLive, '')).ADC_LIVE_TOKEN;
   const literals = [env.ADC_LIVE_TOKEN, fileToken].map((value) => ({ name: 'ADC_LIVE_TOKEN', value }));
@@ -634,14 +639,15 @@ const USAGE = [
 ].join('\n');
 
 function initState(ctx) {
-  const info = resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption });
+  const root = repoRoot(ctx.cwd);
+  const info = resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption, root });
   const dir = toPosix(info.dir);
   const refused = `${info.rel}/ is tracked by git; run \`git rm -r --cached ${info.rel}\` first`;
   if (trackedStateFiles(info).length) return { dir, refused };
   const would = ['create the state dir (0700)', info.insideRepo && `add /${info.rel}/ to the exclude file`,
     'write budget.json and .env.live from the templates'];
   if (ctx.dryRun) return { dir, dry_run: true, would: would.filter(Boolean) };
-  const prepared = prepareStateDir(ctx, { create: true });
+  const prepared = prepareStateDir(ctx, { create: true, root });
   const t = materializeTemplates(prepared);
   return { dir, exclude: prepared.exclude, budget: t.budget, env_live: t.envLive };
 }
@@ -683,7 +689,7 @@ export const doctorCommand = defineCommand({
     const failing = report.prerequisites.filter((p) => p.category === 'required' && p.status === 'missing').length;
     const n = report.install_paths.length;
     const summary = [report.host_guess || 'no host', `node ${report.node.version}`, `git ${report.git.version || '-'}`,
-      `${n} cop${n === 1 ? 'y' : 'ies'}`, `${report.hooks.length} hook(s)`, `${report.warnings.length} warning(s)`,
+      `${n} ${plural(n, 'copy', 'copies')}`, `${report.hooks.length} hook(s)`, `${report.warnings.length} warning(s)`,
       failing && `${failing} required item(s) missing`, exit === EXIT.ENV && 'state dir tracked (exit 3)'];
     return { result: report, exit, human: humanReport(report), summary: summary.filter(Boolean).join('; ') };
   },

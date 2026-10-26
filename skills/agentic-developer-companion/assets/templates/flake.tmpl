@@ -1,8 +1,6 @@
-# flake scaffolds (plan §10.4): the quarantine policy, the weekly quarantine workflow and, with
-# --test, a diagnosis report in the state dir; the registry (quarantine.json, mode=keep: an existing
-# registry is never replaced). The shared .github/adc/gate.mjs helper comes from ci-gate.tmpl.
-# Attributes: scope=repo, scope=state (never committed), when=diagnosis, mode=keep.
-# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
+# flake (plan §10.4): the quarantine policy and registry (mode=keep), the weekly quarantine workflow and,
+# with --test, a diagnosis report in the state dir. The shared .github/adc/gate.mjs comes from ci-gate.tmpl.
+# Attributes: see scripts/lib/scaffold.mjs (renderFiles).
 
 @@@ file: flaky-test-policy.md @@@
 # Flaky-test policy

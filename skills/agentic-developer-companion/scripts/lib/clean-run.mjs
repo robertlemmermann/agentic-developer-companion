@@ -7,18 +7,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   EXIT, usageError, defineCommand, readJson, readText, writeFileAtomic, writeJsonAtomic, ensureDir, sha256,
-  nonce, nowIso, toPosix, relPosix, quoteArg, tmpRoot, which, IS_WINDOWS, run, truncate, stamp, log,
-  numberOption, spawnCapture, onInterrupt, firstLine, toArray, uniq, makeCheck as checkWithDefaults,
+  nowIso, toPosix, relPosix, displayPath, quoteArg, tmpRoot, tmpPath, which, IS_WINDOWS, run, truncate, runId, log,
+  numberOption, spawnCapture, onInterrupt, firstLine, toArray, uniq, makeCheck as checkWithDefaults, isWithin,
+  listDir, statOrNull, readFilePart, tryJson, subPath, joinRel,
 } from './core.mjs';
 import { worktreeAdd, worktreeRemove, diffNameStatus, emptyTree, readBlobs, gitTry } from './git.mjs';
-import { prepareTarget } from './state.mjs';
+import { prepareTarget, ledgerFiles } from './state.mjs';
 import {
   parseReport, parseSummaryText, normalizeFormat, normalizeReportPath, rootVariants, stripAnsi,
 } from './reports.mjs';
 import { detect, RUNNERS } from './detect.mjs';
 import * as M from './markers.mjs';
+import { CHECK_FM, STATUS_RANK } from './evidence.mjs';
 
-const FM = { 'CK-CLEANRUN': ['FM-02', 'FM-13'], 'CK-REDGREEN': ['FM-03'], 'CK-TYPES': ['FM-04'] };
 export const DEFAULT_TIMEOUT_S = 1800;
 const [LOG_HEAD, LOG_TAIL] = [2 * 1024 * 1024, 8 * 1024 * 1024];
 const MAX_CACHED_IDS = 50_000;
@@ -180,12 +181,13 @@ export const redact = (text) => M.makeRedactor()(text);
 /** `redact` applied to every string of a result (digests and object names kept). */
 export const redactAll = (value) => M.redactDeep(value, M.makeRedactor());
 
-/** A ledger check (plan §9.2) with the command, summary and finding texts redacted. */
+/** A ledger check (plan §9.2; `fm` from the check id) with the command, summary and finding texts redacted. */
 export function makeCheck(fields) {
   const r = M.makeRedactor();
   const f = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
   const red = (x) => ({ ...x, message: r(x.message), evidence: x.evidence == null ? x.evidence : r(x.evidence) });
-  return checkWithDefaults({ duration_ms: 0, ...f, command: f.command == null ? null : r(f.command),
+  return checkWithDefaults({ duration_ms: 0, fm: [...(CHECK_FM[f.id] || [])], ...f,
+    command: f.command == null ? null : r(f.command),
     summary: r(f.summary || ''), findings: toArray(f.findings).map(red) });
 }
 
@@ -193,20 +195,9 @@ export function makeCheck(fields) {
 export const projectSlug = (root) => (!root || root === '.' ? 'root'
   : toPosix(root).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'root');
 
-/** Posix path for an artifact: repo-relative when inside the repo, absolute otherwise. */
-export function artifactPath(repoRoot, file) {
-  const rel = relPosix(repoRoot, file);
-  return rel && rel !== '.' ? rel : toPosix(path.resolve(file));
-}
-
-/** The project's directory inside worktree `wt`. */
 export const projectDir = (wt, project) => path.join(wt.dir, project.root || '.');
 const pickCounts = (c) => Object.fromEntries(COUNT_KEYS.map((k) => [k, c[k] ?? 0]));
 const tail = (s, n) => (s && s.length > n ? '...' + s.slice(-n) : s || '');
-const inside = (dir, f) => {
-  const rel = path.relative(dir, f);
-  return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
-};
 
 /** Substitute placeholders; a value inside a double-quoted segment is inserted raw, else shell-quoted. */
 export function substitute(template, values) {
@@ -308,7 +299,7 @@ export function acquireWorktree(root, commit, label, { keep = false } = {}) {
     return cur;
   }
   if (cur) releaseEntry(key, cur);
-  const dir = path.join(tmpRoot(root), `${label}-${String(commit).slice(0, 12)}-${nonce().slice(0, 6)}`);
+  const dir = tmpPath(root, label, commit);
   worktreeAdd(root, commit, dir);
   const entry = { root, commit, label, dir, keep, dirty: false, installed: new Map(), links: [] };
   POOL.set(key, entry);
@@ -353,13 +344,11 @@ function sameNodeDeps(wt, rel) {
     if (work != null || old != null) return work != null && old != null && lf(work) === lf(old);
   }
   const deps = (text) => {
-    try {
-      const j = JSON.parse(text);
-      return JSON.stringify([j.dependencies || {}, j.devDependencies || {}, j.optionalDependencies || {}]);
-    } catch { return null; }
+    const j = tryJson(text);
+    return j && JSON.stringify([j.dependencies || {}, j.devDependencies || {}, j.optionalDependencies || {}]);
   };
-  const a = deps(read(wt.root, 'package.json') || '');
-  return a != null && a === deps(read(wt.dir, 'package.json') || '');
+  const a = deps(read(wt.root, 'package.json'));
+  return a != null && a === deps(read(wt.dir, 'package.json'));
 }
 
 /**
@@ -439,11 +428,7 @@ const NODE_VALUE_OPTS = new Set(['--import', '--require', '-r', '--loader', '--e
 
 function cargoTargetDir(dir) {
   const res = run('cargo', ['metadata', '--format-version', '1', '--no-deps'], { cwd: dir, timeoutMs: 120_000 });
-  try {
-    return JSON.parse(res.stdout).target_directory || path.join(dir, 'target');
-  } catch {
-    return path.join(dir, 'target');
-  }
+  return tryJson(res.stdout)?.target_directory || path.join(dir, 'target');
 }
 
 /**
@@ -594,9 +579,8 @@ function reportFiles(report) {
   if (!report || report.stdout) return [];
   if (report.path) return fs.existsSync(report.path) ? [report.path] : [];
   const re = new RegExp(`^${String(report.glob || '*').split('*').map(esc).join('.*')}$`);
-  return toArray(report.dirs || report.dir).flatMap((d) => {
-    try { return fs.readdirSync(d).filter((f) => re.test(f)).sort().map((f) => path.join(d, f)); } catch { return []; }
-  });
+  return toArray(report.dirs || report.dir)
+    .flatMap((d) => listDir(d).filter((f) => re.test(f)).sort().map((f) => path.join(d, f)));
 }
 
 /** Parse what a run produced: the report (files merged), else the runner's summary lines. */
@@ -660,7 +644,7 @@ export async function runProject(wt, project, runner, {
   const exec = () => {
     // A reused worktree may hold reports of an earlier run (fixed paths, report dirs): never parse those.
     for (const f of reportFiles(built.report)) {
-      if (inside(wt.dir, f) || inside(outDir, f)) fs.rmSync(f, { force: true });
+      if (isWithin(wt.dir, f, { strict: true }) || isWithin(outDir, f, { strict: true })) fs.rmSync(f, { force: true });
     }
     log(redact(`run: ${built.cmd} (in ${toPosix(dir)})`));
     fs.appendFileSync(logFile, `$ ${built.cmd}\n`);
@@ -691,7 +675,7 @@ export async function runProject(wt, project, runner, {
 // One folder per target (one CLI invocation; verify shares its target across steps): a ledger
 // hashes its artifacts when a check is added, so a later run of the same tree (audit-tests after
 // verify, a repeated clean-run) must never overwrite them.
-const runIdOf = (target) => target.adcRunId || (target.adcRunId = `${stamp()}-${nonce().slice(0, 6)}`);
+const runIdOf = (target) => (target.adcRunId ||= runId());
 const RUN_DIR_RE = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/;
 const [KEEP_RUNS, KEEP_TREES] = [20, 50];
 const pruned = new Set();
@@ -700,13 +684,10 @@ const pruned = new Set();
 function pruneRuns(runsDir, treeDir, slugDir, runId) {
   if (pruned.has(`${slugDir}\0${runId}`)) return;
   pruned.add(`${slugDir}\0${runId}`);
-  const older = (dir, keep, filter) => {
-    try {
-      return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && filter(e.name))
-        .map((e) => ({ full: path.join(dir, e.name), t: fs.statSync(path.join(dir, e.name)).mtimeMs }))
-        .sort((a, b) => b.t - a.t).slice(keep).map((e) => e.full);
-    } catch { return []; }
-  };
+  const older = (dir, keep, filter) => listDir(dir, { types: true })
+    .filter((e) => e.isDirectory() && filter(e.name))
+    .map((e) => ({ full: path.join(dir, e.name), t: statOrNull(path.join(dir, e.name))?.mtimeMs ?? 0 }))
+    .sort((a, b) => b.t - a.t).slice(keep).map((e) => e.full);
   for (const d of [...older(slugDir, KEEP_RUNS, (n) => RUN_DIR_RE.test(n) && n !== runId),
     ...older(runsDir, KEEP_TREES, (n) => path.join(runsDir, n) !== treeDir)]) {
     try { fs.rmSync(d, { recursive: true, force: true }); } catch {}
@@ -715,17 +696,11 @@ function pruneRuns(runsDir, treeDir, slugDir, runId) {
 
 /** A file's text, or its head and tail when it is larger than LOG_HEAD + LOG_TAIL. */
 function readCapped(file) {
-  const size = fs.statSync(file).size;
+  const size = statOrNull(file)?.size ?? 0;
   if (size <= LOG_HEAD + LOG_TAIL) return readText(file, '');
-  const fd = fs.openSync(file, 'r');
-  try {
-    const [head, end] = [Buffer.alloc(LOG_HEAD), Buffer.alloc(LOG_TAIL)];
-    fs.readSync(fd, head, 0, LOG_HEAD, 0);
-    fs.readSync(fd, end, 0, LOG_TAIL, size - LOG_TAIL);
-    return `${head}\n[... ${size - LOG_HEAD - LOG_TAIL} bytes omitted by agentic-developer-companion ...]\n${end}`;
-  } finally {
-    fs.closeSync(fd);
-  }
+  const head = readFilePart(file, LOG_HEAD)?.text ?? '';
+  const end = readFilePart(file, LOG_TAIL, { fromEnd: true })?.text ?? '';
+  return `${head}\n[... ${size - LOG_HEAD - LOG_TAIL} bytes omitted by agentic-developer-companion ...]\n${end}`;
 }
 
 /**
@@ -748,12 +723,12 @@ export function storeArtifacts(target, tree, slug, rec, { prefix = '' } = {}) {
   };
   if (rec.log_path && fs.existsSync(rec.log_path)) {
     out.output_sha256 = sha256(save(rec.log_path, path.join(dir, `${prefix}run.log`)));
-    out.artifacts.push(out.log_path = artifactPath(target.root, path.join(dir, `${prefix}run.log`)));
+    out.artifacts.push(out.log_path = displayPath(target.root, path.join(dir, `${prefix}run.log`)));
   }
   const files = toArray(rec.report_files || rec.report_path).filter((f) => fs.existsSync(f) && fs.statSync(f).isFile());
   if (files.length === 1) {
     save(files[0], path.join(dir, prefix + path.basename(files[0])));
-    out.artifacts.push(out.report_path = artifactPath(target.root, path.join(dir, prefix + path.basename(files[0]))));
+    out.artifacts.push(out.report_path = displayPath(target.root, path.join(dir, prefix + path.basename(files[0]))));
   } else if (files.length) {
     const sub = ensureDir(path.join(dir, `${prefix}reports`));
     // Same-named reports (TEST-x.xml in several modules) get their index as a prefix.
@@ -763,7 +738,7 @@ export function storeArtifacts(target, tree, slug, rec, { prefix = '' } = {}) {
       const name = path.basename(f);
       save(f, path.join(sub, `${seen.get(name) > 1 ? `${i}-` : ''}${name}`));
     });
-    out.artifacts.push(out.report_path = artifactPath(target.root, sub));
+    out.artifacts.push(out.report_path = displayPath(target.root, sub));
   }
   return out;
 }
@@ -900,8 +875,7 @@ export function evaluateRun(run, base, { explained = 0, skipFired = false, nowSk
   return waived || (c.flaky > 0 ? { status: 'finding', reason: 'FLAKY' } : { status: 'pass', reason: null });
 }
 
-const RANK = { fail: 5, unverified: 4, finding: 3, 'pass-with-baseline': 2, pass: 1, skipped: 0 };
-const worstStatus = (list) => list.reduce((a, s) => ((RANK[s] ?? 0) > (RANK[a] ?? 0) ? s : a), 'skipped');
+const worstStatus = (list) => list.reduce((a, s) => ((STATUS_RANK[s] ?? 0) > (STATUS_RANK[a] ?? 0) ? s : a), 'skipped');
 
 /**
  * Command exit code: 1 for fail/finding, 4 for unverified, 3 when every unverified check is
@@ -918,10 +892,8 @@ export function exitFor(status, checks = []) {
 /** Waived deletions and fired checks from the newest ledger for this tree digest (§9.1.1, standalone runs). */
 function ledgerContext(state, tree) {
   let best = null;
-  let names = [];
-  try { names = fs.readdirSync(state.paths.evidence).filter((x) => x.endsWith('.json')); } catch {}
-  for (const n of names) {
-    const j = readJson(path.join(state.paths.evidence, n), null);
+  for (const { file } of ledgerFiles(state.dir)) {
+    const j = readJson(file, null);
     const t = j && j.tree_digest === tree ? Date.parse(j.finalized_at || j.created_at || '') || 0 : -1;
     if (t >= 0 && (!best || t > best.t)) best = { t, j };
   }
@@ -962,7 +934,7 @@ export async function cleanRun({
     timeoutMs: Math.max(1, Number(timeoutS) || DEFAULT_TIMEOUT_S) * 1000,
     waived: waivers !== undefined ? toArray(waivers).filter((w) => !w.check || w.check === 'CK-TEST-DEL') : ctx.waivers,
     fired: firedChecks !== undefined ? toArray(firedChecks) : ctx.fired,
-    check: (fields) => makeCheck({ id: 'CK-CLEANRUN', fm: FM['CK-CLEANRUN'], ...fields }),
+    check: (fields) => makeCheck({ id: 'CK-CLEANRUN', ...fields }),
   };
   const out = { tree_digest: tree, base: { ref: target.base.ref, sha: target.base.sha, source: target.base.source },
     changed_files: changed.length, projects: [], status: 'skipped', checks: [] };
@@ -1025,7 +997,7 @@ async function cleanRunProject(o) {
       install: { cmd: o.noInstall || !m ? null : m.install },
       check: check({ status: 'skipped', reason: 'DRY_RUN', command: built.cmd, summary }) });
   }
-  const outRoot = path.join(tmpRoot(target.root), `out-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+  const outRoot = tmpPath(target.root, 'out', tree);
   const head = acquireWorktree(target.root, target.snapshot.commit, 'head', { keep });
   const rec = await runProject(head, project, runner,
     { outDir: path.join(outRoot, slug, 'head'), noInstall: o.noInstall, timeoutMs: o.timeoutMs });
@@ -1051,7 +1023,6 @@ async function cleanRunProject(o) {
     prow.delta = Object.fromEntries(['executed', 'passed', 'failed', 'skipped', 'flaky']
       .map((k) => [k, rec.counts[k] - (baseOk[k] || 0)]));
   }
-  // The snapshot equals HEAD: its counts are HEAD's, a later run's base.
   if (rec.counts && o.snapshotIsHead) {
     const entry = { project: prow.root, runner, cmd: rec.cmd, counts: rec.counts, tests: rec.tests };
     writeCountsCache(target.state, target.snapshot.head, slug, entry);
@@ -1121,7 +1092,7 @@ async function redGreenProof({ target, projects, files, runnerOpt, noInstall, ke
   const root = target.root;
   const tree = target.snapshot.tree;
   const specs = parseRedGreenSpec(files)
-    .map((s) => ({ ...s, file: relPosix(root, path.resolve(root, s.file)) || s.file }));
+    .map((s) => ({ ...s, file: relPosix(root, s.file) ?? s.file }));
   const res = { status: 'unverified', reason: null, files: specs.map((s) => s.file + (s.name ? `::${s.name}` : '')),
     pairs: [], base_report: null, head_report: null };
   const finish = (status, reason, summary, x = {}) => {
@@ -1129,7 +1100,7 @@ async function redGreenProof({ target, projects, files, runnerOpt, noInstall, ke
     const data = { files: res.files, pairs: res.pairs, base_report: res.base_report, head_report: res.head_report,
       base_counts: baseCounts, head_counts: headCounts };
     return Object.assign(res, { status, reason, summary,
-      check: makeCheck({ id: 'CK-REDGREEN', fm: FM['CK-REDGREEN'], ...fields, status, reason, summary, data }) });
+      check: makeCheck({ id: 'CK-REDGREEN', ...fields, status, reason, summary, data }) });
   };
   // One `git cat-file --batch` for every file (checked here, copied into the base worktree below).
   const blobs = readBlobs(root, specs.map((s) => `${target.snapshot.commit}:${s.file}`));
@@ -1151,7 +1122,7 @@ async function redGreenProof({ target, projects, files, runnerOpt, noInstall, ke
   const prel = toPosix(project.root || '.');
   const runner = resolveRunner(project, runnerOpt, { ecosystem: fileEcosystem(specs[0].file) });
   if (!runner) return finish('unverified', 'NO_RUNNER', `no test runner detected for ${prel}`, { project: prel });
-  const select = { files: specs.map((s) => (prel === '.' ? s.file : s.file.slice(prel.length + 1))),
+  const select = { files: specs.map((s) => subPath(s.file, prel)),
     names: uniq(specs.map((s) => s.name)) };
   if (dryRun) {
     const summary = `dry run: would copy ${res.files.join(', ')} into a base worktree and run them there and in `
@@ -1159,7 +1130,7 @@ async function redGreenProof({ target, projects, files, runnerOpt, noInstall, ke
     return finish('skipped', 'DRY_RUN', summary, { project: prel });
   }
   const slug = projectSlug(prel);
-  const outRoot = path.join(tmpRoot(root), `rg-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+  const outRoot = tmpPath(root, 'rg', tree);
   // Red: the base with only the new test files copied in (the worktree becomes dirty: not reused).
   const baseWt = acquireWorktree(root, target.base.sha, 'base', { keep });
   baseWt.dirty = true;
@@ -1300,10 +1271,14 @@ const errorKey = (e) => `${e.file || ''}\0${e.code || ''}\0`
 /** Head errors that are not in the base (multiset by file + code + message, line numbers ignored). */
 export function newErrors(baseErrors, headErrors) {
   const counts = new Map();
-  for (const e of baseErrors) counts.set(errorKey(e), (counts.get(errorKey(e)) || 0) + 1);
+  for (const e of baseErrors) {
+    const k = errorKey(e);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
   return headErrors.filter((e) => {
-    const n = counts.get(errorKey(e)) || 0;
-    counts.set(errorKey(e), n - 1);
+    const k = errorKey(e);
+    const n = counts.get(k) || 0;
+    counts.set(k, n - 1);
     return n <= 0;
   });
 }
@@ -1374,7 +1349,7 @@ export async function typecheck({
   const det = detectResult || await detect({ root, stateInfo: dryRun ? null : target.state });
   const timeoutMs = Math.max(1, Number(timeoutS) || DEFAULT_TIMEOUT_S) * 1000;
   const out = { cmd: null, base: null, head: null, new_errors: [], status: 'skipped', checkers: [], checks: [] };
-  const check = (fields) => makeCheck({ id: 'CK-TYPES', fm: FM['CK-TYPES'], ...fields });
+  const check = (fields) => makeCheck({ id: 'CK-TYPES', ...fields });
   const checkers = checkersFor(det, runner, checkerCmd);
   if (!checkers.length) {
     out.checks.push(check({ status: 'skipped', reason: 'NO_CHECKER', summary: 'no compile or type checker detected' }));
@@ -1388,7 +1363,7 @@ export async function typecheck({
       out.checks.push(check({ project: prel, status: 'skipped', reason: 'DRY_RUN', command: cmd, summary }));
       continue;
     }
-    const outRoot = path.join(tmpRoot(root), `tc-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+    const outRoot = tmpPath(root, 'tc', tree);
     const io = { outRoot, noInstall, timeoutMs };
     const headWt = acquireWorktree(root, target.snapshot.commit, 'typecheck', { keep });
     const head = await typecheckIn(headWt, c, cmd, { ...io, label: 'head' });
@@ -1412,7 +1387,7 @@ export async function typecheck({
       base: { exit: base.exit ?? null, errors: base.errors.length, ...(baseProblem && { problem: baseProblem }) },
       head: { exit: head.exit, errors: head.errors.length }, new_errors: unknown ? [] : fresh, status, reason };
     const finding = (e) => ({ id: 'CK-TYPES', severity: 'fail', line: e.line,
-      file: e.file ? (prel === '.' ? e.file : `${prel}/${e.file}`) : null,
+      file: e.file ? joinRel(prel, e.file) : null,
       message: `${e.code ? `${e.code}: ` : ''}${e.message}`, evidence: truncate(e.message, 200) });
     out.checkers.push(rec);
     out.checks.push(check({
@@ -1446,7 +1421,8 @@ export const COMMON_OPTIONS = {
 export function repoRelativeEntries(values, cwd, root) {
   if (!values) return null;
   return parseRedGreenSpec(values).map(({ file, name }) => {
-    const rel = cwd !== root && fs.existsSync(path.resolve(cwd, file)) ? relPosix(root, path.resolve(cwd, file)) : null;
+    const abs = path.resolve(cwd, file);
+    const rel = cwd !== root && fs.existsSync(abs) ? relPosix(root, abs) : null;
     return (rel && rel !== '.' ? rel : file) + (name != null ? `::${name}` : '');
   });
 }

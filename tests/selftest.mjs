@@ -14,8 +14,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  EXIT, SKILL_DIR, SKILL_NAME, IS_WINDOWS, defineCommand, usageError, readText, readJson, run, which,
-  toolVersion, versionGte, parseVersion, toPosix, tmpRoot, truncate, nowIso, nonce,
+  EXIT, SKILL_DIR, SKILL_NAME, IS_WINDOWS, defineCommand, dispatch, usageError, readText, readJson, run, which,
+  toolVersion, versionGte, parseVersion, toPosix, tmpRoot, truncate, tryJson, nowIso, nonce,
 } from '../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import { createSnapshot, lsTree } from '../skills/agentic-developer-companion/scripts/lib/git.mjs';
 import { materializeTemplates, prepareStateDir } from '../skills/agentic-developer-companion/scripts/lib/state.mjs';
@@ -32,7 +32,7 @@ const isDevLayout = (skillDir) => path.basename(path.dirname(path.resolve(skillD
 const DEV_ONLY = ['tests', 'evals', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', '.gitattributes', 'README.md'];
 
 /** Unit files per area (tests/unit/); any other unit file present runs under `scripts`. */
-export const UNIT_FILES = Object.freeze({
+const UNIT_FILES = Object.freeze({
   scripts: ['core.test.mjs'],
   frontmatter: ['tooling-lint.test.mjs'],
   hooks: ['hooks.test.mjs'],
@@ -46,7 +46,7 @@ export const UNIT_FILES = Object.freeze({
 });
 
 /** Areas in run order with what each covers (`--only` takes these names). */
-export const AREAS = Object.freeze({
+const AREAS = Object.freeze({
   footprint: 'skill folder only: file count, folder size, file size, LF, no development files, references linked and within budget, links, substitution tokens, .env files, adc templates, notices',
   frontmatter: 'SKILL.md frontmatter invariants, tooling-lint --strict, skills-ref / claude plugin validate / gh skill publish --dry-run when installed',
   scripts: 'node --check on every module, the adc.mjs command table, version and help, core unit tests',
@@ -95,7 +95,7 @@ const errText = (err) => truncate(String(err && err.message ? err.message : err)
 const firstLine = (s) => String(s || '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) || '';
 
 /** Process environment for children: host-session markers, ADC_* and repository-redirecting git variables removed. */
-export function childEnv(base = process.env, extra = {}) {
+function childEnv(base = process.env, extra = {}) {
   const drop = /^(?:ADC_|CLAUDE|COPILOT|GITHUB_COPILOT|CODEX_|VSCODE_|TERM_PROGRAM$|NODE_TEST_CONTEXT$|NODE_OPTIONS$|GIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|PREFIX|CEILING_DIRECTORIES)$)/;
   const env = {};
   for (const [k, v] of Object.entries(base)) if (!drop.test(k.toUpperCase())) env[k] = v;
@@ -119,10 +119,6 @@ function gitOk(sx, cwd, args, opts) {
 /** `node <skill>/scripts/adc.mjs ...` synchronously, with the sanitized environment. */
 function adc(sx, args, { cwd, input = '', env = {}, timeoutMs = 120_000, nodeArgs = [] } = {}) {
   return run(process.execPath, [...nodeArgs, sx.adc, ...args], { cwd: cwd || sx.tmp(), input, env: { ...sx.env, ...env }, timeoutMs });
-}
-
-function parseJsonOut(stdout) {
-  try { return JSON.parse(String(stdout || '').trim()); } catch { return undefined; }
 }
 
 /** A temp repository under this run's temp root, realpath'd (macOS /var vs /private/var). */
@@ -201,7 +197,7 @@ const tapName = (s) => s.replace(/\\#/g, '#').replace(/\\\\/g, '\\').trim();
  * Parse node's TAP reporter output. Returns { tests, suites, pass, fail, cancelled, skipped,
  * todo, duration_ms, complete, bail, points, failures[{name, path[], location, error, failureType}] }.
  */
-export function parseTap(text) {
+function parseTap(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   const points = [];
   const summary = {};
@@ -279,7 +275,7 @@ function killTree(child) {
 function killAll() { for (const c of live) killTree(c); }
 
 /** Run one unit file: `{ exit, signal, timedOut, stdout, stderr, ms }`. */
-export function runUnitProcess(file, { cwd, env, timeoutMs }) {
+function runUnitProcess(file, { cwd, env, timeoutMs }) {
   return new Promise((resolve) => {
     const started = Date.now();
     let stdout = '';
@@ -314,7 +310,7 @@ export function runUnitProcess(file, { cwd, env, timeoutMs }) {
 }
 
 /** Cases for one unit file run: one summary case plus one case per failing test. */
-export function unitCases(rel, res, tap, timeoutS) {
+function unitCases(rel, res, tap, timeoutS) {
   const secs = (res.ms / 1000).toFixed(1);
   const counts = `${tap.tests} test(s): ${tap.pass} pass, ${tap.fail} fail, ${tap.skipped} skipped, ${tap.todo} todo${tap.cancelled ? `, ${tap.cancelled} cancelled` : ''} (${secs} s)`;
   const cases = [];
@@ -339,7 +335,7 @@ export function unitCases(rel, res, tap, timeoutS) {
 // Markdown helpers (GitHub-flavored, enough for our own docs)
 
 /** Text with fenced code blocks blanked (line numbers kept) and the fences returned separately. */
-export function splitFences(text) {
+function splitFences(text) {
   const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
   const prose = [];
   const fences = [];
@@ -385,7 +381,7 @@ const maskSpans = (line) => {
 };
 
 /** ATX headings outside code: [{ level, text, line }]. */
-export function markdownHeadings(text) {
+function markdownHeadings(text) {
   const { lines } = splitFences(text);
   const out = [];
   lines.forEach((l, i) => {
@@ -397,7 +393,7 @@ export function markdownHeadings(text) {
 }
 
 /** GitHub's heading anchor: lowercase, punctuation and emoji dropped, spaces to hyphens. */
-export function githubSlug(text) {
+function githubSlug(text) {
   const plain = String(text)
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
@@ -407,7 +403,7 @@ export function githubSlug(text) {
 }
 
 /** Anchors a Markdown file offers: heading slugs (with GitHub's -1, -2 suffixes) and HTML ids. */
-export function markdownAnchors(text) {
+function markdownAnchors(text) {
   const anchors = new Set();
   const seen = new Map();
   for (const h of markdownHeadings(text)) {
@@ -423,7 +419,7 @@ export function markdownAnchors(text) {
 const INLINE_LINK = /(!?)\[((?:[^[\]\\]|\\.|\[(?:[^[\]\\]|\\.)*\])*)\]\(\s*(<[^>\n]*>|[^\s()]*(?:\([^\s()]*\)[^\s()]*)*)(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)/g;
 
 /** Links outside code: [{ target, line, image, text }] (inline and reference definitions). */
-export function markdownLinks(text) {
+function markdownLinks(text) {
   const { lines } = splitFences(text);
   const out = [];
   lines.forEach((raw, i) => {
@@ -443,7 +439,7 @@ export function markdownLinks(text) {
  * Check the relative links of one Markdown file: target exists (file or folder) and, for
  * Markdown targets, the anchor exists. `root` bounds `/`-rooted links. Returns problem strings.
  */
-export function checkMarkdownLinks(file, { text = null, root = null, label = null } = {}) {
+function checkMarkdownLinks(file, { text = null, root = null, label = null } = {}) {
   const src = text ?? readText(file, '');
   const shown = label || toPosix(path.basename(file));
   const problems = [];
@@ -484,7 +480,7 @@ const MERMAID_TYPES = new Set(['flowchart', 'graph', 'sequenceDiagram', 'classDi
   'architecture', 'radar-beta', 'treemap-beta', 'C4Context', 'C4Container', 'C4Component', 'C4Dynamic', 'C4Deployment']);
 
 /** Problems in one Mermaid fence body: unknown diagram type, unbalanced ( [ { or quotes. */
-export function checkMermaid(body) {
+function checkMermaid(body) {
   const lines = (Array.isArray(body) ? body : String(body).split('\n'));
   let i = 0;
   const skipBlank = () => { while (i < lines.length && (!lines[i].trim() || /^\s*%%/.test(lines[i]))) i++; };
@@ -534,7 +530,7 @@ function gitIgnoredSet(cwd, rels, env) {
 }
 
 /** Files and folders of the skill tree as git would ship them (`.git`, `node_modules` and ignored paths left out). */
-export function walkSkillTree(root, { env = process.env } = {}) {
+function walkSkillTree(root, { env = process.env } = {}) {
   const all = [];
   const walk = (abs, rel, depth) => {
     if (depth > 24) return;
@@ -794,7 +790,7 @@ async function areaFootprint(sx) {
 }
 
 /** A table of contents: a "Contents"/"Table of contents" heading, or three in-page links near the top. */
-export function hasToc(text) {
+function hasToc(text) {
   if (markdownHeadings(text).some((h) => /^(?:table of )?contents\b|^toc$|^on this page$/i.test(h.text.replace(/^[^A-Za-z]+/, '')))) return true;
   const top = String(text).split('\n').slice(0, 60).join('\n');
   return (top.match(/\]\(#[^)]+\)/g) || []).length >= 3;
@@ -804,7 +800,7 @@ export function hasToc(text) {
  * Host substitutions (§5.3). `strict` (SKILL.md): anywhere, including `$1`-style tokens. Otherwise
  * (references, which hosts never preprocess): only outside code, so docs can name the tokens.
  */
-export function substitutionTokens(text, { strict = false } = {}) {
+function substitutionTokens(text, { strict = false } = {}) {
   const out = [];
   const src = String(text ?? '');
   const lines = strict ? src.split(/\r?\n/) : splitFences(src).lines;
@@ -835,7 +831,7 @@ function foundationVersion(text) {
 }
 
 /** Candidate gh binaries (ADC_GH, every gh on PATH, side-by-side installs); the first >= 2.90 wins. */
-export function findGh(env = process.env) {
+function findGh(env = process.env) {
   const seen = new Set();
   const found = [];
   const add = (p) => {
@@ -1011,7 +1007,7 @@ function splitRow(line) {
 }
 
 /** Rows of every table in PREREQUISITES.md with the category and group their section implies. */
-export function parsePrereqTables(md) {
+function parsePrereqTables(md) {
   const { lines } = splitFences(md);
   const rows = [];
   let section = '';
@@ -1106,7 +1102,7 @@ async function areaPrereqs(sx) {
 // Area: readme
 
 /** The §12 sections after the title, in order. */
-export const README_SECTIONS = Object.freeze([
+const README_SECTIONS = Object.freeze([
   ['What it is', /\bwhat it is\b/i], ['Features', /\bfeatures\b/i], ['Works with', /\bworks with\b/i], ['Install', /\binstall/i],
   ['Use', /^\W*use\b/i], ['Hooks (optional)', /\bhooks\b/i], ['The .adc/ directory', /\.adc\b.*\bdirectory\b|\bdirectory\b.*\.adc\b/i],
   ['Evidence ledger', /\bevidence ledger\b/i], ['Testing the skill itself', /\btesting\b/i], ['Using it at work', /\bat work\b/i],
@@ -1116,7 +1112,7 @@ export const README_SECTIONS = Object.freeze([
 const LOCAL_PATH = /(?:^|[\s("'`=<])((?:\/(?:home|Users)\/[^/\s"'`)<>]+\/[^\s"'`)<>]*)|\/root\/[^\s"'`)<>]+|\/(?:private\/)?var\/folders\/[^\s"'`)<>]+|\/mnt\/[a-z]\/Users\/[^\s"'`)<>]+|[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s"'`)<>]+|file:\/\/\/[^\s"'`)<>]+)/;
 
 /** README checks (§12): returns cases. `file` is the README path, `root` the repository root. */
-export function checkReadme(file, { root = path.dirname(file), skillName = SKILL_NAME } = {}) {
+function checkReadme(file, { root = path.dirname(file), skillName = SKILL_NAME } = {}) {
   const text = readText(file, '');
   const cases = [];
   const heads = markdownHeadings(text);
@@ -1186,7 +1182,7 @@ async function areaReadme(sx) {
 const VERSION_IN = /v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/;
 
 /** Top CHANGELOG.md entry: { version, line, unreleased } or null. */
-export function changelogTop(text) {
+function changelogTop(text) {
   let unreleased = false;
   for (const h of markdownHeadings(text)) {
     if (h.level !== 2) continue;
@@ -1362,7 +1358,7 @@ function oneJsonObject(stdout) {
   const lines = s.split('\n').filter((l) => l.trim());
   if (lines.length !== 1) return { ok: false, why: `${lines.length} output line(s)` };
   if (!isAscii(s)) return { ok: false, why: 'non-ASCII bytes on stdout' };
-  const v = parseJsonOut(s);
+  const v = tryJson(s);
   if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, why: `not one JSON object: ${truncate(s.trim(), 80)}` };
   return { ok: true, value: v };
 }
@@ -1440,7 +1436,7 @@ async function areaHooks(sx) {
 // Area: adc (§13 `.adc/` handling)
 
 /** CLI commands that act on a repository's state dir; each must exit 3 while `.adc/` is tracked. */
-export const STATE_COMMANDS = Object.freeze([
+const STATE_COMMANDS = Object.freeze([
   ['detect'], ['diff-scope'], ['deps-check', '--offline'], ['typecheck'], ['clean-run', '--no-install'], ['coverage-delta'],
   ['mutation-scope'], ['flake-probe'], ['evidence', 'status'], ['trace', '--spec', 'spec.md'], ['verify', '--quick'],
   ['live', 'run', '--dry-run'], ['budget', 'show'], ['tooling', 'lint', '.'], ['scaffold', 'regress', '--dry-run'], ['doctor', '--no-probes'],
@@ -1470,7 +1466,7 @@ async function areaAdc(sx) {
   for (const args of STATE_COMMANDS) {
     const r = adc(sx, [...args, '--json', '--cwd', tracked], { cwd: tracked, timeoutMs: 120_000 });
     const label = args.filter((a) => !a.startsWith('--') && a !== 'spec.md' && a !== '.').join(' ');
-    const out = parseJsonOut(r.stdout);
+    const out = tryJson(r.stdout);
     if (notBuilt(r)) { unbuilt.push(label); continue; }
     if (args[0] === 'doctor') {
       if (r.exit !== EXIT.ENV || !out || out.error) wrong.push(`doctor: exit ${r.exit}${out?.error ? ` (${out.error.code})` : ''}; expected 3 with the report still printed`);
@@ -1580,7 +1576,7 @@ async function areaAdc(sx) {
   else {
     const repo = makeRepo(sx, 'adc-credits', { 'a.txt': 'a\n' });
     const r = adc(sx, ['live', 'run', '--credits-override', '100', '--json', '--cwd', repo], { cwd: repo });
-    cases.push(r.exit === EXIT.USAGE ? pass('--credits-override without a terminal exits 2', firstLine(parseJsonOut(r.stdout)?.error?.message || r.stderr))
+    cases.push(r.exit === EXIT.USAGE ? pass('--credits-override without a terminal exits 2', firstLine(tryJson(r.stdout)?.error?.message || r.stderr))
       : fail('--credits-override without a terminal exits 2', `exit ${r.exit}: ${truncate(r.stdout.trim() || r.stderr.trim(), 160)}`));
   }
 
@@ -1606,7 +1602,7 @@ function leakChecks(sx) {
   if (!ds || notBuilt(ds)) cases.push(skip('token absent from diff-scope output and the snapshot tree', 'diff-scope is not built yet'));
   else {
     const p = leaks(ds.stdout + ds.stderr).map((w) => `${w} appears in the diff-scope output`);
-    const tree = parseJsonOut(ds.stdout)?.tree_digest;
+    const tree = tryJson(ds.stdout)?.tree_digest;
     if (!tree) p.push(`no tree_digest in the output (exit ${ds.exit})`);
     else {
       const files = lsTree(repo, tree);
@@ -1620,7 +1616,7 @@ function leakChecks(sx) {
   const dr = sx.libExists('doctor.mjs') ? adc(sx, ['doctor', '--json', '--no-probes', '--cwd', repo], { cwd: repo, env }) : null;
   if (!dr || notBuilt(dr)) cases.push(skip('token absent from doctor output', 'doctor is not built yet'));
   else {
-    const out = parseJsonOut(dr.stdout);
+    const out = tryJson(dr.stdout);
     const p = leaks(dr.stdout + dr.stderr).map((w) => `${w} appears in doctor --json`);
     if (!out || out.error) p.push(`doctor printed no report (exit ${dr.exit})`);
     cases.push(verdict('token absent from doctor output', p, 'credential reported as set/unset only'));
@@ -1638,7 +1634,7 @@ function leakChecks(sx) {
       input: JSON.stringify({ sessionId: 'adc-selftest-cp', timestamp: Date.now(), cwd: repo, toolName: 'bash', toolArgs: { command: 'npm test' }, toolResult: { resultType: 'success', textResultForLlm: resp.stdout } }) }));
     for (const r of outputs) {
       // A Copilot `modifiedResult` hands the tool's own output back to the model; only the rest is the hook's.
-      const o = parseJsonOut(r.stdout);
+      const o = tryJson(r.stdout);
       const own = o && typeof o === 'object' ? JSON.stringify({ ...o, modifiedResult: undefined }) : r.stdout;
       p.push(...leaks(own + r.stderr).map((w) => `${w} appears in a hook's own output`));
     }
@@ -1654,7 +1650,7 @@ function leakChecks(sx) {
   if (!vr || notBuilt(vr)) cases.push(skip('verify: git status unchanged, token absent from ledger and metrics', 'verify is not built yet'));
   else {
     const p = leaks(vr.stdout + vr.stderr).map((w) => `${w} appears in verify output`);
-    const out = parseJsonOut(vr.stdout);
+    const out = tryJson(vr.stdout);
     if (!out || out.error) p.push(`verify produced no ledger (exit ${vr.exit}: ${truncate(out?.error?.message || vr.stderr.trim(), 120)})`);
     const statusAfter = git(sx, repo, ['status', '--porcelain']).stdout;
     if (statusAfter !== statusBefore) p.push(`git status --porcelain changed: ${JSON.stringify(statusBefore)} -> ${JSON.stringify(statusAfter)}`);
@@ -1726,7 +1722,7 @@ const DIRECT = { footprint: areaFootprint, frontmatter: areaFrontmatter, scripts
 // Runner
 
 /** Parse `--only a,b` into area names (throws a usage error for an unknown one). */
-export function resolveAreas(only) {
+function resolveAreas(only) {
   const all = Object.keys(AREAS);
   if (only == null || only === '' || (Array.isArray(only) && !only.length)) return all;
   const list = (Array.isArray(only) ? only : String(only).split(',')).map((s) => s.trim()).filter(Boolean);
@@ -1787,7 +1783,7 @@ async function runUnits(sx, plan, { jobs, units, progress }) {
  * version, passed, failed, skipped, unit_tests, areas[], cases[{area, kind, name, status, detail}] }`;
  * the counts are cases: a direct check, a unit file's summary, or one failing unit test each.
  */
-export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = DEFAULT_TIMEOUT_S, jobs = 1, external = true,
+async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = DEFAULT_TIMEOUT_S, jobs = 1, external = true,
   units = true, keep = false, env = process.env, progress = null } = {}) {
   const areas = resolveAreas(only);
   const started = Date.now();
@@ -1849,7 +1845,7 @@ export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = D
 }
 
 /** What a run would do, without running anything (`--list` / `--dry-run`). */
-export function selftestPlan({ skillDir = SKILL_DIR, only = null } = {}) {
+function selftestPlan({ skillDir = SKILL_DIR, only = null } = {}) {
   const areas = resolveAreas(only);
   const sx = { skillDir: path.resolve(skillDir), devRoot: devRootOf(path.resolve(skillDir)) };
   const plan = unitPlan(sx, areas);
@@ -1889,7 +1885,7 @@ const USAGE = [
   '                checks of root material (README, CHANGELOG, evals, unit files)',
 ].join('\n');
 
-export const selftestCommand = defineCommand({
+const selftestCommand = defineCommand({
   name: 'selftest',
   usage: USAGE,
   positionals: false,
@@ -1927,6 +1923,5 @@ export const selftestCommand = defineCommand({
 
 // Standalone entry: `node tests/selftest.mjs [options]` (the shipped adc.mjs has no selftest command).
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { dispatch } = await import('../skills/agentic-developer-companion/scripts/lib/core.mjs');
   process.exitCode = await dispatch('selftest', process.argv.slice(2), async () => ({ selftestCommand }), 'selftestCommand');
 }

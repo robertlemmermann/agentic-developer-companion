@@ -1,15 +1,11 @@
-# ci-gate scaffolds (plan §10.5): a GitHub Actions merge gate with one always-present aggregate job
-# ("Merge OK"), path filtering below it, the full suite with retries off, reports and counts,
-# changed-line coverage (reported first, enforced on request), the diff-scope ratchet, a secret
-# scan and an informational dependency audit; plus .github/adc/gate.mjs, the dependency-free helper
-# the workflows call. Fragments (part=fragment) are assembled by scripts/lib/scaffold.mjs. Every
-# command is inserted into a YAML block scalar. Workflows start with the ci-gate header, which
-# makes a later `verify` report edits to them as findings rather than CK-CI failures. The JSON data
-# fragments say how each runner runs in CI: `ci` flags (retries off, a report in <d>), `tail`, `report`
-# (default <d>/junit.xml), `format` (default junit), `only`/`skip` for @quarantine tests, `coverage`
-# (`<cmd>` is the runner command; `requires`: a dependency that must be declared), the audits and
-# the agent hosts of the optional agent-verify jobs.
-# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
+# ci-gate (plan §10.5): a GitHub Actions merge gate behind one always-present aggregate job ("Merge OK"):
+# path filtering, the full suite with retries off, reports and counts, changed-line coverage (reported,
+# enforced on request), the diff-scope ratchet, a secret scan and an informational dependency audit; plus
+# .github/adc/gate.mjs, the dependency-free helper the workflows call. Commands land in YAML block scalars.
+# The ci-gate header lets a later `verify` report edits to the workflows as findings, not CK-CI failures.
+# JSON data fragments: `runners` (`ci` flags with the report dir <d>, `tail`, `report` [<d>/junit.xml],
+# `format` [junit], `only`/`skip` for @quarantine tests, `coverage` with `<cmd>` and `requires`), `audits`
+# and `agents` (the optional agent-verify jobs). Attributes: see scripts/lib/scaffold.mjs (renderFiles).
 
 @@@ file: .github/workflows/ci-gate.yml unless=gate-script-only @@@
 {{header}}

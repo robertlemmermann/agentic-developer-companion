@@ -7,22 +7,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   EXIT, AdcError, usageError, unverifiable, defineCommand, defineGroup, readText, writeFileAtomic,
-  writeJsonAtomic, withLock, sha256, sha256File, nonce, nowIso, stamp, today, toPosix, relPosix, ensureDir, truncate,
-  generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, canonicalJson, toArray, mdCell, isObj, hostFromEnv, statOrNull,
-  readInput, readJsonInput, numberOption, spawnCapture, uniq,
+  writeJsonAtomic, withLock, sha256, sha256File, nonce, nowIso, stamp, today, toPosix, relPosix, displayPath,
+  ensureDir, truncate, generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, canonicalJson, toArray, mdCell, isObj,
+  hostFromEnv, statOrNull, readInput, readJsonInput, numberOption, spawnCapture, uniq, oneLine, tryJson, runId,
 } from './core.mjs';
-import { requireRepo, repoRoot, gitTry, createSnapshot } from './git.mjs';
+import { requireRepo, repoRoot, originUrl, createSnapshot } from './git.mjs';
 import {
-  prepareStateDir, prepareTarget, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes,
+  prepareStateDir, prepareTarget, statePaths, resolveSession, readSession, appendMetrics, snapshotExcludes,
   listLedgers,
 } from './state.mjs';
 import { makeRedactor, redactDeep } from './markers.mjs';
-import { citationChecker, evaluateMatrix, parseCitation, renderTraceMarkdown, readSpecInput } from './trace.mjs';
+import {
+  citationChecker, evaluateMatrix, parseCitation, renderTraceMarkdown, readSpecInput, TRACE_SCHEMA,
+} from './trace.mjs';
 
 export const SCHEMA = 'adc-evidence/1';
 export const STATUSES = Object.freeze(['pass', 'fail', 'finding', 'skipped', 'unverified', 'pass-with-baseline']);
 export const TOOLS = Object.freeze(['copilot-cli', 'vscode', 'copilot-cloud', 'claude-code', 'codex', 'unknown']);
-export const CHECK_ID_RE = /^CK-[A-Z0-9][A-Z0-9-]{0,40}$/;
+const CHECK_ID_RE = /^CK-[A-Z0-9][A-Z0-9-]{0,40}$/;
 
 /** Failure modes per check (Appendix A); used when a check arrives without `fm`. */
 export const CHECK_FM = Object.freeze({
@@ -43,7 +45,9 @@ const NON_WAIVABLE = new Set(['CK-SECRETS', 'CK-CLEANRUN', 'CK-TYPES', 'CK-DEPS'
   'CK-CLAIMS', 'CK-REVIEW']);
 // Owned by the scripted steps; `evidence add --run` cannot record them (a narrowed command is not a clean run).
 const SCRIPTED = new Set(Object.keys(CHECK_FM).filter((id) => id !== 'CK-REVIEW'));
-const RANK = { skipped: 0, pass: 1, 'pass-with-baseline': 2, finding: 3, unverified: 4, fail: 5 };
+/** Check statuses from best to worst (the worst entry of a check decides). */
+export const STATUS_RANK = Object.freeze({ skipped: 0, pass: 1, 'pass-with-baseline': 2, finding: 3, unverified: 4,
+  fail: 5 });
 const SHORTFALL_REASONS = new Set(['COUNT_SHORTFALL', 'EXECUTED_SHORTFALL', 'SHORTFALL', 'FEWER_TESTS',
   'EXECUTED_DROPPED']);
 const MAX_FINDINGS = 200;
@@ -54,15 +58,9 @@ const HEADER_KEYS = ['schema', 'tool', 'mode', 'session_id', 'session_source', '
   'effective_test_globs', 'projects_summary', 'options', 'created_at', 'generated_by'];
 // Fields recomputed on every write; excluded from entry hashes.
 const DERIVED_KEYS = { checks: [], waivers: [], claims: ['status'] };
-/** Session ids from --session (the live runner and the hooks use the same shape). */
-export const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 
 // Repository a ledger belongs to: explicit, else the one containing the ledger, else the cwd's.
 const rootFor = (file, root) => root || repoRoot(path.dirname(file)) || requireRepo(process.cwd());
-const posixRef = (root, file) => {
-  const rel = root ? relPosix(root, file) : null;
-  return rel && rel !== '.' ? rel : toPosix(file);
-};
 
 // ---------------------------------------------------------------------------
 // Host identity
@@ -188,7 +186,7 @@ function normalizeFindings(list, checkId) {
 }
 
 function clampData(data) {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+  if (!isObj(data)) return {};
   let text;
   try { text = JSON.stringify(data); } catch { return { unserializable: true }; }
   if (text.length <= MAX_DATA_CHARS) return JSON.parse(text);
@@ -200,7 +198,7 @@ function clampData(data) {
  * a usage error on a bad id or status; script output with a bad status becomes `unverified`.
  */
 export function normalizeCheck(raw, { strict = false } = {}) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+  if (!isObj(raw)) {
     if (strict) throw usageError('each check must be a JSON object');
     return null;
   }
@@ -244,15 +242,11 @@ export function normalizeCheck(raw, { strict = false } = {}) {
 export function readLedgerFile(file) {
   const text = readText(file);
   if (text == null) throw usageError(`ledger not found: ${toPosix(file)}`);
-  let ledger;
-  try {
-    ledger = JSON.parse(text);
-  } catch {
-    throw unverifiable('LEDGER_INVALID', `ledger is not valid JSON: ${toPosix(file)}`);
-  }
-  if (ledger?.schema !== SCHEMA) throw unverifiable('LEDGER_INVALID', `not an ${SCHEMA} ledger: ${toPosix(file)}`);
+  const ledger = tryJson(text);
+  if (ledger == null) throw unverifiable('LEDGER_INVALID', `ledger is not valid JSON: ${toPosix(file)}`);
+  if (ledger.schema !== SCHEMA) throw unverifiable('LEDGER_INVALID', `not an ${SCHEMA} ledger: ${toPosix(file)}`);
   for (const k of ['checks', 'waivers', 'claims', 'observed_runs']) if (!Array.isArray(ledger[k])) ledger[k] = [];
-  if (!ledger.integrity || typeof ledger.integrity !== 'object') ledger.integrity = {};
+  if (!isObj(ledger.integrity)) ledger.integrity = {};
   return ledger;
 }
 
@@ -262,7 +256,7 @@ export const markdownPath = (file) => file.replace(/\.json$/, '.md');
 export const artifactsDir = (file) => file.replace(/\.json$/, '');
 
 /** `{ path, ledger }` for an explicit path, else the newest ledger; throws when there is none. */
-export function loadLedger(pathOrNull, stateInfo) {
+function loadLedger(pathOrNull, stateInfo) {
   const file = pathOrNull || listLedgers(stateInfo.dir)[0]?.file;
   if (!file) {
     throw new AdcError(EXIT.USAGE, 'NO_LEDGER', 'no evidence ledger found; run `verify` (or `evidence init`) first');
@@ -281,32 +275,15 @@ export function allocateLedgerPath(stateInfo, tree, { create = true } = {}) {
   }
 }
 
-function repoIdentity(root) {
-  const url = gitTry(root, ['config', '--get', 'remote.origin.url']);
-  if (url) return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1');
-  return path.basename(root);
-}
-
-/** Session identity (§10.3.2): --session > newest open hook session file > generated run id. */
-export function resolveSession(stateInfo, explicit) {
-  if (explicit) {
-    if (!SESSION_ID_RE.test(String(explicit))) throw usageError(`--session must match ${SESSION_ID_RE}`);
-    return { id: String(explicit), source: 'flag' };
-  }
-  const open = newestOpenSession(stateInfo.dir);
-  if (open) return { id: String(open.id), source: 'session-file', record: open.session };
-  return { id: `run-${stamp()}-${nonce().slice(0, 6)}`, source: 'generated' };
-}
-
 function budgetSnapshot(stateInfo, sessionId, identitySource) {
   const b = readJson(statePaths(stateInfo.dir).budget, null);
-  if (!b || typeof b !== 'object') return null;
-  const ses = b.sessions && typeof b.sessions === 'object' ? b.sessions[sessionId] : null;
-  const override = ses && ses.override && Number.isFinite(Number(ses.override.max)) ? ses.override : null;
+  if (!isObj(b)) return null;
+  const ses = isObj(b.sessions) ? b.sessions[sessionId] : null;
+  const override = Number.isFinite(Number(ses?.override?.max)) ? ses.override : null;
   const maxSession = override ? Number(override.max) : Number(b.max_per_session) || 0;
   const maxDay = Number(b.max_per_day) || 0;
   const spent = ses ? Number(ses.spent) || 0 : 0;
-  const day = b.days && b.days[today()] ? Number(b.days[today()].spent) || 0 : 0;
+  const day = Number(b.days?.[today()]?.spent) || 0;
   return {
     unit: String(b.unit || 'credits'), session_id: sessionId, identity_source: identitySource,
     max_per_session: maxSession, max_per_day: maxDay, spent, spent_today: day,
@@ -336,12 +313,13 @@ export async function initLedger({
   const redact = makeRedactor();
   const st = target.state;
   const ledgerFile = file || allocateLedgerPath(st, target.snapshot.tree, { create: !dryRun });
-  const session = sessionId && typeof sessionId === 'object' ? sessionId : resolveSession(st, sessionId);
+  const session = isObj(sessionId) ? sessionId : resolveSession(st.dir, sessionId);
   const ledger = {
     schema: SCHEMA, tool: tool || detectTool(), mode, session_id: session.id, session_source: session.source,
-    session_nonce: nonce(), repo: repoIdentity(target.root), base: target.base.sha, base_ref: target.base.ref,
-    base_source: target.base.source, tree_digest: target.snapshot.tree, snapshot_commit: target.snapshot.commit,
-    head: target.snapshot.head, spec: spec == null ? null : truncate(String(spec), 500),
+    session_nonce: nonce(), repo: originUrl(target.root) || path.basename(target.root), base: target.base.sha,
+    base_ref: target.base.ref, base_source: target.base.source, tree_digest: target.snapshot.tree,
+    snapshot_commit: target.snapshot.commit, head: target.snapshot.head,
+    spec: spec == null ? null : truncate(String(spec), 500),
     spec_sha256: specText == null ? null : sha256(String(specText)), spec_copy: null, spec_copy_sha256: null,
     effective_test_globs: [...new Set(toArray(effectiveTestGlobs).map(String))].slice(0, 100),
     projects_summary: projectsSummary == null ? null : truncate(String(projectsSummary), 500),
@@ -360,7 +338,7 @@ export async function initLedger({
     // The spec is copied once so waiver quotes are checked against what was verified.
     const copy = path.join(artifactsDir(ledgerFile), 'spec.txt');
     const content = redact(String(specText));
-    ledger.spec_copy = posixRef(target.root, copy);
+    ledger.spec_copy = displayPath(target.root, copy);
     ledger.spec_copy_sha256 = sha256(content);
     if (!dryRun) writeFileAtomic(copy, content);
   }
@@ -378,6 +356,10 @@ function writeLedger(file, ledger) {
 
 const finalizedError = () => new AdcError(EXIT.USAGE, 'LEDGER_FINALIZED',
   'the ledger is finalized and cannot change; run verify again');
+
+const staleError = (ledgerTree, currentTree, hint = '') => unverifiable('LEDGER_STALE', 'the working tree changed '
+  + `since this ledger was recorded (ledger ${String(ledgerTree).slice(0, 12)}, now ${currentTree.slice(0, 12)}); `
+  + `re-run verify${hint}`, { ledger_tree: ledgerTree, current_tree: currentTree });
 
 async function mutateLedger(file, fn, { dryRun = false } = {}) {
   const body = async () => {
@@ -397,11 +379,8 @@ function refreshDerived(ledger) {
   ledger.verdict = d.verdict;
   ledger.verdict_reasons = d.reasons;
   ledger.needs_human_triage = d.needs_human_triage;
-  for (const c of ledger.claims) {
-    const m = d.claims.find((x) => x.seq === c.seq);
-    if (m) c.status = m.status;
-  }
-  return d;
+  const status = new Map(d.claims.map((c) => [c.seq, c.status]));
+  for (const c of ledger.claims) if (status.has(c.seq)) c.status = status.get(c.seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -449,12 +428,12 @@ function traceEntry(ledger, raw, { root, file, dryRun }) {
   const jsonOut = path.join(dir, 'trace-completed.json');
   const mdOut = path.join(dir, 'trace-completed.md');
   if (!dryRun) {
-    writeJsonAtomic(jsonOut, { schema: 'adc-trace/1', tree_digest: ledger.tree_digest, ...ev });
+    writeJsonAtomic(jsonOut, { schema: TRACE_SCHEMA, tree_digest: ledger.tree_digest, ...ev });
     writeFileAtomic(mdOut, renderTraceMarkdown(ev));
   }
   return {
-    id: 'CK-TRACE', fm: ['FM-14', 'FM-11'], project: '.', status: ev.status, reason: ev.reason, summary: ev.summary,
-    findings: ev.findings, artifacts: [posixRef(root, jsonOut), posixRef(root, mdOut)],
+    id: 'CK-TRACE', project: '.', status: ev.status, reason: ev.reason, summary: ev.summary,
+    findings: ev.findings, artifacts: [displayPath(root, jsonOut), displayPath(root, mdOut)],
     data: {
       counts: ev.counts, extras: ev.extras.slice(0, 100),
       requirements: ev.requirements
@@ -556,7 +535,7 @@ function splitClaimText(text) {
       if (t.length >= 8 && t.length <= 500 && CLAIM_HINT.test(t)) out.push(t);
     }
   }
-  if (!out.length && String(text).trim()) out.push(truncate(String(text).trim().replace(/\s+/g, ' '), 300));
+  if (!out.length && String(text).trim()) out.push(truncate(oneLine(text), 300));
   return out;
 }
 
@@ -565,9 +544,8 @@ export function parseClaims(input) {
   let items;
   if (typeof input === 'string') {
     const t = input.trim();
-    if (t.startsWith('[') || t.startsWith('{')) {
-      try { return parseClaims(JSON.parse(t)); } catch {}
-    }
+    const doc = t.startsWith('[') || t.startsWith('{') ? tryJson(t) : null;
+    if (doc) return parseClaims(doc);
     items = splitClaimText(t);
   } else if (Array.isArray(input)) items = input;
   else if (isObj(input)) items = Array.isArray(input.claims) ? input.claims : [input];
@@ -585,7 +563,7 @@ export async function setClaims(file, claims, { dryRun = false } = {}) {
   const redact = makeRedactor();
   const parsed = parseClaims(claims);
   const { ledger, result } = await mutateLedger(file, (ledger) => {
-    const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+    const norm = (s) => oneLine(s.toLowerCase());
     const have = new Set(ledger.claims.map((c) => norm(c.text)));
     const added = [];
     for (const c of parsed) {
@@ -608,11 +586,11 @@ export async function setClaims(file, claims, { dryRun = false } = {}) {
 // ---------------------------------------------------------------------------
 // Waivers (§9.2): the only justification channel; quoted spec text, capped at PASS-WITH-FINDINGS
 
-const normQuote = (s) => String(s).toLowerCase().replace(/[`*_>#]/g, '').replace(/[‘’]/g, "'")
-  .replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
+const normQuote = (s) => oneLine(String(s).toLowerCase().replace(/[`*_>#]/g, '').replace(/[‘’]/g, "'")
+  .replace(/[“”]/g, '"'));
 
 /** Quoted segments ('...', "...", curly quotes) of at least 8 characters. */
-export function quotedSegments(reason) {
+function quotedSegments(reason) {
   const out = [];
   const re = /'([^']{8,})'|"([^"]{8,})"|“([^”]{8,})”|‘([^’]{8,})’/g;
   let m;
@@ -737,7 +715,8 @@ export function deriveVerdict(ledger) {
   let triage = false;
   for (const entries of groups.values()) {
     // Worst status wins, so a later "pass" can never upgrade a recorded failure or UNVERIFIED.
-    const worst = entries.reduce((a, b) => ((RANK[b.status] ?? 4) > (RANK[a.status] ?? 4) ? b : a));
+    const rank = (c) => STATUS_RANK[c.status] ?? STATUS_RANK.unverified;
+    const worst = entries.reduce((a, b) => (rank(b) > rank(a) ? b : a));
     const row = {
       id: worst.id, project: worst.project || '.', status: worst.status, effective: worst.status,
       reason: worst.reason || null, summary: worst.summary || '', waived: false, notes: [], entries,
@@ -828,6 +807,9 @@ export function deriveVerdict(ledger) {
   return { verdict, reasons, needs_human_triage: triage, effective: rows, claims };
 }
 
+/** Derived claims without their ledger sequence numbers (for output). */
+export const claimsView = (derived) => derived.claims.map(({ seq, ...c }) => c);
+
 /** Exit code for a verdict: 1 on FAIL, 4 on UNVERIFIED, else 0. */
 export function verdictExit(verdict) {
   if (verdict === 'FAIL') return EXIT.FINDINGS;
@@ -860,11 +842,7 @@ export async function finalizeLedger(file, { target, dryRun = false } = {}) {
       throw unverifiable('LEDGER_TAMPERED', `ledger integrity check failed (${integ.problems.length} problem(s), `
         + `first: ${integ.problems[0].detail}); re-run verify`, { problems: integ.problems.slice(0, 20) });
     }
-    if (target.snapshot.tree !== ledger.tree_digest) {
-      throw unverifiable('LEDGER_STALE', 'the working tree changed since this ledger was recorded (ledger '
-        + `${String(ledger.tree_digest).slice(0, 12)}, now ${target.snapshot.tree.slice(0, 12)}); re-run verify`,
-      { ledger_tree: ledger.tree_digest, current_tree: target.snapshot.tree });
-    }
+    if (target.snapshot.tree !== ledger.tree_digest) throw staleError(ledger.tree_digest, target.snapshot.tree);
     const d = deriveVerdict(ledger);
     const claimsRow = d.effective.find((r) => r.id === 'CK-CLAIMS');
     const entry = normalizeCheck({
@@ -898,12 +876,12 @@ export function ledgerStatus({ target, ledgerPath = null }) {
   const integrity = verifyIntegrity(ledger, { root: target.root });
   const d = deriveVerdict(ledger);
   return {
-    ledger: posixRef(target.root, file), verdict: d.verdict, stored_verdict: ledger.verdict,
+    ledger: displayPath(target.root, file), verdict: d.verdict, stored_verdict: ledger.verdict,
     finalized: Boolean(ledger.finalized_at), created_at: ledger.created_at, finalized_at: ledger.finalized_at,
     tree_digest: ledger.tree_digest, current_tree: target.snapshot.tree,
     stale: target.snapshot.tree !== ledger.tree_digest, integrity, needs_human_triage: d.needs_human_triage,
     pending: ledger.checks.filter((c) => c.pending && !superseded(c, ledger.checks)).map((c) => c.id),
-    checks: checkRows(d), claims: d.claims.map(({ seq, ...c }) => c),
+    checks: checkRows(d), claims: claimsView(d),
   };
 }
 
@@ -1038,7 +1016,7 @@ export function renderMarkdown(input, { short = false } = {}) {
 const question = (kind, dimension, passIf, text) => ({ kind, dimension, pass_if: passIf, question: text });
 
 /** Built-in yes/no questions with their passing answer. Custom questions must give pass_if. */
-export const QUESTIONS = Object.freeze({
+const QUESTIONS = Object.freeze({
   'AT-NO-ASSERT': question('audit-tests', 'structure', 'no', 'Does any changed test lack an assertion?'),
   'AT-MIRROR': question('audit-tests', 'structure', 'no',
     'Do assertions mirror the implementation (expected values computed by the code under test)?'),
@@ -1078,6 +1056,7 @@ function normAnswer(v) {
   return null;
 }
 
+const OUTCOME_KEY = { pass: 'passed', fail: 'failed', unknown: 'unknown', rejected: 'rejected' };
 const citationsOf = (x) => [...toArray(x.citation), ...toArray(x.citations)].map(String);
 
 // File and line of the first well-formed citation (findings point there).
@@ -1103,7 +1082,6 @@ export function scoreAnswers(input, { root = null, tree = null } = {}) {
   const answers = [];
   const dims = {};
   const kinds = new Set();
-  const OUTCOME_KEY = { pass: 'passed', fail: 'failed', unknown: 'unknown', rejected: 'rejected' };
   for (const raw of doc.answers.slice(0, 500)) {
     if (!isObj(raw)) continue;
     const id = raw.id ? String(raw.id) : null;
@@ -1220,7 +1198,7 @@ async function runRecorded({ root, file, id, command, repro, project, summary, t
   // Async with a process-group kill on timeout: a child that outlives its shell cannot hang the CLI.
   const res = await spawnCapture(command, [], { shell: true, cwd, env: recordedEnv(), timeoutMs: timeoutS * 1000 });
   const output = [res.stdout, res.stderr].filter(Boolean).join('\n');
-  const log = path.join(artifactsDir(file), `run-${stamp()}-${nonce().slice(0, 6)}.log`);
+  const log = path.join(artifactsDir(file), `${runId('run')}.log`);
   writeFileAtomic(log, makeRedactor()(output));
   const notFound = NOT_FOUND_EXITS.has(res.exit)
     || (IS_WINDOWS && /is not recognized as an internal or external command/i.test(res.stderr));
@@ -1240,7 +1218,7 @@ async function runRecorded({ root, file, id, command, repro, project, summary, t
     : `command exited ${res.exit}`);
   return {
     ...base, status, reason, exit_code: res.exit, duration_ms: res.ms, summary: text, output_sha256: sha256(output),
-    artifacts: [posixRef(root, log)],
+    artifacts: [displayPath(root, log)],
     data: { repro, confirmed, signal: res.signal, ...(res.truncated ? { output_truncated: true } : {}) },
   };
 }
@@ -1268,12 +1246,9 @@ function openCurrent(ctx, values, { refuseStale = true } = {}) {
   const { root, state } = openRepoState(ctx);
   const found = loadLedger(ledgerArg(ctx, values), state);
   const target = currentTarget({ root, state });
-  const { snapshot } = target;
-  if (refuseStale && snapshot.tree !== found.ledger.tree_digest) {
-    throw unverifiable('LEDGER_STALE', 'the working tree changed since this ledger was recorded (ledger '
-      + `${String(found.ledger.tree_digest).slice(0, 12)}, now ${snapshot.tree.slice(0, 12)}); re-run verify. Keep `
-      + 'scratch files (answers, matrices) outside the repository or under .adc/',
-    { ledger_tree: found.ledger.tree_digest, current_tree: snapshot.tree });
+  if (refuseStale && target.snapshot.tree !== found.ledger.tree_digest) {
+    throw staleError(found.ledger.tree_digest, target.snapshot.tree,
+      '. Keep scratch files (answers, matrices) outside the repository or under .adc/');
   }
   return { root, state, target, ...found };
 }
@@ -1281,7 +1256,6 @@ function openCurrent(ctx, values, { refuseStale = true } = {}) {
 const ledgerArg = (ctx, values) => (values.ledger ? path.resolve(ctx.cwd, values.ledger) : null);
 const LEDGER_OPT = { ledger: { type: 'string' } };
 const adcCmd = () => `node "${toPosix(ADC_SCRIPT)}"`;
-const claimsView = (d) => d.claims.map(({ seq, ...c }) => c);
 
 const initCmd = defineCommand({
   name: 'evidence init',
@@ -1299,7 +1273,7 @@ const initCmd = defineCommand({
       target, tool, spec: spec ? spec.ref : null, specText: spec ? spec.text : null, sessionId: values.session || null,
       mode: 'manual', dryRun: ctx.dryRun,
     });
-    const ref = posixRef(target.root, file);
+    const ref = displayPath(target.root, file);
     return {
       result: {
         ledger: ref, dry_run: ctx.dryRun, tree_digest: ledger.tree_digest, session_id: ledger.session_id,
@@ -1349,7 +1323,7 @@ const addCmd = defineCommand({
     const added = res.added
       .map(({ id, project, status, reason, summary, seq }) => ({ id, project, status, reason, summary, seq }));
     return {
-      result: { ledger: posixRef(root, file), dry_run: ctx.dryRun, added, verdict: d.verdict, checks: checkRows(d) },
+      result: { ledger: displayPath(root, file), dry_run: ctx.dryRun, added, verdict: d.verdict, checks: checkRows(d) },
       exit: EXIT.OK, summary: `added ${res.added.length} check(s); verdict now ${d.verdict}`,
     };
   },
@@ -1369,7 +1343,7 @@ const claimsCmd = defineCommand({
     const supported = d.claims.filter((c) => c.status === 'supported').length;
     return {
       result: {
-        ledger: posixRef(root, file), dry_run: ctx.dryRun, added: res.added.length, claims: claimsView(d),
+        ledger: displayPath(root, file), dry_run: ctx.dryRun, added: res.added.length, claims: claimsView(d),
         verdict: d.verdict,
       },
       exit: EXIT.OK, summary: `${res.added.length} claim(s) recorded; ${supported}/${d.claims.length} supported`,
@@ -1390,7 +1364,7 @@ const waiveCmd = defineCommand({
     const d = deriveVerdict(res.ledger);
     const w = res.waiver;
     return {
-      result: { ledger: posixRef(root, file), dry_run: ctx.dryRun, waiver: w, verdict: d.verdict },
+      result: { ledger: displayPath(root, file), dry_run: ctx.dryRun, waiver: w, verdict: d.verdict },
       exit: EXIT.OK, summary: `waived ${w.check}${w.file ? ` (${w.file})` : ''}; verdict now ${d.verdict}`,
     };
   },
@@ -1406,10 +1380,10 @@ const finalizeCmd = defineCommand({
     const { target, path: file } = openCurrent(ctx, values, { refuseStale: false });
     const res = await finalizeLedger(file, { target, dryRun: ctx.dryRun });
     const d = deriveVerdict(res.ledger);
-    const ref = posixRef(target.root, file);
+    const ref = displayPath(target.root, file);
     return {
       result: {
-        ledger: ref, markdown: posixRef(target.root, markdownPath(file)), dry_run: ctx.dryRun, verdict: d.verdict,
+        ledger: ref, markdown: displayPath(target.root, markdownPath(file)), dry_run: ctx.dryRun, verdict: d.verdict,
         needs_human_triage: d.needs_human_triage, reasons: d.reasons, checks: checkRows(d), claims: claimsView(d),
       },
       exit: verdictExit(d.verdict), summary: `${d.verdict}${ctx.dryRun ? ' (dry run, not sealed)' : ''}; ledger ${ref}`,
@@ -1488,7 +1462,7 @@ const scoreCmd = defineCommand({
     }
     return {
       result: {
-        ...scored, ledger: found ? posixRef(root, found.path) : null, citations_checked_against: tree, added,
+        ...scored, ledger: found ? displayPath(root, found.path) : null, citations_checked_against: tree, added,
         dry_run: ctx.dryRun,
       },
       exit: scored.verdict === 'fail' ? EXIT.FINDINGS : EXIT.OK, summary: scored.check.summary,

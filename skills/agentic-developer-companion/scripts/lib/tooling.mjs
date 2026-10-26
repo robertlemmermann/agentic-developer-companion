@@ -1,28 +1,29 @@
-// `tooling` command group (§11): lint (tooling-lint.mjs), cost, port (tooling-port.mjs), trigger-set,
-// modify, plugin and scaffold. Instructions, skills, agents, hooks, plugins and MCP configs are treated
-// as software: known-good templates, measured context cost, headless trigger evals and a
-// baseline/compare loop for every change.
+// `tooling` command group (§11): lint (tooling-lint.mjs), cost, port (tooling-port.mjs), trigger-set, modify,
+// plugin and scaffold. Agent tooling is treated as software: templates, measured context cost, headless trigger
+// evals and a baseline/compare loop for every change.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  defineCommand, defineGroup, makeContext, usageError, envError, EXIT, readText, readJson, writeFileAtomic,
-  writeJsonAtomic, ensureDir, toPosix, relPosix, sha256, nowIso, today, nonce, which, run, runTool, spawnCapture,
-  quoteArg, quoteFor, loadBundle, selectSections, renderString, parseBundle, generatedBy, listFiles, truncate,
-  numberOption, realPath, hostHomes, lastLine, makeTempDir, isDir, statOrNull, uniq, parseJsonl, IS_WINDOWS, SKILL_DIR,
-  ADC_SCRIPT, ASSETS_DIR,
+  defineCommand, defineGroup, makeContext, usageError, envError, EXIT, readText, readJson, readJsonFile, tryJson,
+  writeFileAtomic, writeJsonAtomic, ensureDir, toPosix, relPosix, displayPath, isWithin, sha256, nowIso, today, nonce,
+  which, run, runTool, spawnCapture, quoteArg, quoteFor, loadBundle, selectSections, renderString, parseBundle,
+  generatedBy, listFiles, listDir, truncate, numberOption, realPath, hostHomes, lastLine, oneLine, makeTempDir, isDir,
+  statOrNull, uniq, joinRel, parseJsonl, IS_WINDOWS, SKILL_DIR, ADC_SCRIPT, ASSETS_DIR,
 } from './core.mjs';
-import { repoRoot, gitRaw, gitTry, statusPorcelain } from './git.mjs';
+import { repoRoot, gitTry, headSha, originUrl, ignoredPaths, statusPorcelain } from './git.mjs';
 import { LOCKFILE_MANAGERS, makeRedactor } from './markers.mjs';
-import { prepareStateDir, statePaths, appendMetrics, writeOutputs, backupDirFactory } from './state.mjs';
+import {
+  resolveStateDir, assertStateUntracked, prepareStateDir, statePaths, appendMetrics, writeOutputs, backupDirFactory,
+} from './state.mjs';
 import { parseFrontmatter, stringifyFrontmatter, markdownLines } from './frontmatter.mjs';
 import { detect } from './detect.mjs';
-import { lintPaths, lintCommand } from './tooling-lint.mjs';
+import { lintPaths, lintCommand, apPluginName, reservedPluginName } from './tooling-lint.mjs';
 import {
   HOSTS, SKILL_DIRS, CODEX_ONLY_SKILLS_DIR, COPY_IGNORE, classifyArtifact, skillNameProblems, toSkillName,
   inlineImports, parseHookConfig, renderHookConfig, mergeHooks, parseMcpConfig, renderMcpConfig, mergeMcp, mergeToml,
   cloudAgentMcp, parseAgent, renderAgent, renderOpenAiYaml, shortDescription, firstSentence, portCommand, migrate,
-  migrationSources, MIGRATIONS, json, SCRIPT_EXT,
+  migrationSources, MIGRATIONS, json, asList, secureUrl, apSchema, projectSkills, SCRIPT_EXT,
 } from './tooling-port.mjs';
 
 const CHARS_PER_TOKEN = 4;
@@ -34,35 +35,50 @@ const PAID_NOTE = 'paid: every run is a real model call billed to your account';
 const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 /** ceil(chars / 4): the usual English-text heuristic (roughly +-25%). */
-export const estimateTokens = (chars) => Math.ceil(Math.max(0, chars) / CHARS_PER_TOKEN);
+const estimateTokens = (chars) => Math.ceil(Math.max(0, chars) / CHARS_PER_TOKEN);
 
-// Resolved paths throughout: git reports the real root, while the cwd may pass through a symlink
-// (macOS /var -> /private/var), and every user path would otherwise look outside the repository.
-const rootOf = (ctx) => realPath(repoRoot(ctx.cwd) || ctx.cwd);
+// The git root found for a command context: the state-dir checks reuse it instead of asking git again.
+const gitRoots = new WeakMap();
+/**
+ * The repository root, or the cwd outside git. Resolved: the cwd may pass through a symlink (macOS /var ->
+ * /private/var) that git resolves, and every user path would otherwise look outside the repository.
+ */
+function rootOf(ctx) {
+  const git = repoRoot(ctx.cwd);
+  const root = realPath(git || ctx.cwd);
+  gitRoots.set(ctx, { root, git: Boolean(git) });
+  return root;
+}
+/** `root` when git found it, null when git found none, undefined when this root was not looked up here. */
+const knownRoot = (ctx, root) => {
+  const k = gitRoots.get(ctx);
+  return k?.root === root ? (k.git ? root : null) : undefined;
+};
 const userPath = (ctx, p) => realPath(path.resolve(ctx.cwd, p));
-/** Every command refuses (exit 3) while `.adc/` is tracked; this checks without creating it. */
-const checkState = (ctx, root) => prepareStateDir({ ...ctx, cwd: root }, { create: false });
-const openState = (ctx, root) => prepareStateDir({ ...ctx, cwd: root }, { create: true });
+/** Every command refuses (exit 3) while `.adc/` is tracked; this checks without creating anything. */
+function checkState(ctx, root) {
+  const info = resolveStateDir({ cwd: root, stateDirOption: ctx.stateDirOption, root: knownRoot(ctx, root) });
+  assertStateUntracked(info);
+  return info;
+}
+const openState = (ctx, root) => prepareStateDir({ ...ctx, cwd: root }, { create: true, root: knownRoot(ctx, root) });
 const backups = (ctx, root) => backupDirFactory(ctx, root, 'tooling', 'backups');
 const absOf = (root, rel) => path.join(root, ...rel.split('/'));
 const exists = (root, rel) => fs.existsSync(absOf(root, rel));
-const relOf = (root, abs) => relPosix(root, abs) ?? toPosix(abs);
-const listOpt = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : null);
+/** A comma-separated option as a list, or null when it is not given. */
+const listOpt = (v) => (v ? asList(v) : null);
 // Sortable unique id: UTC time to the millisecond (core.stamp stops at the second), so baselines made
 // in the same second keep their order.
 const tsId = () => `${new Date().toISOString().replace(/[-:.]/g, '')}-${nonce().slice(0, 6)}`;
 const artifactSlug = (rel) => toPosix(rel).replace(/\/SKILL\.md$/, '').replace(/[^A-Za-z0-9._-]+/g, '__')
   .replace(/^_+|_+$/g, '')
   .slice(0, 120) || 'root';
-const insideSkill = (abs) => {
-  const r = path.relative(realPath(SKILL_DIR), realPath(abs));
-  return !r.startsWith('..') && !path.isAbsolute(r);
-};
+const insideSkill = (abs) => isWithin(realPath(SKILL_DIR), realPath(abs));
 
 function parseHosts(value, { allowAll = true } = {}) {
   const v = String(value || 'all').trim();
   if (v === 'all' && allowAll) return [...HOSTS];
-  const list = uniq(v.split(',').map((s) => s.trim()).filter(Boolean));
+  const list = uniq(asList(v));
   for (const h of list) if (!HOSTS.includes(h)) throw usageError(`host must be copilot, claude, `
     + `codex${allowAll ? ' or all' : ''} (got "${h}")`);
   return list;
@@ -72,15 +88,16 @@ function parseHosts(value, { allowAll = true } = {}) {
 // Discovery and context cost (§11.3)
 
 /** Tooling files under `root` (or under the given paths): `[{ path, abs, kind, host, hosts, ... }]`. */
-export function discoverTooling(root, { paths = null } = {}) {
+function discoverTooling(root, { paths = null } = {}) {
   const rels = new Set();
   const addTree = (abs) => {
-    for (const f of listFiles(abs, { ignore: WALK_IGNORE, maxFiles: 20_000 })) rels.add(relOf(root, path.join(abs, f)));
+    const base = displayPath(root, abs);
+    for (const f of listFiles(abs, { ignore: WALK_IGNORE, maxFiles: 20_000 })) rels.add(joinRel(base, f));
   };
   for (const p of paths || []) {
     const abs = path.resolve(root, p);
     if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(p)}`);
-    if (isDir(abs)) addTree(abs); else rels.add(relOf(root, abs));
+    if (isDir(abs)) addTree(abs); else rels.add(displayPath(root, abs));
   }
   if (!paths?.length) {
     for (const d of TOOLING_DIRS) if (isDir(path.join(root, d))) addTree(path.join(root, d));
@@ -96,7 +113,6 @@ export function discoverTooling(root, { paths = null } = {}) {
 
 const stripHtmlComments = (t) => t.replace(/<!--[\s\S]*?-->/g, '');
 const lineCount = (t) => (t ? t.split('\n').length - (t.endsWith('\n') ? 1 : 0) : 0);
-const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const hostTokens = (h, text) => estimateTokens((h === 'claude' ? stripHtmlComments(text) : text).length);
 
 /** The listing line a host shows for a skill, agent or command (Claude adds when_to_use, capped at 1,536). */
@@ -176,7 +192,7 @@ export function toolingCost({
     if (e.load !== 'always' || !['instructions', 'scoped'].includes(e.kind)) continue;
     const { abs, text } = src.get(e.path);
     for (const imp of uniq(inlineImports(text, abs).files)) {
-      const rel = relOf(root, imp);
+      const rel = displayPath(root, imp);
       let t = byPath.get(rel);
       if (!t) {
         t = entry(rel, imp, 'import', readText(imp, ''), { load: 'always', imported_by: [] });
@@ -273,8 +289,7 @@ export function toolingCost({
 /** Rule-like lines (30+ characters, list markers and emphasis removed) outside code and headings. */
 function ruleLines(text) {
   return markdownLines(text).filter((l) => !l.code && !/^\s*(#|<!--)/.test(l.raw)).map((l) => ({ line: l.n,
-    text: l.raw.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim()
-      .toLowerCase(),
+    text: oneLine(l.raw.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/[*_`]/g, '')).toLowerCase(),
   }))
     .filter((l) => l.text.length >= 30);
 }
@@ -378,8 +393,7 @@ function staleReferences(root, files, src) {
   // `../` paths are outside the repository (git would refuse the whole batch); they stay stale.
   const ask = unseen.filter((u) => !u.p.startsWith('../')).map((u) => u.p);
   if (!ask.length) return findings;
-  const r = gitRaw(root, ['check-ignore', '--no-index', '--stdin'], { input: `${uniq(ask).join('\n')}\n` });
-  const ignored = new Set(r.exit === 0 ? r.stdout.split(/\r?\n/) : []);
+  const ignored = ignoredPaths(root, ask, { noIndex: true });
   const drop = new Set(unseen.filter((u) => ignored.has(u.p)).map((u) => u.finding));
   return findings.filter((x) => !drop.has(x));
 }
@@ -454,6 +468,27 @@ function projectName(root) {
 
 const DEFAULT_DESCRIPTION = 'Describe in one sentence what this does. Use when (the requests and phrases that should '
   + 'trigger it). Not for (near-miss tasks it must not handle).';
+/** SKILL.md metadata of a new skill (Codex lists the short description). */
+const skillMeta = (description) => {
+  const sd = shortDescription(description);
+  return { version: '0.1.0', ...(sd && { 'short-description': sd }) };
+};
+
+/** Write (or, without --write, plan) scaffold outputs; notes on skipped files and the dry run lead the next steps. */
+function writeScaffold(ctx, root, outRoot, values, outputs) {
+  const write = Boolean(values.write) && !ctx.dryRun;
+  const applied = writeOutputs(outputs, { root: outRoot, dryRun: !write, force: Boolean(values.force),
+    mergeNeedsForce: true, backupDir: backups(ctx, root) });
+  const notes = [];
+  if (applied.skipped.length) {
+    const how = applied.skipped.some((s) => s.planned === 'merge') ? 'merge or overwrite' : 'overwrite';
+    notes.push(`${applied.skipped.length} file(s) exist and were left alone; pass --force to ${how} them (a backup `
+      + 'goes to .adc/tooling/backups/).');
+  }
+  const n = applied.written.length;
+  if (!write) notes.push(`Dry run: nothing was written; re-run with --write to create ${n} file(s).`);
+  return { write, applied, notes };
+}
 
 function renderSections(kind, host, vars, fm = () => '') {
   return selectSections(loadBundle('tooling'), { kind, host })
@@ -558,10 +593,8 @@ async function buildScaffold(kind, hosts, values, root) {
     for (const h of hosts) {
       if (h === 'codex') {
         const dir = `${CODEX_ONLY_SKILLS_DIR}/${name}`;
-        const meta = { version: '0.1.0',
-          ...(shortDescription(description) ? { 'short-description': shortDescription(description) } : {}) };
         add(renderSections('agent', 'codex', { ...vars, skill_dir: dir },
-          () => stringifyFrontmatter({ name, description, metadata: meta }).trimEnd()), h);
+          () => stringifyFrontmatter({ name, description, metadata: skillMeta(description) }).trimEnd()), h);
         outputs.push({ path: `${dir}/agents/openai.yaml`, content: renderOpenAiYaml({ name, description }), host: h });
         manual.push(`Codex has no custom agent files: ${name} is the skill ${dir} (invoke it as $${name}). The `
           + `.codex/agents/<name>.toml role format is unverified and was not generated.`);
@@ -570,7 +603,9 @@ async function buildScaffold(kind, hosts, values, root) {
       // Least privilege by default; shared conventions are preloaded as skills, not repeated in the body.
       const data = { name, description, tools: h === 'copilot' ? ['read', 'search'] : 'Read, Grep, Glob',
         ...(preload.length ? { skills: preload } : {}) };
-      add(renderSections('agent', h, { ...vars, agent_file: name },
+      const [agentPath, input] = h === 'copilot' ? [`.github/agents/${name}.agent.md`, "The user's request"]
+        : [`.claude/agents/${name}.md`, 'The delegation message'];
+      add(renderSections('agent', h, { ...vars, agent_path: agentPath, agent_input: input },
         () => stringifyFrontmatter(data, { flowKeys: ['tools', 'skills'] }).trimEnd()), h);
     }
     next.push('Keep the tool list least-privilege; add edit or execute tools only when the agent must change files or '
@@ -578,12 +613,10 @@ async function buildScaffold(kind, hosts, values, root) {
   } else if (kind === 'skill' || kind === 'prompt') {
     const name = validName(values.name || `my-${kind === 'prompt' ? 'command' : 'skill'}`, kind);
     Object.assign(vars, { name, description, summary: firstSentence(description), prompt_frontmatter: '' });
-    const meta = { version: '0.1.0',
-      ...(shortDescription(description) ? { 'short-description': shortDescription(description) } : {}) };
     const dirs = skillDirsFor(hosts, name, values['skill-root'] || null);
     for (const d of dirs) {
       const data = { name, description, ...(values.license ? { license: String(values.license) } : {}),
-        metadata: meta };
+        metadata: skillMeta(description) };
       if (kind === 'prompt' && !(d.hosts.length === 1 && d.hosts[0] === 'codex')) {
         data['disable-model-invocation'] = true;
       }
@@ -650,7 +683,7 @@ async function buildScaffold(kind, hosts, values, root) {
   } else if (kind === 'mcp') {
     const name = toSkillName(values.server || 'example');
     const url = values.url ? String(values.url) : null;
-    if (url && !/^https:\/\//i.test(url) && !/^http:\/\/(localhost|127\.|\[::1\])/i.test(url)) {
+    if (url && !secureUrl(url)) {
       throw usageError('--url must use https (http only for localhost)');
     }
     const vars2 = listOpt(values.env) || [];
@@ -700,22 +733,11 @@ export async function scaffoldTooling(kind, opts = {}) {
   const hosts = parseHosts(values.for || values.host || 'all');
   const outRoot = values.out ? userPath(ctx, values.out) : root;
   if (insideSkill(outRoot)) throw usageError('refusing to scaffold into the companion skill itself');
-  const write = Boolean(values.write) && !ctx.dryRun;
   const built = await buildScaffold(kind, hosts, values, root);
-  const applied = writeOutputs(built.outputs,
-    { root: outRoot, dryRun: !write, force: Boolean(values.force), mergeNeedsForce: true,
-    backupDir: backups(ctx, root) });
-  const next = [...built.next_steps];
-  if (!write) next.unshift(
-    `Dry run: nothing was written. Re-run with --write to create ${applied.written.length} file(s).`);
-  if (applied.skipped.length) {
-    const how = applied.skipped.some((s) => s.planned === 'merge') ? 'merge or overwrite' : 'overwrite';
-    next.unshift(`${applied.skipped.length} file(s) exist and were left alone; pass --force to ${how} them (a backup `
-      + `goes to .adc/tooling/backups/).`);
-  }
+  const { write, applied, notes } = writeScaffold(ctx, root, outRoot, values, built.outputs);
   return { kind, hosts, out: toPosix(path.relative(root, outRoot) || '.'), dry_run: !write, written: applied.written,
-    skipped: applied.skipped,
-    backups: applied.backups, next_steps: next, manual_steps: built.manual_steps };
+    skipped: applied.skipped, backups: applied.backups, next_steps: [...notes, ...built.next_steps],
+    manual_steps: built.manual_steps };
 }
 
 const scaffoldCommand = defineCommand({
@@ -760,8 +782,7 @@ export function assignSplit(queries) {
 /** Load and validate a trigger set (`adc-trigger-set/1` or skill-creator's `[{query, should_trigger}]`). */
 export function loadTriggerSet(file) {
   const text = readText(file);
-  let doc = null;
-  try { doc = text == null ? null : JSON.parse(text); } catch { /* reported below */ }
+  const doc = tryJson(text);
   if (doc == null) throw usageError(`trigger set not found or not valid JSON: ${toPosix(file)}`);
   const list = Array.isArray(doc) ? doc : doc.queries;
   if (!Array.isArray(list)) throw usageError(`${toPosix(file)}: expected a "queries" array`);
@@ -792,10 +813,10 @@ function skillInfo(root, cwd, p) {
   const abs = realPath(path.resolve(cwd, p || '.'));
   const dir = isDir(abs) ? abs : path.dirname(abs);
   const text = readText(path.join(dir, 'SKILL.md'));
-  if (text == null) throw usageError(`no SKILL.md in ${relOf(root, dir)}; pass a skill directory`);
+  if (text == null) throw usageError(`no SKILL.md in ${displayPath(root, dir)}; pass a skill directory`);
   const d = parseFrontmatter(text).data;
   const name = String(d.name ?? path.basename(dir));
-  return { dir, rel: relOf(root, dir), name,
+  return { dir, rel: displayPath(root, dir), name,
     description_sha256: sha256(`${name}\n${d.description ?? ''}\n${d.when_to_use ?? ''}`) };
 }
 
@@ -1020,12 +1041,7 @@ function triggerCommands(skillRel, setRel) {
 /** The newest trigger result of a skill (by measurement time), optionally for one host and description. */
 function latestResults(stateDir, slug, { host = null, descriptionSha = null } = {}) {
   const dir = path.join(statePaths(stateDir).tooling, slug);
-  let files = [];
-  try {
-    files = fs.readdirSync(dir).filter((f) => /^trigger-[a-z]+-.*\.json$/.test(f));
-  } catch {
-    return { latest: null, count: 0 };
-  }
+  const files = listDir(dir).filter((f) => /^trigger-[a-z]+-.*\.json$/.test(f));
   const mine = files.map((f) => ({ file: path.join(dir, f), doc: readJson(path.join(dir, f)) }))
     .filter((x) => x.doc && (!host || x.doc.host === host))
     .sort((a, b) => String(a.doc.measured_at || '')
@@ -1045,7 +1061,7 @@ export async function triggerSet({
 } = {}) {
   const skill = skillInfo(root, ctx.cwd, skillPath);
   const setAbs = setPath ? userPath(ctx, setPath) : path.join(skill.dir, 'evals', 'trigger-set.json');
-  const setRel = relOf(root, setAbs);
+  const setRel = displayPath(root, setAbs);
   const out = { skill: skill.name, skill_dir: skill.rel, set_path: setRel,
     description_sha256: skill.description_sha256, host: host || null };
   if (init) out.init = writeOutputs([{ path: setRel, content: triggerSetTemplate(skill.name), host: 'eval' }],
@@ -1120,7 +1136,7 @@ export async function triggerSet({
   if (state) {
     const file = path.join(statePaths(state.dir).tooling, artifactSlug(skill.rel), `trigger-${host}-${tsId()}.json`);
     writeJsonAtomic(file, out);
-    out.results_path = relOf(root, file);
+    out.results_path = displayPath(root, file);
     appendMetrics(state.dir,
       { kind: 'tooling-trigger-set', skill: skill.name, host, suite_score: out.suite_score, sd: out.sd,
       cost_usd: out.cost_usd ?? null,
@@ -1176,7 +1192,7 @@ async function lintArtifact(root, absPaths, { strict = false } = {}) {
     const row = (file, host, e) => {
       const message = String(e?.message ?? e);
       const rule = e?.rule || e?.id || null;
-      return { file: relOf(root, path.resolve(root, String(file ?? ''))), host, rule, message,
+      return { file: displayPath(root, path.resolve(root, String(file ?? ''))), host, rule, message,
         key: `${host}|${rule}|${message.replace(/\d+/g, '#')}` };
     };
     const errors = [];
@@ -1239,9 +1255,10 @@ function scrubPaths(text, root) {
 /** The first JSON value in CLI output that may carry warning lines around it. */
 function firstJson(text) {
   const s = String(text || '').trim();
-  try { return JSON.parse(s); } catch { /* look for the first line that starts JSON */ }
+  const whole = tryJson(s);
+  if (whole != null) return whole;
   const k = s.search(/^[[{]/m);
-  try { return k < 0 ? null : JSON.parse(s.slice(k)); } catch { return null; }
+  return k > 0 ? tryJson(s.slice(k)) : null;
 }
 
 /**
@@ -1296,7 +1313,7 @@ function readOutcome(file) {
 }
 
 /** All measurements of one artifact (§11.6 steps 1 and 3). */
-export async function measureArtifact({
+async function measureArtifact({
   ctx, root, rel, state, strict = false, outcomeResults = null, external = false, triggerHost = null,
   runTriggers = false, triggerOpts = {},
 }) {
@@ -1332,7 +1349,7 @@ export async function measureArtifact({
       const found = latestResults(state.dir, artifactSlug(skill.rel),
         { host: triggerHost, descriptionSha: sha }).latest;
       if (found) m.trigger = { status: 'measured', host: found.doc.host, suite_score: found.doc.suite_score,
-        sd: found.doc.sd ?? 0, results_path: relOf(root, found.file), description_sha256: sha };
+        sd: found.doc.sd ?? 0, results_path: displayPath(root, found.file), description_sha256: sha };
     }
   }
   // The context is stored and its diff printed: a literal credential (an MCP env value) never is.
@@ -1346,12 +1363,7 @@ const baselineRoot = (stateDir, rel) => path.join(statePaths(stateDir).tooling, 
 
 function latestBaseline(stateDir, rel) {
   const dir = baselineRoot(stateDir, rel);
-  let names = [];
-  try {
-    names = fs.readdirSync(dir).filter((n) => fs.existsSync(path.join(dir, n, 'baseline.json'))).sort();
-  } catch {
-    return null;
-  }
+  const names = listDir(dir).filter((n) => fs.existsSync(path.join(dir, n, 'baseline.json'))).sort();
   if (!names.length) return null;
   const d = path.join(dir, names.at(-1));
   const doc = readJson(path.join(d, 'baseline.json'));
@@ -1520,9 +1532,9 @@ function bumpVersion(root, rel, cls, kind) {
       lines[i] = `${m[1]}"${to}"${m[4]}${lines[i].endsWith('\r') ? '\r' : ''}`;
       writeFileAtomic(file, lines.join('\n'));
     }
-    return { file: relOf(root, file), from: m[3], to, ...(to ? {} : { reason: 'not semantic versioning' }) };
+    return { file: displayPath(root, file), from: m[3], to, ...(to ? {} : { reason: 'not semantic versioning' }) };
   }
-  return { file: relOf(root, file), from: null, to: null, reason: 'no metadata.version to bump; add one' };
+  return { file: displayPath(root, file), from: null, to: null, reason: 'no metadata.version to bump; add one' };
 }
 
 function resolveArtifactRel(root, cwd, p) {
@@ -1570,7 +1582,7 @@ function migrationEquivalence(kind, root, srcTexts, target) {
 async function migrateRun(ctx, root, values, p, common) {
   const kind = values.migrate;
   if (!MIGRATIONS[kind]) throw usageError(`--migrate must be one of ${Object.keys(MIGRATIONS).join(', ')}`);
-  const state = openState(ctx, root);
+  const state = ctx.dryRun ? checkState(ctx, root) : openState(ctx, root);
   const srcAbs = absOf(root, resolveArtifactRel(root, ctx.cwd, p));
   const sources = migrationSources(kind, root, root, srcAbs);
   const srcTexts = Object.fromEntries(sources.map((s) => [s, readText(absOf(root, s), '')]));
@@ -1578,7 +1590,8 @@ async function migrateRun(ctx, root, values, p, common) {
   for (const s of sources) {
     before.push(await measureArtifact({ ctx, root, rel: s, state, ...common, runTriggers: false }));
   }
-  const baselines = ctx.dryRun ? [] : before.map((m) => relOf(root, saveBaseline(root, state.dir, m.artifact, m)));
+  const baselines = ctx.dryRun ? []
+    : before.map((m) => displayPath(root, saveBaseline(root, state.dir, m.artifact, m)));
   const mig = migrate(kind,
     { path: srcAbs, root, cwd: root, host: values.to || null, dryRun: ctx.dryRun, force: Boolean(values.force),
     backupDir: backups(ctx, root) });
@@ -1643,7 +1656,7 @@ async function modifyRun(ctx, verb, values, p) {
   const state = ctx.dryRun ? checkState(ctx, root) : openState(ctx, root);
   if (verb === 'baseline') {
     const m = await measureArtifact({ ctx, root, rel, state, ...common });
-    const dir = ctx.dryRun ? null : relOf(root, saveBaseline(root, state.dir, rel, m));
+    const dir = ctx.dryRun ? null : displayPath(root, saveBaseline(root, state.dir, rel, m));
     const { context, ...rest } = m;
     const measure = m.kind === 'skill' && m.trigger.status !== 'measured'
       ? [`Measure triggering before the change (${PAID_NOTE}): tooling trigger-set ${rel} --host claude --run`] : [];
@@ -1654,7 +1667,7 @@ async function modifyRun(ctx, verb, values, p) {
   }
   const base = latestBaseline(state.dir, rel);
   if (!base) throw usageError(`no baseline for ${rel}; run: tooling modify baseline ${rel}`);
-  const baselineDir = relOf(root, base.dir);
+  const baselineDir = displayPath(root, base.dir);
   if (verb === 'restore') {
     const restored = restoreFiles(root, base, ctx.dryRun);
     const extra = (fs.existsSync(absOf(root, rel)) ? artifactFiles(root, rel) : [])
@@ -1701,7 +1714,7 @@ async function modifyRun(ctx, verb, values, p) {
     }
     if (fresh.outcome?.status !== 'measured') fresh.outcome = after.outcome;
     out.recorded = { changelog: 'CHANGELOG.md', version,
-      baseline_dir: relOf(root, saveBaseline(root, state.dir, rel, fresh)) };
+      baseline_dir: displayPath(root, saveBaseline(root, state.dir, rel, fresh)) };
   }
   if (values.restore && cmp.verdict === 'reject') out.restored = { files: restoreFiles(root, base, ctx.dryRun),
     dry_run: ctx.dryRun };
@@ -1742,7 +1755,6 @@ const modifyCommand = defineCommand({
 // ---------------------------------------------------------------------------
 // Plugins for the user's own projects (§11.7)
 
-const AP_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
 const MANIFESTS = ['plugin.json', '.claude-plugin/plugin.json', '.codex-plugin/plugin.json'];
 const MARKETPLACES = ['.claude-plugin/marketplace.json', '.github/plugin/marketplace.json',
   '.agents/plugins/marketplace.json', 'marketplace.json',
@@ -1756,42 +1768,18 @@ export function pluginNameProblems(name) {
   const n = String(name ?? '');
   const errors = [];
   const warnings = [];
-  if (!/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/.test(n) || /--|\.\./.test(n)) errors.push('Agent Plugins name: 1-64 '
-    + 'of a-z 0-9 - ., alphanumeric at both ends, no -- or ..');
+  if (!apPluginName(n)) errors.push('Agent Plugins name: 1-64 of a-z 0-9 - ., alphanumeric at both ends, no -- or ..');
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(n)) errors.push('Claude Code plugin names are kebab-case (no dots)');
-  if (['claude', 'anthropic', 'claude-code', 'claude-mods'].includes(n)
-    || /^(claude|anthropic|anthropics|cc-plugin)-/.test(n)) {
+  if (reservedPluginName(n)) {
     errors.push('reserved by Claude Code (claude-, anthropic-, anthropics-, cc-plugin- prefixes and the names claude, '
-      + 'anthropic, claude-code, claude-mods)');
+      + 'anthropic, anthropics, claude-code, claude-mods)');
   } else if (/(^|[^a-z])(claude|anthropic)([^a-z]|$)/.test(n)) warnings.push('Claude Code warns about claude or '
     + 'anthropic as a whole word in plugin names');
   return { errors, warnings };
 }
 
-/** Project skills by name (first location wins): `Map(name -> repo-relative dir)`. */
-function projectSkills(root) {
-  const out = new Map();
-  for (const base of [SKILL_DIRS.codex, SKILL_DIRS.copilot, SKILL_DIRS.claude, CODEX_ONLY_SKILLS_DIR]) {
-    let names = [];
-    try {
-      names = fs.readdirSync(absOf(root, base), { withFileTypes: true }).filter((e) => e.isDirectory())
-        .map((e) => e.name);
-    } catch {
-      continue;
-    }
-    for (const n of names) if (!out.has(n) && exists(root, `${base}/${n}/SKILL.md`)) out.set(n, `${base}/${n}`);
-  }
-  return out;
-}
-
-function readMaybe(file) {
-  const text = readText(file);
-  if (text == null) return { exists: false };
-  try { return { exists: true, doc: JSON.parse(text) }; } catch (err) { return { exists: true, error: err.message }; }
-}
-
 /** `tooling plugin init`: package the project's own skills, agents, hooks and MCP servers. */
-export async function pluginInit(ctx, values) {
+async function pluginInit(ctx, values) {
   const root = rootOf(ctx);
   checkState(ctx, root);
   const hosts = parseHosts(values.for || 'all');
@@ -1803,7 +1791,7 @@ export async function pluginInit(ctx, values) {
   if (insideSkill(outAbs)) throw usageError('refusing to generate a plugin inside the companion skill (decision D10)');
   const outRel = relPosix(root, outAbs);
   if (outRel == null) throw usageError('--out must be inside the repository');
-  const P = (p) => (outRel === '.' ? p : `${outRel}/${p}`);
+  const P = (p) => joinRel(outRel, p);
   const description = values.description ? String(values.description)
     : `Agentic tooling for ${project}: skills, agents, hooks and MCP servers packaged for ${hosts.join(', ')}.`;
   const owner = values.owner || gitTry(root, ['config', 'user.name']) || 'Your Team';
@@ -1822,7 +1810,8 @@ export async function pluginInit(ctx, values) {
   const apManifest = hosts.includes('copilot');
   const codexManifest = hosts.includes('codex') && !apManifest;
   // Skills: by default Codex-only skills (.codex/skills, usually translated agents) join only a Codex plugin.
-  const available = projectSkills(root);
+  const available = projectSkills(root,
+    [SKILL_DIRS.codex, SKILL_DIRS.copilot, SKILL_DIRS.claude, CODEX_ONLY_SKILLS_DIR]);
   const wanted = listOpt(values.skills)
     || [...available].filter(([, rel]) => !rel.startsWith(`${CODEX_ONLY_SKILLS_DIR}/`)
     || hosts.every((h) => h === 'codex')).map(([n]) => n);
@@ -1847,11 +1836,10 @@ export async function pluginInit(ctx, values) {
     contents.push(`- Skill \`${sname}\` (from ${available.get(sname)})`);
   }
   if (!wanted.length) {
-    const dsc = 'Describe in one sentence what this skill does. Use when (the requests that should trigger it). Not '
-      + 'for (near-miss tasks).';
-    const fm = stringifyFrontmatter({ name, description: dsc, metadata: { version: '0.1.0' } }).trimEnd();
-    outputs.push(...renderSections('skill', null,
-      { name, description: dsc, summary: firstSentence(dsc), skill_dir: P(`skills/${name}`) }, () => fm)
+    const fm = stringifyFrontmatter({ name, description: DEFAULT_DESCRIPTION, metadata: { version: '0.1.0' } })
+      .trimEnd();
+    outputs.push(...renderSections('skill', null, { name, description: DEFAULT_DESCRIPTION,
+      summary: firstSentence(DEFAULT_DESCRIPTION), skill_dir: P(`skills/${name}`) }, () => fm)
       .map((o) => ({ ...o, host: 'all', kind: 'skill' })));
     if (hosts.includes('claude')) outputs.push(...evalOutputs(P('evals'), name, { all: false })
       .map((o) => ({ ...o, host: 'claude', kind: 'eval' })));
@@ -1861,8 +1849,7 @@ export async function pluginInit(ctx, values) {
   // Agents: ported to each host's plugin agent folder (Codex plugins have none).
   const agentSel = listOpt(values.agents);
   for (const [base, h] of [['.github/agents', 'copilot'], ['.claude/agents', 'claude']]) {
-    let names = [];
-    try { names = fs.readdirSync(absOf(root, base)).filter((n) => n.endsWith('.md')); } catch { continue; }
+    const names = listDir(absOf(root, base)).filter((n) => n.endsWith('.md'));
     for (const n of names.filter((x) => !agentSel || agentSel.includes(x.replace(/\.agent\.md$|\.md$/, '')))) {
       const rel = `${base}/${n}`;
       const ir = parseAgent(readText(absOf(root, rel), ''), h, rel);
@@ -1886,11 +1873,8 @@ export async function pluginInit(ctx, values) {
   const hookFiles = {};
   if (values['include-hooks']) {
     const entries = [];
-    let hookSources = [];
-    try {
-      hookSources = fs.readdirSync(absOf(root, '.github/hooks')).filter((x) => x.endsWith('.json'))
-        .map((n) => [`.github/hooks/${n}`, 'copilot']);
-    } catch { /* none */ }
+    const hookSources = listDir(absOf(root, '.github/hooks')).filter((x) => x.endsWith('.json'))
+      .map((n) => [`.github/hooks/${n}`, 'copilot']);
     for (const [rel, h] of [...hookSources, ['.claude/settings.json', 'claude'],
       ['.codex/hooks.json', 'codex']].filter(([rel]) => exists(root, rel))) {
       try {
@@ -1960,7 +1944,7 @@ export async function pluginInit(ctx, values) {
   const meta = { version, description, author: { name: owner },
     ...(values.license ? { license: String(values.license) } : {}) };
   if (apManifest) {
-    const ap = { $schema: AP_SCHEMA, name, ...meta };
+    const ap = { $schema: apSchema('plugin'), name, ...meta };
     if (hookFiles.codex) {
       ap.extensions = { 'com.openai': { hooks: `./${hookFiles.codex}` } };
       manual.push('Unverified: Codex reading plugin hooks from extensions["com.openai"].hooks in an Agent Plugins '
@@ -2007,15 +1991,9 @@ export async function pluginInit(ctx, values) {
   outputs.push(...renderSections('plugin', null,
     { name, description, contents: contents.join('\n'), install: install.join('\n'), plugin_dir: outRel, version,
     date: today() }).map((o) => ({ ...o, path: P(o.path), host: 'all', kind: 'docs' })));
-  const write = Boolean(values.write) && !ctx.dryRun;
-  const applied = writeOutputs(outputs,
-    { root, dryRun: !write, force: Boolean(values.force), mergeNeedsForce: true, backupDir: backups(ctx, root) });
-  const next = [...(write ? []
-    : [`Dry run: nothing was written. Re-run with --write to create ${applied.written.length} file(s).`]),
-    ...(applied.skipped.length
-      ? [`${applied.skipped.length} file(s) exist and were left alone; pass --force to merge or overwrite them.`] : []),
-    `Check it: tooling plugin check ${outRel}`, `Test it locally: tooling plugin test ${outRel}`,
-      `Release it: tooling plugin release ${outRel} --version X.Y.Z`];
+  const { write, applied, notes } = writeScaffold(ctx, root, root, values, outputs);
+  const next = [...notes, `Check it: tooling plugin check ${outRel}`, `Test it locally: tooling plugin test ${outRel}`,
+    `Release it: tooling plugin release ${outRel} --version X.Y.Z`];
   return { kind: 'plugin', name, hosts, plugin_dir: outRel, marketplace: mkt, marketplaces: [mktFile],
     dry_run: !write, files: applied.written.map((w) => w.path),
     written: applied.written, skipped: applied.skipped, backups: applied.backups, validators: [],
@@ -2029,7 +2007,7 @@ function marketplacesFor(root, pdir, name) {
   const target = realPath(pdir);
   const src = (p) => (typeof p.source === 'string' ? p.source : p.source?.source === 'local' ? p.source.path
     : p.source?.path);
-  return MARKETPLACES.map((f) => ({ file: f, abs: absOf(root, f), doc: readMaybe(absOf(root, f)).doc }))
+  return MARKETPLACES.map((f) => ({ file: f, abs: absOf(root, f), doc: readJsonFile(absOf(root, f)).value }))
     .filter((m) => Array.isArray(m.doc?.plugins))
     .map((m) => ({ ...m, name: m.doc.name || null,
       entries: m.doc.plugins.filter((p) => p
@@ -2037,7 +2015,11 @@ function marketplacesFor(root, pdir, name) {
     .filter((m) => m.entries.length);
 }
 
-/** Run a host CLI with throwaway homes (`env` names the variables pointing at them); the homes are always removed. */
+/** A validator record of `tooling plugin check`, skipped until it runs. */
+const validator = (name, cmd, extra) => ({ name, cmd, ran: false, status: 'skipped', errors: [], warnings: [],
+  ...extra });
+
+/** `fn` with one throwaway directory per label (host homes, a cwd); the directories are always removed. */
 function inThrowawayHome(labels, fn) {
   const dirs = labels.map((l) => makeTempDir(l));
   try {
@@ -2063,9 +2045,9 @@ const loadVerdict = (v, skills, loaded, what) => {
  * throwaway COPILOT_HOME.
  */
 function copilotLoadCheck(cli, pdir, prel, skills) {
-  const v = { name: 'copilot --plugin-dir skill list --json (load check)', host: 'Copilot CLI',
-    cmd: `COPILOT_PLUGIN_DIR_ONLY=true copilot --plugin-dir ${prel} skill list --json`,
-    ran: false, status: 'skipped', errors: [], warnings: [], loaded_skills: [] };
+  const v = validator('copilot --plugin-dir skill list --json (load check)',
+    `COPILOT_PLUGIN_DIR_ONLY=true copilot --plugin-dir ${prel} skill list --json`,
+    { host: 'Copilot CLI', loaded_skills: [] });
   if (!cli) return { ...v, reason: 'copilot not on PATH (or set ADC_COPILOT_CLI)' };
   return inThrowawayHome(['copilot-home', 'copilot-cwd'], (home, cwd) => {
     const r = runCli(cli, ['--plugin-dir', pdir, 'skill', 'list', '--json'], { cwd, timeoutMs: 90_000,
@@ -2076,10 +2058,10 @@ function copilotLoadCheck(cli, pdir, prel, skills) {
       const why = lastLine(r.stderr || r.stdout) || `exit ${r.exit}`;
       return Object.assign(v, { status: 'error', reason: `no skill list in the output: ${why}` });
     }
-    const base = realPath(pdir) + path.sep;
+    const base = realPath(pdir);
     // Every plugin skill must be listed with source "plugin" from inside the plugin directory.
     const loaded = rows.filter((x) => x?.source === 'plugin' && typeof x.path === 'string'
-      && (realPath(x.path) + path.sep).startsWith(base)).map((x) => String(x.name));
+      && isWithin(base, realPath(x.path))).map((x) => String(x.name));
     return loadVerdict(v, skills, loaded, 'a skill listing');
   });
 }
@@ -2089,10 +2071,9 @@ function copilotLoadCheck(cli, pdir, prel, skills) {
  * marketplace, install the plugin and render the prompt input; every plugin skill must appear as `<plugin>:<skill>`.
  */
 function codexLoadCheck(cli, root, pdir, name, skills) {
-  const v = { name: 'codex plugin marketplace add + plugin add + debug prompt-input (load check)', host: 'Codex',
-    ran: false, status: 'skipped', errors: [], warnings: [],
-    loaded_skills: [], cmd: `CODEX_HOME=<temp> codex plugin marketplace add . && codex plugin add `
-      + `${name}@<marketplace> && codex debug prompt-input hello` };
+  const v = validator('codex plugin marketplace add + plugin add + debug prompt-input (load check)',
+    `CODEX_HOME=<temp> codex plugin marketplace add . && codex plugin add ${name}@<marketplace> `
+      + '&& codex debug prompt-input hello', { host: 'Codex', loaded_skills: [] });
   if (!cli) return { ...v, reason: 'codex not on PATH (or set ADC_CODEX_CLI)' };
   const mkts = marketplacesFor(root, pdir, name)
     .filter((m) => ['.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json'].includes(m.file));
@@ -2120,9 +2101,8 @@ function codexLoadCheck(cli, root, pdir, name, skills) {
 
 /** `claude plugin validate --strict --json`: warnings fail --strict; a directory without a manifest is not a pass. */
 function claudeValidate(cli, root, t) {
-  const v = { name: 'claude plugin validate --strict --json',
-    cmd: `claude plugin validate --strict --json ${relOf(root, t)}`, ran: false, status: 'skipped', errors: [],
-    warnings: [] };
+  const v = validator('claude plugin validate --strict --json',
+    `claude plugin validate --strict --json ${displayPath(root, t)}`);
   if (!cli) return { ...v, reason: 'claude not on PATH' };
   const r = runCli(cli, ['plugin', 'validate', '--strict', '--json', t], { timeoutMs: 60_000 });
   Object.assign(v, { ran: true, exit: r.exit });
@@ -2136,41 +2116,47 @@ function claudeValidate(cli, root, t) {
     status: !parts.length ? 'not-applicable' : doc.success ? 'pass' : 'fail' });
 }
 
-/** `tooling plugin check`: manifests, layout, name and version consistency, lint and the host validators. */
-export async function pluginCheck(ctx, dirArg, { external = true } = {}) {
+/** The plugin directory a `tooling plugin` verb works on: `{ root, pdir, prel }` (exit 3 while .adc/ is tracked). */
+function pluginDir(ctx, dirArg) {
   const root = rootOf(ctx);
   checkState(ctx, root);
   const pdir = userPath(ctx, dirArg || '.');
   if (!isDir(pdir)) throw usageError(`not a directory: ${toPosix(dirArg || '.')}`);
-  const prel = relOf(root, pdir);
-  const at = (f) => (f ? (prel === '.' ? f : `${prel}/${f}`) : prel);
+  return { root, pdir, prel: displayPath(root, pdir) };
+}
+
+/** `tooling plugin check`: manifests, layout, name and version consistency, lint and the host validators. */
+async function pluginCheck(ctx, dirArg, { external = true } = {}) {
+  const { root, pdir, prel } = pluginDir(ctx, dirArg);
+  const at = (f) => (f ? joinRel(prel, f) : prel);
   const findings = [];
   const F = (severity, file, rule, message) => findings.push({ severity, file: at(file), rule, message });
   const files = listFiles(pdir, { ignore: COPY_IGNORE, maxFiles: 5000 });
-  const [ap, cl, cx] = MANIFESTS.map((f) => readMaybe(path.join(pdir, ...f.split('/'))));
+  const [ap, cl, cx] = MANIFESTS.map((f) => readJsonFile(path.join(pdir, ...f.split('/'))));
   if (!ap.exists && !cl.exists && !cx.exists) F('error', null, 'NO_MANIFEST',
     'no plugin.json, .claude-plugin/plugin.json or .codex-plugin/plugin.json');
   const hosts = uniq([...(ap.exists ? ['copilot', 'codex'] : []), ...(cl.exists ? ['claude'] : []),
     ...(cx.exists ? ['codex'] : [])]);
   // Most manifest, skill, agent and hook rules come from tooling lint below; these span files or close gaps
   // in the schema.
-  const docs = MANIFESTS.map((f, k) => ({ file: f, doc: [ap, cl, cx][k].doc }))
+  const docs = MANIFESTS.map((f, k) => ({ file: f, doc: [ap, cl, cx][k].value }))
     .filter((m) => m.doc && typeof m.doc === 'object');
   const names = uniq(docs.map((m) => m.doc.name).filter(Boolean));
   const versions = docs.filter((m) => m.doc.version).map((m) => ({ file: m.file, version: m.doc.version }));
   if (names.length > 1) F('error', null, 'NAME_MISMATCH', `manifests disagree on the plugin name: ${names.join(', ')}`);
   if (uniq(versions.map((v) => v.version)).length > 1) F('error', null, 'VERSION_MISMATCH',
     `manifest versions differ: ${versions.map((v) => `${v.file} ${v.version}`).join(', ')}`);
-  const author = ap.doc?.author;
+  const author = ap.value?.author;
   const authorKeys = ['name', 'email', 'url'];
   if (author && (typeof author !== 'object' || Object.keys(author).some((k) => !authorKeys.includes(k)))) {
     F('error', 'plugin.json', 'AP_AUTHOR', 'author may contain only name, email and url strings');
   }
-  const keywords = ap.doc?.keywords;
+  const keywords = ap.value?.keywords;
   if (keywords && (!Array.isArray(keywords) || keywords.some((k) => typeof k !== 'string'))) {
     F('error', 'plugin.json', 'AP_KEYWORDS', 'keywords must be an array of strings');
   }
-  for (const [n, s] of Object.entries(ap.exists ? readMaybe(path.join(pdir, 'mcp.json')).doc?.mcpServers || {} : {})) {
+  const apMcp = ap.exists ? readJsonFile(path.join(pdir, 'mcp.json')).value?.mcpServers : null;
+  for (const [n, s] of Object.entries(apMcp || {})) {
     const allowed = AP_MCP_KEYS[s?.type];
     if (!allowed) {
       F('error', 'mcp.json', 'AP_MCP_TYPE', `${n}: type must be stdio, streamable-http or sse`);
@@ -2180,11 +2166,11 @@ export async function pluginCheck(ctx, dirArg, { external = true } = {}) {
       `${n}: "${k}" is not allowed for type ${s.type}`);
     if (s.env && ('PLUGIN_ROOT' in s.env || 'PLUGIN_DATA' in s.env)) F('error', 'mcp.json', 'AP_MCP_ENV',
       `${n}: env must not set PLUGIN_ROOT or PLUGIN_DATA`);
-    if (s.type !== 'stdio' && !/^https:\/\/|^http:\/\/(localhost|127\.|\[::1\])/i.test(String(s.url))) F('error',
+    if (s.type !== 'stdio' && !secureUrl(String(s.url))) F('error',
       'mcp.json', 'AP_MCP_URL', `${n}: url must be https (http only for loopback)`);
   }
-  if (typeof cx.doc?.hooks === 'string' && !fs.existsSync(path.join(pdir, cx.doc.hooks))) F('error',
-    '.codex-plugin/plugin.json', 'CODEX_HOOKS', `hooks file ${cx.doc.hooks} not found`);
+  if (typeof cx.value?.hooks === 'string' && !fs.existsSync(path.join(pdir, cx.value.hooks))) F('error',
+    '.codex-plugin/plugin.json', 'CODEX_HOOKS', `hooks file ${cx.value.hooks} not found`);
   for (const f of files.filter((x) => /(^|\/)evals\/.+\/prompt\.md$/.test(x))) {
     if (/\bTODO\b/.test(readText(path.join(pdir, f), ''))) F('warning', f, 'EVAL_TODO',
       'eval case still contains TODO text');
@@ -2205,8 +2191,8 @@ export async function pluginCheck(ctx, dirArg, { external = true } = {}) {
       : [])]) findings.push({ severity: 'error', file: prel, rule, message: e });
     validators.push(v);
   };
-  if (!external) validators.push({ name: 'host load checks', ran: false, status: 'skipped', errors: [], warnings: [],
-    reason: 'not requested (tooling plugin check runs them; tooling plugin test runs them with --run)' });
+  if (!external) validators.push(validator('host load checks', undefined,
+    { reason: 'not requested (tooling plugin check runs them; tooling plugin test runs them with --run)' }));
   else {
     const claude = hostCli('claude');
     const roots = [...(cl.exists ? [pdir] : []),
@@ -2214,9 +2200,9 @@ export async function pluginCheck(ctx, dirArg, { external = true } = {}) {
     for (const t of roots) report(claudeValidate(claude, root, t), 'CLAUDE_VALIDATE', true);
     if (cl.exists && files.some((x) => /^evals\/.+\/prompt\.md$/.test(x))) {
       // Parses every eval case and runs none: a case name that matches nothing costs nothing.
-      const v = { name: 'claude plugin eval (load check, runs no case)',
-        cmd: `claude plugin eval ${prel} --case __adc_load_check__ --trust-plugin --no-publish`,
-        ran: false, status: 'skipped', errors: [], warnings: [], ...(claude ? {} : { reason: 'claude not on PATH' }) };
+      const v = validator('claude plugin eval (load check, runs no case)',
+        `claude plugin eval ${prel} --case __adc_load_check__ --trust-plugin --no-publish`,
+        claude ? {} : { reason: 'claude not on PATH' });
       if (claude) {
         const r = runCli(claude,
           ['plugin', 'eval', pdir, '--case', '__adc_load_check__', '--trust-plugin', '--no-publish', '--max-cost-usd',
@@ -2233,7 +2219,7 @@ export async function pluginCheck(ctx, dirArg, { external = true } = {}) {
     if (ap.exists || cl.exists) report(copilotLoadCheck(hostCli('copilot'), pdir, prel, skills), 'COPILOT_LOAD');
     report(codexLoadCheck(hostCli('codex'), root, pdir, name, skills), 'CODEX_LOAD');
   }
-  const mkt = MARKETPLACES.slice(0, 3).map((f) => readMaybe(absOf(root, f)).doc?.name).find(Boolean) || null;
+  const mkt = MARKETPLACES.slice(0, 3).map((f) => readJsonFile(absOf(root, f)).value?.name).find(Boolean) || null;
   return { plugin_dir: prel, name, hosts, files, skills, findings, validators,
     errors: findings.filter((f) => f.severity === 'error').length,
     warnings: findings.filter((f) => f.severity === 'warning').length,
@@ -2321,18 +2307,13 @@ function releaseSteps(name, version, prel) {
 }
 
 /** `tooling plugin release`: version consistency, tags, pinned SHA, SHA256SUMS. */
-export async function pluginRelease(ctx, dirArg, values) {
-  const root = rootOf(ctx);
-  checkState(ctx, root);
-  const pdir = userPath(ctx, dirArg || '.');
-  if (!isDir(pdir)) throw usageError(`not a directory: ${toPosix(dirArg || '.')}`);
-  const prel = relOf(root, pdir);
-  const manifests = MANIFESTS.map((f) => ({ file: prel === '.' ? f : `${prel}/${f}`,
-    abs: path.join(pdir, ...f.split('/')) }))
-    .map((m) => ({ ...m, ...readMaybe(m.abs) })).filter((m) => m.exists);
+async function pluginRelease(ctx, dirArg, values) {
+  const { root, pdir, prel } = pluginDir(ctx, dirArg);
+  const manifests = MANIFESTS.map((f) => ({ file: joinRel(prel, f), abs: path.join(pdir, ...f.split('/')) }))
+    .map((m) => ({ ...m, ...readJsonFile(m.abs) })).filter((m) => m.exists);
   if (!manifests.length) throw usageError(`${prel} has no plugin manifest`);
-  const name = manifests.find((m) => m.doc?.name)?.doc.name || path.basename(pdir);
-  const current = uniq(manifests.map((m) => m.doc?.version).filter(Boolean));
+  const name = manifests.find((m) => m.value?.name)?.value.name || path.basename(pdir);
+  const current = uniq(manifests.map((m) => m.value?.version).filter(Boolean));
   const version = values.version || current[0] || null;
   if (!version) throw usageError('no version in the manifests; pass --version X.Y.Z');
   if (!SEMVER.test(version)) throw usageError('--version must be semantic (X.Y.Z)');
@@ -2341,9 +2322,9 @@ export async function pluginRelease(ctx, dirArg, values) {
   const updated = [];
   const marketplaces = marketplacesFor(root, pdir, name);
   if (values.version) {
-    for (const m of manifests.filter((x) => x.doc && x.doc.version !== version)) {
-      updated.push({ file: m.file, from: m.doc.version ?? null, to: version });
-      if (write) writeFileAtomic(m.abs, json({ ...m.doc, version }));
+    for (const m of manifests.filter((x) => x.value && x.value.version !== version)) {
+      updated.push({ file: m.file, from: m.value.version ?? null, to: version });
+      if (write) writeFileAtomic(m.abs, json({ ...m.value, version }));
     }
     for (const mk of marketplaces) {
       const stale = mk.entries.filter((e) => 'version' in e && e.version !== version);
@@ -2354,11 +2335,10 @@ export async function pluginRelease(ctx, dirArg, values) {
       if (stale.length && write) writeFileAtomic(mk.abs, json(mk.doc));
     }
   }
-  const head = gitTry(root, ['rev-parse', 'HEAD']);
+  const head = headSha(root);
   const tags = (gitTry(root, ['tag', '-l', `v${version}`, `${name}--v${version}`]) || '').split(/\r?\n/)
     .filter(Boolean);
-  const gh = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/
-    .exec(gitTry(root, ['config', '--get', 'remote.origin.url']) || '');
+  const gh = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(originUrl(root) || '');
   const files = listFiles(pdir, { ignore: COPY_IGNORE, maxFiles: 5000 }).filter((f) => f !== 'SHA256SUMS');
   const sums = files.map((f) => `${sha256(fs.readFileSync(path.join(pdir, f)))}  ${f}`).join('\n') + '\n';
   let sumsPath = null;
@@ -2366,7 +2346,7 @@ export async function pluginRelease(ctx, dirArg, values) {
     const file = path.join(statePaths(openState(ctx, root).dir).tooling, 'releases', `${name}-${version}`,
       'SHA256SUMS');
     writeFileAtomic(file, sums);
-    sumsPath = relOf(root, file);
+    sumsPath = displayPath(root, file);
   }
   const warnings = [
     current.length > 1 && `manifest versions differ: ${current.join(', ')}`,
@@ -2389,7 +2369,7 @@ export async function pluginRelease(ctx, dirArg, values) {
  * `tooling plugin test`: the local test commands; `--run` executes the free, side-effect-free load
  * checks of `check`.
  */
-export async function pluginTest(ctx, dirArg, values) {
+async function pluginTest(ctx, dirArg, values) {
   const check = await pluginCheck(ctx, dirArg, { external: Boolean(values.run) });
   const host = check.validators.filter((v) => v.name !== 'tooling lint');
   return { plugin_dir: check.plugin_dir, name: check.name, hosts: check.hosts,

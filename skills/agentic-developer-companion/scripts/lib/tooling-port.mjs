@@ -6,10 +6,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  defineCommand, usageError, readText, stripBom, toPosix, relPosix, realPath, listFiles, uniq, EXIT,
+  defineCommand, usageError, readText, stripBom, toPosix, displayPath, realPath, listFiles, listDir, uniq, oneLine,
+  EXIT,
 } from './core.mjs';
-import { repoRoot } from './git.mjs';
-import { prepareStateDir, writeOutputs, backupDirFactory } from './state.mjs';
+import { repoRoot, workRoot } from './git.mjs';
+import { resolveStateDir, assertStateUntracked, writeOutputs, backupDirFactory } from './state.mjs';
 import { parseFrontmatter, stringifyFrontmatter, stringifyYaml, markdownLines } from './frontmatter.mjs';
 import { parseToml } from './formats.mjs';
 
@@ -19,7 +20,8 @@ export const COPY_IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'result
 const HOST_NAME = { copilot: 'Copilot', claude: 'Claude Code', codex: 'Codex' };
 
 const asText = (v) => (v == null ? null : Array.isArray(v) ? v.join(', ') : String(v));
-const asList = (v) => (v == null ? [] : Array.isArray(v) ? v.map(String)
+/** A list value or a comma-separated string as trimmed, non-empty strings. */
+export const asList = (v) => (v == null ? [] : Array.isArray(v) ? v.map(String)
   : String(v).split(',').map((s) => s.trim()).filter(Boolean));
 const asBool = (v) => (v === true || /^(true|yes|on|1)$/i.test(String(v ?? '')) ? true
   : v === false || /^(false|no|off|0)$/i.test(String(v ?? '')) ? false : null);
@@ -60,6 +62,22 @@ export const SKILL_DIRS = Object.freeze({
  * with codex-cli 0.164.0, `codex debug prompt-input`, 2026-10-25); Copilot and Claude Code do not.
  */
 export const CODEX_ONLY_SKILLS_DIR = '.codex/skills';
+
+/** Project skill folders by name (the first of `bases` holding one wins): Map(name -> repo-relative dir). */
+export function projectSkills(root, bases) {
+  const out = new Map();
+  for (const base of bases) {
+    for (const e of listDir(path.join(root, base), { types: true })) {
+      if (e.isDirectory() && !out.has(e.name) && fs.existsSync(path.join(root, base, e.name, 'SKILL.md'))) {
+        out.set(e.name, `${base}/${e.name}`);
+      }
+    }
+  }
+  return out;
+}
+
+/** The Agent Plugins schema URL of a manifest kind ('plugin', 'mcp'). */
+export const apSchema = (kind, version = '1.0.0') => `https://agent-plugins.org/schemas/${version}/${kind}.schema.json`;
 
 const CP = ['copilot'];
 const CL = ['claude', 'copilot'];
@@ -239,7 +257,9 @@ const COPILOT_EVENT_TO_PASCAL = {
 };
 const PASCAL_TO_COPILOT_EVENT = Object.fromEntries(Object.entries(COPILOT_EVENT_TO_PASCAL).map(([a, b]) => [b, a]));
 const COPILOT_ONLY_EVENTS = ['errorOccurred', 'userPromptTransformed'];
-const EVENTS = {
+/** Hook events per host (Copilot: the camelCase names of hooks files version 1); tooling lint checks against these. */
+export const EVENTS = {
+  copilot: [...Object.keys(COPILOT_EVENT_TO_PASCAL), ...COPILOT_ONLY_EVENTS],
   claude: ['SessionStart', 'Setup', 'SessionEnd', 'UserPromptSubmit', 'UserPromptExpansion', 'Stop', 'StopFailure',
     'PreToolUse', 'PermissionRequest', 'PermissionDenied', 'PostToolUse', 'PostToolUseFailure', 'PostToolBatch',
     'SubagentStart', 'SubagentStop', 'TaskCreated', 'TaskCompleted', 'TeammateIdle', 'PreCompact', 'PostCompact',
@@ -250,9 +270,9 @@ const EVENTS = {
     'SubagentStart', 'SubagentStop', 'PreCompact', 'PostCompact', 'PreModelRequest', 'PostModelRequest', 'Interrupt'],
 };
 // Events that take a matcher: in Claude Code all but these, in Codex only these.
-const CLAUDE_NO_MATCHER = ['UserPromptSubmit', 'PostToolBatch', 'Stop', 'TeammateIdle', 'TaskCreated', 'TaskCompleted',
-  'CwdChanged', 'WorktreeCreate', 'WorktreeRemove', 'MessageDisplay'];
-const CODEX_MATCHER_EVENTS = ['PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact',
+export const CLAUDE_NO_MATCHER = ['UserPromptSubmit', 'PostToolBatch', 'Stop', 'TeammateIdle', 'TaskCreated',
+  'TaskCompleted', 'CwdChanged', 'WorktreeCreate', 'WorktreeRemove', 'MessageDisplay'];
+export const CODEX_MATCHER_EVENTS = ['PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact',
   'SessionStart', 'SessionEnd', 'SubagentStart', 'SubagentStop'];
 const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied'];
 // Handler fields each host supports beyond command and timeout (kept when porting between them).
@@ -537,6 +557,8 @@ const tomlValue = (v) => (Array.isArray(v) ? `[${v.map(tomlValue).join(', ')}]`
 const ENV_REF = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}$/;
 const INPUT_RE = /\$\{input:([A-Za-z0-9_.-]+)(?::[^}]*)?\}/g;
 const LOOPBACK = /^http:\/\/(localhost|127\.|\[::1\])/i;
+/** https, or plain http to a loopback address. */
+export const secureUrl = (url) => /^https:\/\//i.test(url) || LOOPBACK.test(url);
 const MCP_KEYS = ['type', 'command', 'args', 'env', 'cwd', 'url', 'headers', 'tools'];
 const CODEX_MCP_KEYS = ['command', 'args', 'env', 'env_vars', 'cwd', 'url', 'http_headers', 'env_http_headers',
   'bearer_token_env_var', 'enabled_tools', 'enabled'];
@@ -700,7 +722,7 @@ export function renderMcpConfig(servers, target, { file = 'mcp' } = {}) {
     if (/^http:\/\//i.test(e.url || '') && !LOOPBACK.test(e.url)) manual.push(`${s.name}: use https (remote URL).`);
     out[s.name] = e;
   }
-  const doc = target === 'agent-plugins' ? { $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json' } : {};
+  const doc = target === 'agent-plugins' ? { $schema: apSchema('mcp') } : {};
   return { doc: { ...doc, mcpServers: out }, dropped, manual };
 }
 
@@ -969,7 +991,7 @@ export function renderAgent(ir, host, { file = ir.name, pluginScoped = false } =
 
 /** The first sentence of a description (at most 200 characters). */
 export function firstSentence(text) {
-  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  const s = oneLine(text || '');
   return (/^(.{10,}?[.!?])(\s|$)/.exec(s)?.[1] || s).slice(0, 200);
 }
 
@@ -1186,16 +1208,15 @@ export function port({ path: srcPath, from = null, to = 'all', out = null, root 
   force = false, inPlace = false, backupDir = null } = {}) {
   if (!srcPath) throw usageError('tooling port needs a path (e.g. .github/agents/reviewer.agent.md)');
   const base = cwd || root || process.cwd();
-  // Resolved paths throughout: git reports the real root, while the cwd may pass through a
-  // symlink (macOS /var -> /private/var) and every source would otherwise look outside the repo.
-  const rootDir = realPath(root || repoRoot(base) || base);
+  // Resolved paths: the cwd may pass through a symlink (macOS /var -> /private/var) that git resolves.
+  const rootDir = root ? realPath(root) : workRoot(base);
   let abs = realPath(path.resolve(base, srcPath));
   if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(srcPath)}`);
   if (fs.statSync(abs).isDirectory()) {
     if (!fs.existsSync(path.join(abs, 'SKILL.md'))) throw usageError(`${toPosix(srcPath)} has no SKILL.md`);
     abs = path.join(abs, 'SKILL.md');
   }
-  const src = { abs, rel: relPosix(rootDir, abs) ?? toPosix(abs), text: readText(abs, '') };
+  const src = { abs, rel: displayPath(rootDir, abs), text: readText(abs, '') };
   const cls = classifyArtifact(src.rel);
   if (!cls) throw usageError(`cannot tell which tooling format ${src.rel} is; pass a file at its host location`);
   if (from && !HOSTS.includes(from)) throw usageError(`--from must be copilot, claude or codex (got "${from}")`);
@@ -1211,7 +1232,7 @@ export function port({ path: srcPath, from = null, to = 'all', out = null, root 
   }
   const fromHost = cls.host === 'portable' && from ? from : cls.host;
   const targets = inPlace ? [cls.host] : !to || to === 'all' ? HOSTS.filter((h) => h !== fromHost)
-    : uniq(String(to).split(',').map((s) => s.trim()).filter(Boolean));
+    : uniq(asList(to));
   const bad = targets.find((h) => !HOSTS.includes(h));
   if (bad) throw usageError(`--to must be copilot, claude, codex or all (got "${bad}")`);
   const acc = { outputs: [], dropped: [], manual: [], notes: [] };
@@ -1252,7 +1273,7 @@ export function migrationSources(kind, root, cwd, p) {
   };
   const dir = fs.statSync(abs).isDirectory();
   const files = dir ? listFiles(abs, { ignore: COPY_IGNORE }).map((f) => path.join(abs, f)) : [abs];
-  const out = files.map((f) => relPosix(root, f) ?? toPosix(f)).filter((rel) => !dir || ok(rel));
+  const out = files.map((f) => displayPath(root, f)).filter((rel) => !dir || ok(rel));
   const bad = out.find((rel) => !ok(rel));
   if (bad) throw usageError(`${bad} is not a source for ${kind} (${spec.describe})`);
   if (!out.length) throw usageError(`no ${spec.describe.split(' ->')[0]} files under ${toPosix(p)}`);
@@ -1283,8 +1304,10 @@ export const portCommand = defineCommand({
   options: { from: { type: 'string' }, to: { type: 'string' }, out: { type: 'string' }, force: { type: 'boolean' } },
   async run(ctx, values, positionals) {
     if (positionals.length !== 1) throw usageError('tooling port takes one path');
-    const root = realPath(repoRoot(ctx.cwd) || ctx.cwd);
-    prepareStateDir({ ...ctx, cwd: root }, { create: false });
+    const gitRoot = repoRoot(ctx.cwd);
+    const root = realPath(gitRoot || ctx.cwd);
+    // Exit 3 while .adc/ is tracked (nothing is created); git's root is passed on, not asked for again.
+    assertStateUntracked(resolveStateDir({ cwd: root, stateDirOption: ctx.stateDirOption, root: gitRoot && root }));
     const backupDir = backupDirFactory(ctx, root, 'tooling', 'backups');
     const res = port({ path: positionals[0], from: values.from || null, to: values.to || 'all', out: values.out || null,
       root, cwd: ctx.cwd, dryRun: ctx.dryRun, force: Boolean(values.force), backupDir });

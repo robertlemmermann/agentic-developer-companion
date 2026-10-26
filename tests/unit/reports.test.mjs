@@ -1,27 +1,23 @@
 // Tests for WP-D: report and coverage parsers (reports.mjs), clean-run / red-green / typecheck
 // (clean-run.mjs) and the coverage, mutation and flake probes (probes.mjs). End-to-end cases build
 // tiny projects in temp git repos and run real runners (node --test always; go and pytest when present).
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as reports from '../../skills/agentic-developer-companion/scripts/lib/reports.mjs';
 import * as cr from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
 import * as probes from '../../skills/agentic-developer-companion/scripts/lib/probes.mjs';
 import { prepareTarget } from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import { detect } from '../../skills/agentic-developer-companion/scripts/lib/detect.mjs';
+import { AWS_KEY, FIX, makeRepo as newRepo, removeAfter, runAdc, tmpDir, writeFiles } from './helpers.mjs';
 
-const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const fixture = (name) => fs.readFileSync(path.join(FIX, 'reports', name), 'utf8');
-const ADC = core.ADC_SCRIPT;
 process.env.ADC_QUIET = '1';
 
-const TEMP = [];
-const tmp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMP.push(d); return d; };
 // Go's build cache and its local telemetry counters (written to the user config dir, which
 // GOTELEMETRY=off does not prevent) stay in the temp dir: tests leave nothing outside os.tmpdir().
 // macOS has no override for that config dir.
@@ -29,7 +25,6 @@ const GO_CONFIG = path.join(os.tmpdir(), 'adc-wpd-goconfig');
 const GO_ENV = { GOCACHE: path.join(os.tmpdir(), 'adc-wpd-gocache'), GOTOOLCHAIN: 'local', GOFLAGS: '', GOTELEMETRY: 'off',
   ...(process.platform === 'win32' ? { APPDATA: GO_CONFIG } : process.platform === 'darwin' ? {} : { XDG_CONFIG_HOME: GO_CONFIG }) };
 Object.assign(process.env, GO_ENV);
-after(() => { for (const d of TEMP) fs.rmSync(d, { recursive: true, force: true }); });
 
 const HAS_GO = Boolean(core.which('go'));
 // pytest on PATH, else an offline `uv run --with pytest` (uses uv's existing cache), else skipped.
@@ -47,37 +42,15 @@ function alive(pid) {
 }
 
 function makeRepo(files = {}) {
-  const dir = tmp('adc-wpd-repo-');
-  TEMP.push(core.tmpRoot(dir)); // per-repo snapshot and worktree dir under the OS temp dir
-  const g = (...args) => {
-    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout.trim();
-  };
-  g('init', '-q', '-b', 'main');
-  g('config', 'user.email', 't@example.com');
-  g('config', 'user.name', 'Test');
-  g('config', 'commit.gpgsign', 'false');
-  const write = (fs2) => {
-    for (const [p, c] of Object.entries(fs2)) {
-      const full = path.join(dir, p);
-      if (c == null) { fs.rmSync(full, { force: true }); continue; }
-      fs.mkdirSync(path.dirname(full), { recursive: true });
-      fs.writeFileSync(full, c);
-    }
-  };
-  write(files);
-  g('add', '-A');
-  g('commit', '-q', '-m', 'base', '--allow-empty');
-  return { dir, g, write, state: tmp('adc-wpd-state-') };
+  const { dir, g } = newRepo(files, { prefix: 'adc-wpd-repo-', message: 'base' });
+  removeAfter(core.tmpRoot(dir)); // per-repo snapshot and worktree dir under the OS temp dir
+  return { dir, g, write: (more) => writeFiles(dir, more), state: tmpDir('adc-wpd-state-') };
 }
 
 function adc(args, { env = {} } = {}) {
-  const r = spawnSync(process.execPath, [ADC, ...args, '--json'], { encoding: 'utf8', env: { ...process.env, ADC_QUIET: '1', ...env }, timeout: 120_000 });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
+  const r = runAdc(args, { env: { ...process.env, ...env } });
   assert.ok(/^[\x00-\x7e]*$/.test(r.stdout), 'stdout is ASCII-only');
-  return { exit: r.status, json, stderr: r.stderr, stdout: r.stdout };
+  return r;
 }
 
 const target = (repo) => prepareTarget({ cwd: repo.dir, stateDirOption: repo.state }, {});
@@ -374,7 +347,7 @@ describe('clean-run helpers', () => {
     assert.ok(out.endsWith(core.quoteArg(raw)));
   });
   test('buildRunCommand: report flags, retries off last, env placeholders, selection and shuffle', () => {
-    const outDir = tmp('adc-wpd-build-');
+    const outDir = tmpDir('adc-wpd-build-');
     const vit = cr.resolveRunner({ runners: [{ name: 'vitest', cmd: 'npm test' }] });
     const b = cr.buildRunCommand(vit, { dir: outDir, outDir, select: { files: ['src/a.test.ts'], names: [] }, seed: 7 });
     assert.match(b.cmd, /^npm test -- --reporter=junit --outputFile=\S+report\.xml --retry=0 --sequence\.shuffle --sequence\.seed=7 src\/a\.test\.ts$/);
@@ -431,7 +404,7 @@ describe('clean-run helpers', () => {
     assert.ok(!cr.testMatchesFile({ id: 'tests.test_other::t' }, 'tests/test_calc.py'));
   });
   test('importBaseCounts accepts clean-run output, a map by project and a bare counts object', () => {
-    const dir = tmp('adc-wpd-bc-');
+    const dir = tmpDir('adc-wpd-bc-');
     const w = (name, obj) => { const f = path.join(dir, name); fs.writeFileSync(f, JSON.stringify(obj)); return f; };
     assert.equal(cr.importBaseCounts(w('a.json', { projects: [{ root: '.', run: { executed: 9, passed: 9, failed: 0, errors: 0, skipped: 1, flaky: 0 } }] }), '.').executed, 9);
     assert.equal(cr.importBaseCounts(w('b.json', { projects: { 'pkg/a': { executed: 4, skipped: 0 } } }), 'pkg/a').executed, 4);
@@ -483,7 +456,7 @@ describe('clean-run helpers', () => {
     }
   });
   test('resolveRunners: one runner per ecosystem from detect; wrappers and e2e runners only as a last resort', async () => {
-    const d = tmp('adc-wpd-detect-');
+    const d = tmpDir('adc-wpd-detect-');
     fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ scripts: { test: 'node --test test/' } }));
     fs.writeFileSync(path.join(d, 'package-lock.json'), '{}');
     fs.writeFileSync(path.join(d, 'go.mod'), 'module x\n');
@@ -497,7 +470,7 @@ describe('clean-run helpers', () => {
       { name: 'vitest', ecosystem: 'node', cmd: 'npx vitest run' }] });
     assert.deepEqual(mixed.map((r) => r.name), ['pytest', 'vitest']);
     assert.deepEqual(cr.resolveRunners({ runners: [{ name: 'make', kind: 'wrapper', cmd: 'make test' }] }).map((r) => r.name), ['make']);
-    assert.equal((await detectAt(tmp('adc-wpd-empty-'))).projects.length, 0);
+    assert.equal((await detectAt(tmpDir('adc-wpd-empty-'))).projects.length, 0);
   });
 });
 
@@ -510,7 +483,7 @@ describe('clean-run end to end', () => {
     repo.write({ 'test/more.test.mjs': nodeTest('adds negatives', 'assert.equal(add(-1, -2), -3);') });
     const before = repo.g('status', '--porcelain');
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test']);
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     const p = r.json.projects[0];
     assert.equal(r.json.status, 'pass');
     assert.equal(p.run.executed, 3);
@@ -603,12 +576,12 @@ describe('clean-run end to end', () => {
     const repo = makeRepo({ 'README.md': '# x\n' });
     repo.write({ 'README.md': '# y\n' });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state]);
-    assert.equal(r.exit, 4);
+    assert.equal(r.status, 4);
     assert.equal(r.json.checks[0].reason, 'NO_RUNNER');
     const node = makeRepo(NODE_PROJECT);
     node.write({ 'src/math.mjs': '// changed\n' + NODE_PROJECT['src/math.mjs'] });
     const dry = adc(['clean-run', '--cwd', node.dir, '--state-dir', node.state, '--runner', 'node-test', '--dry-run']);
-    assert.equal(dry.exit, 0);
+    assert.equal(dry.status, 0);
     assert.equal(dry.json.checks[0].reason, 'DRY_RUN');
     assert.equal(worktrees(node), 1);
     assert.ok(!fs.existsSync(path.join(core.tmpRoot(node.dir), 'dry-run-out')), 'a dry run writes no output dirs');
@@ -635,7 +608,6 @@ describe('clean-run end to end', () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': '// changed\n' + NODE_PROJECT['src/math.mjs'] });
     const token = ['hunter2', 'abcXYZ', '987'].join('');
-    const shape = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
     const printer = path.join(repo.state, 'print.cjs');
     fs.writeFileSync(printer, "console.log('token=' + (process.env.ADC_LIVE_TOKEN || 'absent')); console.log(['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('')); console.log('# pass 1'); console.log('# fail 0');\n");
     process.env.ADC_LIVE_TOKEN = token;
@@ -644,7 +616,7 @@ describe('clean-run end to end', () => {
       const log = fs.readFileSync(res.checks[0].artifacts.find((a) => a.endsWith('run.log')), 'utf8');
       assert.ok(log.includes('token=absent'));
       assert.ok(!log.includes(token));
-      assert.ok(!log.includes(shape), 'secret shape redacted');
+      assert.ok(!log.includes(AWS_KEY), 'secret shape redacted');
       assert.ok(!JSON.stringify(res).includes(token));
     } finally {
       delete process.env.ADC_LIVE_TOKEN;
@@ -663,7 +635,7 @@ describe('clean-run --red-green', () => {
     const repo = makeRepo(BUGGY);
     repo.write({ 'src/math.mjs': FIXED, 'test/regress.test.mjs': nodeTest('divides by two', 'assert.equal(div(8, 2), 4);') });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test', '--no-base', '--red-green', 'test/regress.test.mjs']);
-    assert.equal(r.exit, 0, JSON.stringify(r.json && r.json.checks.map((c) => [c.status, c.summary, c.findings])));
+    assert.equal(r.status, 0, JSON.stringify(r.json && r.json.checks.map((c) => [c.status, c.summary, c.findings])));
     const rg = r.json.checks.find((c) => c.id === 'CK-REDGREEN');
     assert.equal(rg.status, 'pass');
     assert.equal(r.json.red_green.pairs.length, 1);
@@ -775,11 +747,11 @@ describe('typecheck', () => {
     const repo = makeRepo({ 'check.cjs': CHECKER, 'src/a.ts': 'ok\n' });
     repo.write({ 'src/a.ts': 'ok // TYPE_ERROR\n' });
     const r = adc(['typecheck', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node check.cjs']);
-    assert.equal(r.exit, 1, r.stderr);
+    assert.equal(r.status, 1, r.stderr);
     assert.equal(r.json.status, 'fail');
     assert.equal(r.json.checks[0].id, 'CK-TYPES');
     const bad = adc(['typecheck', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'nope']);
-    assert.equal(bad.exit, 2);
+    assert.equal(bad.status, 2);
   });
 
   test('go vet: a new vet error in the snapshot fails', { skip: !HAS_GO && 'go not installed' }, async () => {
@@ -815,7 +787,7 @@ describe('coverage-delta', () => {
       'test/mul.test.mjs': nodeTest('multiplies', 'assert.equal(mul(2, 3), 6);', "import { mul } from '../src/math.mjs';"),
     });
     const r = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test']);
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.equal(r.json.precision, 'line');
     assert.ok(r.json.pct > 0 && r.json.pct < 100, String(r.json.pct));
     assert.ok(r.json.uncovered.some((u) => u.file === 'src/math.mjs' && u.lines.includes(7)), JSON.stringify(r.json.uncovered));
@@ -823,7 +795,7 @@ describe('coverage-delta', () => {
     assert.equal(r.json.checks[0].status, 'pass');
     assert.equal(r.json.checks[0].data.enforced, false);
     const strict = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test', '--fail-under', '100']);
-    assert.equal(strict.exit, 1);
+    assert.equal(strict.status, 1);
     assert.equal(strict.json.checks[0].reason, 'BELOW_THRESHOLD');
     assert.equal(strict.json.source, 'cache', 'coverage map reused for the same tree');
     // Another command line selects other tests: measured anew, never read from that cache.
@@ -833,7 +805,7 @@ describe('coverage-delta', () => {
     const lcov = path.join(repo.state, 'given.info');
     fs.writeFileSync(lcov, 'SF:src/math.mjs\nDA:3,1\nDA:4,1\nDA:5,1\nDA:6,1\nDA:7,1\nDA:8,1\nend_of_record\n');
     const given = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state, '--report', lcov, '--fail-under', '90']);
-    assert.equal(given.exit, 0, given.stdout);
+    assert.equal(given.status, 0, given.stdout);
     assert.equal(given.json.pct, 100);
     assert.equal(given.json.source, 'provided');
     assert.equal(worktrees(repo), 1);
@@ -876,7 +848,7 @@ describe('mutation-scope', () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': NODE_PROJECT['src/math.mjs'] + 'export const three = 3;\n' });
     const r = adc(['mutation-scope', '--cwd', repo.dir, '--state-dir', repo.state]);
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.equal(r.json.checks[0].id, 'CK-MUTATION');
     assert.equal(r.json.checks[0].status, 'skipped');
     assert.equal(r.json.checks[0].reason, 'NO_MUTATION_TOOL');
@@ -903,7 +875,7 @@ describe('flake-probe', () => {
     ].join('\n');
     repo.write({ 'test/flaky.test.mjs': flaky });
     const r = adc(['flake-probe', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node-test', '--times', '4']);
-    assert.equal(r.exit, 1, r.stderr + r.stdout);
+    assert.equal(r.status, 1, r.stderr + r.stdout);
     assert.equal(r.json.runs, 4);
     assert.equal(r.json.shuffle, true);
     assert.equal(r.json.seeds.length, 4);
@@ -1000,7 +972,7 @@ describe('outcomes, exits and command plumbing', () => {
     assert.equal(cr.splitNodeTestCmd('node --test --test-concurrency=1 test/*.test.mjs').head, 'node --test --test-concurrency=1');
     assert.equal(cr.splitNodeTestCmd('node --test').head, 'node --test');
     assert.equal(cr.splitNodeTestCmd('node --test --test-reporter spec').head, 'node --test --test-reporter spec');
-    const b = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test test/' }] }), { dir: tmp('adc-wpd-b-'), outDir: tmp('adc-wpd-o-'), select: { files: ['test/x.test.mjs'], names: [] } });
+    const b = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test test/' }] }), { dir: tmpDir('adc-wpd-b-'), outDir: tmpDir('adc-wpd-o-'), select: { files: ['test/x.test.mjs'], names: [] } });
     assert.match(b.cmd, /^node --test --test-reporter=junit .* test\/x\.test\.mjs$/);
     assert.ok(!/ test\/ /.test(b.cmd));
   });
@@ -1025,7 +997,7 @@ describe('clean-run options and layouts', () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'adc-no-such-runner-x1 --all', '--no-base']);
-    assert.equal(r.exit, 3, r.stdout);
+    assert.equal(r.status, 3, r.stdout);
     assert.equal(r.json.checks[0].status, 'unverified');
     assert.equal(r.json.checks[0].reason, 'RUNNER_NOT_FOUND');
   });
@@ -1100,13 +1072,11 @@ describe('clean-run options and layouts', () => {
   });
 
   test('unborn repository: no base, the snapshot still runs', async () => {
-    const dir = tmp('adc-wpd-unborn-');
-    TEMP.push(core.tmpRoot(dir));
-    spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
-    for (const [p, cont] of Object.entries(NODE_PROJECT)) { fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true }); fs.writeFileSync(path.join(dir, p), cont); }
-    const state = tmp('adc-wpd-state-');
+    const { dir } = newRepo(NODE_PROJECT, { prefix: 'adc-wpd-unborn-', commit: false });
+    removeAfter(core.tmpRoot(dir));
+    const state = tmpDir('adc-wpd-state-');
     const r = adc(['clean-run', '--cwd', dir, '--state-dir', state, '--runner', 'node-test']);
-    assert.equal(r.exit, 0, r.stdout);
+    assert.equal(r.status, 0, r.stdout);
     assert.equal(r.json.projects[0].run.executed, 2);
     assert.equal(r.json.projects[0].base_counts.reason, 'NO_BASE');
     assert.equal(r.json.base.sha, null);
@@ -1123,7 +1093,7 @@ describe('Go end to end', { skip: !HAS_GO && 'go not installed' }, () => {
     const repo = makeRepo(GO);
     repo.write({ 'calc/calc.go': GO['calc/calc.go'] + '\nfunc Sign(x int) int {\n\tif x < 0 {\n\t\treturn -1\n\t}\n\treturn 1\n}\n', 'calc/sign_test.go': 'package calc\n\nimport "testing"\n\nfunc TestSign(t *testing.T) {\n\tif Sign(5) != 1 {\n\t\tt.Fatal("sign")\n\t}\n}\n' });
     const r = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state]);
-    assert.equal(r.exit, 0, r.stdout);
+    assert.equal(r.status, 0, r.stdout);
     assert.match(r.json.tool, /go \(go-cover\)/);
     assert.ok(r.json.pct > 0 && r.json.pct < 100, String(r.json.pct));
     assert.deepEqual(r.json.uncovered.map((u) => u.file), ['calc/calc.go']);
@@ -1133,7 +1103,7 @@ describe('Go end to end', { skip: !HAS_GO && 'go not installed' }, () => {
     const repo = makeRepo(GO);
     repo.write({ 'calc/flaky_test.go': 'package calc\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestAlternates(t *testing.T) {\n\tb, _ := os.ReadFile("counter")\n\tos.WriteFile("counter", append(b, \'x\'), 0o644)\n\tif len(b)%2 == 1 {\n\t\tt.Fatal("odd run")\n\t}\n}\n' });
     const r = adc(['flake-probe', '--cwd', repo.dir, '--state-dir', repo.state, '--times', '3']);
-    assert.equal(r.exit, 1, r.stdout);
+    assert.equal(r.status, 1, r.stdout);
     assert.equal(r.json.shuffle, true);
     assert.equal(r.json.seeds.length, 3);
     assert.deepEqual(r.json.suspect_tests.map((s) => s.id), ['example.com/g/calc::TestAlternates']);
@@ -1153,7 +1123,7 @@ describe('Cargo end to end', { skip: !core.which('cargo') && 'cargo not installe
     det.projects[0].managers = []; // `cargo fetch` without a lockfile could reach the network
     // A dependency-free crate needs nothing from ~/.cargo; keep cargo's locks and caches in the temp dir.
     const savedHome = process.env.CARGO_HOME;
-    process.env.CARGO_HOME = tmp('adc-wpd-cargo-home-');
+    process.env.CARGO_HOME = tmpDir('adc-wpd-cargo-home-');
     let res;
     try {
       res = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true, redGreen: ['tests/half.rs'] });
@@ -1236,7 +1206,7 @@ describe('review regressions', () => {
     const repo = makeRepo({ ...NODE_PROJECT, 'package.json': JSON.stringify({ name: 'demo', version: '1.0.0', type: 'module', scripts: { test: 'node --test "test/**/*.test.mjs"' } }) + '\n' });
     repo.write({ 'test/more.test.mjs': nodeTest('adds more', 'assert.equal(add(2, 2), 4);') });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state]);
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     const p = r.json.projects[0];
     assert.equal(p.run.count_source, 'report', p.run.cmd);
     assert.equal(p.run.executed, 3);
@@ -1292,13 +1262,13 @@ describe('review regressions', () => {
     const repo = makeRepo(NODE_PROJECT);
     for (const args of [['flake-probe', '--times', '0'], ['flake-probe', '--times', '2.5'], ['clean-run', '--timeout', 'abc'], ['mutation-scope', '--budget=-1'], ['coverage-delta', '--fail-under', '120'], ['typecheck', '--timeout', '0']]) {
       const r = adc([...args, '--cwd', repo.dir, '--state-dir', repo.state]);
-      assert.equal(r.exit, 2, `${args.join(' ')}: ${r.stderr}`);
+      assert.equal(r.status, 2, `${args.join(' ')}: ${r.stderr}`);
     }
     assert.deepEqual(fs.readdirSync(repo.state), [], 'nothing was written');
   });
 
   test('--red-green and --tests entries are taken relative to --cwd when they exist there', () => {
-    const root = tmp('adc-wpd-rel-');
+    const root = tmpDir('adc-wpd-rel-');
     fs.mkdirSync(path.join(root, 'pkg', 'test'), { recursive: true });
     fs.writeFileSync(path.join(root, 'pkg', 'test', 'a.test.mjs'), '');
     assert.deepEqual(cr.repoRelativeEntries(['test/a.test.mjs::adds,other/b.js'], path.join(root, 'pkg'), root), ['pkg/test/a.test.mjs::adds', 'other/b.js']);
@@ -1307,7 +1277,7 @@ describe('review regressions', () => {
   });
 
   test('cargo selection: unit tests of a binary-only crate use --bins, not --lib', () => {
-    const dir = tmp('adc-wpd-cargo-');
+    const dir = tmpDir('adc-wpd-cargo-');
     fs.mkdirSync(path.join(dir, 'src'));
     fs.writeFileSync(path.join(dir, 'src', 'main.rs'), '');
     const runner = cr.resolveRunner({ runners: [{ name: 'cargo' }] });
@@ -1321,7 +1291,7 @@ describe('review regressions', () => {
     const repo = makeRepo({ 'print.cjs': "console.log('# pass 1'); console.log('# fail 0');\n" });
     repo.write({ 'other.txt': 'changed\n' });
     const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', `node print.cjs ${shape}`], { env: { ADC_QUIET: '0' } });
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.ok(!r.stdout.includes(shape), 'stdout redacted');
     assert.match(r.stderr, /adc: run: node print\.cjs \[REDACTED:/, 'progress lines are printed, redacted');
     assert.ok(!r.stderr.includes(shape), 'summary and progress lines redacted');
@@ -1331,7 +1301,7 @@ describe('review regressions', () => {
   });
 
   test('artifact folders: one per target, never reused by a later run; old runs and old trees are pruned', async () => {
-    const state = tmp('adc-wpd-prune-');
+    const state = tmpDir('adc-wpd-prune-');
     const cache = path.join(state, 'cache');
     const slugDir = path.join(cache, 'runs', 'aaaaaaaaaaaa', 'root');
     const age = (d, s) => { const t = new Date(Date.now() - s * 1000); fs.utimesSync(d, t, t); };
@@ -1378,9 +1348,9 @@ describe('round 3 fixes', () => {
     const jest = plan(cr.resolveRunner({}, 'jest'), { select: { files: ['a.test.js'], names: ['x.y'] } });
     assert.match(jest.cmd, /-t ['"]?x\\\.y['"]? a\.test\.js$/);
     // node ignores options after the first file path: prove the filter is applied by a real run.
-    const dir = tmp('adc-wpd-name-');
+    const dir = tmpDir('adc-wpd-name-');
     fs.writeFileSync(path.join(dir, 'a.test.mjs'), "import test from 'node:test';\ntest('adds', () => {});\ntest('other', () => {});\n");
-    const out = tmp('adc-wpd-name-out-');
+    const out = tmpDir('adc-wpd-name-out-');
     const built = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test' }] }), { dir, outDir: out, select: { files: ['a.test.mjs'], names: ['adds'] } });
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
@@ -1391,7 +1361,7 @@ describe('round 3 fixes', () => {
   });
 
   test('multi-module Maven/Gradle: every report dir is read and stored', () => {
-    const dir = tmp('adc-wpd-mm-');
+    const dir = tmpDir('adc-wpd-mm-');
     const files = ['a', 'b'].map((m) => {
       const f = path.join(dir, m, 'target', 'surefire-reports', 'TEST-T.xml');
       fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -1400,11 +1370,11 @@ describe('round 3 fixes', () => {
     });
     const runner = cr.resolveRunner({ runners: [{ name: 'maven', ecosystem: 'jvm', cmd: 'mvn -B test',
       report: { dir: 'target/surefire-reports', glob: 'TEST-*.xml', format: 'junit', dirs: ['a/target/surefire-reports', 'b/target/surefire-reports'] } }] });
-    const built = cr.buildRunCommand(runner, { dir, outDir: tmp('adc-wpd-o-'), plan: true });
+    const built = cr.buildRunCommand(runner, { dir, outDir: tmpDir('adc-wpd-o-'), plan: true });
     assert.equal(built.report.dirs.length, 3);
     const parsed = cr.parseRunOutput(built.report, '', '', [dir]);
     assert.deepEqual([parsed.source, parsed.counts.executed, parsed.tests.map((t) => t.id).sort()], ['report', 2, ['a.T::t', 'b.T::t']]);
-    const state = tmp('adc-wpd-st-');
+    const state = tmpDir('adc-wpd-st-');
     const other = path.join(dir, 'c', 'TEST-U.xml');
     fs.mkdirSync(path.dirname(other), { recursive: true });
     fs.writeFileSync(other, '<testsuite name="c"/>');
@@ -1414,7 +1384,7 @@ describe('round 3 fixes', () => {
     // A detected report with module dirs only (no root dir) is kept, not replaced by the catalog default.
     const dirsOnly = cr.resolveRunner({ runners: [{ name: 'maven', ecosystem: 'jvm', cmd: 'mvn -B test',
       report: { glob: 'TEST-*.xml', format: 'junit', dirs: ['a/target/surefire-reports', 'b/target/surefire-reports'] } }] });
-    assert.deepEqual(cr.buildRunCommand(dirsOnly, { dir, outDir: tmp('adc-wpd-o-'), plan: true }).report.dirs.map((d) => path.relative(dir, d).split(path.sep).join('/')),
+    assert.deepEqual(cr.buildRunCommand(dirsOnly, { dir, outDir: tmpDir('adc-wpd-o-'), plan: true }).report.dirs.map((d) => path.relative(dir, d).split(path.sep).join('/')),
       ['a/target/surefire-reports', 'b/target/surefire-reports']);
   });
 

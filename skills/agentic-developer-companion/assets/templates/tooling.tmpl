@@ -1,8 +1,6 @@
-# Tooling scaffolds for `tooling scaffold <kind> --for copilot|claude|codex|all` (§11.1).
-# A section serves the hosts named in host= (no host= means every host). Placeholders are
-# filled by scripts/lib/tooling.mjs. {{frontmatter}} is rendered in code so YAML quoting is
-# always valid; hook, MCP and plugin JSON/TOML configs are rendered in code from one model
-# shared with `tooling port`, so scaffolds and ports produce the same shapes.
+# Tooling scaffolds (§11.1), rendered by scripts/lib/tooling.mjs; a section without host= serves every host.
+# {{frontmatter}} and the hook, MCP and plugin configs are rendered in code (configs from the model shared
+# with `tooling port`), so YAML quoting stays valid and scaffolds and ports produce the same shapes.
 @@@ file: AGENTS.md kind=instructions @@@
 # {{project_name}}
 
@@ -108,35 +106,14 @@ every path.
 ## (Topic)
 
 - (Detail that only some invocations need.)
-@@@ file: .github/agents/{{agent_file}}.agent.md kind=agent host=copilot @@@
+@@@ file: {{agent_path}} kind=agent host=copilot|claude @@@
 {{frontmatter}}
 
 You are {{name}}. {{summary}}
 
 ## Inputs
 
-- The user's request and the files it names. Read only what the task needs.
-
-## Output contract
-
-Return exactly:
-
-1. A one-line verdict.
-2. A list of findings, each with `file:line` and a one-sentence explanation.
-3. The commands you ran and their exit codes.
-
-## Rules
-
-- Use only the tools in your tool list. Do not edit files unless the request asks for it.
-- Say "unknown" instead of guessing.
-@@@ file: .claude/agents/{{name}}.md kind=agent host=claude @@@
-{{frontmatter}}
-
-You are {{name}}. {{summary}}
-
-## Inputs
-
-- The delegation message and the files it names. Read only what the task needs.
+- {{agent_input}} and the files it names. Read only what the task needs.
 
 ## Output contract
 

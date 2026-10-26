@@ -9,27 +9,25 @@ import path from 'node:path';
 import {
   defineCommand, EXIT, which, runTool, sha256, asciiJson, toPosix, truncate, redactLiterals, readText, readInput,
   matchGlob, tmpRoot, nonce, ensureDir, parseVersion, versionGte, liveSecrets, parseJsonl, makeCheck, log, toolEnv,
+  oneLine as norm, plural, indentOf, tryJson, normRel, isUnder,
 } from './core.mjs';
-import { emptyTree, diffNameStatus, diffLines, lsTree } from './git.mjs';
-import { prepareTarget, snapshotExcludes } from './state.mjs';
+import { lsTree } from './git.mjs';
+import { prepareTarget } from './state.mjs';
 import { detect } from './detect.mjs';
 import * as M from './markers.mjs';
 import {
   parseManifest, isParsableManifest, manifestDelta, lockFor, lockIndex, lockHas, lockManager, normPypi, goSumNeeded,
-  blobReader,
+  snapshotDiff, relDir,
 } from './deps.mjs';
+import { CHECK_FM } from './evidence.mjs';
 
-export const CHECK_FM = Object.freeze({
-  'CK-SCOPE': ['FM-11'], 'CK-TEST-DEL': ['FM-01'], 'CK-SKIP': ['FM-01'], 'CK-ASSERT': ['FM-01', 'FM-03'],
-  'CK-TEST-CFG': ['FM-01', 'FM-06'], 'CK-SUPPRESS': ['FM-05'], 'CK-CI': ['FM-06'], 'CK-SWALLOW': ['FM-07'],
-  'CK-SECRETS': ['FM-09'], 'CK-LOCK': ['FM-12'], 'CK-RETRY': ['FM-13'],
-});
+// The checks diffScope reports, in output order.
+const CHECK_IDS = ['CK-SCOPE', 'CK-TEST-DEL', 'CK-SKIP', 'CK-ASSERT', 'CK-TEST-CFG', 'CK-SUPPRESS', 'CK-CI',
+  'CK-SWALLOW', 'CK-SECRETS', 'CK-LOCK', 'CK-RETRY'];
 // Files larger than this are not scanned line by line (lockfiles and manifests are still parsed).
 const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 const MAX_FINDINGS_PER_CHECK = 200;
-const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const SEVERITY_RANK = { info: 0, finding: 1, fail: 2 };
-const plural = (n, one, many = `${one}s`) => (n === 1 ? one : many);
 // Path classes whose content some check reads (code files are read too).
 const READ_CLASSES = ['ci', 'runnerConfig', 'lintConfig', 'manifest', 'lockfile'];
 
@@ -37,17 +35,14 @@ const READ_CLASSES = ['ci', 'runnerConfig', 'lintConfig', 'manifest', 'lockfile'
 // Shared state for one run
 
 function makeState(target, detectResult, env) {
-  const root = target.root;
-  const from = target.base.sha || emptyTree(root);
-  const to = target.snapshot.commit;
-  const pathspec = ['.', ...snapshotExcludes(target.state).map((p) => `:(top,exclude)${p}`)];
-  const changes = diffNameStatus(root, from, to, pathspec);
-  const linesByPath = new Map(diffLines(root, from, to, pathspec).map((f) => [f.path, f]));
+  const diff = snapshotDiff(target);
+  const { root, from, to, changes } = diff;
+  const linesByPath = new Map(diff.lines().map((f) => [f.path, f]));
   const secrets = liveSecrets(env);
-  const blobs = blobReader(root);
+  const blobs = diff.blobs();
   const S = {
     root, from, to, target, env, secrets, findings: [], unverified: {}, summaries: {}, data: {}, counts: {},
-    read: blobs.read, prefetch: blobs.prefetch, headTree: null, baseTree: null,
+    read: blobs.read, prefetch: blobs.prefetch, headFiles: diff.headFiles, baseFiles: diff.baseFiles,
   };
   const linesCache = new Map();
   const linesOf = (text) => {
@@ -61,8 +56,6 @@ function makeState(target, detectResult, env) {
   };
   S.headLines = (file) => linesOf(S.read(to, file));
   S.baseLines = (file) => (target.base.sha ? linesOf(S.read(from, file)) : null);
-  S.headFiles = () => (S.headTree ||= new Set(lsTree(root, to)));
-  S.baseFiles = () => (S.baseTree ||= new Set(target.base.sha ? lsTree(root, from) : []));
   // A Rust file holding `#[cfg(test)]`/`#[test]` is a test file too, so Rust content is read.
   const testCache = new Map();
   S.isTest = (file, side) => {
@@ -511,7 +504,6 @@ function checkRetries(S) {
 // ---------------------------------------------------------------------------
 // Config context helpers (shared by CK-TEST-CFG and CK-SUPPRESS)
 
-const indentOf = (l) => l.length - l.trimStart().length;
 const keyOf = (l) => {
   const t = l.trim();
   return /^(?:-\s+)?["']?([\w$@./-]+)["']?\s*[:=]/.exec(t)?.[1]
@@ -742,17 +734,19 @@ function benignExclusion(text) {
 /** Number of base test files under the directory a runner config governs. */
 function governedBaseTests(S, file) {
   const dir = path.posix.dirname(file);
-  const under = [...S.baseFiles()].filter((p) => (dir === '.' || p.startsWith(`${dir}/`)) && M.isCodeFile(p));
+  const code = [...S.baseFiles()].filter((p) => isUnder(p, dir) && M.isCodeFile(p));
   // Rust files are classified by content: read them in one batch.
-  S.prefetch(under.filter((p) => p.endsWith('.rs')).map((p) => [S.from, p]));
-  return under.filter((p) => S.isTest(p, 'base')).length;
+  S.prefetch(code.filter((p) => p.endsWith('.rs')).map((p) => [S.from, p]));
+  return code.filter((p) => S.isTest(p, 'base')).length;
 }
 
 const THRESHOLD_ALL = new RegExp(M.THRESHOLD.source, 'g');
+// A THRESHOLD match's setting name, spacing removed (`--cov-fail-under =` and `--cov-fail-under=` are one).
+const thresholdName = (m) => m[1].replace(/\s+/g, '');
 function thresholdLowered(before, after) {
-  const name = (m) => m[1].replace(/\s+/g, '');
-  const b = new Map([...String(before).matchAll(THRESHOLD_ALL)].map((m) => [name(m), Number(m[2])]));
-  return [...String(after).matchAll(THRESHOLD_ALL)].some((m) => b.has(name(m)) && Number(m[2]) < b.get(name(m)));
+  const b = new Map([...String(before).matchAll(THRESHOLD_ALL)].map((m) => [thresholdName(m), Number(m[2])]));
+  return [...String(after).matchAll(THRESHOLD_ALL)]
+    .some((m) => b.has(thresholdName(m)) && Number(m[2]) < b.get(thresholdName(m)));
 }
 
 function checkTestConfig(S) {
@@ -837,12 +831,11 @@ const PACKAGE_RUNNER_KEYS = ['jest', 'mocha', 'ava', 'c8', 'nyc', 'vitest'];
 
 function packageJsonTestConfig(S, f) {
   const file = f.status === 'D' ? f.old_path : f.path;
-  const parse = (t) => { try { return JSON.parse(t); } catch { return null; } };
-  const before = f.status === 'A' ? {} : parse(S.read(S.from, f.old_path) ?? '') || {};
-  const after = f.status === 'D' ? {} : parse(S.read(S.to, f.path) ?? '') || {};
+  const before = f.status === 'A' ? {} : tryJson(S.read(S.from, f.old_path)) || {};
+  const after = f.status === 'D' ? {} : tryJson(S.read(S.to, f.path)) || {};
+  const headL = f.status === 'D' ? [] : S.headLines(f.path) || [];
   const lineOf = (needle) => {
-    const lines = f.status === 'D' ? [] : S.headLines(f.path) || [];
-    const i = lines.findIndex((l) => l.includes(`"${needle}"`));
+    const i = headL.findIndex((l) => l.includes(`"${needle}"`));
     return i === -1 ? null : i + 1;
   };
   const scripts = new Set([...Object.keys(before.scripts || {}), ...Object.keys(after.scripts || {})]
@@ -1256,7 +1249,7 @@ function checkCi(S) {
     const thresholds = (list) => list.map((x) => ({ x, m: M.THRESHOLD.exec(x.text) })).filter((t) => t.m);
     const before = thresholds(f.removed);
     for (const { x, m } of thresholds(f.added)) {
-      const prev = before.find((b) => b.m[1].replace(/\s+/g, '') === m[1].replace(/\s+/g, ''));
+      const prev = before.find((b) => thresholdName(b.m) === thresholdName(m));
       if (prev && Number(m[2]) < Number(prev.m[2])) {
         S.add('CK-CI', hardSeverity, f.path, x.line, `threshold lowered from ${prev.m[2]} to ${m[2]}`, x.text,
           { rule: 'ci.threshold-lowered' });
@@ -1513,8 +1506,7 @@ function checkLockStatic(S) {
     }
     const idx = lockIndex(lock, S.read(S.to, lock));
     if (!idx.ok) continue;
-    const lockDir = path.posix.dirname(lock);
-    const importer = path.posix.relative(lockDir === '.' ? '' : lockDir, path.posix.dirname(f.path)) || '.';
+    const importer = relDir(path.posix.dirname(lock), path.posix.dirname(f.path));
     const registry = [...delta.added, ...delta.changed.map((c) => c.dep)]
       .filter((d) => d.kind === 'registry' || d.kind === 'alias');
     const missing = registry.filter((d) => !lockHas(idx, after.ecosystem, d, { importer }));
@@ -1541,23 +1533,19 @@ function checkLockStatic(S) {
 // ---------------------------------------------------------------------------
 // CK-SCOPE: files outside the spec, generated files, churn, duplicated blocks, shadowing
 
-function matchesSpec(file, specPaths) {
-  return specPaths.some((p) => {
-    const s = toPosix(p).replace(/^\.\//, '').replace(/\/+$/, '');
-    if (!s) return false;
-    if (/[*?{[]/.test(s)) return matchGlob(file, s);
-    return file === s || file.startsWith(`${s}/`);
-  });
-}
+/** `file` is a spec path, below one, or matches one of its globs (`specPaths` normalized). */
+const matchesSpec = (file, specPaths) => specPaths.some((s) => (/[*?{[]/.test(s) ? matchGlob(file, s)
+  : file === s || file.startsWith(`${s}/`)));
 
 const MAX_OUTSIDE_SPEC = 25;
 
 function checkScope(S, specPaths) {
   let outside = 0;
   if (specPaths && specPaths.length) {
+    const spec = specPaths.map(normRel).filter(Boolean);
     for (const f of S.files) {
       const file = f.status === 'D' ? f.old_path : f.path;
-      if (M.classifyPath(file).lockfile || matchesSpec(file, specPaths)) continue;
+      if (M.classifyPath(file).lockfile || matchesSpec(file, spec)) continue;
       if (++outside <= MAX_OUTSIDE_SPEC) {
         S.add('CK-SCOPE', 'finding', file, null, 'changed file is outside the paths the spec names', '',
           { rule: 'scope.outside-spec' });
@@ -1691,8 +1679,9 @@ const COUNT_DATA = {
 
 function buildChecks(S, ms) {
   const command = `git diff -U0 -M ${S.from} ${S.to}`;
-  return Object.entries(CHECK_FM).map(([id, fm]) => {
-    const own = S.findings.filter((f) => f.id === id);
+  const byCheck = Map.groupBy(S.findings, (f) => f.id);
+  return CHECK_IDS.map((id) => {
+    const own = byCheck.get(id) || [];
     const top = own.reduce((m, f) => Math.max(m, SEVERITY_RANK[f.severity] ?? 0), 0);
     const failed = S.unverified[id];
     const status = top === 2 ? 'fail' : failed ? 'unverified' : top === 1 ? 'finding' : 'pass';
@@ -1708,7 +1697,7 @@ function buildChecks(S, ms) {
     if (capped.length < own.length) data.truncated = own.length - capped.length;
     const external = id === 'CK-SECRETS' && S.data.scanner_command;
     return makeCheck({
-      id, fm, status, reason: failed ? failed.code : null,
+      id, fm: [...CHECK_FM[id]], status, reason: failed ? failed.code : null,
       command: external ? S.data.scanner_command : command, cwd: toPosix(S.root),
       exit_code: external ? (S.data.scanner_exit ?? null) : 0, duration_ms: ms,
       summary: S.summaries[id] || (failed ? `could not run: ${failed.message}` : `${own.length} finding(s)`),
@@ -1829,20 +1818,18 @@ export function extractSpecPaths(text, treeFiles = null) {
 // ---------------------------------------------------------------------------
 // Command
 
-const USAGE = `usage: adc.mjs diff-scope [--base <ref>] [--spec <file>] [--allow <glob>]... [--json]
-
-Diff-scoped checks of the working-tree snapshot (uncommitted and untracked files included)
-against the base: CK-SCOPE, CK-TEST-DEL, CK-SKIP, CK-ASSERT, CK-TEST-CFG, CK-SUPPRESS, CK-CI,
-CK-SWALLOW, CK-SECRETS, CK-LOCK (static), CK-RETRY.
---spec      a spec/issue file (- reads stdin); the paths it names define the expected scope (CK-SCOPE)
---allow     mark paths as in scope and drop soft findings on them (never failures or secrets)
-Secret scanner: gitleaks or trufflehog when installed, built-in regexes otherwise
-(override with ADC_SECRETS_SCANNER=builtin|gitleaks|trufflehog).
-Exit: 0 clean, 1 failures or findings, 4 a check could not run.`;
-
 export const diffScopeCommand = defineCommand({
   name: 'diff-scope',
-  usage: USAGE,
+  usage: [
+    'diff-scope [--base <ref>] [--spec <file|->] [--allow <glob>]... [--json]',
+    'Diff-scoped checks of the working-tree snapshot (untracked files included) against the base:',
+    'CK-SCOPE, CK-TEST-DEL, CK-SKIP, CK-ASSERT, CK-TEST-CFG, CK-SUPPRESS, CK-CI, CK-SWALLOW, CK-SECRETS,',
+    'CK-LOCK (static), CK-RETRY.',
+    '--spec   the paths a spec names define the expected scope (CK-SCOPE)',
+    '--allow  in scope; soft findings on these paths are dropped (never failures or secrets)',
+    'Secrets: gitleaks or trufflehog when installed, else built-in patterns (ADC_SECRETS_SCANNER=builtin|gitleaks|',
+    'trufflehog overrides). Exit 0 clean, 1 failures or findings, 4 a check could not run.',
+  ].join('\n'),
   options: { base: { type: 'string' }, spec: { type: 'string' }, allow: { type: 'string', multiple: true } },
   positionals: false,
   async run(ctx, values) {

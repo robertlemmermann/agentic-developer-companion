@@ -7,13 +7,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  EXIT, usageError, envError, defineCommand, defineGroup, readText, readJson, writeFileAtomic, writeJsonAtomic,
-  withLock, matchGlob, sha256, nonce, nowIso, stamp, today, toPosix, relPosix, truncate, isObj, toArray, parseJsonl,
-  numberOption, makeCheck, spawnCapture, onInterrupt, makeTempDir, isAbsolutePath,
+  EXIT, usageError, envError, defineCommand, defineGroup, readText, readJson, readJsonFile, writeFileAtomic,
+  writeJsonAtomic, withLock, matchGlob, sha256, nowIso, stamp, today, toPosix, relPosix, displayPath, truncate, isObj,
+  toArray, parseJsonl, numberOption, makeCheck, spawnCapture, onInterrupt, makeTempDir, isAbsolutePath, listDir,
+  statOrNull, cmp, runId as newRunId,
 } from './core.mjs';
 import {
   DEFAULT_BUDGET, statePaths, prepareStateDir, parseEnvFile, setOwnerOnly, checkOwnerOnly, stateIgnored,
-  newestOpenSession, appendMetrics, prepareTarget, sanitizeId, listLedgers,
+  newestOpenSession, resolveSession, appendMetrics, prepareTarget, sanitizeId, listLedgers, ledgerFiles,
 } from './state.mjs';
 import { makeRedactor, redactDeep } from './markers.mjs';
 import { initLedger, addChecks } from './evidence.mjs';
@@ -26,13 +27,12 @@ export const CI_BUDGET_CEILING = 10_000;
 const KEEP = { sessions: 50, days: 90, probes: 200, runLogs: 20 };
 const MAX_TIMEOUT_S = 3600;
 const PROBE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
-const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 const LOCK = { waitMs: 30_000 };
 const TTY_ONLY = 'is accepted only from an interactive terminal: run this from a terminal';
 
 const nonNeg = (v) => v != null && v !== '' && Number.isFinite(Number(v)) && Number(v) >= 0;
 const round = (n) => Math.round(n * 1000) / 1000;
-const desc = (x, y) => (x < y ? 1 : x > y ? -1 : 0);
+const desc = (x, y) => cmp(y, x);
 const liveCheck = (fields) => makeCheck({ id: 'CK-LIVE', fm: ['FM-02'], ...fields });
 
 // ---------------------------------------------------------------------------
@@ -69,15 +69,13 @@ export function normalizeBudget(raw) {
 /** Read `.adc/budget.json` without writing: `{ path, exists, valid, error, notes, budget, defaults_exceeded }`. */
 export function loadBudget(stateInfo) {
   const file = statePaths(stateInfo.dir).budget;
-  const text = readText(file);
-  let error = text == null ? 'missing' : null;
-  let raw = null;
-  try { if (text != null) raw = JSON.parse(text); } catch (err) { error = `unparsable: ${truncate(err.message, 120)}`; }
-  const { ok, error: shapeError, notes, budget: b } = normalizeBudget(raw);
+  const r = readJsonFile(file);
+  const error = !r.exists ? 'missing' : r.error ? `unparsable: ${truncate(r.error, 120)}` : null;
+  const { ok, error: shapeError, notes, budget: b } = normalizeBudget(r.value ?? null);
   const valid = !error && ok;
   const raised = b.max_per_session > DEFAULT_BUDGET.max_per_session || b.max_per_day > DEFAULT_BUDGET.max_per_day;
   return {
-    path: toPosix(file), exists: text != null, valid, error: error || shapeError, notes, budget: b,
+    path: toPosix(file), exists: r.exists, valid, error: error || shapeError, notes, budget: b,
     defaults_exceeded: valid && raised,
   };
 }
@@ -88,12 +86,11 @@ export function liveSpendRecorded(stateInfo, day = today()) {
   const spent = (r) => String(r.ts || '').startsWith(day)
     && ((r.kind === 'live-probe' && Number(r.cost) > 0) || (r.kind === 'live-run' && Number(r.run_spent) > 0));
   if (parseJsonl(readText(p.metrics, '')).some(spent)) return true;
-  let names = [];
-  try { names = fs.readdirSync(p.evidence).filter((n) => n.endsWith('.json')); } catch {}
-  return names.some((n) => {
-    const file = path.join(p.evidence, n);
-    try { if (today(fs.statSync(file).mtime) !== day) return false; } catch { return false; }
-    return toArray(readJson(file, null)?.checks).some((c) => c?.id === 'CK-LIVE' && Number(c.cost) > 0);
+  // Only ledgers written that day can hold its spend, so the others are never parsed.
+  return ledgerFiles(stateInfo.dir).some(({ file }) => {
+    const st = statOrNull(file);
+    return st != null && today(st.mtime) === day
+      && toArray(readJson(file, null)?.checks).some((c) => c?.id === 'CK-LIVE' && Number(c.cost) > 0);
   });
 }
 
@@ -226,10 +223,9 @@ export function loadCredentials(state, { env = process.env, automation = false, 
 export function loadManifest(root, manifest = DEFAULT_MANIFEST) {
   const file = path.resolve(root, manifest);
   const rel = relPosix(root, file) || toPosix(manifest);
-  const text = readText(file);
-  if (text == null) throw envError('NO_PROBES', `${rel} not found; create it with \`scaffold live\` first`);
-  let doc;
-  try { doc = JSON.parse(text); } catch (err) { throw usageError(`${rel} is not valid JSON: ${err.message}`); }
+  const { exists, value: doc, error } = readJsonFile(file);
+  if (!exists) throw envError('NO_PROBES', `${rel} not found; create it with \`scaffold live\` first`);
+  if (error) throw usageError(`${rel} is not valid JSON: ${error}`);
   if (!isObj(doc) || !Array.isArray(doc.probes) || (doc.schema != null && doc.schema !== PROBES_SCHEMA)) {
     throw usageError(`${rel} must be {"schema": "${PROBES_SCHEMA}", "probes": [...]}`);
   }
@@ -250,6 +246,7 @@ export function loadManifest(root, manifest = DEFAULT_MANIFEST) {
     // cwd is relative to the repository root; absent means the manifest's own folder.
     const cwd = p.cwd == null ? dir : typeof p.cwd === 'string' && !isAbsolutePath(p.cwd) ? path.resolve(root, p.cwd)
       : null;
+    const cwdRel = cwd && relPosix(root, cwd);
     const rules = [
       [['readonly', 'synthetic'].includes(kind), 'kind must be readonly or synthetic'],
       [typeof p.cmd === 'string' && p.cmd.trim(), 'cmd must be a non-empty command line'],
@@ -258,23 +255,29 @@ export function loadManifest(root, manifest = DEFAULT_MANIFEST) {
       [timeout > 0 && timeout <= MAX_TIMEOUT_S, `timeout_s must be between 1 and ${MAX_TIMEOUT_S}`],
       [['per_request', 'cumulative'].includes(headerKind), 'cost_header_kind must be per_request or cumulative'],
       [p.cost_header == null || /^[A-Za-z0-9-]{1,100}$/.test(p.cost_header), 'cost_header must be an HTTP header name'],
-      [cwd && relPosix(root, cwd) != null, 'cwd must be a relative path inside the repository'],
+      [cwdRel != null, 'cwd must be a relative path inside the repository'],
     ];
     for (const [ok, msg] of rules) if (!ok) errors.push(`${where}: ${msg}`);
-    return { id, kind, cmd: String(p.cmd ?? ''), cwd, cwd_rel: cwd && relPosix(root, cwd), cost: Number(cost),
+    return { id, kind, cmd: String(p.cmd ?? ''), cwd, cwd_rel: cwdRel, cost: Number(cost),
       timeout_s: timeout, cost_header: p.cost_header ? String(p.cost_header) : null, cost_header_kind: headerKind };
   });
   if (errors.length) throw usageError(`${rel} is invalid: ${errors.slice(0, 5).join('; ')}`, { errors });
   return { path: toPosix(file), rel, dir, probes };
 }
 
-/** The live safety checklist gate for synthetic probes: present, and no line containing TODO. */
-export function checklistStatus(dir) {
-  const file = path.join(dir, CHECKLIST);
-  const text = readText(file);
-  if (text == null) return { path: toPosix(file), exists: false, open: null, ok: false, reason: 'CHECKLIST_MISSING' };
-  const open = text.split(/\r?\n/).filter((l) => l.includes('TODO')).length;
-  return { path: toPosix(file), exists: true, open, ok: open === 0, reason: open ? 'CHECKLIST_OPEN' : null };
+/**
+ * The live safety checklist gate for synthetic probes (the runner and `scaffold live`): the file
+ * exists and no line contains TODO. Pass `text` when the caller has already read the file.
+ * Returns `{ path, exists, open, open_items, ok, reason }`; `open_items` are the first 20 TODO lines.
+ */
+export function checklistStatus(file, text = readText(file)) {
+  if (text == null) {
+    return { path: toPosix(file), exists: false, open: null, open_items: [], ok: false, reason: 'CHECKLIST_MISSING' };
+  }
+  const open = text.split(/\r?\n/).filter((l) => l.includes('TODO'));
+  const items = open.slice(0, 20).map((l) => truncate(l.trim(), 120));
+  const reason = open.length ? 'CHECKLIST_OPEN' : null;
+  return { path: toPosix(file), exists: true, open: open.length, open_items: items, ok: !reason, reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +298,7 @@ async function runProbe(probe, { baseEnv, creds, runId, sessionId, tmpDir, redac
   };
   const timeoutMs = probe.timeout_s * 1000;
   const res = await spawnCapture(probe.cmd, [], { cwd: probe.cwd, env, shell: true, timeoutMs });
-  let result = null;
-  try { result = JSON.parse(readText(resultFile) ?? 'null'); } catch {}
+  const result = readJson(resultFile, null);
   try { fs.rmSync(resultFile, { force: true }); } catch {}
   const http = Number(result?.http_status ?? result?.status);
   const httpStatus = Number.isInteger(http) && http >= 100 && http <= 599 ? http : null;
@@ -318,15 +320,7 @@ async function recordEvidence({ ctx, root, ledgerOpt, checks, session }) {
   const created = !file;
   if (created) file = (await initLedger({ target, sessionId: session, mode: 'live' })).path;
   await addChecks(file, checks, { source: 'script', root: target.root });
-  return { path: relPosix(target.root, file) || toPosix(file), created, tree_digest: target.snapshot.tree };
-}
-
-function resolveSessionId(state, explicit) {
-  if (explicit && !SESSION_ID_RE.test(String(explicit))) throw usageError(`--session must match ${SESSION_ID_RE}`);
-  if (explicit) return { id: String(explicit), source: 'flag' };
-  const open = newestOpenSession(state.dir);
-  return open?.id ? { id: String(open.id), source: 'session-file' }
-    : { id: `run-${stamp()}-${nonce().slice(0, 6)}`, source: 'generated' };
+  return { path: displayPath(target.root, file), created, tree_digest: target.snapshot.tree };
 }
 
 const TOKEN_HELP = {
@@ -355,8 +349,8 @@ export async function liveRun({
   const globs = probes ? String(probes).split(',').map((s) => s.trim()).filter(Boolean) : null;
   const selected = globs ? man.probes.filter((p) => globs.some((g) => p.id === g || matchGlob(p.id, g))) : man.probes;
   if (!selected.length) throw usageError(`${globs ? `--probes ${probes} matches no probe` : 'no probe'} in ${man.rel}`);
-  const session = resolveSessionId(state, sessionId);
-  const runId = `live-${stamp()}-${nonce().slice(0, 6)}`;
+  const session = resolveSession(state.dir, sessionId);
+  const runId = newRunId('live');
   const creds = loadCredentials(state, { env, automation, fixPerms: !dryRun });
   if (creds.error === 'BASE_URL_USERINFO') {
     throw usageError('ADC_LIVE_BASE_URL must not carry credentials (user:password@host); use ADC_LIVE_TOKEN');
@@ -367,7 +361,7 @@ export async function liveRun({
   const say = (msg) => { if (!warnings.includes(msg)) { warnings.push(msg); notify?.(redact(msg)); } };
   const perms = creds.file.perms;
   if (perms && !perms.ok) say(`.env.live is not owner-only (${perms.mode || perms.detail}); ${perms.warning}`);
-  const checklist = checklistStatus(man.dir);
+  const checklist = checklistStatus(path.join(man.dir, CHECKLIST));
   const capsFor = (b) => effectiveCaps(b, { runClass, session: b.sessions[session.id], env, credits });
   const viewOf = (b) => budgetView(b, { sessionId: session.id, identitySource: session.source, caps: capsFor(b),
     runClass });
@@ -484,7 +478,7 @@ export async function liveRun({
       runSpent = round(runSpent + s.cost);
       const logFile = path.join(logDir, `${sanitizeId(probe.id)}.log`);
       writeFileAtomic(logFile, res.output ? `${res.output}\n` : '');
-      const log = relPosix(root, logFile) || toPosix(logFile);
+      const log = displayPath(root, logFile);
       const outcome = { status: res.status, reason: res.reason, cost: s.cost, duration_ms: res.duration_ms,
         exit_code: res.exit_code };
       const tail = res.status !== 'pass' && res.output && truncate(res.output.split('\n').slice(-15).join('\n'), 2000);
@@ -515,8 +509,7 @@ export async function liveRun({
   }
   if (!dryRun) {
     const logs = path.dirname(logDir);
-    let runs = [];
-    try { runs = fs.readdirSync(logs).filter((d) => d.startsWith('live-')).sort().reverse(); } catch {}
+    const runs = listDir(logs).filter((d) => d.startsWith('live-')).sort(desc);
     for (const d of runs.slice(KEEP.runLogs)) fs.rmSync(path.join(logs, d), { recursive: true, force: true });
   }
 
@@ -627,7 +620,7 @@ const budgetShow = defineCommand({
     const state = prepareStateDir(ctx, { create: false });
     const loaded = loadBudget(state);
     const b = loaded.budget;
-    const rel = relPosix(state.root || ctx.cwd, loaded.path) || loaded.path;
+    const rel = displayPath(state.root || ctx.cwd, loaded.path);
     const ses = values.session ? b.sessions[values.session] : null;
     if (values.session && !ses) throw usageError(`no session "${values.session}" in ${rel}`);
     // Remainders under the caps this caller's run class gets (agent runs ignore raised caps).

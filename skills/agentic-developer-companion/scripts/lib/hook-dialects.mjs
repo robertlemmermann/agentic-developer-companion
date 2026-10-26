@@ -1,19 +1,19 @@
-// Hook dialects (§8.3): detect who is calling, normalize the three stdin payload shapes
-// (Copilot camelCase, Copilot/Claude/Codex snake_case) into one record, extract target paths
-// (including Codex `apply_patch` bodies and string-encoded Copilot `toolArgs`), and format a
-// decision in the shape each host expects. Imports only core.mjs: hooks load it on every call.
+// Hook dialects (§8.3): detect the caller, normalize the payload shapes (Copilot camelCase;
+// Copilot, Claude and Codex snake_case) into one record, extract target paths (including Codex
+// `apply_patch` bodies and string-encoded Copilot `toolArgs`), and format a decision for each host.
+// Imports only core.mjs: every hook call loads it.
 
-import { isObj, sha256, toPosix, truncate } from './core.mjs';
+import { isObj, sha256, toPosix, truncate, tryJson } from './core.mjs';
 
-export const DIALECTS = Object.freeze(['copilot', 'claude', 'codex']);
+const DIALECTS = ['copilot', 'claude', 'codex'];
 export const HOOK_EVENTS = Object.freeze(['session-start', 'post-edit', 'post-shell', 'stop', 'pre-guard',
   'session-end']);
 /** Hook levels (§8.5), shared by the handler and the renderer. */
 export const LEVELS = Object.freeze(['advise', 'gate', 'guard']);
-export const CONTEXT_LIMIT = 2000;
+const CONTEXT_LIMIT = 2000;
 
-/** Host event names (Claude and Codex output carry them in hookSpecificOutput.hookEventName). */
-export const HOST_EVENT = Object.freeze({
+// Host event names (Claude and Codex output carry them in hookSpecificOutput.hookEventName).
+const HOST_EVENT = Object.freeze({
   'session-start': 'SessionStart',
   'post-edit': 'PostToolUse',
   'post-shell': 'PostToolUse',
@@ -36,12 +36,11 @@ const CAMEL_KEYS = ['sessionId', 'toolName', 'toolArgs', 'toolResult', 'transcri
 
 const has = (o, k) => isObj(o) && Object.hasOwn(o, k);
 
-/** Parse a value that may be a JSON-encoded string (Copilot camelCase `toolArgs`). */
-export function decodeMaybeJson(value) {
+/** A value that may be a JSON-encoded string (Copilot camelCase `toolArgs`), decoded. */
+function decodeMaybeJson(value) {
   if (typeof value !== 'string') return value;
   const t = value.trim();
-  if (!t || !'{["'.includes(t[0])) return value;
-  try { return JSON.parse(t); } catch { return value; }
+  return t && '{["'.includes(t[0]) ? tryJson(t, value) : value;
 }
 
 /**
@@ -89,8 +88,8 @@ function isoFrom(ts) {
 const RESULT_TEXT_KEYS = ['textResultForLlm', 'text_result_for_llm', 'stdout', 'stderr', 'output', 'aggregated_output',
   'formatted_output', 'text', 'content', 'result', 'message', 'error'];
 
-/** Collect readable text from a tool result (string, {stdout,stderr}, content blocks...). */
-export function resultText(value, max = 200_000) {
+/** Readable text of a tool result (string, {stdout, stderr}, content blocks...). */
+function resultText(value, max = 200_000) {
   const parts = [];
   let size = 0;
   const walk = (v, depth) => {
@@ -208,12 +207,17 @@ const PATCH_FILE = /\*\*\* (Add|Update|Delete) File:/;
 
 const cleanPath = (s) => toPosix(String(s).trim().replace(/^["']|["']$/g, ''));
 
+// A handler asks for the same tool input's patch up to twice (paths, content, ops): it is parsed
+// once. Callers treat the result as read-only.
+let lastPatch = { input: undefined, files: [] };
+
 /**
  * Parse every `apply_patch` body found in the tool input. Returns
  * `[{path, op: 'add'|'update'|'delete', moveTo?, added: [{line, text}]}]`. `line` is the line in the
  * new file, or null where the patch does not say: Codex-style `@@` hunks carry context, not numbers.
  */
 export function parsePatch(input) {
+  if (input === lastPatch.input) return lastPatch.files;
   const bodies = [];
   const walk = (v, depth) => {
     if (depth > 4 || v == null) return;
@@ -255,6 +259,7 @@ export function parsePatch(input) {
       else if (raw.startsWith(' ')) lineNo += 1;
     }
   }
+  lastPatch = { input, files };
   return files;
 }
 

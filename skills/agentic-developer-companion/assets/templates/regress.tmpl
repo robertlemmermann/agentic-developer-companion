@@ -1,8 +1,6 @@
-# regress scaffolds (plan §10.1): one failing regression test per bug, named test_<issue>_<behavior>,
-# tagged regression and linked to the issue, plus reproduction notes in the state dir (.adc/repro/).
-# Rendered by scripts/lib/scaffold.mjs. Attributes: lang, when=<feature>, scope=state (path relative
-# to the state dir, never committed). The placeholder failure keeps an unedited skeleton red.
-# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
+# regress (plan §10.1): one failing regression test per bug, named test_<issue>_<behavior>, tagged
+# regression and linked to the issue, plus reproduction notes in the state dir (.adc/repro/). The
+# placeholder failure keeps an unedited skeleton red. Attributes: see scripts/lib/scaffold.mjs (renderFiles).
 
 @@@ file: {{file_name}} lang=ts|js @@@
 {{test_header}}

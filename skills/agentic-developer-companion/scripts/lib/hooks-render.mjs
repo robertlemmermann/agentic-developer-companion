@@ -1,14 +1,14 @@
-// `hooks render` / `setup hooks` (§8.4, §8.5): render the hook templates in assets/hooks/ for one
-// host with the installed skill path, merge them into the host's config file (never overwrite,
-// always back up), record what was added in `.adc/hooks-installed.json`, remove exactly that
-// again, and list what is registered on this machine for `doctor`.
+// `hooks render` / `setup hooks` (§8.4, §8.5): render the hook template in assets/hooks/ for one
+// host with the installed skill path, merge it into the host's config file (never overwrite, always
+// back up), record what was added in `.adc/hooks-installed.json`, remove exactly that again, and
+// list what is registered on this machine (for `doctor`).
 
 import fs from 'node:fs';
 import path from 'node:path';
 import {
   ASSETS_DIR, EXIT, SKILL_DIR, SKILL_NAME, AdcError, defineCommand, defineGroup, envError, hostFromEnv, hostHomes,
-  isObj, nowIso, quoteFor, readJson, readText, relPosix, run, stamp, toPosix, usageError, writeFileAtomic,
-  writeJsonAtomic, IS_WINDOWS,
+  isObj, listDir, nowIso, plural, quoteFor, readJson, readJsonFile, readText, relPosix, run, stamp, toPosix, usageError,
+  writeFileAtomic, writeJsonAtomic, IS_WINDOWS,
 } from './core.mjs';
 import { appendExclude, checkIgnore, repoRoot } from './git.mjs';
 import { prepareStateDir, resolveStateDir, statePaths, assertStateUntracked } from './state.mjs';
@@ -16,8 +16,8 @@ import { LEVELS } from './hook-dialects.mjs';
 
 export { LEVELS };
 export const HOSTS = Object.freeze(['copilot', 'copilot-cloud', 'claude', 'codex']);
-export const SCOPES = Object.freeze(['user', 'project']);
-export const HOOK_FILE_NAME = `${SKILL_NAME}.json`;
+const SCOPES = ['user', 'project'];
+const HOOK_FILE_NAME = `${SKILL_NAME}.json`;
 const TEMPLATE = {
   copilot: 'copilot.hooks.json',
   'copilot-cloud': 'copilot.cloud.hooks.json',
@@ -56,19 +56,19 @@ const portableUnsafe = (s) => /["$`%!]/.test(s);
 // Backslashes count as safe: Windows paths need no quoting for them.
 const needsQuote = (s) => /[^A-Za-z0-9_\-+=.,/:@\\]/.test(s);
 const winAbs = (p) => /^[A-Za-z]:[\\/]/.test(String(p));
+// Hosts whose config holds one shell string per handler (no exec form): Codex, and Claude's project
+// file, which Copilot also runs.
+const isShellForm = (host, scope) => host === 'codex' || (host === 'claude' && scope === 'project');
 
 const templates = new Map();
 /** The parsed template of a host (read once per process; callers get a copy). */
 function loadTemplate(host) {
   if (!templates.has(host)) {
     const file = path.join(ASSETS_DIR, 'hooks', TEMPLATE[host]);
-    const text = readText(file);
-    if (text == null) throw envError('TEMPLATE_MISSING', `hook template not found: ${toPosix(file)}`);
-    try {
-      templates.set(host, JSON.parse(text));
-    } catch (err) {
-      throw envError('TEMPLATE_INVALID', `hook template is not valid JSON: ${toPosix(file)}: ${err.message}`);
-    }
+    const t = readJsonFile(file);
+    if (!t.exists) throw envError('TEMPLATE_MISSING', `hook template not found: ${toPosix(file)}`);
+    if (t.error) throw envError('TEMPLATE_INVALID', `hook template is not valid JSON: ${toPosix(file)}: ${t.error}`);
+    templates.set(host, t.value);
   }
   return structuredClone(templates.get(host));
 }
@@ -128,7 +128,7 @@ function nodeForms(nodePath, warnings, host, scope, shortPath = null) {
   const posix = toPosix(nodePath);
   const win = winAbs(posix) ? posix.replace(/\//g, '\\') : posix;
   const quoted = needsQuote(posix);
-  const shellForm = host === 'codex' || (host === 'claude' && scope === 'project');
+  const shellForm = isShellForm(host, scope);
   const guarded = {
     bashTest: `command -v ${bashQuote(posix)} >/dev/null 2>&1`, bash: bashQuote(posix),
     psTest: `Get-Command ${psQuote(posix)} -ErrorAction SilentlyContinue`, ps: `& ${psQuote(posix)}`,
@@ -176,7 +176,7 @@ function specOf(obj) {
 }
 
 /** True for a config entry or handler that runs this skill's hook handler. */
-export function isOurs(obj) {
+function isOurs(obj) {
   if (!isObj(obj)) return false;
   if (Array.isArray(obj.hooks)) return obj.hooks.some(isOurs);
   return commandStrings(obj, [...COMMAND_KEYS, 'exec'])
@@ -212,7 +212,7 @@ export function renderHooks({ host, scope = null, level = 'advise', nodePath = n
   }
   const node = nodeForms(np, warnings, host, sc, shortPath);
   const script = `${skill.value}/scripts/adc.mjs`;
-  const shellForm = host === 'codex' || (host === 'claude' && sc === 'project');
+  const shellForm = isShellForm(host, sc);
   if (shellForm && portableUnsafe(script)) {
     warnings.push('the skill path contains $, `, %, ! or a quote; shell-form commands for this host cannot quote it for'
       + ' every shell');
@@ -361,43 +361,47 @@ function nextSteps(host, scope, level, target, skill) {
 // ---------------------------------------------------------------------------
 // Merge, write, remove
 
+/** A host config file as `{ exists, data }` (an empty file is `{}`); throws when it is not a JSON object. */
 function readConfigFile(file) {
-  const text = readText(file);
-  if (text == null) return { exists: false, data: null };
-  if (!text.trim()) return { exists: true, data: {} };
-  try {
-    const data = JSON.parse(text);
-    if (!isObj(data)) throw new Error('top level is not an object');
-    return { exists: true, data };
-  } catch (err) {
+  const r = readJsonFile(file);
+  if (!r.exists) return { exists: false, data: null };
+  if (r.error && !readText(file, '').trim()) return { exists: true, data: {} };
+  const problem = r.error ?? (isObj(r.value) ? null : 'top level is not an object');
+  if (problem) {
     throw envError('CONFIG_UNPARSABLE',
-      `${toPosix(file)} is not valid JSON (${err.message}); fix or move it, nothing was changed`);
+      `${toPosix(file)} is not valid JSON (${problem}); fix or move it, nothing was changed`);
   }
+  return { exists: true, data: r.value };
 }
 
+// Copilot lists handlers per event; Claude and Codex list groups ({matcher, hooks: [handler]}).
 const copilotShaped = (host) => host === 'copilot' || host === 'copilot-cloud';
 
-/** Copy of `data` without this skill's entries; `removed` counts what was taken out. */
-export function stripOurs(data, host) {
-  const out = structuredClone(data || {});
-  let removed = 0;
-  if (!isObj(out.hooks)) return { data: out, removed };
-  const keepForeign = (list) => list.filter((x) => { const ours = isOurs(x); if (ours) removed++; return !ours; });
-  for (const [ev, list] of Object.entries(out.hooks)) {
+/**
+ * Split a config into this skill's handlers and the rest: `{ data, found }`, where `data` is a copy
+ * without them (emptied groups and events dropped) and `found` lists `{host_event, entry, spec}`
+ * (`entry` is the handler, or for Claude and Codex its group holding only that handler).
+ */
+function splitOurs(config, host) {
+  const data = structuredClone(config || {});
+  const found = [];
+  if (!isObj(data.hooks)) return { data, found };
+  for (const [ev, list] of Object.entries(data.hooks)) {
     if (!Array.isArray(list)) continue;
-    const next = copilotShaped(host) ? keepForeign(list) : list.flatMap((group) => {
+    const take = (hd, entry = hd) => isOurs(hd) && found.push({ host_event: ev, entry, spec: specOf(hd) });
+    const next = copilotShaped(host) ? list.filter((hd) => !take(hd)) : list.flatMap((group) => {
       if (!isObj(group) || !Array.isArray(group.hooks)) return [group];
-      const handlers = keepForeign(group.hooks);
+      const handlers = group.hooks.filter((hd) => !take(hd, { ...group, hooks: [hd] }));
       return handlers.length ? [{ ...group, hooks: handlers }] : [];
     });
-    if (next.length) out.hooks[ev] = next; else delete out.hooks[ev];
+    if (next.length) data.hooks[ev] = next; else delete data.hooks[ev];
   }
-  return { data: out, removed };
+  return { data, found };
 }
 
 /** Merge a rendered config into existing file data: our old entries are replaced, others kept. */
-export function mergeConfig(existing, rendered) {
-  const { data: out } = stripOurs(existing || {}, rendered.host);
+function mergeConfig(existing, rendered) {
+  const { data: out } = splitOurs(existing, rendered.host);
   if (copilotShaped(rendered.host)) {
     if (out.version == null) out.version = rendered.config.version ?? 1;
   } else if (rendered.host === 'codex' && out.description == null && !existing) {
@@ -435,7 +439,7 @@ function readRecords(root, stateDirOption = null) {
 
 function writeRecords(ctx, root, mutate) {
   if (!root) return null;
-  const state = prepareStateDir({ ...(ctx || {}), cwd: root }, { create: true });
+  const state = prepareStateDir({ ...(ctx || {}), cwd: root }, { create: true, root });
   const file = state.paths.hooksInstalled;
   const data = readJson(file, null) || {};
   const entries = mutate(Array.isArray(data.entries) ? data.entries : []);
@@ -479,47 +483,23 @@ export function writeHooks(rendered, { root = null, backup = true, dryRun = fals
 }
 
 /** Candidate config files per host and scope that may hold this skill's entries. */
-export function knownConfigFiles({ root = null, env = process.env, home = null } = {}) {
+function knownConfigFiles({ root = null, env = process.env, home = null } = {}) {
   const homes = hostHomes({ env, home });
   const out = [];
-  const add = (host, scope, file, shape) => out.push({ host, scope, file, shape });
-  const listJson = (dir) => {
-    try {
-      return fs.readdirSync(dir).filter((n) => n.endsWith('.json')).map((n) => path.join(dir, n));
-    } catch {
-      return [];
-    }
-  };
-  for (const f of listJson(path.join(homes.copilot, 'hooks'))) add('copilot', 'user', f, 'copilot');
-  add('copilot', 'user', path.join(homes.copilot, 'settings.json'), 'copilot');
-  add('claude', 'user', path.join(homes.claude, 'settings.json'), 'nested');
-  add('codex', 'user', path.join(homes.codex, 'hooks.json'), 'nested');
+  const add = (host, scope, file) => out.push({ host, scope, file });
+  const listJson = (dir) => listDir(dir).filter((n) => n.endsWith('.json')).map((n) => path.join(dir, n));
+  for (const f of listJson(path.join(homes.copilot, 'hooks'))) add('copilot', 'user', f);
+  add('copilot', 'user', path.join(homes.copilot, 'settings.json'));
+  add('claude', 'user', path.join(homes.claude, 'settings.json'));
+  add('codex', 'user', path.join(homes.codex, 'hooks.json'));
   if (root) {
-    for (const f of listJson(path.join(root, '.github', 'hooks'))) add('copilot', 'project', f, 'copilot');
+    for (const f of listJson(path.join(root, '.github', 'hooks'))) add('copilot', 'project', f);
     const settings = ['settings.json', 'settings.local.json'];
-    for (const n of settings) add('copilot', 'project', path.join(root, '.github', 'copilot', n), 'copilot');
-    for (const n of settings) add('claude', 'project', path.join(root, '.claude', n), 'nested');
-    add('codex', 'project', path.join(root, '.codex', 'hooks.json'), 'nested');
+    for (const n of settings) add('copilot', 'project', path.join(root, '.github', 'copilot', n));
+    for (const n of settings) add('claude', 'project', path.join(root, '.claude', n));
+    add('codex', 'project', path.join(root, '.codex', 'hooks.json'));
   }
   return out;
-}
-
-function ourEntriesIn(data, shape) {
-  const found = [];
-  if (!isObj(data) || !isObj(data.hooks)) return found;
-  for (const [ev, list] of Object.entries(data.hooks)) {
-    if (!Array.isArray(list)) continue;
-    for (const item of list) {
-      if (shape === 'copilot') {
-        if (isOurs(item)) found.push({ host_event: ev, entry: item, spec: specOf(item) });
-      } else if (isObj(item) && Array.isArray(item.hooks)) {
-        for (const hd of item.hooks.filter(isOurs)) {
-          found.push({ host_event: ev, entry: { ...item, hooks: [hd] }, spec: specOf(hd) });
-        }
-      }
-    }
-  }
-  return found;
 }
 
 const handlerOf = (entry) => (Array.isArray(entry.hooks) ? entry.hooks[0] || {} : entry);
@@ -573,7 +553,7 @@ export function listRegisteredHooks({ root = null, env = process.env, home = nul
       continue;
     }
     if (!parsed.exists) continue;
-    const found = ourEntriesIn(parsed.data, cand.shape);
+    const { found } = splitOurs(parsed.data, cand.host);
     if (!found.length) continue;
     const skillPaths = [...new Set(found.map((f) => skillPathOf(f.entry)).filter(Boolean))];
     // A project Copilot file with repo-relative skill paths is the committed cloud-agent file.
@@ -589,7 +569,7 @@ export function listRegisteredHooks({ root = null, env = process.env, home = nul
       const scope = host === 'copilot-cloud' ? 'project' : cand.scope;
       const fresh = renderHooks({ host, scope, level, root, env, home,
         nodePath: nodeOf(found[0].entry), skillDir: skillPaths[0] ? resolveSkill(skillPaths[0]) : skillDir });
-      const want = ourEntriesIn(fresh.config, cand.shape).map((f) => JSON.stringify([f.host_event, f.entry])).sort();
+      const want = splitOurs(fresh.config, cand.host).found.map((f) => JSON.stringify([f.host_event, f.entry])).sort();
       const have = found.map((f) => JSON.stringify([f.host_event, f.entry])).sort();
       matches = want.length === have.length && want.every((w, i) => w === have[i]);
     } catch { matches = null; }
@@ -642,7 +622,8 @@ export function removeHooks({ host = null, scope = null, root = null, env = proc
       continue;
     }
     if (!parsed.exists) continue;
-    const { data, removed: n } = stripOurs(parsed.data, t.host);
+    const { data, found } = splitOurs(parsed.data, t.host);
+    const n = found.length;
     if (!n) continue;
     const emptyHooks = !isObj(data.hooks) || Object.keys(data.hooks).length === 0;
     const ownFile = path.basename(file) === HOOK_FILE_NAME || t.created;
@@ -686,7 +667,7 @@ function humanRender(res) {
   if (res.removed) {
     lines.push(res.removed.length ? 'Removed:' : 'Nothing to remove.');
     for (const r of res.removed) {
-      lines.push(`  ${r.host} (${r.scope}) ${r.file}: ${r.entries} entr${r.entries === 1 ? 'y' : 'ies'}`
+      lines.push(`  ${r.host} (${r.scope}) ${r.file}: ${r.entries} ${plural(r.entries, 'entry', 'entries')}`
         + `${r.deleted_file ? ', file deleted' : ''}${r.backup_file ? `, backup ${r.backup_file}` : ''}`);
     }
     return lines.join('\n');
@@ -707,7 +688,7 @@ function humanRender(res) {
 
 /** Every CLI command refuses (exit 3) while the state dir is tracked by git (plan §7.3). */
 function refuseTrackedState(ctx, root) {
-  if (root) assertStateUntracked(resolveStateDir({ cwd: root, stateDirOption: ctx.stateDirOption }));
+  if (root) assertStateUntracked(resolveStateDir({ root, stateDirOption: ctx.stateDirOption }));
 }
 
 async function runRender(ctx, values) {
@@ -724,7 +705,7 @@ async function runRender(ctx, values) {
     }
     const res = removeHooks({ ...sel, dryRun: ctx.dryRun, ctx });
     const n = res.removed.reduce((a, r) => a + (r.entries || 0), 0);
-    const summary = `${ctx.dryRun ? 'would remove' : 'removed'} ${n} hook entr${n === 1 ? 'y' : 'ies'} from`
+    const summary = `${ctx.dryRun ? 'would remove' : 'removed'} ${n} hook ${plural(n, 'entry', 'entries')} from`
       + ` ${res.removed.length} file(s)`;
     return { result: { ...res, dry_run: ctx.dryRun }, exit: EXIT.OK, human: humanRender(res), summary };
   }
@@ -764,11 +745,11 @@ const RENDER_OPTIONS = {
   write: { type: 'boolean' }, remove: { type: 'boolean' },
 };
 
-export const renderCommand = defineCommand({
+const renderCommand = defineCommand({
   name: 'hooks render', usage: RENDER_USAGE, options: RENDER_OPTIONS, positionals: false, run: runRender,
 });
 
-export const listCommand = defineCommand({
+const listCommand = defineCommand({
   name: 'hooks list',
   usage: 'hooks list [--json]  (registered hooks of this skill: user config files plus the current repository)',
   positionals: false,

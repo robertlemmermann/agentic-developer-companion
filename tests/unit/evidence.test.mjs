@@ -2,7 +2,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
@@ -11,48 +10,11 @@ import * as state from '../../skills/agentic-developer-companion/scripts/lib/sta
 import * as ev from '../../skills/agentic-developer-companion/scripts/lib/evidence.mjs';
 import * as tr from '../../skills/agentic-developer-companion/scripts/lib/trace.mjs';
 import * as vf from '../../skills/agentic-developer-companion/scripts/lib/verify.mjs';
+import { AWS_KEY, hostFreeEnv, makeRepo, runAdc, tmpDir, writeFiles } from './helpers.mjs';
 
-const ADC = core.ADC_SCRIPT;
 delete process.env.ADC_HOME;
 
-function makeRepo(files = {}, { commit = true } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-ev-'));
-  const g = (...args) => {
-    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout;
-  };
-  g('init', '-q', '-b', 'main');
-  g('config', 'user.email', 't@example.com');
-  g('config', 'user.name', 'Test');
-  g('config', 'commit.gpgsign', 'false');
-  write(dir, files);
-  if (commit) { g('add', '-A'); g('commit', '-q', '-m', 'init', '--allow-empty'); }
-  return { dir, g };
-}
-
-function write(dir, files) {
-  for (const [p, c] of Object.entries(files)) {
-    if (c === null) { fs.rmSync(path.join(dir, p), { force: true }); continue; }
-    fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
-    fs.writeFileSync(path.join(dir, p), c);
-  }
-}
-
-const cliEnv = () => {
-  const env = { ...process.env };
-  for (const k of ['ADC_HOME', 'ADC_LIVE_TOKEN', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'COPILOT_CLI', 'COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'CODEX_SANDBOX', 'CODEX_THREAD_ID']) delete env[k];
-  return env;
-};
-
-function adc(args, { cwd, input, env } = {}) {
-  const r = spawnSync(process.execPath, [ADC, ...args, '--json', ...(cwd ? ['--cwd', cwd] : [])], {
-    encoding: 'utf8', input: input ?? '', env: { ...cliEnv(), ...(env || {}) }, timeout: 60_000,
-  });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
-  return { status: r.status, json, stdout: r.stdout, stderr: r.stderr };
-}
+const adc = (args, { cwd, input, env } = {}) => runAdc(args, { cwd, input, env: hostFreeEnv(env) });
 
 const ck = (id, status, extra = {}) => ({ id, status, summary: `${id} ${status}`, ...extra });
 
@@ -72,7 +34,6 @@ async function ledgerWith(dir, checks = [], { specText = null } = {}) {
 }
 
 const readLedger = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-const AWS_KEY = () => ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
 
 // ---------------------------------------------------------------------------
 // Host identity, hashing, normalization
@@ -115,7 +76,7 @@ test('createSnapshot sees same-tick edits (racy git) and works with an ignored .
   for (let i = 0; i < 8; i++) {
     const { dir, g } = makeRepo({ 'a.js': 'x\n' });
     fs.writeFileSync(path.join(dir, 'a.js'), 'y\n');
-    write(dir, { '.adc/.env.live': 'ADC_LIVE_TOKEN\n', 'u.txt': 'untracked\n' });
+    writeFiles(dir, { '.adc/.env.live': 'ADC_LIVE_TOKEN\n', 'u.txt': 'untracked\n' });
     fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
     core.sleepSync(40);
     const before = g('status', '--porcelain');
@@ -222,7 +183,7 @@ test('ledger: entries are chained; edits, removals and artifact changes are refu
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
   const art = path.join(dir, '.adc', 'cache', 'runs', 'r1', 'run.log');
   const { file, target } = await ledgerWith(dir, []);
-  write(dir, { '.adc/cache/runs/r1/run.log': 'log\n' });
+  writeFiles(dir, { '.adc/cache/runs/r1/run.log': 'log\n' });
   await ev.addChecks(file, [ck('CK-CLEANRUN', 'pass', { artifacts: ['.adc/cache/runs/r1/run.log'] }), ck('CK-SKIP', 'fail'), ck('CK-SCOPE', 'pass')], { source: 'verify', root: dir });
   const pristine = fs.readFileSync(file, 'utf8');
   assert.equal(ev.verifyIntegrity(readLedger(file), { root: dir }).ok, true);
@@ -248,14 +209,14 @@ test('ledger: entries are chained; edits, removals and artifact changes are refu
 
 test('ledger: finalize refuses a stale snapshot, seals, and freezes the ledger', async () => {
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
-  write(dir, { 'a.txt': 'changed\n', 'new.txt': 'untracked\n' });
+  writeFiles(dir, { 'a.txt': 'changed\n', 'new.txt': 'untracked\n' });
   const { file, ctx } = await ledgerWith(dir, [ck('CK-CLEANRUN', 'pass'), ck('CK-SCOPE', 'pass')]);
   await ev.setClaims(file, 'All tests pass.\n');
-  write(dir, { 'new.txt': 'edited after verify\n' });
+  writeFiles(dir, { 'new.txt': 'edited after verify\n' });
   const staleTarget = await state.prepareTarget(ctx);
   assert.equal(ev.ledgerStatus({ target: staleTarget }).stale, true);
   await assert.rejects(ev.finalizeLedger(file, { target: staleTarget }), (e) => e.exit === 4 && e.code === 'LEDGER_STALE');
-  write(dir, { 'new.txt': 'untracked\n' });
+  writeFiles(dir, { 'new.txt': 'untracked\n' });
   const target = await state.prepareTarget(ctx);
   const st = ev.ledgerStatus({ target });
   assert.equal(st.stale, false);
@@ -288,12 +249,12 @@ test('ledger: input checks are validated; stale input, CK-CLAIMS and matrix-less
 test('ledger: a completed matrix is refused when the stored trace skeleton was edited', async () => {
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
   const skeleton = (strength) => JSON.stringify({ requirements: [{ id: 'R1', text: 'limit requests', strength, kind: 'bullet' }] });
-  write(dir, { '.adc/sk/trace.json': skeleton('strong') });
+  writeFiles(dir, { '.adc/sk/trace.json': skeleton('strong') });
   const { file } = await ledgerWith(dir, [ck('CK-TRACE', 'unverified', { pending: true, artifacts: ['.adc/sk/trace.json'] })]);
   const matrix = ck('CK-TRACE', 'pass', { data: { matrix: { requirements: [{ id: 'R1', status: 'dismissed' }] } } });
-  write(dir, { '.adc/sk/trace.json': skeleton('weak') });
+  writeFiles(dir, { '.adc/sk/trace.json': skeleton('weak') });
   await assert.rejects(ev.addChecks(file, [matrix], { source: 'input', root: dir }), (e) => e.exit === 4 && e.code === 'LEDGER_TAMPERED');
-  write(dir, { '.adc/sk/trace.json': skeleton('strong') });
+  writeFiles(dir, { '.adc/sk/trace.json': skeleton('strong') });
   const { added } = await ev.addChecks(file, [matrix], { source: 'input', root: dir });
   assert.deepEqual([added[0].status, added[0].data.requirements[0].status], ['unverified', 'unknown'], 'a strong requirement cannot be dismissed');
 });
@@ -305,13 +266,13 @@ test('ledger: secrets and the live token never reach the ledger or its Markdown'
   process.env['ADC_LIVE_TOKEN'] = token;
   try {
     const { file } = await ledgerWith(dir, [ck('CK-SECRETS', 'fail', {
-      summary: `found ${AWS_KEY()} and ${token}`, findings: [{ severity: 'fail', file: 'x.js', line: 1, message: 'key', evidence: `k=${AWS_KEY()}` }],
+      summary: `found ${AWS_KEY} and ${token}`, findings: [{ severity: 'fail', file: 'x.js', line: 1, message: 'key', evidence: `k=${AWS_KEY}` }],
     })]);
     await ev.setClaims(file, `Used the token ${token} for the smoke tests.`);
     const json = fs.readFileSync(file, 'utf8');
     const md = fs.readFileSync(ev.markdownPath(file), 'utf8');
     for (const text of [json, md, ev.renderMarkdown(readLedger(file))]) {
-      assert.ok(!text.includes(AWS_KEY()), 'AWS-shaped key redacted');
+      assert.ok(!text.includes(AWS_KEY), 'AWS-shaped key redacted');
       assert.ok(!text.includes(token), 'ADC_LIVE_TOKEN value redacted');
     }
     assert.match(json, /REDACTED/);
@@ -500,7 +461,7 @@ async function traceRepo() {
     'src/limiter.js': 'export function limit() {\n  return 200;\n}\n', 'src/old.js': 'a\nb\nc\nd\n', 'img.bin': Buffer.from([0, 1, 2, 3]),
     'tests/limiter.test.js': "test('x', () => {});\n", 'src/blank.js': 'x\n',
   });
-  write(dir, {
+  writeFiles(dir, {
     'src/limiter.js': "import fs from 'node:fs';\nexport function limit(n) {\n  return n > 100 ? 429 : 200;\n}\n",
     'src/old.js': 'a\nd\n', 'src/extra.js': 'export const unrelated = true;\n', 'img.bin': Buffer.from([9, 9, 9]),
     'tests/limiter.test.js': "test('x', () => {});\ntest('429 over limit', () => { expect(limit(101)).toBe(429); });\n",
@@ -572,12 +533,12 @@ test('trace skeleton and matrix evaluation: citations, missing, unknown, dismiss
 
 test('trace: diff previews never carry a secret into the skeleton, the evaluated matrix or its Markdown', async () => {
   const { dir } = makeRepo({ 'a.js': 'x\n' });
-  write(dir, { 'cfg.js': `const key = '${AWS_KEY()}';\n` });
+  writeFiles(dir, { 'cfg.js': `const key = '${AWS_KEY}';\n` });
   const target = await state.prepareTarget(core.makeContext({ cwd: dir }));
   const sk = tr.trace({ target, specText: '- [ ] keep the key\n' });
   const r = tr.evaluateMatrix({ root: dir, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree,
-    matrix: { requirements: [{ id: 'R1', status: 'missing', text: `uses ${AWS_KEY()}` }] } });
-  for (const text of [JSON.stringify(sk), JSON.stringify(r), tr.renderTraceMarkdown(r)]) assert.ok(!text.includes(AWS_KEY()));
+    matrix: { requirements: [{ id: 'R1', status: 'missing', text: `uses ${AWS_KEY}` }] } });
+  for (const text of [JSON.stringify(sk), JSON.stringify(r), tr.renderTraceMarkdown(r)]) assert.ok(!text.includes(AWS_KEY));
   assert.match(r.extras[0].preview, /REDACTED/);
 });
 
@@ -586,7 +547,7 @@ test('trace: diff previews never carry a secret into the skeleton, the evaluated
 
 test('verify degrades a missing module, a missing export, a thrown step and a bad result to unverified checks', async () => {
   const { dir, g } = makeRepo({ 'a.txt': 'a\n' });
-  write(dir, { 'a.txt': 'b\n', 'u.txt': 'untracked\n' });
+  writeFiles(dir, { 'a.txt': 'b\n', 'u.txt': 'untracked\n' });
   const before = g('status', '--porcelain');
   const steps = [
     { name: 'detect', step: '1', module: './detect-does-not-exist.mjs', export: 'detect', ids: [], kind: 'detect', call: (fn) => fn() },
@@ -623,8 +584,8 @@ test('verify degrades a missing module, a missing export, a thrown step and a ba
 
 test('verify with the default steps: one snapshot, every expected check, porcelain unchanged', async () => {
   const { dir, g } = makeRepo({ 'README.md': '# x\n', 'src/x.js': 'export const x = 1;\n' });
-  write(dir, { 'src/x.js': 'export const x = 2;\n', 'src/y.js': 'export const y = 3;\n' });
-  const specFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-spec-')), 'spec.md');
+  writeFiles(dir, { 'src/x.js': 'export const x = 2;\n', 'src/y.js': 'export const y = 3;\n' });
+  const specFile = path.join(tmpDir('adc-spec-'), 'spec.md');
   fs.writeFileSync(specFile, '## Acceptance criteria\n- `src/y.js` exports y\n');
   const before = g('status', '--porcelain');
   const res = await vf.runVerify(core.makeContext({ cwd: dir }), { quick: true, offline: true, spec: specFile, claims: null, 'no-install': true }, {});
@@ -658,7 +619,7 @@ test('verify --dry-run writes nothing; --finalize seals; bad options are usage e
   await assert.rejects(vf.runVerify(core.makeContext({ cwd: dir }), { times: '-1' }), (e) => e.exit === 2);
   await assert.rejects(vf.runVerify(core.makeContext({ cwd: dir }), { session: 'spaces are not allowed' }), (e) => e.exit === 2);
   const steps = [{ name: 'detect', module: './missing.mjs', export: 'detect', ids: [], kind: 'detect', call: (fn) => fn() }];
-  const claims = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-cl-')), 'claims.txt');
+  const claims = path.join(tmpDir('adc-cl-'), 'claims.txt');
   fs.writeFileSync(claims, 'All tests pass.\n');
   const res = await vf.runVerify(core.makeContext({ cwd: dir }), { finalize: true, claims }, { steps });
   assert.equal(res.result.finalized, true);
@@ -695,7 +656,7 @@ test('e2e with the real step modules: planted skip fails, clean change passes, p
     'src/math.js': 'export const add = (a, b) => a + b;\n',
     'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest('negatives', () => { assert.equal(add(-1, -2), -3); });\n"),
   });
-  write(dir, {
+  writeFiles(dir, {
     'src/math.js': 'export const add = (a, b) => a + b;\nexport const twice = (a) => add(a, a);\n',
     'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest.skip('negatives', () => { assert.equal(add(-1, -2), -3); });\n"),
   });
@@ -709,7 +670,7 @@ test('e2e with the real step modules: planted skip fails, clean change passes, p
     assert.equal(bad.json.verdict, 'FAIL');
     assert.equal(bad.status, 1);
   }
-  write(dir, { 'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest('negatives', () => { assert.equal(add(-1, -2), -3); });\n") });
+  writeFiles(dir, { 'test/math.test.js': testFile("test('adds', () => { assert.equal(add(1, 2), 3); });\ntest('negatives', () => { assert.equal(add(-1, -2), -3); });\n") });
   const before2 = g('status', '--porcelain');
   const good = adc(['verify', '--quick', '--offline', '--claims', '-', '--finalize'], { cwd: dir, input: 'All tests pass.\n' });
   assert.ok(good.json && good.json.checks, good.stderr);
@@ -725,8 +686,8 @@ test('e2e with the real step modules: planted skip fails, clean change passes, p
 
 test('e2e: verify -> trace matrix -> claims -> score -> repro -> finalize -> render', () => {
   const { dir, g } = makeRepo({ 'src/limiter.js': 'export const limit = () => 200;\n', 'tests/limiter.test.js': "test('a', () => {});\n" });
-  write(dir, { 'src/limiter.js': 'export const limit = (n) => (n > 100 ? 429 : 200);\n', 'tests/limiter.test.js': "test('a', () => {});\ntest('429', () => {});\n", 'notes.txt': 'untracked\n' });
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-e2e-'));
+  writeFiles(dir, { 'src/limiter.js': 'export const limit = (n) => (n > 100 ? 429 : 200);\n', 'tests/limiter.test.js': "test('a', () => {});\ntest('429', () => {});\n", 'notes.txt': 'untracked\n' });
+  const tmp = tmpDir('adc-e2e-');
   const spec = path.join(tmp, 'spec.md');
   fs.writeFileSync(spec, '## Acceptance criteria\n- Requests over 100 get 429\n');
   const before = g('status', '--porcelain');
@@ -794,11 +755,11 @@ test('e2e: verify -> trace matrix -> claims -> score -> repro -> finalize -> ren
 
 test('e2e: evidence init + add command output; tampered ledger is refused; trace CLI', () => {
   const { dir } = makeRepo({ 'a.js': 'x\n' });
-  write(dir, { 'a.js': 'y\n' });
+  writeFiles(dir, { 'a.js': 'y\n' });
   const init = adc(['evidence', 'init'], { cwd: dir });
   assert.equal(init.status, 0, init.stderr);
   const ledgerAbs = path.join(dir, init.json.ledger);
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-e2e2-'));
+  const tmp = tmpDir('adc-e2e2-');
   const out = path.join(tmp, 'out.json');
   fs.writeFileSync(out, JSON.stringify({ tree_digest: init.json.tree_digest, checks: [ck('CK-CLEANRUN', 'pass'), ck('CK-SCOPE', 'pass')] }));
   const add = adc(['evidence', 'add', out], { cwd: dir });
@@ -828,7 +789,7 @@ test('e2e: evidence init + add command output; tampered ledger is refused; trace
   assert.equal(ev2.status, 0);
   assert.equal(adc(['trace'], { cwd: dir }).status, 2);
 
-  write(dir, { 'a.js': 'edited after the ledger\n' });
+  writeFiles(dir, { 'a.js': 'edited after the ledger\n' });
   const stale = adc(['evidence', 'claims', '-'], { cwd: dir, input: 'All tests pass.\n' });
   assert.equal(stale.status, 4);
   assert.equal(stale.json.error.code, 'LEDGER_STALE', 'a late write cannot refresh an old ledger');

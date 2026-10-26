@@ -1,11 +1,8 @@
 // Unit tests for scripts/lib/frontmatter.mjs (YAML subset) and scripts/lib/tooling-lint.mjs.
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import {
   parseFrontmatter, parseYaml, parseYamlDocument, parseYamlAll, stringifyYaml, stringifyFrontmatter, YamlError, resolvePlain,
   normalizeSkillFrontmatter, INSTALL_METADATA_KEY, lineLocator,
@@ -14,23 +11,13 @@ import * as lint from '../../skills/agentic-developer-companion/scripts/lib/tool
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as hr from '../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs';
 import { toolingCommand } from '../../skills/agentic-developer-companion/scripts/lib/tooling.mjs';
-
-const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
-export function tableSection(name) {
-  return JSON.parse(fs.readFileSync(path.join(FIX, `${name}.json`), 'utf8'));
-}
+import { AWS_KEY, fixtureJson, git, runAdc, tmpDir, writeFiles } from './helpers.mjs';
 
 const SKILL_DIR = core.SKILL_DIR;
-const dirs = [];
-after(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true }); });
-function tmp(prefix = 'adc-lint-') {
-  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-  dirs.push(d);
-  return d;
-}
+const tmp = (prefix = 'adc-lint-') => tmpDir(prefix, { real: true });
 
 // Test-only credentials, assembled at run time so no secret-shaped literal is stored.
-const SECRETS = { aws: ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('') };
+const SECRETS = { aws: AWS_KEY };
 const LITERAL_TOKEN = ['tok', '9f3k2', 'Lm8Qz7', 'Xw4Rt1'].join('');
 
 function expand(content) {
@@ -42,15 +29,7 @@ function expand(content) {
     .replace(/\{\{literal-token\}\}/g, LITERAL_TOKEN);
 }
 
-function materialize(files) {
-  const dir = tmp();
-  for (const [rel, content] of Object.entries(files)) {
-    const abs = path.join(dir, ...rel.split('/'));
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, expand(content));
-  }
-  return dir;
-}
+const materialize = (files) => writeFiles(tmp(), files, expand);
 
 function findings(res) {
   const out = [];
@@ -356,7 +335,7 @@ describe('tooling-lint: rule catalog', () => {
 // Fixture cases (documented examples must be clean; every rule must fire somewhere)
 
 const triggered = new Set();
-const lintCases = tableSection('lint').cases;
+const lintCases = fixtureJson('lint').cases;
 
 describe('tooling-lint: fixture cases', () => {
   for (const c of lintCases) {
@@ -638,18 +617,7 @@ function j(v) { return JSON.stringify(v, null, 2) + '\n'; }
 // ---------------------------------------------------------------------------
 // CLI end to end: node scripts/adc.mjs tooling lint --json --cwd <temp repo>
 
-function gitInit(dir) {
-  const r = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
-  assert.equal(r.status, 0, r.stderr);
-}
-function adc(args, { cwd, env = {} } = {}) {
-  const r = spawnSync(process.execPath, [core.ADC_SCRIPT, ...args], {
-    cwd, encoding: 'utf8', env: { ...process.env, ADC_LINT_NO_EXTERNAL: '1', CI: '', GITHUB_ACTIONS: '', ...env },
-  });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
-  return { exit: r.status, json, stdout: r.stdout, stderr: r.stderr };
-}
+const adc = (args, { cwd, env = {} } = {}) => runAdc(args, { cwd, env: { ...process.env, ADC_LINT_NO_EXTERNAL: '1', CI: '', GITHUB_ACTIONS: '', ...env } });
 
 describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
   test('tooling lint is the lint subcommand of the tooling group', async () => {
@@ -659,9 +627,9 @@ describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
 
   test('clean repository: exit 0, ASCII JSON with the documented shape', async () => {
     const dir = materialize({ '.github/skills/good-skill/SKILL.md': skillMd('good-skill', '\nlicense: MIT'), 'AGENTS.md': '# Agents\n\nRun the tests with npm test.\n' });
-    gitInit(dir);
-    const r = adc(['tooling', 'lint', '--json', '--cwd', dir, '--strict']);
-    assert.equal(r.exit, 0, r.stdout + r.stderr);
+    git(dir, 'init', '-q');
+    const r = adc(['tooling', 'lint', '--strict'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.ok(/^[\x00-\x7f]*$/.test(r.stdout), 'ASCII-only stdout');
     assert.deepEqual(r.json.files.map((f) => f.path).sort(), ['.github/skills/good-skill/SKILL.md', 'AGENTS.md']);
     for (const f of r.json.files) for (const h of f.host_results) assert.deepEqual([...h.errors, ...h.warnings], [], `${f.path} ${h.host}`);
@@ -672,28 +640,28 @@ describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
 
   test('findings: exit 1; --host narrows the results; explicit paths', async () => {
     const dir = materialize({ 'skills/Bad/SKILL.md': skillMd('Bad'), '.github/hooks/h.json': j({ version: 1, hooks: { preToolUse: [{ type: 'command', bash: 'x.sh' }] } }) });
-    gitInit(dir);
-    const all = adc(['tooling', 'lint', '--json', '--cwd', dir, 'skills']);
-    assert.equal(all.exit, 1);
+    git(dir, 'init', '-q');
+    const all = adc(['tooling', 'lint', 'skills'], { cwd: dir });
+    assert.equal(all.status, 1);
     assert.ok(all.json.files.every((f) => f.path.startsWith('skills/')), 'only the named path');
     assert.ok(findings(all.json).some((f) => f.rule === 'SK-NAME-FORMAT' && f.host === 'spec'));
-    const codex = adc(['tooling', 'lint', '--json', '--cwd', dir, '--host', 'codex']);
+    const codex = adc(['tooling', 'lint', '--host', 'codex'], { cwd: dir });
     assert.ok(codex.json.files.every((f) => f.host_results.every((h) => h.host === 'codex')));
-    const hooks = adc(['tooling', 'lint', '.github/hooks/h.json', '--json', '--cwd', dir]);
+    const hooks = adc(['tooling', 'lint', '.github/hooks/h.json'], { cwd: dir });
     assert.ok(findings(hooks.json).some((f) => f.rule === 'HK-CP-NO-WINDOWS'));
   });
 
   test('usage errors exit 2; a tracked .adc/ exits 3', async () => {
     const dir = materialize({ 'AGENTS.md': '# A\n' });
-    gitInit(dir);
-    const bad = adc(['tooling', 'lint', '--json', '--cwd', dir, '--host', 'vscode']);
-    assert.equal(bad.exit, 2);
+    git(dir, 'init', '-q');
+    const bad = adc(['tooling', 'lint', '--host', 'vscode'], { cwd: dir });
+    assert.equal(bad.status, 2);
     assert.equal(bad.json.error.code, 'USAGE');
-    assert.equal(adc(['tooling', 'lint', 'nope.md', '--json', '--cwd', dir]).exit, 2);
+    assert.equal(adc(['tooling', 'lint', 'nope.md'], { cwd: dir }).status, 2);
     fs.mkdirSync(path.join(dir, '.adc'));
     fs.writeFileSync(path.join(dir, '.adc', 'x.json'), '{}\n');
-    assert.equal(spawnSync('git', ['add', '-f', '.adc/x.json'], { cwd: dir }).status, 0);
-    assert.equal(adc(['tooling', 'lint', '--json', '--cwd', dir]).exit, 3);
+    git(dir, 'add', '-f', '.adc/x.json');
+    assert.equal(adc(['tooling', 'lint'], { cwd: dir }).status, 3);
   });
 
   test('lintCommand directly: human output, --allow-host, outside a git repository', async () => {

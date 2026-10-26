@@ -3,77 +3,41 @@
 // (JSON, YAML, JS, TS, Python, Go, Rust, Ruby), the generated CI helper, and real runs of the
 // scaffolds on sample projects (CLI harness, regression red-green, API tests, live probes under
 // `adc.mjs live run`; Playwright when the browsers and the npm registry are reachable).
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as scaffold from '../../skills/agentic-developer-companion/scripts/lib/scaffold.mjs';
 import * as M from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
+import { checklistStatus } from '../../skills/agentic-developer-companion/scripts/lib/live.mjs';
 import { importBaseCounts } from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
+import { git, has, hostFreeEnv, makeRepo, read, runAdc, spawnAsync, tmpDir, writeFiles } from './helpers.mjs';
 
 const ADC = core.ADC_SCRIPT;
-const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-scaffold-')));
+const TMP = tmpDir('adc-scaffold-', { real: true });
 const HOME = path.join(TMP, 'home');
 fs.mkdirSync(HOME);
-after(() => fs.rmSync(TMP, { recursive: true, force: true }));
-
-// NODE_TEST_CONTEXT: a nested `node --test` that inherits it reports to this runner and exits 0.
-const MARKERS = ['ADC_HOME', 'ADC_LIVE_TOKEN', 'ADC_LIVE_BASE_URL', 'ADC_LIVE_TENANT', 'ADC_LIVE_BUDGET', 'LIVE_TESTS_ENABLED',
-  'CI', 'GITHUB_ACTIONS', 'COPILOT_CLI', 'COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'UPDATE_GOLDEN', 'UPDATE_CONTRACTS',
-  'GOLDEN_DIR', 'NODE_TEST_CONTEXT'];
 
 /** A clean environment: no host or CI markers, no live variables, an empty HOME. */
 function baseEnv(extra = {}) {
-  const env = { ...process.env };
-  for (const k of Object.keys(env)) if (MARKERS.includes(k) || k === 'CLAUDECODE' || k.startsWith('CLAUDE_') || k.startsWith('CODEX_') || k.startsWith('E2E_')) delete env[k];
-  return { ...env, HOME, USERPROFILE: HOME, ...extra };
+  const env = hostFreeEnv({ HOME, USERPROFILE: HOME, ...extra });
+  delete env.NODE_TEST_CONTEXT; // a nested `node --test` that inherits it reports to this runner and exits 0
+  return env;
 }
 
 let seq = 0;
-function write(dir, files) {
-  for (const [p, c] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
-    fs.writeFileSync(path.join(dir, p), c);
-  }
-}
-
-function git(dir, ...args) {
-  const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
-  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-  return r.stdout;
-}
-
 /** A temp git repository with `files` committed (or a plain directory with { git: false }). */
 function repo(files = {}, { git: useGit = true, commit = true } = {}) {
   const dir = path.join(TMP, `r${++seq}`);
   fs.mkdirSync(dir);
-  if (useGit) {
-    git(dir, 'init', '-q', '-b', 'main');
-    git(dir, 'config', 'user.email', 't@example.com');
-    git(dir, 'config', 'user.name', 'Test');
-    git(dir, 'config', 'commit.gpgsign', 'false');
-  }
-  write(dir, files);
-  if (useGit && commit) {
-    git(dir, 'add', '-A');
-    git(dir, 'commit', '-q', '-m', 'init', '--allow-empty');
-  }
-  return dir;
+  return useGit ? makeRepo(files, { dir, commit }).dir : writeFiles(dir, files);
 }
 
-function adc(args, { cwd, env } = {}) {
-  const r = spawnSync(process.execPath, [ADC, ...args, '--json', ...(cwd ? ['--cwd', cwd] : [])], {
-    encoding: 'utf8', input: '', env: env || baseEnv(), timeout: 60_000,
-  });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
-  return { status: r.status, json, stdout: r.stdout, stderr: r.stderr };
-}
+const adc = (args, { cwd, env } = {}) => runAdc(args, { cwd, env: env || baseEnv() });
 
 /** Run a scaffold and assert its exit code; returns the parsed result. */
 function sc(dir, kind, extra = [], { exit = 0, env } = {}) {
@@ -83,8 +47,6 @@ function sc(dir, kind, extra = [], { exit = 0, env } = {}) {
   return r.json;
 }
 
-const read = (dir, rel) => fs.readFileSync(path.join(dir, ...rel.split('/')), 'utf8');
-const has = (dir, rel) => fs.existsSync(path.join(dir, ...rel.split('/')));
 const paths = (res) => res.written.map((w) => w.path);
 const tool = (name) => core.which(name);
 
@@ -315,15 +277,15 @@ describe('rendering helpers', () => {
     assert.throws(() => merge('not json'));
   });
 
-  test('checklistGate counts TODO lines like the live runner', () => {
+  test('the checklist gate scaffold live shares with the runner counts TODO lines (CRLF too)', () => {
     const dir = repo({}, { git: false });
-    assert.equal(scaffold.checklistGate(path.join(dir, 'missing.md')).reason, 'CHECKLIST_MISSING');
-    write(dir, { 'a.md': '# x\n- one: TODO\r\n- two: done\n- three: TODO later\n', 'b.md': '# x\n- all answered\n' });
-    const a = scaffold.checklistGate(path.join(dir, 'a.md'));
+    assert.equal(checklistStatus(path.join(dir, 'missing.md')).reason, 'CHECKLIST_MISSING');
+    writeFiles(dir, { 'a.md': '# x\n- one: TODO\r\n- two: done\n- three: TODO later\n', 'b.md': '# x\n- all answered\n' });
+    const a = checklistStatus(path.join(dir, 'a.md'));
     assert.equal(a.ok, false);
     assert.equal(a.open, 2);
     assert.equal(a.reason, 'CHECKLIST_OPEN');
-    assert.equal(scaffold.checklistGate(path.join(dir, 'b.md')).ok, true);
+    assert.equal(checklistStatus(path.join(dir, 'b.md')).ok, true);
   });
 
   test('ciTestCommand: full suite, retries off, a report per runner', () => {
@@ -434,7 +396,7 @@ describe('scaffold command', () => {
     const res = sc(alias, 'e2e-cli', ['--out', 'e2e/x']);
     assert.equal(res.out, 'e2e/x');
     assert.ok(paths(res).includes('e2e/x/harness.mjs'), paths(res).join(', '));
-    write(dir, { 'notes/live-checklist.md': '# answered\n' });
+    writeFiles(dir, { 'notes/live-checklist.md': '# answered\n' });
     const live = sc(alias, 'live', ['--checklist', path.join(alias, 'notes', 'live-checklist.md'), '--synthetic-cost', '3']);
     assert.equal(live.synthetic.checklist, 'notes/live-checklist.md');
   });
@@ -684,18 +646,6 @@ function startServer(handler) {
   });
 }
 
-function runAsync(cmd, args, opts) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => { stderr += d; });
-    const timer = setTimeout(() => child.kill('SIGKILL'), opts.timeout || 60_000);
-    child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
-  });
-}
-
 describe('e2e-api', () => {
   test('node-test: client, contract snapshot and negative tests run against a real server', async () => {
     const dir = repo(nodeProject());
@@ -712,7 +662,7 @@ describe('e2e-api', () => {
     });
     try {
       const env = baseEnv({ E2E_API_BASE_URL: url, E2E_API_TOKEN: 'test-token-value', E2E_API_PROTECTED_PATHS: '/private', E2E_TEST_RUN_ID: 'run-1' });
-      const r = await runAsync(process.execPath, ['--test', 'e2e/api/api.e2e.test.mjs'], { cwd: dir, env });
+      const r = await spawnAsync(process.execPath, ['--test', 'e2e/api/api.e2e.test.mjs'], { cwd: dir, env });
       assert.equal(r.status, 0, r.stdout + r.stderr);
       assert.match(r.stdout, /pass 4/);
       assert.deepEqual(JSON.parse(read(dir, 'e2e/api/contracts/get-health.json')), { checks: { db: [{ status: 'string' }] }, status: 'string' });
@@ -724,7 +674,7 @@ describe('e2e-api', () => {
         if (req.url === '/healthz') { res2.writeHead(200, { 'content-type': 'application/json' }); return res2.end(JSON.stringify({ state: 'pass' })); }
         res2.writeHead(404); res2.end();
       });
-      const drift = await runAsync(process.execPath, ['--test', 'e2e/api/api.e2e.test.mjs'], { cwd: dir, env: { ...env, CI: 'true', E2E_API_PROTECTED_PATHS: '' } });
+      const drift = await spawnAsync(process.execPath, ['--test', 'e2e/api/api.e2e.test.mjs'], { cwd: dir, env: { ...env, CI: 'true', E2E_API_PROTECTED_PATHS: '' } });
       assert.notEqual(drift.status, 0);
       assert.match(drift.stdout, /response shape changed/);
     } finally {
@@ -855,7 +805,7 @@ describe('e2e-web', () => {
     const { server, url } = await startServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><html><head><title>Demo</title></head><body><main>Hello</main></body></html>'); });
     try {
       const cli = path.join(web, 'node_modules', '@playwright', 'test', 'cli.js');
-      const r = await runAsync(process.execPath, [cli, 'test', '--project=chromium'], { cwd: web, env: baseEnv({ PLAYWRIGHT_BROWSERS_PATH: browsers, E2E_BASE_URL: url }), timeout: 120_000 });
+      const r = await spawnAsync(process.execPath, [cli, 'test', '--project=chromium'], { cwd: web, env: baseEnv({ PLAYWRIGHT_BROWSERS_PATH: browsers, E2E_BASE_URL: url }), timeout: 120_000 });
       assert.equal(r.status, 0, r.stdout + r.stderr);
       assert.match(r.stdout, /2 passed/);
       assert.match(r.stdout, /1 skipped/);
@@ -895,7 +845,7 @@ describe('live', () => {
     if (!core.IS_WINDOWS) assert.equal(fs.statSync(path.join(dir, '.adc/.env.live')).mode & 0o777, 0o600);
     assert.match(read(dir, '.adc/.env.live'), /^ADC_LIVE_TOKEN=$/m);
     assert.equal(git(dir, 'status', '--porcelain', '--', '.adc'), '');
-    assert.ok(scaffold.checklistGate(path.join(dir, 'tests/live/live-checklist.md')).open > 5, 'the template checklist starts with TODO lines');
+    assert.ok(checklistStatus(path.join(dir, 'tests/live/live-checklist.md')).open > 5, 'the template checklist starts with TODO lines');
     const wf = read(dir, '.github/workflows/live-probes.yml');
     assert.match(wf, /if: \$\{\{ vars\.LIVE_TESTS_ENABLED == 'true' \}\}/);
     assert.match(wf, /node "\$ADC" live run --probes 'readonly\/\*' --json/);
@@ -978,13 +928,13 @@ describe('live', () => {
     try {
       const dir = repo({ 'package.json': JSON.stringify({ name: 'svc', private: true, type: 'module' }) });
       sc(dir, 'live', ['--write', '--lang', 'js', '--base-url', url]);
-      const r = await runAsync(process.execPath, [ADC, 'live', 'run', '--json', '--cwd', dir], { env: baseEnv({ ADC_LIVE_TOKEN: token }) });
+      const r = await spawnAsync(process.execPath, [ADC, 'live', 'run', '--json', '--cwd', dir], { env: baseEnv({ ADC_LIVE_TOKEN: token }) });
       assert.equal(r.status, 0, r.stdout + r.stderr);
       const out = JSON.parse(r.stdout);
       assert.deepEqual(out.probes.map((p) => [p.id, p.status, p.cost]), [['readonly/health', 'pass', 1]]);
       assert.ok(!r.stdout.includes(token) && !r.stderr.includes(token));
       // A rejected token fails closed and is reported as AUTH_REJECTED.
-      const bad = await runAsync(process.execPath, [ADC, 'live', 'run', '--json', '--cwd', dir], { env: baseEnv({ ADC_LIVE_TOKEN: `${token}-wrong` }) });
+      const bad = await spawnAsync(process.execPath, [ADC, 'live', 'run', '--json', '--cwd', dir], { env: baseEnv({ ADC_LIVE_TOKEN: `${token}-wrong` }) });
       const badOut = JSON.parse(bad.stdout);
       assert.equal(badOut.probes[0].status, 'fail');
       assert.equal(badOut.probes[0].reason, 'AUTH_REJECTED');
@@ -1085,7 +1035,7 @@ describe('ci-gate', () => {
       return spawnSync(process.execPath, [gate, ...args], { cwd: dir, encoding: 'utf8', env });
     };
     const junit = (cases) => `<?xml version="1.0"?>\n<testsuites><testsuite name="s" tests="${cases.length}">${cases.join('')}</testsuite></testsuites>\n`;
-    write(dir, {
+    writeFiles(dir, {
       'reports/ok.xml': junit(['<testcase classname="a" name="one"/>', '<testcase classname="a" name="two"/>', '<testcase classname="a" name="three"><skipped/></testcase>']),
       'reports/sub/fail.xml': junit(['<testcase classname="b" name="bad"><failure message="boom">x</failure></testcase>']),
       'reports/empty.xml': junit([]),
@@ -1107,7 +1057,7 @@ describe('ci-gate', () => {
     assert.equal(run(['counts', '--report', 'x']).status, 2);
     assert.equal(run(['nope']).status, 2);
 
-    write(dir, {
+    writeFiles(dir, {
       'ds-fail.json': JSON.stringify({ base: { ref: 'main' }, findings: [{ id: 'CK-SKIP', severity: 'fail', file: 'a.test.js', line: 3, message: 'it.only added' }, { id: 'CK-SCOPE', severity: 'finding', file: 'b.js', line: null, message: 'outside spec, 50%: x' }] }),
       'ds-soft.json': JSON.stringify({ base: { ref: 'main' }, findings: [{ id: 'CK-CI', severity: 'finding', file: '.github/workflows/x.yml', message: 'new CI workflow' }] }),
       'ds-error.json': JSON.stringify({ error: { code: 'SHALLOW', message: 'run git fetch --unshallow' } }),
@@ -1121,11 +1071,11 @@ describe('ci-gate', () => {
     assert.match(run(['ratchet', '--report', 'ds-error.json', '--exit', '4']).stdout, /could not run: SHALLOW/);
     assert.equal(run(['ratchet', '--report', 'missing.json', '--exit', '0']).status, 1);
 
-    write(dir, { 'cov.json': JSON.stringify({ tool: 'adc', changed_lines: 10, pct: 80, precision: 'line', uncovered: [{ file: 'a.go', lines: [3, 4] }] }) });
+    writeFiles(dir, { 'cov.json': JSON.stringify({ tool: 'adc', changed_lines: 10, pct: 80, precision: 'line', uncovered: [{ file: 'a.go', lines: [3, 4] }] }) });
     assert.equal(run(['coverage', '--report', 'cov.json']).status, 0);
     assert.match(fs.readFileSync(path.join(out, 'summary.md'), 'utf8'), /80\.0% of 10 changed line/);
 
-    const reg = (tests) => { write(dir, { 'tests/quarantine.json': JSON.stringify({ schema: 'adc-quarantine/1', tests }) }); return run(['quarantine', '--registry', 'tests/quarantine.json', '--today', '2026-10-25']); };
+    const reg = (tests) => { writeFiles(dir, { 'tests/quarantine.json': JSON.stringify({ schema: 'adc-quarantine/1', tests }) }); return run(['quarantine', '--registry', 'tests/quarantine.json', '--today', '2026-10-25']); };
     const good = reg([{ id: 'login flaky', owner: '@team', issue: '#12', added: '2026-10-20', expires: '2026-11-10', reason: 'race' }]);
     assert.equal(good.status, 0, good.stdout);
     assert.match(fs.readFileSync(path.join(out, 'output'), 'utf8'), /^count=1$/m);

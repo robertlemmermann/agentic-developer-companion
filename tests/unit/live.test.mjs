@@ -2,71 +2,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import * as markers from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
 import * as live from '../../skills/agentic-developer-companion/scripts/lib/live.mjs';
 import * as doctor from '../../skills/agentic-developer-companion/scripts/lib/doctor.mjs';
+import { AWS_KEY, git, hostFreeEnv, makeRepo as newRepo, readJsonStrict, runAdc, spawnAsync, tmpDir, writeFiles } from './helpers.mjs';
 
 const ADC = core.ADC_SCRIPT;
 const POSIX = process.platform !== 'win32';
-const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-live-home-'));
-const MARKERS = ['ADC_HOME', 'ADC_LIVE_TOKEN', 'ADC_LIVE_BASE_URL', 'ADC_LIVE_TENANT', 'ADC_LIVE_BUDGET', 'LIVE_TESTS_ENABLED',
-  'CI', 'GITHUB_ACTIONS', 'COPILOT_CLI', 'COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'COPILOT_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_SKILLS_DIRS'];
+const HOME = tmpDir('adc-live-home-');
 
 /** A clean environment: no host markers, no live variables, an empty HOME. */
-function baseEnv(extra = {}) {
-  const env = { ...process.env };
-  for (const k of Object.keys(env)) if (MARKERS.includes(k) || k === 'CLAUDECODE' || k.startsWith('CLAUDE_') || k.startsWith('CODEX_')) delete env[k];
-  return { ...env, HOME, USERPROFILE: HOME, ...extra };
-}
+const baseEnv = (extra = {}) => hostFreeEnv({ HOME, USERPROFILE: HOME, ...extra });
+const makeRepo = (files = {}) => newRepo(files, { prefix: 'adc-live-', real: true });
+const adc = (args, { cwd, env, input } = {}) => runAdc(args, { cwd, env: env || baseEnv(), input });
 
-function makeRepo(files = {}) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-live-')));
-  const g = (...args) => {
-    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout;
-  };
-  g('init', '-q', '-b', 'main');
-  g('config', 'user.email', 't@example.com');
-  g('config', 'user.name', 'Test');
-  g('config', 'commit.gpgsign', 'false');
-  write(dir, files);
-  g('add', '-A');
-  g('commit', '-q', '-m', 'init', '--allow-empty');
-  return { dir, g };
-}
-
-function write(dir, files) {
-  for (const [p, c] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
-    fs.writeFileSync(path.join(dir, p), c);
-  }
-}
-
-function adc(args, { cwd, env, input } = {}) {
-  const r = spawnSync(process.execPath, [ADC, ...args, '--json', ...(cwd ? ['--cwd', cwd] : [])], {
-    encoding: 'utf8', input: input ?? '', env: env || baseEnv(), timeout: 60_000,
-  });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
-  return { status: r.status, json, stdout: r.stdout, stderr: r.stderr };
-}
-
-function adcAsync(args, { cwd, env } = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [ADC, ...args, '--json', '--cwd', cwd], { env: env || baseEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('close', (status) => { let json = null; try { json = JSON.parse(out); } catch {} resolve({ status, json, stdout: out, stderr: err }); });
-  });
+async function adcAsync(args, { cwd, env } = {}) {
+  const r = await spawnAsync(process.execPath, [ADC, ...args, '--json', '--cwd', cwd], { env: env || baseEnv() });
+  return { ...r, json: core.tryJson(r.stdout) };
 }
 
 // The fake probe: prints what it received, reports cost data through ADC_PROBE_RESULT.
@@ -114,7 +71,7 @@ async function runLive(dir, opts = {}) {
   return { r, st, notes };
 }
 
-const readBudget = (st) => JSON.parse(fs.readFileSync(st.paths.budget, 'utf8'));
+const readBudget = (st) => readJsonStrict(st.paths.budget);
 // Test credentials are built from parts so the file carries no `ADC_LIVE_TOKEN: <value>` literal.
 const tk = (...parts) => parts.join('-');
 const sha = (s) => createHash('sha256').update(s).digest('hex');
@@ -135,7 +92,7 @@ function allFiles(dir) {
 // Budget ledger: normalization, caps, pruning
 
 test('the shipped budget template keeps the documented defaults', () => {
-  const tpl = JSON.parse(fs.readFileSync(path.join(core.TEMPLATES_DIR, 'adc', 'budget.json'), 'utf8'));
+  const tpl = readJsonStrict(path.join(core.TEMPLATES_DIR, 'adc', 'budget.json'));
   assert.equal(tpl.max_per_session, 2500);
   assert.equal(tpl.max_per_day, 2500);
   assert.ok(tpl.warn_at < tpl.max_per_session);
@@ -196,7 +153,7 @@ test('pruneBudget keeps the newest 50 sessions, the protected one and 90 days of
 test('loadManifest validates probes and applies defaults', () => {
   const { dir } = makeRepo({});
   assert.throws(() => live.loadManifest(dir), (e) => e.exit === 3 && e.code === 'NO_PROBES');
-  const put = (doc) => write(dir, { 'tests/live/probes.json': typeof doc === 'string' ? doc : JSON.stringify(doc) });
+  const put = (doc) => writeFiles(dir, { 'tests/live/probes.json': typeof doc === 'string' ? doc : JSON.stringify(doc) });
   put('{nope');
   assert.throws(() => live.loadManifest(dir), (e) => e.exit === 2);
   put({ schema: 'adc-probes/1', probes: [{ id: 'synthetic/w', kind: 'synthetic', cmd: 'x' }] });
@@ -217,12 +174,16 @@ test('loadManifest validates probes and applies defaults', () => {
 });
 
 test('checklistStatus gates synthetic probes on a present checklist without TODO lines', () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-cl-'));
-  assert.equal(live.checklistStatus(d).reason, 'CHECKLIST_MISSING');
-  fs.writeFileSync(path.join(d, 'live-checklist.md'), '# Checklist\r\n- kill switch: TODO\r\n- tenant: TODO\r\n');
-  assert.deepEqual([live.checklistStatus(d).ok, live.checklistStatus(d).open], [false, 2]);
-  fs.writeFileSync(path.join(d, 'live-checklist.md'), '# Checklist\n- kill switch: LIVE_TESTS_ENABLED\n');
-  assert.equal(live.checklistStatus(d).ok, true);
+  const file = path.join(tmpDir('adc-cl-'), 'live-checklist.md');
+  assert.equal(live.checklistStatus(file).reason, 'CHECKLIST_MISSING');
+  fs.writeFileSync(file, '# Checklist\r\n- kill switch: TODO\r\n- tenant: TODO\r\n');
+  const open = live.checklistStatus(file);
+  assert.deepEqual([open.ok, open.open, open.reason, open.open_items], [false, 2, 'CHECKLIST_OPEN',
+    ['- kill switch: TODO', '- tenant: TODO']]);
+  // Text the caller already read is not read again.
+  assert.equal(live.checklistStatus(file, '# Checklist\n- done\n').ok, true);
+  fs.writeFileSync(file, '# Checklist\n- kill switch: LIVE_TESTS_ENABLED\n');
+  assert.equal(live.checklistStatus(file).ok, true);
 });
 
 test('loadCredentials: environment wins, every value is a redaction literal, unignored files and CI never feed the token', () => {
@@ -250,12 +211,11 @@ test('loadCredentials: environment wins, every value is a redaction literal, uni
 test('the runner\'s redactor (markers.makeRedactor) replaces raw, URL-encoded and base64 token forms and shapes', () => {
   const tok = 'hunter2abc';
   const redact = markers.makeRedactor({ literals: [{ name: 'ADC_LIVE_TOKEN', value: tok }], env: {} });
-  const aws = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
-  const text = `a ${tok} b ${Buffer.from(tok).toString('base64')} c ${encodeURIComponent(tok + '/x')} ADC_LIVE_TOKEN=other-value key ${aws}`;
+  const text = `a ${tok} b ${Buffer.from(tok).toString('base64')} c ${encodeURIComponent(tok + '/x')} ADC_LIVE_TOKEN=other-value key ${AWS_KEY}`;
   const out = redact(text);
   assert.ok(!out.includes(tok) && !out.includes(Buffer.from(tok).toString('base64')));
   assert.ok(!out.includes('other-value'));
-  assert.ok(!out.includes(aws));
+  assert.ok(!out.includes(AWS_KEY));
   assert.match(out, /\[REDACTED:ADC_LIVE_TOKEN\]/);
   assert.deepEqual(markers.redactDeep({ a: [tok], output_sha256: 'abc', [tok]: 1 }, redact, { keys: true }), { a: ['[REDACTED:ADC_LIVE_TOKEN]'], output_sha256: 'abc', '[REDACTED:ADC_LIVE_TOKEN]': 1 });
 });
@@ -291,7 +251,7 @@ test('liveRun: pass, fail and a gated synthetic probe; header cost; evidence led
   assert.equal(b.days[core.today()].spent, 4);
   assert.deepEqual(b.sessions[r.session_id].probes.map((p) => [p.id, p.status, p.cost]), [['readonly/health', 'pass', 3], ['readonly/broken', 'fail', 1]]);
   assert.ok(r.ledger && r.ledger.created, JSON.stringify(r.ledger_error));
-  const ledger = JSON.parse(fs.readFileSync(path.join(st.root, r.ledger.path), 'utf8'));
+  const ledger = readJsonStrict(path.join(st.root, r.ledger.path));
   const lc = ledger.checks.filter((c) => c.id === 'CK-LIVE');
   assert.deepEqual(lc.map((c) => [c.project, c.status]).sort(), [['.', 'fail'], ['readonly/broken', 'fail'], ['readonly/health', 'pass'], ['synthetic/write', 'skipped']]);
   assert.equal(lc.find((c) => c.project === 'readonly/health').cost, 3);
@@ -387,7 +347,7 @@ test('kill switch and unset token: nothing runs; the token case is UNVERIFIED in
   assert.deepEqual([r.stopped_reason, r.exit], ['TOKEN_UNSET', 4]);
   assert.equal(readBudget(st).sessions[r.session_id], undefined, 'a run that cannot start registers no session');
   assert.equal(r.checks[0].summary, 'UNVERIFIED: ADC_LIVE_TOKEN unset (set it in .adc/.env.live, or in the environment for CI); probes never run unauthenticated');
-  const ledger = JSON.parse(fs.readFileSync(path.join(st.root, r.ledger.path), 'utf8'));
+  const ledger = readJsonStrict(path.join(st.root, r.ledger.path));
   const c = ledger.checks.find((x) => x.id === 'CK-LIVE');
   assert.deepEqual([c.status, c.reason], ['unverified', 'TOKEN_UNSET']);
 });
@@ -405,7 +365,7 @@ test('cost accounting: cumulative headers use the recorded baseline, reported co
 });
 
 test('timeouts fail the probe and kill its tree, a missing runner is UNVERIFIED, HTTP 401 is AUTH_REJECTED', async () => {
-  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-kill-')), 'grandchild-survived');
+  const marker = path.join(tmpDir('adc-kill-'), 'grandchild-survived');
   const { dir } = liveRepo([
     P('slow', `--sleep=5000 --marker=${marker}`, { timeout_s: 0.5 }),
     { id: 'norunner', kind: 'readonly', cmd: 'adc-no-such-runner-xyz --x', cost: 1 },
@@ -504,7 +464,7 @@ test('cli: leak matrix - neither the file token nor the env token reaches output
   const log = fs.readFileSync(path.join(dir, r.json.probes[0].log), 'utf8');
   assert.ok(log.includes(`token-sha=${sha(envTok)}`), 'the probe received the environment token (precedence)');
   assert.ok(log.includes('[REDACTED:ADC_LIVE_TOKEN]'));
-  const tree = spawnSync('git', ['ls-tree', '-r', 'HEAD'], { cwd: dir, encoding: 'utf8' }).stdout;
+  const tree = git(dir, 'ls-tree', '-r', 'HEAD');
   assert.ok(!tree.includes('.adc'));
 });
 
@@ -617,8 +577,8 @@ test('nodeEol flags end of life, odd lines and old versions', () => {
 });
 
 test('regression: Git Bash on Windows is found next to git or via CLAUDE_CODE_GIT_BASH_PATH, never as WSL\'s bash', () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-gitbash-'));
-  write(d, { 'Git/cmd/git.exe': '', 'Git/bin/bash.exe': '', 'custom/bash.exe': '' });
+  const d = tmpDir('adc-gitbash-');
+  writeFiles(d, { 'Git/cmd/git.exe': '', 'Git/bin/bash.exe': '', 'custom/bash.exe': '' });
   const wsl = 'C:/Windows/System32/bash.exe';
   const find = (map) => (n) => map[n] || null;
   assert.equal(doctor.gitBashPath({}, find({ git: path.join(d, 'Git', 'cmd', 'git.exe'), bash: wsl })), path.join(d, 'Git', 'bin', 'bash.exe'));
@@ -629,7 +589,7 @@ test('regression: Git Bash on Windows is found next to git or via CLAUDE_CODE_GI
 });
 
 test('every PROBED_TOOLS id has an entry in assets/prerequisites.json', () => {
-  const items = JSON.parse(fs.readFileSync(path.join(core.ASSETS_DIR, 'prerequisites.json'), 'utf8')).items;
+  const items = readJsonStrict(path.join(core.ASSETS_DIR, 'prerequisites.json')).items;
   for (const id of doctor.PROBED_TOOLS) assert.ok(items.some((i) => i.id === id), id);
 });
 
@@ -642,7 +602,7 @@ test('cli: doctor reports without writing; every prerequisite has a status and t
   assert.equal(j.node.ok, true);
   assert.equal(j.skill.script, core.toPosix(ADC));
   assert.equal(fs.existsSync(path.join(dir, '.adc')), false, 'doctor without --init writes nothing');
-  const items = JSON.parse(fs.readFileSync(path.join(core.ASSETS_DIR, 'prerequisites.json'), 'utf8')).items;
+  const items = readJsonStrict(path.join(core.ASSETS_DIR, 'prerequisites.json')).items;
   assert.deepEqual(j.prerequisites.map((p) => p.id), items.map((i) => i.id));
   for (const p of j.prerequisites) {
     assert.ok(['present', 'missing', 'old', 'unknown', 'n/a'].includes(p.status), `${p.id}: ${p.status}`);
@@ -666,7 +626,7 @@ test('cli: doctor --init creates .adc/, the exclude entry and the templates; doc
   assert.match(fs.readFileSync(path.join(dir, '.git', 'info', 'exclude'), 'utf8'), /^\/\.adc\/$/m);
   if (POSIX) assert.equal(fs.statSync(path.join(dir, '.adc', '.env.live')).mode & 0o077, 0);
   assert.deepEqual([r.json.state.exists, r.json.state.ignored, r.json.state.env_live.ignored], [true, true, true]);
-  assert.equal(spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8' }).stdout, '');
+  assert.equal(git(dir, 'status', '--porcelain'), '');
 });
 
 test('cli: doctor --probe echoes the nonce (launcher probe target)', () => {
@@ -696,7 +656,7 @@ test('launcher probes pass through exec and sh -c, and report a launcher whose P
 test('cli: doctor lists a vendored copy with its scope, version and tracking, and warns about the folder and versions', () => {
   const { dir } = makeRepo({});
   const copy = path.join(dir, '.agents', 'skills', core.SKILL_NAME);
-  write(copy, { 'SKILL.md': `---\nname: ${core.SKILL_NAME}\ndescription: test copy\nmetadata:\n  version: "9.9.9"\n---\n\n# x\n`, 'scripts/adc.mjs': '// stub\n' });
+  writeFiles(copy, { 'SKILL.md': `---\nname: ${core.SKILL_NAME}\ndescription: test copy\nmetadata:\n  version: "9.9.9"\n---\n\n# x\n`, 'scripts/adc.mjs': '// stub\n' });
   const r = adc(['doctor', '--no-probes'], { cwd: dir });
   assert.equal(r.status, 0, r.stderr);
   const c = r.json.install_paths.find((x) => x.path === core.toPosix(copy));
@@ -726,7 +686,7 @@ test('doctor lists registered hooks (hooks-render) and probes the launchers of t
   try { hr = await import('../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs'); } catch { return; }
   if (typeof hr.renderHooks !== 'function' || typeof hr.writeHooks !== 'function') return;
   const { dir } = makeRepo({});
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-hooks-home-'));
+  const home = tmpDir('adc-hooks-home-');
   const env = baseEnv({ HOME: home, USERPROFILE: home });
   const rendered = hr.renderHooks({ host: 'codex', scope: 'user', level: 'advise', root: dir, env, home });
   hr.writeHooks(rendered, { root: dir, backup: false });
@@ -758,7 +718,7 @@ function releaseRepo() {
 function vendoredRepo(skillMd, files = {}) {
   const r = makeRepo({});
   const base = `.agents/skills/${core.SKILL_NAME}`;
-  write(r.dir, Object.fromEntries(Object.entries({ ...RELEASE_FILES, 'SKILL.md': skillMd, ...files }).filter(([, v]) => v != null).map(([k, v]) => [`${base}/${k}`, v])));
+  writeFiles(r.dir, Object.fromEntries(Object.entries({ ...RELEASE_FILES, 'SKILL.md': skillMd, ...files }).filter(([, v]) => v != null).map(([k, v]) => [`${base}/${k}`, v])));
   r.g('add', '-A');
   r.g('commit', '-q', '-m', 'vendor');
   return { ...r, copy: path.join(r.dir, ...base.split('/')) };

@@ -1,13 +1,10 @@
 // Unit and scenario tests for scripts/lib/markers.mjs, diff-scope.mjs and deps.mjs.
 // Scenarios come from tests/fixtures (section "diffs") and run in temp git repos, both
 // committed on a feature branch and uncommitted/untracked on main.
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as git from '../../skills/agentic-developer-companion/scripts/lib/git.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
@@ -15,17 +12,10 @@ import * as M from '../../skills/agentic-developer-companion/scripts/lib/markers
 import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand, ciBlock, workflowEvents } from '../../skills/agentic-developer-companion/scripts/lib/diff-scope.mjs';
 import * as deps from '../../skills/agentic-developer-companion/scripts/lib/deps.mjs';
 import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/formats.mjs';
+import { AWS_KEY, fixtureJson, git as gitCli, makeRepo, runAdc as adcRun, tmpDir, writeFile, writeFiles as writeTree } from './helpers.mjs';
 
-const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
-export function tableSection(name) {
-  return JSON.parse(fs.readFileSync(path.join(FIX, `${name}.json`), 'utf8'));
-}
-
-const ADC = core.ADC_SCRIPT;
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-diffscope-'));
-after(() => fs.rmSync(TMP, { recursive: true, force: true }));
+const TMP = tmpDir('adc-diffscope-');
 // Secrets are assembled at runtime so no secret-shaped literal exists in the repository.
-const AWS_KEY = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
 const GH_TOKEN = ['ghp', '_', 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'].join('');
 const PRIVATE_KEY_HEADER = ['-----BEGIN', ' RSA PRIVATE', ' KEY-----'].join('');
 const PLACEHOLDERS = { '{{AWS_KEY}}': AWS_KEY, '{{GH}}': GH_TOKEN, '{{PK}}': PRIVATE_KEY_HEADER };
@@ -38,31 +28,10 @@ delete ENV.ADC_LIVE_TOKEN;
 delete ENV.ADC_HOME;
 
 let seq = 0;
-function sh(cwd, ...args) {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-  return r.stdout.trim();
-}
-function writeFiles(dir, files) {
-  for (const [p, c] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
-    fs.writeFileSync(path.join(dir, p), fill(c));
-  }
-}
-function initRepo(files) {
-  const dir = fs.mkdtempSync(path.join(TMP, 'repo-'));
-  sh(dir, 'init', '-q', '-b', 'main');
-  sh(dir, 'config', 'user.email', 't@example.com');
-  sh(dir, 'config', 'user.name', 'Test');
-  sh(dir, 'config', 'commit.gpgsign', 'false');
-  sh(dir, 'config', 'core.autocrlf', 'false');
-  writeFiles(dir, files);
-  sh(dir, 'add', '-A');
-  sh(dir, 'commit', '-q', '-m', 'base');
-  return dir;
-}
+const writeFiles = (dir, files) => writeTree(dir, files, fill);
+const initRepo = (files) => makeRepo(files, { dir: fs.mkdtempSync(path.join(TMP, 'repo-')), message: 'base', config: { 'core.autocrlf': 'false' }, transform: fill }).dir;
 
-const DIFFS = tableSection('diffs');
+const DIFFS = fixtureJson('diffs');
 const templates = new Map();
 /** A fresh copy of the base repository (plus a scenario's own `base` files, if any). */
 function scenarioRepo(extraBase = null) {
@@ -75,7 +44,7 @@ function scenarioRepo(extraBase = null) {
 function applyOps(dir, ops) {
   for (const op of ops) {
     const p = (rel) => path.join(dir, rel);
-    if (op.op === 'write') { fs.mkdirSync(path.dirname(p(op.path)), { recursive: true }); fs.writeFileSync(p(op.path), fill(op.content)); }
+    if (op.op === 'write') writeFile(dir, op.path, fill(op.content));
     else if (op.op === 'delete') fs.rmSync(p(op.path));
     else if (op.op === 'rename') { fs.mkdirSync(path.dirname(p(op.to)), { recursive: true }); fs.renameSync(p(op.from), p(op.to)); }
     else if (op.op === 'edit') {
@@ -88,10 +57,10 @@ function applyOps(dir, ops) {
 /** committed: on a feature branch; uncommitted: working tree + untracked files; staged: in the index only. */
 function prepare(ops, variant, extraBase = null) {
   const dir = scenarioRepo(extraBase);
-  if (variant === 'committed') sh(dir, 'checkout', '-q', '-b', 'feature');
+  if (variant === 'committed') gitCli(dir, 'checkout', '-q', '-b', 'feature');
   applyOps(dir, ops);
-  if (variant === 'committed') { sh(dir, 'add', '-A'); sh(dir, 'commit', '-q', '-m', 'change'); }
-  if (variant === 'staged') sh(dir, 'add', '-A');
+  if (variant === 'committed') { gitCli(dir, 'add', '-A'); gitCli(dir, 'commit', '-q', '-m', 'change'); }
+  if (variant === 'staged') gitCli(dir, 'add', '-A');
   return dir;
 }
 async function targetFor(dir) {
@@ -502,16 +471,16 @@ describe('deps parsing', () => {
   test('blobReader: one batch for many blobs, same answers as git show (text, binary, missing, oversized)', () => {
     const files = { 'a.txt': 'alpha\r\n', 'b.bin': 'x\u0000y', 'big.txt': 'z'.repeat(100), 'sub/c.js': 'c\n' };
     const dir = initRepo(files);
-    const head = sh(dir, 'rev-parse', 'HEAD');
+    const head = gitCli(dir, 'rev-parse', 'HEAD').trim();
     const names = [...Object.keys(files), 'nope.txt'];
-    const batched = deps.blobReader(dir, { maxBytes: 50 });
+    const batched = git.blobReader(dir, { maxBytes: 50 });
     batched.prefetch(names.map((f) => [head, f]));
     // Without the repository, only what the batch loaded can still be read.
     fs.renameSync(path.join(dir, '.git'), path.join(dir, '.git-away'));
     assert.equal(batched.read(head, 'a.txt'), 'alpha\r\n');
     assert.equal(batched.read(head, 'sub/c.js'), 'c\n');
     fs.renameSync(path.join(dir, '.git-away'), path.join(dir, '.git'));
-    const single = deps.blobReader(dir, { maxBytes: 50 });
+    const single = git.blobReader(dir, { maxBytes: 50 });
     for (const f of names) assert.equal(batched.read(head, f), single.read(head, f), f);
     assert.deepEqual(['b.bin', 'big.txt', 'nope.txt'].map((f) => single.read(head, f)), [null, null, null]);
   });
@@ -582,11 +551,11 @@ describe('diff-scope scenarios', () => {
     for (const variant of ['committed', 'uncommitted']) {
       test(`${s.name} (${variant})`, async () => {
         const dir = prepare(s.ops, variant);
-        const before = sh(dir, 'status', '--porcelain');
+        const before = gitCli(dir, 'status', '--porcelain');
         const target = await targetFor(dir);
         const res = await diffScope({ target, env: ENV });
         assert.deepEqual(severities(res.findings), sortedExpect(s.expect), JSON.stringify(res.findings.filter((f) => f.severity !== 'info'), null, 1));
-        assert.equal(sh(dir, 'status', '--porcelain'), before, 'diff-scope leaves the working tree and index untouched');
+        assert.equal(gitCli(dir, 'status', '--porcelain'), before, 'diff-scope leaves the working tree and index untouched');
         assert.equal(res.checks.length, 11);
         for (const c of res.checks) {
           assert.ok(['pass', 'fail', 'finding'].includes(c.status), `${c.id} ${c.status} ${c.summary}`);
@@ -785,7 +754,7 @@ describe('diff-scope behaviour', () => {
 
   test('unborn repository: everything is new and diffs against the empty tree', async () => {
     const dir = fs.mkdtempSync(path.join(TMP, 'unborn-'));
-    sh(dir, 'init', '-q', '-b', 'main');
+    gitCli(dir, 'init', '-q', '-b', 'main');
     writeFiles(dir, { 'tests/a.test.js': "it.only('x', () => { expect(1).toBe(1); });\n", 'src/a.js': 'module.exports = 1;\n' });
     const res = await diffScope({ target: await targetFor(dir), env: ENV });
     assert.equal(res.base.sha, null);
@@ -997,13 +966,13 @@ describe('deps-check lock tools', () => {
     pkg.dependencies.other = 'file:./other';
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
     writeFiles(dir, { 'other/package.json': JSON.stringify({ name: 'other', version: '1.0.0' }) + '\n' });
-    const before = sh(dir, 'status', '--porcelain');
+    const before = gitCli(dir, 'status', '--porcelain');
     const res = await deps.depsCheck({ target: await targetFor(dir), offline: true, tools: true, env: ENV });
     assert.equal(res.lock_status.status, 'inconsistent');
     assert.equal(res.lock_status.lockfiles[0].tool.status, 'inconsistent');
     assert.equal(res.checks.find((c) => c.id === 'CK-LOCK').status, 'fail');
-    assert.equal(sh(dir, 'status', '--porcelain'), before);
-    assert.equal(sh(dir, 'worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length, 1, 'temp worktree removed');
+    assert.equal(gitCli(dir, 'status', '--porcelain'), before);
+    assert.equal(gitCli(dir, 'worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length, 1, 'temp worktree removed');
   });
 
   test('a lock entry added by the change is not proof of existence; a base entry is', async () => {
@@ -1071,14 +1040,7 @@ describe('deps-check lock tools', () => {
 // End to end through adc.mjs
 
 describe('adc.mjs end to end', () => {
-  const runAdc = (args, dir, env = {}) => {
-    const r = spawnSync(process.execPath, [ADC, ...args, '--json', '--cwd', dir], {
-      encoding: 'utf8', env: { ...ENV, ADC_HOME: path.join(TMP, `home-${path.basename(dir)}`), ...env },
-    });
-    let json = null;
-    try { json = JSON.parse(r.stdout); } catch { /* asserted below */ }
-    return { ...r, json };
-  };
+  const runAdc = (args, dir, env = {}) => adcRun(args, { cwd: dir, env: { ...ENV, ADC_HOME: path.join(TMP, `home-${path.basename(dir)}`), ...env } });
 
   test('diff-scope exits 1 with findings, 0 when clean; stdout is one ASCII JSON document', () => {
     const bad = prepare(DIFFS.scenarios.find((s) => s.name === 'it.only').ops, 'uncommitted');
@@ -1130,25 +1092,25 @@ describe('adc.mjs end to end', () => {
     const dir = prepare(DIFFS.scenarios.find((s) => s.name === 'it.only').ops, 'uncommitted');
     for (let i = 0; i < 2; i++) {
       // The second run finds .adc/ already ignored through info/exclude.
-      const r = spawnSync(process.execPath, [ADC, 'diff-scope', '--json', '--cwd', dir], { encoding: 'utf8', env: ENV });
+      const r = adcRun(['diff-scope'], { cwd: dir, env: ENV });
       assert.equal(r.status, 1, r.stderr);
       assert.ok(fs.existsSync(path.join(dir, '.adc')));
-      assert.ok(!JSON.parse(r.stdout).files.some((f) => f.path.startsWith('.adc/')));
+      assert.ok(!r.json.files.some((f) => f.path.startsWith('.adc/')));
     }
     assert.match(fs.readFileSync(path.join(dir, '.git', 'info', 'exclude'), 'utf8'), /^\/\.adc\/$/m);
-    assert.equal(sh(dir, 'status', '--porcelain'), 'M tests/math.test.js', 'only the planted edit; .adc/ stays invisible');
+    assert.equal(gitCli(dir, 'status', '--porcelain'), ' M tests/math.test.js\n', 'only the planted edit; .adc/ stays invisible');
   });
 
   test('a tracked .adc/ makes both commands exit 3', () => {
     const dir = scenarioRepo();
     fs.mkdirSync(path.join(dir, '.adc'));
     fs.writeFileSync(path.join(dir, '.adc', 'notes.json'), '{}\n');
-    sh(dir, 'add', '-f', '.adc/notes.json');
-    sh(dir, 'commit', '-q', '-m', 'oops');
+    gitCli(dir, 'add', '-f', '.adc/notes.json');
+    gitCli(dir, 'commit', '-q', '-m', 'oops');
     for (const cmd of ['diff-scope', 'deps-check']) {
-      const r = spawnSync(process.execPath, [ADC, cmd, '--json', '--cwd', dir], { encoding: 'utf8', env: ENV });
+      const r = adcRun([cmd], { cwd: dir, env: ENV });
       assert.equal(r.status, 3, `${cmd}: ${r.stdout}`);
-      assert.equal(JSON.parse(r.stdout).error.code, 'STATE_TRACKED');
+      assert.equal(r.json.error.code, 'STATE_TRACKED');
     }
   });
 
@@ -1164,21 +1126,21 @@ describe('adc.mjs end to end', () => {
     fs.mkdirSync(path.join(dir, '.adc'));
     fs.writeFileSync(path.join(dir, '.adc', '.env.live'), `ADC_LIVE_TOKEN=${fileToken}\n`);
     fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
-    const r = spawnSync(process.execPath, [ADC, 'diff-scope', '--json', '--cwd', dir], { encoding: 'utf8', env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
+    const r = adcRun(['diff-scope'], { cwd: dir, env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
     assert.equal(r.status, 1, r.stderr);
     for (const out of [r.stdout, r.stderr]) {
       assert.ok(!out.includes(fileToken) && !out.includes(envToken), 'no token value in stdout or stderr');
     }
-    const res = JSON.parse(r.stdout);
+    const res = r.json;
     assert.ok(res.findings.some((f) => f.rule === 'secret.adc-live-token-value' && f.file === 'src/client.js'));
     assert.ok(!res.files.some((f) => f.path.startsWith('.adc/')));
-    const d = spawnSync(process.execPath, [ADC, 'deps-check', '--json', '--offline', '--static-only', '--cwd', dir], { encoding: 'utf8', env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
+    const d = adcRun(['deps-check', '--offline', '--static-only'], { cwd: dir, env: { ...ENV, ADC_LIVE_TOKEN: envToken } });
     assert.ok(!d.stdout.includes(fileToken) && !d.stdout.includes(envToken));
   });
 
   test('deps-check --dry-run creates no state directory', () => {
     const dir = prepare(DIFFS.scenarios.find((s) => s.name === 'clean').ops, 'uncommitted');
-    const r = spawnSync(process.execPath, [ADC, 'deps-check', '--json', '--offline', '--static-only', '--dry-run', '--cwd', dir], { encoding: 'utf8', env: ENV });
+    const r = adcRun(['deps-check', '--offline', '--static-only', '--dry-run'], { cwd: dir, env: ENV });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.ok(!fs.existsSync(path.join(dir, '.adc')));
   });

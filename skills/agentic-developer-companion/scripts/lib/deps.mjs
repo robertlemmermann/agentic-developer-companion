@@ -8,74 +8,56 @@ import os from 'node:os';
 import path from 'node:path';
 import { builtinModules } from 'node:module';
 import {
-  defineCommand, EXIT, runTool, which, sha256, asciiJson, toPosix, truncate, redactLiterals, IS_WINDOWS, tmpRoot,
-  readText, nonce, stripBom, lastLine, liveSecrets, makeCheck, toolEnv,
+  defineCommand, EXIT, runTool, which, sha256, asciiJson, toPosix, truncate, redactLiterals, IS_WINDOWS, tmpPath,
+  readText, stripBom, lastLine, liveSecrets, makeCheck, toolEnv, tryJson, words, indentOf, plural, listDir,
 } from './core.mjs';
 import {
-  emptyTree, diffNameStatus, diffLines, gitRaw, readBlobs, showFile, lsTree, worktreeAdd, worktreeRemove,
+  emptyTree, diffNameStatus, diffLines, lsTree, worktreeAdd, worktreeRemove, blobReader,
 } from './git.mjs';
 import { prepareTarget, snapshotExcludes } from './state.mjs';
 import { parseToml, parseIni, parseJsonc } from './formats.mjs';
 import { classifyPath, redactSecrets, LOCKFILE_MANAGERS } from './markers.mjs';
+import { CHECK_FM } from './evidence.mjs';
 
 const MAX_LOOKUPS = 25;
 const TOOL_TIMEOUT_MS = 120_000;
 const LOOKUP_TIMEOUT_MS = 30_000;
-const MAX_BLOB_BYTES = 64 * 1024 * 1024;
 
-/** Strict JSON (npm rejects comments in package.json), BOM tolerated; null when it does not parse. */
-const json = (text) => { try { return JSON.parse(stripBom(String(text))); } catch { return null; } };
+// Manifests and locks are strict JSON (npm rejects comments in package.json): tryJson, not parseJsonc.
 const toml = (text) => parseToml(text, { lenient: true }).value;
 const lastUseful = (s) => truncate(lastLine(s), 200);
 const NON_REGISTRY = new Set(['local', 'git', 'url']);
 
-
 // ---------------------------------------------------------------------------
-// Blob reads
+// The snapshot diff (shared with diff-scope)
+
+const diffCache = new WeakMap();
 
 /**
- * Cached text of `<rev>:<file>` blobs; null for a missing, binary (NUL) or oversized blob.
- * `prefetch([[rev, file], ...])` loads many in two git processes (`cat-file --batch-check` for the
- * sizes, `--batch` for the contents) instead of one `git cat-file blob` per file and side.
+ * What the diff-scoped checks of `target` read, computed once per target (verify runs diff-scope and
+ * deps-check on one): base (or the empty tree) to snapshot with the state dirs excluded. `changes`
+ * is eager; `lines()`, `headFiles()`, `baseFiles()` and the cached `blobs()` reader run on first use.
  */
-export function blobReader(root, { maxBytes = MAX_BLOB_BYTES } = {}) {
-  const cache = new Map();
-  const specOf = (rev, file) => `${rev}:${toPosix(file)}`;
-  const tooBig = (text) => text.length > maxBytes || text.includes('\u0000');
-  function prefetch(pairs) {
-    const want = [...new Set(pairs.filter(([, f]) => f && !/[\r\n]/.test(f)).map(([rev, f]) => specOf(rev, f)))]
-      .filter((s) => !cache.has(s));
-    if (want.length < 2) return;
-    try {
-      const res = gitRaw(root, ['cat-file', '--batch-check'], { input: `${want.join('\n')}\n` });
-      const lines = res.stdout.split('\n');
-      if (res.exit !== 0 || lines.length < want.length) return;
-      const small = [];
-      want.forEach((s, i) => {
-        const m = /^([0-9a-f]+) (\w+) (\d+)\r?$/.exec(lines[i]);
-        if (!m) return; // missing or unexpected: read() asks git for this one
-        if (m[2] !== 'blob' || Number(m[3]) > maxBytes) cache.set(s, null);
-        else small.push([s, m[1]]);
-      });
-      const blobs = readBlobs(root, small.map(([, sha]) => sha));
-      for (const [s, sha] of small) {
-        const buf = blobs.get(sha);
-        if (buf) cache.set(s, buf.includes(0) ? null : buf.toString('utf8'));
-      }
-    } catch {
-      // Batching is an optimization: read() falls back to one process per blob.
-    }
-  }
-  function read(rev, file) {
-    if (!file) return null;
-    const s = specOf(rev, file);
-    if (!cache.has(s)) {
-      const text = showFile(root, rev, file);
-      cache.set(s, text == null || tooBig(text) ? null : text);
-    }
-    return cache.get(s);
-  }
-  return { read, prefetch };
+export function snapshotDiff(target) {
+  let d = diffCache.get(target);
+  if (d) return d;
+  const root = target.root;
+  const from = target.base.sha || emptyTree(root);
+  const to = target.snapshot.commit;
+  const pathspec = ['.', ...snapshotExcludes(target.state).map((p) => `:(top,exclude)${p}`)];
+  const once = (fn) => {
+    let value;
+    return () => (value ??= fn());
+  };
+  d = {
+    root, from, to, changes: diffNameStatus(root, from, to, pathspec),
+    lines: once(() => diffLines(root, from, to, pathspec)),
+    headFiles: once(() => new Set(lsTree(root, to))),
+    baseFiles: once(() => new Set(target.base.sha ? lsTree(root, from) : [])),
+    blobs: once(() => blobReader(root)),
+  };
+  diffCache.set(target, d);
+  return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +66,7 @@ export function blobReader(root, { maxBytes = MAX_BLOB_BYTES } = {}) {
 export const normPypi = (n) => String(n).toLowerCase().replace(/[-_.]+/g, '-');
 const CASE_INSENSITIVE = new Set(['nuget', 'go', 'npm', 'maven', 'composer']);
 /** Canonical comparison key for a dependency name in its ecosystem. */
-export function normName(ecosystem, name) {
+function normName(ecosystem, name) {
   const n = String(name || '').trim();
   if (ecosystem === 'pypi') return normPypi(n);
   if (ecosystem === 'crates') return n.toLowerCase().replace(/_/g, '-');
@@ -101,7 +83,7 @@ const SAFE_NAME = /^(?!(?:.*\/)?\.\.?(?:\/|$))[A-Za-z0-9@_][\w.@/~+-]{0,213}$/;
 // Manifests
 
 /** Kind of an npm dependency spec: registry | local | workspace | git | url | alias. */
-export function npmSpecKind(spec) {
+function npmSpecKind(spec) {
   const s = String(spec ?? '').trim();
   if (/^(?:file|link|portal):/.test(s) || /^(?:\.{1,2}\/|\/|~\/)/.test(s)) return 'local';
   if (/^workspace:/.test(s)) return 'workspace';
@@ -149,7 +131,7 @@ export function parseManifest(file, text) {
   };
   const addReq = (req, section) => { const d = pep508(req); if (d) add(d.name, d.spec, section, d.kind); };
   if (base === 'package.json') {
-    const j = json(text);
+    const j = tryJson(text);
     if (!j || typeof j !== 'object') return null;
     for (const sec of NPM_SECTIONS) {
       for (const [n, spec] of Object.entries(j[sec] || {})) {
@@ -163,7 +145,7 @@ export function parseManifest(file, text) {
     return { ecosystem: 'npm', deps, packageName: typeof j.name === 'string' ? j.name : null, workspaces: ws };
   }
   if (base === 'composer.json') {
-    const j = json(text);
+    const j = tryJson(text);
     if (!j) return null;
     const platform = /^(?:php|ext-.*|lib-.*|composer(?:-plugin)?-api|composer-runtime-api|hhvm)$/i;
     for (const sec of ['require', 'require-dev']) {
@@ -419,7 +401,7 @@ export function lockIndex(lock, text) {
   };
   const lines = text.split(/\r?\n/);
   const needJson = ['npm', 'pipenv', 'composer', 'nuget'].includes(manager);
-  const j = needJson ? json(text) : manager === 'bun' ? parseJsonc(text) : null;
+  const j = needJson ? tryJson(text) : manager === 'bun' ? parseJsonc(text) : null;
   if ((needJson || manager === 'bun') && !j) return { ...idx, ok: false };
   try {
     if (manager === 'npm' && j.packages) {
@@ -520,7 +502,7 @@ function parsePnpmLock(lines, idx, put) {
   for (const line of lines) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
-    const indent = line.length - line.trimStart().length;
+    const indent = indentOf(line);
     if (indent === 0) {
       top = /^importers:\s*\{\s*\}/.test(t) ? null : t.replace(/:.*$/, '');
       importer = depSection = depName = null;
@@ -646,7 +628,7 @@ vlucas/phpdotenv`,
 const popularCache = new Map();
 const popularSet = (eco) => {
   if (!popularCache.has(eco)) {
-    popularCache.set(eco, new Set((POPULAR[eco] || '').split(/\s+/).filter(Boolean).map((n) => normName(eco, n))));
+    popularCache.set(eco, new Set(words(POPULAR[eco]).map((n) => normName(eco, n))));
   }
   return popularCache.get(eco);
 };
@@ -698,7 +680,6 @@ export function lookalikeOf(ecosystem, name, siblings = []) {
 // Existence: local caches, then the registry's CLI
 
 const home = () => os.homedir();
-const listDir = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir) : []);
 
 function npmRegistries(root, env, { scoped = false } = {}) {
   const regs = env.npm_config_registry ? [env.npm_config_registry] : [];
@@ -713,7 +694,7 @@ function npmRegistries(root, env, { scoped = false } = {}) {
 }
 
 /** Hosts npm is configured to install from (default, project and user .npmrc, scoped registries). */
-export function npmRegistryHosts(root, env = process.env) {
+function npmRegistryHosts(root, env = process.env) {
   const hosts = new Set(['registry.npmjs.org', 'registry.yarnpkg.com']);
   for (const r of npmRegistries(root, env, { scoped: true })) {
     try { hosts.add(new URL(r).host); } catch { /* not a URL */ }
@@ -726,7 +707,7 @@ function cacacheHas(cacheDir, key) {
   const h = sha256(key);
   const text = readText(path.join(cacheDir, '_cacache', 'index-v5', h.slice(0, 2), h.slice(2, 4), h.slice(4)));
   return Boolean(text) && text.split('\n').some((line) => {
-    const entry = line.includes('\t') ? json(line.slice(line.indexOf('\t') + 1)) : null;
+    const entry = line.includes('\t') ? tryJson(line.slice(line.indexOf('\t') + 1)) : null;
     return entry?.key === key && entry.integrity;
   });
 }
@@ -846,7 +827,7 @@ export function registryLookup(ecosystem, name, {
   }
   if (ecosystem === 'nuget' && tool('dotnet')) {
     const r = runTool(tool('dotnet'), ['package', 'search', name, '--exact-match', '--format', 'json'], opts);
-    const j = r.exit === 0 ? json(r.stdout) : null;
+    const j = r.exit === 0 ? tryJson(r.stdout) : null;
     if (Array.isArray(j?.searchResult)) {
       return { exists: j.searchResult.some((s) => (s.packages || []).length > 0), source: 'registry:dotnet' };
     }
@@ -970,11 +951,11 @@ export function defaultOffline(env = process.env) {
   return Object.keys(env).some((k) => k.startsWith('CODEX_SANDBOX'));
 }
 
-const relDir = (from, to) => path.posix.relative(from === '.' ? '' : from, to) || '.';
+/** Directory `to` relative to directory `from` (repo-relative POSIX; '.' for the same one): a pnpm importer key. */
+export const relDir = (from, to) => path.posix.relative(from === '.' ? '' : from, to) || '.';
 const newDep = (fields) => ({
   old_spec: null, kind: 'registry', exists: null, source: null, lookalike_of: null, ...fields,
 });
-const plural = (n, one, many) => (n === 1 ? one : many);
 
 /** New and changed dependencies of the changed manifests; redirections and new Go replaces are findings. */
 function manifestDeps(c, before, after, finding) {
@@ -1005,7 +986,7 @@ function manifestDeps(c, before, after, finding) {
 }
 
 /** Packages imported on added lines (JS/TS, Go) that the nearest manifest does not declare. */
-function undeclaredImports({ root, from, to, pathspec, headFiles, blobs }) {
+function undeclaredImports({ to, lines, headFiles, blobs }) {
   const read = (file) => blobs.read(to, file);
   const out = [];
   const seen = new Set();
@@ -1023,7 +1004,7 @@ function undeclaredImports({ root, from, to, pathspec, headFiles, blobs }) {
     const manifests = [...headFiles].filter((f) => f.endsWith('package.json') && !f.includes('node_modules/'))
       .slice(0, 300);
     blobs.prefetch(manifests.map((p) => [to, p]));
-    workspaceNames = new Set(manifests.map((p) => json(read(p) || '')?.name).filter((n) => typeof n === 'string'));
+    workspaceNames = new Set(manifests.map((p) => tryJson(read(p))?.name).filter((n) => typeof n === 'string'));
     return workspaceNames;
   };
   const npmCache = new Map();
@@ -1051,7 +1032,7 @@ function undeclaredImports({ root, from, to, pathspec, headFiles, blobs }) {
       name, ecosystem: eco, manifest, section: 'import', spec: null, declared: false, imported_at: at, siblings,
     }));
   };
-  const files = diffLines(root, from, to, pathspec)
+  const files = lines
     .filter((f) => !f.binary && f.added.length && f.status !== 'D' && !classifyPath(f.path).generated);
   blobs.prefetch(files.filter((f) => f.path.endsWith('.go')).map((f) => [to, f.path]));
   for (const f of files) {
@@ -1113,9 +1094,8 @@ function staticLockStatus({ lock, manifests, idx, headFiles, read }) {
       if (!(d.name in idx.root) || idx.root[d.name] === d.spec) continue;
       st.mismatched.push(`${d.name}: manifest ${d.spec}, lock ${idx.root[d.name]}`);
     }
-    for (const n of Object.keys(idx.root)) {
-      if (!parsed.deps.some((d) => d.name === n)) st.mismatched.push(`${n}: in lock, not in manifest`);
-    }
+    const declared = new Set(parsed.deps.map((d) => d.name));
+    for (const n of Object.keys(idx.root)) if (!declared.has(n)) st.mismatched.push(`${n}: in lock, not in manifest`);
   }
   // A manifest that cannot be parsed leaves the lock unjudged, never consistent.
   st.status = (checked && st.missing.length) || st.mismatched.length ? 'inconsistent'
@@ -1150,8 +1130,8 @@ function lockReports(ctx) {
   }
   const reports = [];
   const worktrees = {};
-  // A nonce keeps concurrent runs on the same snapshot (verify plus a manual deps-check) apart.
-  const wtRoot = path.join(tmpRoot(root), `deps-${String(target.snapshot.tree).slice(0, 12)}-${nonce().slice(0, 8)}`);
+  // A fresh path keeps concurrent runs on the same snapshot (verify plus a manual deps-check) apart.
+  const wtRoot = tmpPath(root, 'deps', target.snapshot.tree);
   const inWorktree = (side, rev, dir) => {
     worktrees[side] ||= worktreeAdd(root, rev, path.join(wtRoot, side));
     return path.join(worktrees[side], ...(dir === '.' ? [] : dir.split('/')));
@@ -1210,15 +1190,12 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
   timeoutMs = TOOL_TIMEOUT_MS, maxLookups = MAX_LOOKUPS } = {}) {
   const started = Date.now();
   if (offline == null) offline = defaultOffline(env);
-  const root = target.root;
-  const from = target.base.sha || emptyTree(root);
-  const to = target.snapshot.commit;
-  const pathspec = ['.', ...snapshotExcludes(target.state).map((p) => `:(top,exclude)${p}`)];
-  const changes = diffNameStatus(root, from, to, pathspec);
-  const headFiles = new Set(lsTree(root, to));
-  const baseFiles = new Set(target.base.sha ? lsTree(root, from) : []);
+  const diff = snapshotDiff(target);
+  const { root, from, to, changes } = diff;
+  const headFiles = diff.headFiles();
+  const baseFiles = diff.baseFiles();
   const secrets = liveSecrets(env);
-  const blobs = blobReader(root);
+  const blobs = diff.blobs();
   const read = blobs.read;
   // Every changed manifest and lockfile, both sides, plus the lockfiles of changed manifests: one batch.
   const relevant = changes.filter((c) => c.status !== 'D' && (isParsableManifest(c.path) || lockManager(c.path)));
@@ -1263,13 +1240,13 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
       removed: delta.removed.length, changed: delta.changed.length });
     newDeps.push(...deps);
   }
-  newDeps.push(...undeclaredImports({ root, from, to, pathspec, headFiles, blobs }));
+  newDeps.push(...undeclaredImports({ to, lines: diff.lines(), headFiles, blobs }));
 
   // Existence: lockfile => cache => resolver/registry. A lock entry that already existed at the base is
   // proof enough; one added by this change may be hand-written (a fabricated package plus a fabricated
   // lock entry), so it only counts after the cache or the registry confirms the name.
   let lookups = 0;
-  const registryHosts = npmRegistryHosts(root, env);
+  let registryHosts = null;
   for (const d of newDeps) {
     d.lookalike_of = lookalikeOf(d.ecosystem, d.name, d.siblings || []);
     delete d.siblings;
@@ -1287,7 +1264,8 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
       }
       if (lk.base?.ok && lk.base.names.has(key)) { d.exists = true; d.source = `lockfile:${lock}`; continue; }
       d.lock_entry = 'new';
-      if (d.ecosystem === 'npm' && d.resolved_host && !registryHosts.has(d.resolved_host)) d.unexpected_host = true;
+      if (d.ecosystem === 'npm' && d.resolved_host
+        && !(registryHosts ||= npmRegistryHosts(root, env)).has(d.resolved_host)) d.unexpected_host = true;
     }
     const cached = cacheLookup(d.ecosystem, d.name, { root, env });
     if (cached) { d.exists = true; d.source = cached.source; continue; }
@@ -1359,14 +1337,14 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
   const lockCheck = has(lockF, 'fail') ? 'fail' : lockStatus === 'unknown' ? 'unverified'
     : has(lockF, 'finding') ? 'finding' : lockStatus === 'unsupported' ? 'skipped' : 'pass';
   const checks = [
-    makeCheck({ ...common, id: 'CK-DEPS', fm: ['FM-04'], status: depsStatus, reason: depsReason,
+    makeCheck({ ...common, id: 'CK-DEPS', fm: [...CHECK_FM['CK-DEPS']], status: depsStatus, reason: depsReason,
       summary: !newDeps.length ? 'no new dependencies or undeclared imports'
         : `${newDeps.length} new ${plural(newDeps.length, 'dependency', 'dependencies')}: `
           + `${count((d) => d.exists === true)} verified, ${count((d) => d.exists === false)} nonexistent, `
           + `${unverified.length} unverified${offline ? ' (offline)' : ''}, ${count((d) => d.lookalike_of)} look-alike`,
       output_sha256: sha256(asciiJson(depsF, 0)), findings: depsF,
       data: { offline, new_deps: newDeps.length, lookups } }),
-    makeCheck({ ...common, id: 'CK-LOCK', fm: ['FM-12'], status: lockCheck,
+    makeCheck({ ...common, id: 'CK-LOCK', fm: [...CHECK_FM['CK-LOCK']], status: lockCheck,
       reason: lockCheck === 'unverified' ? 'LOCK_UNVERIFIED' : lockCheck === 'skipped' ? 'UNSUPPORTED_LOCKFILE' : null,
       summary: lockStatus === 'unchanged' ? 'no manifest or lockfile changes'
         : `${reports.length} lockfile(s): ${reports.map((r) => `${r.path} ${r.status}`
@@ -1395,22 +1373,20 @@ export async function depsCheck({ target, offline = null, resolver = null, tools
 // ---------------------------------------------------------------------------
 // Command
 
-const USAGE = `usage: adc.mjs deps-check [--base <ref>] [--offline | --online] [--static-only] [--json]
-
-New and changed dependencies in the working-tree snapshot vs the base: existence
-(lockfile, local package-manager cache, then npm view / uv / pip index / cargo info /
-go list -m / gem search / dotnet package search), look-alike names, undeclared imports, and
-lockfile consistency (static parse plus npm ci --dry-run, pnpm --frozen-lockfile, uv lock --check,
-poetry check --lock, go mod tidy -diff, cargo metadata --locked, dotnet restore --locked-mode in a
-temp worktree).
---offline      no registry lookups (default inside the Codex sandbox, CODEX_SANDBOX*, and with ADC_OFFLINE=1)
---online       look names up even where offline is the default
---static-only  parse lockfiles only; do not run the package managers' own checks
-Exit: 0 pass, 1 failures or findings, 4 could not verify (offline and unresolved).`;
-
 export const depsCheckCommand = defineCommand({
   name: 'deps-check',
-  usage: USAGE,
+  usage: [
+    'deps-check [--base <ref>] [--offline | --online] [--static-only] [--json]',
+    'New and changed dependencies of the working-tree snapshot vs the base (CK-DEPS): existence (lockfile, local',
+    'package-manager cache, then npm view / uv / pip index / cargo info / go list -m / gem search / dotnet package',
+    'search), look-alike names, undeclared imports. Lockfile consistency (CK-LOCK): static parse plus, in a temp',
+    'worktree, npm ci --dry-run, pnpm --frozen-lockfile, uv lock --check, poetry check --lock, go mod tidy -diff,',
+    'cargo metadata --locked, dotnet restore --locked-mode.',
+    '--offline      no registry lookups (default in the Codex sandbox, CODEX_SANDBOX*, and with ADC_OFFLINE=1)',
+    '--online       look names up even where offline is the default',
+    '--static-only  parse lockfiles only; skip the package managers\' own checks',
+    'Exit 0 pass, 1 failures or findings, 4 could not verify (offline and unresolved).',
+  ].join('\n'),
   options: { base: { type: 'string' }, offline: { type: 'boolean' }, online: { type: 'boolean' },
     'static-only': { type: 'boolean' } },
   positionals: false,

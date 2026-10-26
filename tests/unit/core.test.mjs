@@ -2,33 +2,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as git from '../../skills/agentic-developer-companion/scripts/lib/git.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import { AWS_KEY, makeRepo, tmpDir } from './helpers.mjs';
 
 const ADC = core.ADC_SCRIPT;
-
-export function makeRepo(files = {}, { commit = true } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-test-'));
-  const g = (...args) => {
-    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout.trim();
-  };
-  g('init', '-q', '-b', 'main');
-  g('config', 'user.email', 't@example.com');
-  g('config', 'user.name', 'Test');
-  g('config', 'commit.gpgsign', 'false');
-  for (const [p, c] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
-    fs.writeFileSync(path.join(dir, p), c);
-  }
-  if (commit) { g('add', '-A'); g('commit', '-q', '-m', 'init', '--allow-empty'); }
-  return { dir, g };
-}
 
 test('asciiJson escapes every non-ASCII character', () => {
   const s = core.asciiJson({ a: 'héllo ✓ 😀' }, 0);
@@ -70,7 +51,7 @@ test('template bundles parse sections, attributes and placeholders', () => {
 });
 
 test('withLock serializes and breaks stale locks', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-lock-'));
+  const dir = tmpDir('adc-lock-');
   const lock = path.join(dir, 'x.lock');
   fs.writeFileSync(lock, 'stale');
   const old = new Date(Date.now() - 60_000);
@@ -129,7 +110,7 @@ test('.env.live is not materialized when a .gitignore negation un-ignores it', (
 
 test('exclude path resolves from a linked worktree', () => {
   const { dir, g } = makeRepo({ 'a.txt': 'x\n' });
-  const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-wt-')), 'linked');
+  const wt = path.join(tmpDir('adc-wt-'), 'linked');
   g('worktree', 'add', '-q', wt);
   const info = state.prepareStateDir({ cwd: wt });
   assert.ok(info.exclude.ok);
@@ -178,7 +159,7 @@ const LIB = '../../skills/agentic-developer-companion/scripts/lib';
 const formats = await import(`${LIB}/formats.mjs`);
 const markers = await import(`${LIB}/markers.mjs`);
 const fm = await import(`${LIB}/frontmatter.mjs`);
-const tmp = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `adc-${label}-`));
+const tmp = (label) => tmpDir(`adc-${label}-`);
 const POSIX = process.platform !== 'win32';
 
 test('value and text helpers', () => {
@@ -377,7 +358,7 @@ test('git: parseUnifiedDiff hunks, readBlobs, lsTree entries, lsFiles strict, st
   assert.equal(git.appendExclude(null, '/.other/', { aliases: ['/.other'], excludeFile: custom }).written, false);
   assert.ok(git.appendExclude(null, '/x/', { excludeFile: custom, comment: null }).written);
   assert.equal(fs.readFileSync(custom, 'utf8'), '/.other\n/x/\n');
-  assert.equal(g('status', '--porcelain'), '?? new.txt');
+  assert.equal(g('status', '--porcelain'), '?? new.txt\n');
 });
 
 test('state: git-free repo lookup and state dir (hooks), tracked check, ledgers', () => {
@@ -497,12 +478,11 @@ test('markers: isTestFile / projectForFile with detect globs, heuristics and Rus
 });
 
 test('markers.makeRedactor and redactDeep', () => {
-  const aws = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
   const tok = ['live', 'Tok', '987654321'].join('');
   const lit = ['hunter2', 'abc/+='].join('');
   const redact = markers.makeRedactor({ literals: [{ name: 'PW', value: lit }], env: { ADC_LIVE_TOKEN: tok } });
-  const out = redact(`k=${aws} t=${tok} b64=${Buffer.from(lit).toString('base64')} ADC_LIVE_TOKEN=${'x'.repeat(12)} FOO_TOKEN=abcdef1`);
-  assert.ok(!out.includes(aws) && !out.includes(tok) && !out.includes(Buffer.from(lit).toString('base64')) && !out.includes('xxxxxxxxxxxx'), out);
+  const out = redact(`k=${AWS_KEY} t=${tok} b64=${Buffer.from(lit).toString('base64')} ADC_LIVE_TOKEN=${'x'.repeat(12)} FOO_TOKEN=abcdef1`);
+  assert.ok(!out.includes(AWS_KEY) && !out.includes(tok) && !out.includes(Buffer.from(lit).toString('base64')) && !out.includes('xxxxxxxxxxxx'), out);
   assert.match(out, /\[REDACTED:aws[\w-]*\]/);
   assert.match(out, /\[REDACTED:ADC_LIVE_TOKEN\]/);
   assert.match(out, /\[REDACTED:PW\]/);
@@ -633,13 +613,13 @@ test('file helpers: listDir, readFilePart; runId and tmpPath', () => {
 
 test('git: baseRef chain and resolveBase, ignoredPaths, lsFiles others, originUrl, workRoot, blobReader', () => {
   const { dir, g } = makeRepo({ 'a.txt': 'a\n', '.gitignore': 'ignored/\n*.log\n' });
-  assert.deepEqual(git.baseRef(dir, null), { ref: 'main', tip: g('rev-parse', 'HEAD'), source: 'main' });
+  assert.deepEqual(git.baseRef(dir, null), { ref: 'main', tip: g('rev-parse', 'HEAD').trim(), source: 'main' });
   g('checkout', '-q', '-b', 'feature');
   fs.writeFileSync(path.join(dir, 'b.txt'), 'b\n');
   g('add', '-A');
   g('commit', '-q', '-m', 'b');
   const base = git.resolveBase(dir, null);
-  assert.deepEqual([base.ref, base.source, base.sha], ['main', 'main', g('rev-parse', 'main')]);
+  assert.deepEqual([base.ref, base.source, base.sha], ['main', 'main', g('rev-parse', 'main').trim()]);
   assert.equal(git.resolveBase(dir, 'feature').source, 'flag');
   assert.throws(() => git.baseRef(dir, 'no-such-ref'), (e) => e.exit === core.EXIT.USAGE);
   const ignored = git.ignoredPaths(dir, ['ignored/x', 'a.txt', 'z.log', 'z.log']);

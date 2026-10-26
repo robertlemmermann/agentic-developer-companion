@@ -1,10 +1,8 @@
-# live scaffolds (plan §10.3): a plain probe project under tests/live/ that the companion's trusted
-# runner executes (`adc.mjs live run`), which owns credentials, the budget and redaction. Probes get
-# ADC_LIVE_TOKEN, ADC_LIVE_BASE_URL, ADC_LIVE_TENANT, ADC_TEST_RUN_ID, ADC_PROBE_ID and
-# ADC_PROBE_RESULT from the runner's environment only. Rendered by scripts/lib/scaffold.mjs.
-# Attributes: lang=ts (Playwright API testing) | js (node:test + fetch) | python (pytest + httpx),
-# when=synthetic (only after the live safety checklist has no TODO line), scope=repo, part=fragment.
-# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
+# live (plan §10.3): a plain probe project for the companion's trusted runner (`adc.mjs live run`), which
+# owns credentials, the budget and redaction; probes get ADC_LIVE_TOKEN, ADC_LIVE_BASE_URL, ADC_LIVE_TENANT,
+# ADC_TEST_RUN_ID, ADC_PROBE_ID and ADC_PROBE_RESULT from its environment only. lang=ts (Playwright API
+# testing) | js (node:test + fetch) | python (pytest + httpx); when=synthetic only once the live safety
+# checklist has no TODO line. Attributes: see scripts/lib/scaffold.mjs (renderFiles).
 
 @@@ file: package.json lang=ts @@@
 {

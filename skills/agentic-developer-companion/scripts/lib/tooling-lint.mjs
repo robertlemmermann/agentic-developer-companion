@@ -1,15 +1,15 @@
-// `tooling lint`: checks instructions, skills, agents, prompt files, hooks, plugins, marketplaces and MCP
-// configs against each host's documented rules (plan §11.2). The rule catalog (ids, hosts with a severity
-// each, sources, and the title that is a finding's default message) and the source citations live in
-// references/tooling-lint.md and are parsed at load, so the reference the model reads and the linter cannot
-// drift apart. The hosts' own validators are merged when installed (none runs a model turn). Read-only.
+// `tooling lint` (plan §11.2): instructions, skills, agents, prompt files, hooks, plugins, marketplaces and MCP
+// configs against each host's documented rules. The rule catalog (ids, per-host severities, sources, titles) and the
+// source citations are parsed from references/tooling-lint.md at load, so the reference and the linter cannot drift.
+// Installed host validators are merged in (none runs a model turn). Read-only.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   defineCommand, usageError, envError, EXIT, readText, toPosix, globToRegExp, which, runTool, toolVersion,
-  versionGte, truncate, isObj, isDir, statOrNull, findUp, hostHomes, samePath, listFiles, firstLine, SKILL_DIR,
+  versionGte, truncate, isObj, statOrNull, findUp, hostHomes, samePath, listFiles, listDir, firstLine, oneLine, words,
+  tryJson, lineLocator, relPosix, displayPath, isWithin, isUnder, SKILL_DIR,
 } from './core.mjs';
 import { repoRoot } from './git.mjs';
 import { resolveStateDir, assertStateUntracked } from './state.mjs';
@@ -17,13 +17,12 @@ import { parseJson, parseToml } from './formats.mjs';
 import { scanSecrets, redactSecrets } from './markers.mjs';
 import {
   parseFrontmatter, parseYamlDocument, INSTALL_METADATA_KEY, markdownLines, markdownLinks, isExternalLink, linkPath,
-  lineLocator,
 } from './frontmatter.mjs';
+import { EVENTS, CLAUDE_NO_MATCHER, CODEX_MATCHER_EVENTS, apSchema, projectSkills } from './tooling-port.mjs';
 
 export const HOSTS = Object.freeze(['spec', 'copilot', 'claude', 'codex']);
 const LABEL = { spec: 'Agent Skills spec', copilot: 'Copilot', claude: 'Claude Code', codex: 'Codex' };
-const W = (s) => s.trim().split(/\s+/);
-const S = (s) => new Set(W(s));
+const S = (s) => new Set(words(s));
 
 // ---------------------------------------------------------------------------
 // Catalog: the reference's `| \`ID\` | spec E, copilot W; strict: spec E | checks | \`source\` ... |` rows
@@ -59,11 +58,12 @@ export const SOURCES = Object.freeze(Object.fromEntries((REF.split(/^## Sources$
 // Host facts used by the rules
 
 const SPEC_FIELDS = 'name description license compatibility metadata allowed-tools';
+const SPEC = S(SPEC_FIELDS);
 const SKILL_FIELDS = {
   copilot: S(`${SPEC_FIELDS} argument-hint user-invocable disable-model-invocation context`),
   claude: S(`${SPEC_FIELDS} when_to_use argument-hint arguments disable-model-invocation user-invocable
     disallowed-tools model effort context agent background hooks paths shell`),
-  codex: S(SPEC_FIELDS),
+  codex: SPEC,
 };
 const AGENT_FIELDS = {
   copilot: S(`name description target tools model disable-model-invocation user-invocable infer mcp-servers metadata
@@ -73,46 +73,47 @@ const AGENT_FIELDS = {
     hooks memory background omitClaudeMd effort isolation color initialPrompt experimental`),
 };
 const AGENT_ENUMS = {
-  copilot: { target: W('vscode github-copilot'), modelPolicy: W('preferred required') },
-  claude: { permissionMode: W('default acceptEdits auto dontAsk bypassPermissions plan manual'),
-    memory: W('user project local'), isolation: ['worktree'], effort: W('low medium high xhigh max') },
+  copilot: { target: words('vscode github-copilot'), modelPolicy: words('preferred required') },
+  claude: { permissionMode: words('default acceptEdits auto dontAsk bypassPermissions plan manual'),
+    memory: words('user project local'), isolation: ['worktree'], effort: words('low medium high xhigh max') },
 };
 const CP_TOOL_ALIASES = S(`execute shell Bash bash powershell read Read NotebookRead edit Edit MultiEdit Write
   NotebookEdit search Grep Glob agent custom-agent Task web WebSearch WebFetch todo TodoWrite *`);
 
-const CP_EVENTS = W(`sessionStart sessionEnd userPromptSubmitted userPromptTransformed preToolUse postToolUse
-  postToolUseFailure agentStop subagentStart subagentStop errorOccurred preCompact permissionRequest notification`);
-const CP_EVENTS_PASCAL = W(`SessionStart SessionEnd UserPromptSubmit PreToolUse PostToolUse PostToolUseFailure Stop
+const CP_EVENTS = EVENTS.copilot;
+const CP_EVENTS_PASCAL = words(`SessionStart SessionEnd UserPromptSubmit PreToolUse PostToolUse PostToolUseFailure Stop
   SubagentStop ErrorOccurred PreCompact PermissionRequest`);
-const CP_EVENTS_UNDOC = W('SubagentStart Notification UserPromptTransformed');
+const CP_EVENTS_UNDOC = words('SubagentStart Notification UserPromptTransformed');
 const CP_OUTPUT_IGNORED = S(`errorOccurred sessionEnd preCompact userPromptSubmitted ErrorOccurred SessionEnd
   PreCompact UserPromptSubmit`);
 const CP_ENTRY_FIELDS = S(`type bash powershell command exec args cwd env timeoutSec timeout matcher url headers
   allowedEnvVars prompt hooks comment description`);
-const CL_EVENTS = W(`SessionStart Setup SessionEnd UserPromptSubmit UserPromptExpansion Stop StopFailure PreToolUse
-  PermissionRequest PermissionDenied PostToolUse PostToolUseFailure PostToolBatch SubagentStart SubagentStop
-  TaskCreated TaskCompleted TeammateIdle PreCompact PostCompact PreModelSwitch PostModelSwitch Elicitation
-  ElicitationResult Notification MessageDisplay InstructionsLoaded ConfigChange CwdChanged DirectoryAdded FileChanged
-  WorktreeCreate WorktreeRemove`);
-const CL_NO_MATCHER = S(`UserPromptSubmit PostToolBatch Stop TeammateIdle TaskCreated TaskCompleted CwdChanged
-  WorktreeCreate WorktreeRemove MessageDisplay`);
+const CL_EVENTS = EVENTS.claude;
+const CL_NO_MATCHER = new Set(CLAUDE_NO_MATCHER);
 const CL_IF_EVENTS = S('PreToolUse PostToolUse PostToolUseFailure PermissionRequest PermissionDenied');
 const CL_ALL_TYPES = S(`PermissionDenied PostToolBatch PostToolUse PostToolUseFailure PreToolUse Stop SubagentStop
   TaskCompleted TaskCreated TeammateIdle UserPromptExpansion UserPromptSubmit`);
 const CL_HANDLER_FIELDS = S(`type if timeout statusMessage once command args shell async asyncRewake onFailure url
   headers allowedEnvVars server tool input prompt model continueOnBlock`);
-const claudeTypes = (e) => W(CL_ALL_TYPES.has(e) ? 'command http mcp_tool prompt agent'
-  : e === 'PermissionRequest' ? 'command http mcp_tool prompt'
-    : e === 'SessionStart' || e === 'Setup' ? 'command mcp_tool' : 'command http mcp_tool');
-const CX_EVENTS = W(`PreModelRequest PostModelRequest PreToolUse PermissionRequest PostToolUse PreCompact PostCompact
-  SessionStart SessionEnd UserPromptSubmit SubagentStart SubagentStop Stop Interrupt`);
-const CX_NO_MATCHER = S('UserPromptSubmit Stop Interrupt PreModelRequest PostModelRequest');
+const CL_TYPES = words('command http mcp_tool prompt agent');
+const claudeTypes = (e) => (CL_ALL_TYPES.has(e) ? CL_TYPES
+  : words(e === 'PermissionRequest' ? 'command http mcp_tool prompt'
+    : e === 'SessionStart' || e === 'Setup' ? 'command mcp_tool' : 'command http mcp_tool'));
+const CX_EVENTS = EVENTS.codex;
+const CX_NO_MATCHER = new Set(CX_EVENTS.filter((e) => !CODEX_MATCHER_EVENTS.includes(e)));
 const CX_HANDLER_FIELDS = {
   command: S('type command commandWindows command_windows timeout async statusMessage additionalContextLimit'),
   mcp_tool: S('type server tool input timeout statusMessage'),
 };
 
-const AP_SCHEMA = (kind) => ['1.0.0', '1.1.0'].map((v) => `https://agent-plugins.org/schemas/${v}/${kind}.schema.json`);
+const AP_SCHEMA = (kind) => ['1.0.0', '1.1.0'].map((v) => apSchema(kind, v));
+const AP_NAME = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
+const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const RESERVED_PLUGINS = S('claude anthropic anthropics claude-code claude-mods');
+/** An Agent Plugins name: 1-64 of a-z 0-9 - ., alphanumeric at both ends, no -- or .. */
+export const apPluginName = (n) => typeof n === 'string' && AP_NAME.test(n) && !/--|\.\./.test(n);
+/** A plugin name Claude Code reserves (claude-, anthropic(s)-, cc-plugin- prefixes and a few whole names). */
+export const reservedPluginName = (n) => RESERVED_PLUGINS.has(n) || /^(?:claude|anthropics?|cc-plugin)-/.test(n);
 const CL_PATH_FIELDS = 'skills commands agents hooks mcpServers lspServers outputStyles workflows';
 const PLUGIN_FIELDS = {
   'agent-plugins': S('$schema name version description author homepage repository license keywords extensions'),
@@ -159,9 +160,7 @@ const keyLine = (text, key) => { const i = text.indexOf(`"${key}"`); return i < 
 const badRegex = (re) => { try { new RegExp(re); return null; } catch (err) { return err; } };
 const strs = (...xs) => xs.flat().filter((x) => typeof x === 'string');
 const own = (o, k) => isObj(o) && Object.hasOwn(o, k);
-const subdirs = (d) => {
-  try { return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()); } catch { return []; }
-};
+const subdirs = (d) => listDir(d, { types: true }).filter((e) => e.isDirectory());
 const guess = (list, name, pre = ' (did you mean ', post = '?)') => {
   const g = list.find((e) => e.toLowerCase() === String(name).toLowerCase());
   return g ? `${pre}${g}${post}` : '';
@@ -202,9 +201,9 @@ const unpinned = (s) => UNPINNED.map(([re, ok]) => [re.exec(s), ok]).filter(([m,
 // ---------------------------------------------------------------------------
 // Discovery and classification
 
-const under = (abs, dir) => abs === dir || abs.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
+// POSIX without a trailing slash: a home of '/' becomes '' (isUnder: everything) and `${H.home}/x` stays well-formed.
 const homes = (env, home) => Object.fromEntries(Object.entries(hostHomes({ env, home }))
-  .map(([k, v]) => [k, toPosix(v)]));
+  .map(([k, v]) => [k, toPosix(v).replace(/\/+$/, '')]));
 const INSTRUCTION_FILES = { 'copilot-instructions.md': 'copilot-instructions copilot',
   'AGENTS.md': 'agents-md copilot claude codex', 'AGENTS.override.md': 'agents-override codex',
   'CLAUDE.md': 'claude-md claude copilot', 'CLAUDE.local.md': 'claude-local claude', 'GEMINI.md': 'gemini-md copilot' };
@@ -221,8 +220,10 @@ function classify(absPath, { root = null, H, read, sniff = false }) {
   const abs = toPosix(path.resolve(absPath));
   const b = path.posix.basename(abs);
   const parent = path.posix.basename(path.posix.dirname(abs));
-  const user = under(abs, H.home) && [H.copilot, H.claude, H.codex, `${H.home}/.agents`].some((d) => under(abs, d));
-  const res = (kind, sub, reads, extra) => ({ kind, sub, scope: user ? 'user' : 'project', reads: W(reads), ...extra });
+  const user = isUnder(abs, H.home)
+    && [H.copilot, H.claude, H.codex, `${H.home}/.agents`].some((d) => isUnder(abs, d));
+  const res = (kind, sub, reads, extra) => ({ kind, sub, scope: user ? 'user' : 'project', reads: words(reads),
+    ...extra });
   const has = (re) => re.test(abs);
   const up = (marker) => findUp(path.dirname(absPath), marker, { stopAt: root, maxDepth: 12 });
   let cl;
@@ -239,7 +240,7 @@ function classify(absPath, { root = null, H, read, sniff = false }) {
     return res('codex-skill-meta', 'openai-yaml', 'codex');
   }
   if (b.endsWith('.agent.md') || has(/(?:^|\/)(?:\.github|com\.github\.copilot)\/agents\/.+\.md$/)
-    || under(abs, `${H.copilot}/agents`)) return res('agent', 'copilot', 'copilot codex');
+    || isUnder(abs, `${H.copilot}/agents`)) return res('agent', 'copilot', 'copilot codex');
   if (has(/(?:^|\/)\.claude\/agents\/.+\.md$/)) return res('agent', 'claude', 'claude copilot codex');
   if (b.endsWith('.md') && parent === 'agents' && clPlugin()) {
     return res('agent', 'claude', 'claude codex', { plugin: toPosix(clPlugin()) });
@@ -250,7 +251,7 @@ function classify(absPath, { root = null, H, read, sniff = false }) {
   if (b.endsWith('.prompt.md')) return res('prompt', 'prompt', 'copilot');
   if (has(/(?:^|\/)\.claude\/commands\/.+\.md$/)) return res('command', 'claude-command', 'claude copilot');
   if (has(/(?:^|\/)\.github\/hooks\/[^/]+\.json$/)) return res('hooks', 'copilot', 'copilot');
-  if (under(abs, `${H.copilot}/hooks`) && b.endsWith('.json')) {
+  if (isUnder(abs, `${H.copilot}/hooks`) && b.endsWith('.json')) {
     return res('hooks', 'copilot', 'copilot', { scope: 'user' });
   }
   if (has(/(?:^|\/)com\.github\.copilot\/hooks\/hooks\.json$/)) {
@@ -267,9 +268,8 @@ function classify(absPath, { root = null, H, read, sniff = false }) {
   if (b === 'hooks.json' && parent === 'hooks' && clPlugin()) {
     return res('hooks', 'claude-plugin', 'claude', { plugin: toPosix(clPlugin()) });
   }
-  if (b === 'hooks.json' && up('plugin.json')) {
-    return res('hooks', 'copilot', 'copilot', { plugin: toPosix(up('plugin.json')) });
-  }
+  const manifest = b === 'hooks.json' && up('plugin.json');
+  if (manifest) return res('hooks', 'copilot', 'copilot', { plugin: toPosix(manifest) });
   if (has(/(?:^|\/)\.claude-plugin\/plugin\.json$/)) return res('plugin', 'claude', 'claude copilot');
   if (has(/(?:^|\/)\.codex-plugin\/plugin\.json$/)) return res('plugin', 'codex', 'codex');
   if (b === 'plugin.json' && /agent-plugins\.org/.test(String(parseJson(read(absPath) || '').value?.$schema))) {
@@ -477,7 +477,7 @@ function skillFields(fl, data, L, dirName) {
   const E = (id, key, msg, o) => fl.emit(id, L(key), msg, o);
   const { name, description: d, metadata: m, compatibility: c } = data;
   const n = String(name);
-  const why = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(n) ? null : /[A-Z]/.test(n) ? 'uppercase letters' : /^-|-$/.test(n)
+  const why = KEBAB.test(n) ? null : /[A-Z]/.test(n) ? 'uppercase letters' : /^-|-$/.test(n)
     ? 'a leading or trailing hyphen' : /--/.test(n) ? 'a double hyphen' : 'characters other than a-z, 0-9 and -';
   if (name === undefined || name === null || name === '') fl.emit('SK-NAME-REQUIRED', 1);
   else {
@@ -499,7 +499,7 @@ function skillFields(fl, data, L, dirName) {
     if (NOT_THIRD.test(d)) E('SK-DESC-PERSON', 'description');
   }
   for (const key of Object.keys(data)) {
-    if (!W(SPEC_FIELDS).includes(key)) E('SK-FIELD-NONSPEC', key, `"${key}" is not one of the six spec fields`,
+    if (!SPEC.has(key)) E('SK-FIELD-NONSPEC', key, `"${key}" is not one of the six spec fields`,
       { field: key });
     for (const host of ['copilot', 'claude', 'codex'].filter((h) => !SKILL_FIELDS[h].has(key))) {
       E('SK-FIELD-IGNORED', key, `${LABEL[host]} does not read "${key}"`, { only: [host], field: key });
@@ -545,7 +545,7 @@ function skillStructure(fl, dir, body, offset) {
     const [abs, r] = [path.resolve(dir, t), rel(path.resolve(dir, t))];
     const bad = target.includes('\\') ? ['SK-LINK-BACKSLASH', 'uses backslashes; use forward slashes']
       : /^[/~]/.test(t) || WIN_ABS.test(t) || /^file:/i.test(target) ? ['SK-LINK-ABSOLUTE', 'is an absolute local path']
-        : r.startsWith('..') ? ['SK-LINK-ABSOLUTE', 'leaves the skill folder (not installed with it)'] : null;
+        : !isWithin(dir, abs) ? ['SK-LINK-ABSOLUTE', 'leaves the skill folder (not installed with it)'] : null;
     if (isExternalLink(target) || !t) continue;
     if (bad) { fl.emit(bad[0], line, `link "${target}" ${bad[1]}`); continue; }
     if (!fs.existsSync(abs)) fl.emit('SK-LINK-MISSING', line, `link target ${r} does not exist`);
@@ -553,16 +553,16 @@ function skillStructure(fl, dir, body, offset) {
     if (/^references\/.+\//.test(r)) fl.emit('SK-REF-DEPTH', line, `${r} is nested below references/`);
   }
   const refDir = path.join(dir, 'references');
-  const refFiles = (isDir(refDir) ? fs.readdirSync(refDir) : []).map((n) => path.join(refDir, n))
-    .filter((f) => statOrNull(f)?.isFile());
+  const refEntries = listDir(refDir, { types: true });
+  const refFiles = refEntries.map((e) => path.join(refDir, e.name)).filter((f) => statOrNull(f)?.isFile());
   // A file named only in another reference: hosts follow links one level deep from SKILL.md.
   const linkedVia = (full, name) => {
     const re = new RegExp(`(?:^|[\\s(\\[\`'"/])${RegExp.escape(name)}\\b`);
     const mentions = (t) => t.includes(`references/${name}`) || re.test(t);
     return refFiles.find((o) => o !== full && mentions(fl.run.read(o) || ''));
   };
-  const walkRefs = (d) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+  const walkRefs = (d, entries = listDir(d, { types: true })) => {
+    for (const e of entries) {
       const full = path.join(d, e.name);
       const via = !e.isDirectory() && !linked.has(full) && linkedVia(full, e.name);
       if (e.isDirectory()) fl.emit('SK-REF-DEPTH', null, `${rel(full)}/ nests references more than one level deep`);
@@ -573,12 +573,11 @@ function skillStructure(fl, dir, body, offset) {
       }
     }
   };
-  if (isDir(refDir)) walkRefs(refDir);
+  walkRefs(refDir, refEntries);
   let files = 0;
   const HIDDEN = S('.git node_modules bin obj dist');
   const walk = (d) => {
-    let entries = [];
-    try { entries = fs.readdirSync(d, { withFileTypes: true }).filter((e) => !HIDDEN.has(e.name)); } catch { return; }
+    const entries = listDir(d, { types: true }).filter((e) => !HIDDEN.has(e.name));
     if (entries.length > 50) fl.emit('SK-FOOTPRINT-FOLDER', null, `${rel(d) || '.'}/ has ${entries.length} entries`);
     for (const e of entries) {
       const full = path.join(d, e.name);
@@ -649,7 +648,7 @@ function globProblem(g) {
   return null;
 }
 
-const NOT_USER = `(?!(?:<|\\{|\\$|%|${W('USER user username you your YOUR me name runner runneradmin example')
+const NOT_USER = `(?!(?:<|\\{|\\$|%|${words('USER user username you your YOUR me name runner runneradmin example')
   .join('\\b|')}\\b|\\.\\.\\.))`;
 const USER_PATH = [new RegExp(`(?:^|[\\s"'(=:])(\\/(?:Users|home)\\/${NOT_USER}[A-Za-z0-9._-]+)`),
   new RegExp(`(?:^|[\\s"'(=])([A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\${NOT_USER}[A-Za-z0-9._ -]+)`, 'i')];
@@ -675,7 +674,7 @@ function lintInstructions(fl) {
   if (!fl.text.trim()) return fl.emit('IN-EMPTY', null);
   const { data, L, body, offset } = parts(fl);
   const [host, globKeys, known] = FM_KEYS[sub] || [];
-  for (const key of host ? W(globKeys).filter((k) => own(data, k)) : []) {
+  for (const key of host ? words(globKeys).filter((k) => own(data, k)) : []) {
     const v = data[key];
     for (const g of Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : [v]) {
       const p = globProblem(typeof g === 'string' ? g.trim() : g);
@@ -749,12 +748,12 @@ function directives(ml, offset) {
   return out;
 }
 
-const words = (s) => `(?:${W(s).join('|')})`;
+const anyOf = (s) => `(?:${words(s).join('|')})`;
 const NEG_RE = /^(?:do not|don't|dont|never|avoid|must not|should not|shouldn't|no need to)\s+(.+)$/;
 const POS_RE = /^(?:always|must|you must|please)\s+(.+)$/;
-const VERB_RE = new RegExp(`^${words(`use run prefer write add keep commit call install put place name format indent
+const VERB_RE = new RegExp(`^${anyOf(`use run prefer write add keep commit call install put place name format indent
   import return throw log test create edit update include mention enable disable set wrap push merge rebase`)}\\b`);
-const LANG_WORD = new RegExp(`\\b${words(`typescript javascript python golang go rust java c# csharp yaml json markdown
+const LANG_WORD = new RegExp(`\\b${anyOf(`typescript javascript python golang go rust java c# csharp yaml json markdown
   css scss html ts js py tsx jsx ruby php shell bash powershell sql xml kotlin swift scala terraform makefile dockerfile
   tests?`)}\\b`);
 const INDENT_RE = new RegExp('\\b(\\d+)[- ]spaces?\\b[^.]*\\bindent|\\bindent(?:ation|ed)?\\b[^.]*?\\b(\\d+)\\s*spaces?'
@@ -789,8 +788,10 @@ function firstConflict(f, ix) {
 /** Duplicates and contradictions across always-on instruction files that load together. */
 function crossInstructionChecks(run) {
   // Nested AGENTS.md files refine their parent on purpose: compare the files that load together at the root.
-  const groups = Map.groupBy(run.directives, (e) => (toPosix(path.relative(run.root, e.dir)).split('/')[0] === '.github'
-    || path.resolve(e.dir) === run.root ? 'root' : e.dir));
+  const groups = Map.groupBy(run.directives, (e) => {
+    const rel = relPosix(run.root, e.dir);
+    return rel === '.' || rel?.split('/')[0] === '.github' ? 'root' : e.dir;
+  });
   for (const entries of groups.values()) {
     const seen = new Map();
     const ix = { prior: [], pos: new Map(), neg: new Map(), indent: new Map(), pm: new Map() };
@@ -825,9 +826,10 @@ function siblingChecks(fl) {
   }
   if (sub !== 'agents-md' && sub !== 'agents-override') return;
   // Codex concatenates one file per directory from the project root down to this one.
-  const rel = path.relative(fl.run.root, dir);
-  const dirs = !rel || rel.startsWith('..') || path.isAbsolute(rel) ? [dir]
-    : rel.split(path.sep).reduce((a, seg) => [...a, path.join(a.at(-1), seg)], [fl.run.root]);
+  const rel = relPosix(fl.run.root, dir);
+  const below = rel != null && rel !== '.';
+  const dirs = [below ? fl.run.root : dir];
+  for (const seg of below ? rel.split('/') : []) dirs.push(path.join(dirs.at(-1), seg));
   const files = dirs.map((d) => ['AGENTS.override.md', 'AGENTS.md'].map((n) => path.join(d, n))
     .find((p) => statOrNull(p)?.size > 0)).filter(Boolean).map((f) => [f, statOrNull(f).size]);
   const total = files.reduce((n, [, size]) => n + size, 0);
@@ -857,7 +859,7 @@ function lintAgent(fl) {
     if (host === 'copilot') copilotAgent(fl, data, L, body, base);
     else if (name === undefined || name === null || name === '') fl.emit('AG-NAME-REQUIRED', 1);
     else if (String(name).length > 256 || String(name).includes(':')) E('AG-NAME-FORMAT', 'name');
-    for (const k of host === 'claude' && fl.cls.plugin ? W('hooks mcpServers permissionMode initialPrompt') : []) {
+    for (const k of host === 'claude' && fl.cls.plugin ? words('hooks mcpServers permissionMode initialPrompt') : []) {
       if (own(data, k)) E('AG-PLUGIN-FIELDS', k, `plugin subagents ignore "${k}"`);
     }
   }
@@ -1095,7 +1097,7 @@ function claudeHandler(fl, event, h, line, { project, plugin }) {
   if (!isObj(h)) return E('HK-CL-SHAPE', 'every hook handler must be an object');
   const { type, onFailure } = h;
   const types = claudeTypes(event);
-  if (!W('command http mcp_tool prompt agent').includes(type)) return E('HK-CL-TYPE', `type ${JSON.stringify(type)}`);
+  if (!CL_TYPES.includes(type)) return E('HK-CL-TYPE', `type ${JSON.stringify(type)}`);
   if (CL_EVENTS.includes(event) && !types.includes(type)) E('HK-CL-TYPE',
     `${type} hooks are not supported (only ${types.join(', ')})`);
   fl.unknown(h, CL_HANDLER_FIELDS, 'HK-CL-FIELD', () => line, 'handler field', { prefix: `${event}: ` });
@@ -1141,7 +1143,7 @@ const COPILOT_OUTPUT = /\b(?:modifiedArgs|modifiedResult|textResultForLlm)\b/;
 function codexHandler(fl, event, h, line) {
   const E = (id, msg, o) => fl.emit(id, line, `${event}: ${msg ?? title(id)}`, o);
   if (!isObj(h)) return E('HK-CX-SHAPE', 'every handler must be an object');
-  if (!W('command mcp_tool prompt agent').includes(h.type)) return E('HK-CX-TYPE',
+  if (!words('command mcp_tool prompt agent').includes(h.type)) return E('HK-CX-TYPE',
     `handler type ${JSON.stringify(h.type)}`);
   if (h.type === 'prompt' || h.type === 'agent') return E('HK-CX-TYPE', `${h.type} handlers never run`,
     { severity: 'warning' });
@@ -1221,24 +1223,12 @@ function pluginRootOf(abs) {
   return b === 'plugin' && path.basename(path.dirname(d)) === '.github' ? path.dirname(path.dirname(d)) : d;
 }
 
-const AP_NAME = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
-const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const hasSkill = (...p) => fs.existsSync(path.join(...p, 'SKILL.md'));
 
-/** Project skill folders by name (first found wins), listed once per run. */
-function projectSkills(run) {
-  if (run.projectSkills) return run.projectSkills;
-  const project = (run.projectSkills = new Map());
-  for (const rel of ['.github/skills', '.agents/skills', '.claude/skills']) {
-    for (const e of subdirs(path.join(run.root, rel))) {
-      if (!project.has(e.name) && hasSkill(run.root, rel, e.name)) project.set(e.name, `${rel}/${e.name}`);
-    }
-  }
-  return project;
-}
-
 function pluginSkillCollisions(fl, pluginRoot) {
-  const project = projectSkills(fl.run);
+  // Listed once per run: every plugin manifest checks against the same project skills.
+  const project = (fl.run.projectSkills ??= projectSkills(fl.run.root, ['.github/skills', '.agents/skills',
+    '.claude/skills']));
   const skillsDir = path.join(pluginRoot, 'skills');
   for (const e of project.size ? subdirs(skillsDir) : []) {
     const fmName = parseFrontmatter(fl.run.read(path.join(skillsDir, e.name, 'SKILL.md')) || '').data?.name;
@@ -1262,8 +1252,7 @@ function lintPlugin(fl) {
     for (const k of Object.keys(v).filter((x) => !PLUGIN_FIELDS[sub].has(x))) {
       fl.emit('PL-AP-FIELD', L(k), `"${k}" is outside the Agent Plugins field set (use "extensions")`, { field: k });
     }
-    if (typeof name !== 'string' || !AP_NAME.test(name) || /--|\.\./.test(name)) fl.emit('PL-AP-NAME', L('name'),
-      `name ${JSON.stringify(name)}`);
+    if (!apPluginName(name)) fl.emit('PL-AP-NAME', L('name'), `name ${JSON.stringify(name)}`);
     if (hasSkill(root) && !fs.existsSync(skillsDir)) fl.emit('PL-AP-SKILLS', null, 'a root SKILL.md is not loaded');
     for (const e of subdirs(skillsDir).filter((x) => !hasSkill(skillsDir, x.name))) {
       if (subdirs(path.join(skillsDir, e.name)).some((y) => hasSkill(skillsDir, e.name, y.name))) {
@@ -1279,7 +1268,7 @@ function lintPlugin(fl) {
       fl.emit('PL-CP-MANIFEST', L('description'), `description has ${v.description.length} characters (max 1,024)`);
     }
     fl.unknown(v, PLUGIN_FIELDS[sub], 'PL-CP-FIELD', L, 'plugin field');
-    for (const f of W('agents skills commands hooks mcpServers lspServers')) {
+    for (const f of words('agents skills commands hooks mcpServers lspServers')) {
       for (const p of strs(v[f]).filter((x) => !fs.existsSync(path.resolve(root, x)))) {
         fl.emit('PL-CP-MANIFEST', L(f), `"${f}" path "${p}" does not exist`, { field: f });
       }
@@ -1302,8 +1291,7 @@ function lintPlugin(fl) {
 function claudePlugin(fl, v, root, L) {
   const name = v.name;
   const missing = ['version', 'description', 'author'].filter((k) => v[k] === undefined);
-  const reserved = typeof name === 'string' && (S('claude anthropic anthropics claude-code claude-mods').has(name)
-    || /^(?:claude|anthropics?|cc-plugin)-/.test(name));
+  const reserved = typeof name === 'string' && reservedPluginName(name);
   if (typeof name !== 'string' || !name) fl.emit('PL-CL-NAME', L('name') || 1, '"name" is required');
   else if (!KEBAB.test(name)) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is not kebab-case`);
   if (reserved) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is reserved`);
@@ -1313,12 +1301,12 @@ function claudePlugin(fl, v, root, L) {
   if (missing.length) fl.emit('PL-CL-META', null, `no ${missing.join(', ')} (claude plugin validate warns)`);
   if (v.author !== undefined && typeof v.author?.name !== 'string') fl.emit('PL-CL-FIELD', L('author'),
     '"author" needs a "name"');
-  for (const f of W(CL_PATH_FIELDS).filter((x) => v[x] !== undefined && !isObj(v[x]))) {
+  for (const f of words(CL_PATH_FIELDS).filter((x) => v[x] !== undefined && !isObj(v[x]))) {
     for (const p of strs(v[f])) {
-      const [abs, rel] = [path.resolve(root, p), path.relative(root, path.resolve(root, p))];
+      const abs = path.resolve(root, p);
       const why = !(p.startsWith('./') || (f === 'skills' && (p === '.' || p === './'))) ? 'must start with ./'
         : p.includes('\\') ? 'uses backslashes'
-          : rel.startsWith('..') || path.isAbsolute(rel) ? 'leaves the plugin root'
+          : !isWithin(root, abs) ? 'leaves the plugin root'
             : !fs.existsSync(abs) ? 'does not exist' : null;
       if (why) fl.emit('PL-CL-PATH', null, `"${f}" path "${p}" ${why}`, { field: f });
     }
@@ -1382,9 +1370,9 @@ const literalCredential = (key, v) => typeof v === 'string' && v.length >= 8 && 
     || (SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(v) && /\d/.test(v) && /[A-Za-z]/.test(v)));
 const credentialKeys = (bag) => Object.entries(isObj(bag) ? bag : {}).filter(([k, v]) => literalCredential(k, v));
 
-const MCP_TYPES = { vscode: { copilot: W('stdio http sse') },
-  'agent-plugins': { copilot: W('stdio streamable-http sse'), codex: W('stdio streamable-http sse') },
-  other: { copilot: W('local stdio http sse'), claude: W('stdio http sse') } };
+const MCP_TYPES = { vscode: { copilot: words('stdio http sse') },
+  'agent-plugins': { copilot: words('stdio streamable-http sse'), codex: words('stdio streamable-http sse') },
+  other: { copilot: words('local stdio http sse'), claude: words('stdio http sse') } };
 
 function mcpServer(fl, name, s, sub) {
   const line = keyLine(fl.text, name);
@@ -1519,7 +1507,7 @@ function skillsRefProblems(text) {
     else if (items.length && l.trim()) items[items.length - 1] += ` ${l.trim()}`;
   }
   const out = items.length ? items : lines.map((l) => l.trim()).filter((l) => l && !/^Validation failed for\b/.test(l));
-  return out.slice(0, items.length || 8).map((m) => truncate(m.replace(/\s+/g, ' '), 300));
+  return out.slice(0, items.length || 8).map((m) => truncate(oneLine(m), 300));
 }
 
 /** Skills named in Codex's <skills_instructions> block: [{ name, file }], or null when the block is absent. */
@@ -1527,7 +1515,7 @@ export function codexListedSkills(stdout) {
   const texts = [];
   const collect = (v) => (typeof v === 'string' ? v.includes('<skills_instructions>') && texts.push(v)
     : v && typeof v === 'object' && Object.values(v).forEach(collect));
-  try { collect(JSON.parse(stdout)); } catch {}
+  collect(tryJson(stdout));
   if (!texts.length && String(stdout).includes('<skills_instructions>')) {
     texts.push(String(stdout).replace(/\\n/g, '\n').replace(/\\"/g, '"'));
   }
@@ -1600,10 +1588,7 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
     env = process.env } = targets;
   const want = (h) => hosts.includes(h);
   // Paths inside the root are shown relative to it, others (user-scope files) in full.
-  const rel = (p) => {
-    const r = path.relative(root, String(p));
-    return !r ? '.' : r.startsWith('..') || path.isAbsolute(r) ? toPosix(p) : toPosix(r);
-  };
+  const rel = (p) => displayPath(root, p);
   const statusOf = (r) => (r.exit === 0 ? 'pass' : r.exit === null || r.error ? 'error' : 'fail');
   const push = (tool, target, status, command, summary, findings = [], exit = null) =>
     out.push({ tool, target, status, exit, command, summary: redactSecrets(summary), findings });
@@ -1661,8 +1646,7 @@ function claudeValidate(dirs, { exec, whichFn, version, push, rel, first, root }
       ? `Claude Code ${v?.version || '?'} is older than 2.1.259 (no --json)` : null;
     if (skip) { push(tool, rel(dir), 'skipped', command, skip); continue; }
     const r = exec(exe, ['plugin', 'validate', dir, '--strict', '--json'], { cwd: root });
-    let report = null;
-    try { report = JSON.parse(r.stdout); } catch {}
+    const report = tryJson(r.stdout);
     const res = isObj(report) && r.exit !== 2 && r.exit !== null ? claudeReport(report, dir) : undefined;
     if (res === undefined) push(tool, rel(dir), 'error', command, first(r) || 'no JSON report', [], r.exit);
     else if (res === null) push(tool, rel(dir), 'not-applicable', command, 'a bare skills directory is not validated',
@@ -1707,8 +1691,8 @@ function copilotLists(skills, instructions, { exec, whichFn, push, rel, root, en
   if (!exe) return push('copilot', '.', 'skipped', both, 'copilot is not on PATH');
   for (const [kind, list] of [['skill', cpSkills], ['instruction', cpInstructions]].filter(([, l]) => l.length)) {
     const r = exec(exe, [kind, 'list', '--json'], { cwd: root, timeoutMs: 60_000 });
-    let rows = null;
-    try { const j = JSON.parse(r.stdout); rows = [j, j?.skills, j?.instructions].find(Array.isArray) || null; } catch {}
+    const j = tryJson(r.stdout);
+    const rows = [j, j?.skills, j?.instructions].find(Array.isArray) || null;
     const listed = (rows || []).filter((x) => x.sourcePath).map((x) => path.resolve(root, String(x.sourcePath)));
     const findings = !rows ? [] : kind === 'skill' ? listingFindings(list, rows, {
       host: 'copilot', rule: 'EXT-COPILOT-SKILL', tool: 'copilot skill list', missing: ' in its skill folder',
@@ -1750,8 +1734,7 @@ function codexDoctor(configs, { exec, whichFn, push, rel, first, root }) {
   const [tool, command, exe] = ['codex doctor', 'codex doctor --json', whichFn('codex')];
   if (!exe) return configs.forEach((f) => push(tool, rel(f), 'skipped', command, 'codex is not on PATH'));
   const r = exec(exe, ['doctor', '--json'], { cwd: root, timeoutMs: 60_000 });
-  let report = null;
-  try { report = JSON.parse(r.stdout); } catch {}
+  const report = tryJson(r.stdout);
   const load = isObj(report?.checks?.['config.load']) ? report.checks['config.load'] : null;
   const details = isObj(load?.details) ? load.details : {};
   const ignored = [...String(details['startup warning'] || '').matchAll(IGNORED_KEY)]
@@ -1814,10 +1797,7 @@ export async function lintPaths(paths = [], opts = {}) {
   const first = list[0] ? path.resolve(list[0]) : process.cwd();
   const root = path.resolve(opts.root || repoRoot(statOrNull(first)?.isDirectory() ? first : path.dirname(first))
     || process.cwd());
-  const display = (abs) => {
-    const r = path.relative(root, abs);
-    return !r ? '.' : r.startsWith('..') || path.isAbsolute(r) ? toPosix(abs) : toPosix(r);
-  };
+  const display = (abs) => displayPath(root, abs);
   const run = { selected: host === 'all' ? [...HOSTS] : strict && host !== 'spec' ? [host, 'spec'] : [host], root, home,
     strict: Boolean(strict), allowHosts: new Set([...LOOPBACK, ...allowHosts.map((h) => String(h).toLowerCase())]),
     files: [], security: [], secSeen: new Set(), directives: [], display, read: fileReader() };
@@ -1868,7 +1848,7 @@ function mergeExternal(run, opts) {
 export async function lintSkillDir(dir, { strict = false, host = 'all', external = false, ...rest } = {}) {
   const abs = path.resolve(dir);
   const name = fs.existsSync(path.join(abs, 'SKILL.md')) ? 'SKILL.md'
-    : statOrNull(abs)?.isDirectory() && fs.readdirSync(abs).find((n) => n.toLowerCase() === 'skill.md');
+    : listDir(abs).find((n) => n.toLowerCase() === 'skill.md');
   if (!name) throw usageError(`no SKILL.md in ${toPosix(abs)}`);
   const targets = [path.join(abs, name), path.join(abs, 'agents', 'openai.yaml')].filter((f) => fs.existsSync(f));
   return lintPaths(targets, { strict, host, external, root: repoRoot(abs) || abs, ...rest });
@@ -1916,7 +1896,9 @@ export const lintCommand = defineCommand({
       throw usageError(`--host must be all, copilot, claude or codex (got "${host}")`);
     }
     const gitRoot = repoRoot(ctx.cwd);
-    if (gitRoot) assertStateUntracked(resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption }));
+    if (gitRoot) {
+      assertStateUntracked(resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption, root: gitRoot }));
+    }
     const external = !values['no-external'] && !/^(?:1|true|yes)$/i.test(process.env.ADC_LINT_NO_EXTERNAL || '');
     const res = await lintPaths(positionals.map((p) => path.resolve(ctx.cwd, p)),
       { host, strict: Boolean(values.strict), root: gitRoot || ctx.cwd, external,

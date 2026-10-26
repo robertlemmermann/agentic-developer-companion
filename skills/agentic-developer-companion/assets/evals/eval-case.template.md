@@ -1,8 +1,7 @@
-# One `claude plugin eval` case (prompt.md + graders/*.md), rendered by
-# `tooling scaffold skill` into <skill>/evals/<case>/. Placeholders: {{name}}, {{case}}.
-# prompt.md frontmatter keys are checked by `claude plugin eval` (unknown keys fail to load);
-# a case passes when its weighted grader score reaches --threshold. The skill-creator
-# evals/evals.json format is different and not interchangeable with this layout.
+# One `claude plugin eval` case (prompt.md + graders/*.md) for <skill>/evals/<case>/, rendered by
+# `tooling scaffold skill` ({{name}}, {{case}}). `claude plugin eval` rejects unknown prompt.md frontmatter
+# keys; a case passes when its weighted grader score reaches --threshold. skill-creator's evals/evals.json
+# is a different format, not interchangeable with this layout.
 @@@ file: {{case}}/prompt.md @@@
 ---
 max_turns: 10

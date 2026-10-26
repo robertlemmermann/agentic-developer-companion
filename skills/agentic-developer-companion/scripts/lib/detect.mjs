@@ -4,23 +4,22 @@
 // branch. Manifests are read as text, project code is never executed. The result is cached in
 // <state>/detect.json under a digest of every detection input (hooks read `summary` and test globs).
 
-import fs from 'node:fs';
 import path from 'node:path';
 import {
   EXIT, defineCommand, usageError, readText, readJson, writeJsonAtomic, sha256, nowIso, toPosix, matchGlob, which,
-  skillVersion, generatedBy, truncate, listFiles, splitShell, uniq, isObj, isDir, statOrNull,
+  skillVersion, generatedBy, truncate, listFiles, splitShell, uniq, isObj, isDir, statOrNull, cmp, isUnder as under,
+  subPath, normRel, relPosix, readFilePart, words,
 } from './core.mjs';
-import { gitRaw, gitTry, repoRoot, resolveBase, revParse } from './git.mjs';
+import { gitTry, repoRoot, baseRef, headSha, lsFiles } from './git.mjs';
 import { prepareStateDir, statePaths, STATE_DIR_NAME } from './state.mjs';
 import * as M from './markers.mjs';
 import { parseToml, parseIni, parseJsonc } from './formats.mjs';
 import { parseYamlAll } from './frontmatter.mjs';
 
-export const DETECT_SCHEMA = 'adc-detect/1';
+const DETECT_SCHEMA = 'adc-detect/1';
 const MAX_READ = 2 * 1024 * 1024;
 const MAX_FILES = 200_000;
 const { join: J, dirname: dirOf, basename: baseOf } = path.posix;
-const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 // Heavy, generated or vendored folders: never a project, never a detection input.
 const SKIP_DIRS = new Set(['.git', '.hg', '.svn', STATE_DIR_NAME, 'node_modules', 'bower_components', 'jspm_packages',
@@ -138,16 +137,9 @@ const ciRef = (s) => `ci: ${s.file}${s.line ? `:${s.line}` : ''}`;
 // ---------------------------------------------------------------------------
 // Paths, globs, quoting, Makefile targets
 
-const under = (rel, dir) => dir === '.' || rel === dir || rel.startsWith(`${dir}/`);
-const subPath = (rel, dir) => (dir === '.' ? rel : rel === dir ? '' : rel.slice(dir.length + 1));
 const inFixtureDir = (rel) => dirOf(rel).split('/').some((s) => FIXTURE_DIRS.has(s));
 // Workspace globs are anchored at the workspace root (a bare `app` means ./app, not any app/).
 const anchored = (sub, glob) => matchGlob(sub, normRel(glob), { anchored: true });
-function normRel(file) {
-  let f = toPosix(String(file || '')).replace(/^\.\/+/, '');
-  while (f.startsWith('./')) f = f.slice(2);
-  return f.replace(/\/+$/, '');
-}
 
 /** Quote an argument so the same text works in sh and cmd.exe; `portable` is false when it cannot. */
 export function portableArg(arg) {
@@ -218,12 +210,10 @@ export function normalizeGlob(glob) {
 // ---------------------------------------------------------------------------
 // Gather: list files, read every detection input, derive file-list facts
 
+/** Tracked and untracked, not ignored files from git; a directory walk outside git or without git. */
 function listRepoFiles(root) {
-  let res = null;
-  try {
-    res = gitRaw(root, ['-c', 'core.quotePath=false', 'ls-files', '-z', '-c', '-o', '--exclude-standard']);
-  } catch { /* git is not installed: walk the directory */ }
-  if (res?.exit === 0) return { files: res.stdout.split('\0').filter(Boolean), source: 'git' };
+  const files = lsFiles(root, [], { others: true, strict: true });
+  if (files) return { files, source: 'git' };
   return { files: listFiles(root, { ignore: SKIP_DIRS, maxFiles: MAX_FILES, maxDepth: 14 }), source: 'walk' };
 }
 
@@ -234,13 +224,6 @@ function relevantKind(rel) {
   if (PRESENCE_NAMES.has(base) || Object.hasOwn(M.LOCKFILE_MANAGERS, base.toLowerCase())
     || PRESENCE_RES.some((re) => re.test(base)) || /(?:^|\/)bin\/rails$/.test(rel)) return 'presence';
   return null;
-}
-
-function readHead(file, bytes = 512) {
-  const buf = Buffer.alloc(bytes);
-  let fd;
-  try { fd = fs.openSync(file, 'r'); return buf.toString('utf8', 0, fs.readSync(fd, buf, 0, bytes, 0)); }
-  catch { return ''; } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 /** File-list facts the detectors use: languages by extension, test files, test folders, Python packages. */
@@ -262,10 +245,10 @@ function fileTags(sub) {
 
 function gather(root, { stateInfo, env }) {
   const listing = listRepoFiles(root);
-  const own = [stateInfo?.rel, env.ADC_HOME && toPosix(path.relative(root, path.resolve(env.ADC_HOME)))]
-    .filter((r) => r && !r.startsWith('..') && !path.isAbsolute(r));
+  // The companion's own state dirs inside the checkout are never detection inputs.
+  const own = [stateInfo?.rel, env.ADC_HOME && relPosix(root, env.ADC_HOME)].filter((r) => r && r !== '.');
   const skipped = (rel) => rel.split('/').slice(0, -1).some((s) => SKIP_DIRS.has(s))
-    || own.some((x) => rel === x || rel.startsWith(`${x}/`));
+    || own.some((x) => under(rel, x));
   const files = listing.files.map(normRel).filter((f) => f && !skipped(f)).slice(0, MAX_FILES);
   const relevant = new Map();
   const oversize = [];
@@ -275,8 +258,9 @@ function gather(root, { stateInfo, env }) {
     const st = kind && statOrNull(full);
     if (!st?.isFile()) continue;
     // yarn.lock's header tells Berry (`__metadata:`) from classic; nothing else is needed from lockfiles.
-    if (kind === 'presence') relevant.set(rel, baseOf(rel) === 'yarn.lock' ? readHead(full) : null);
-    else if (st.size <= MAX_READ) relevant.set(rel, readText(full, ''));
+    if (kind === 'presence') {
+      relevant.set(rel, baseOf(rel) === 'yarn.lock' ? readFilePart(full, 512)?.text ?? '' : null);
+    } else if (st.size <= MAX_READ) relevant.set(rel, readText(full, ''));
     else { relevant.set(rel, null); oversize.push(rel); }
   }
   // Project candidates: manifests outside fixture folders, Makefiles/justfiles with test targets.
@@ -780,8 +764,8 @@ function pyDeps(ctx, dir, pp) {
 
 /** pytest settings by pytest's own precedence (first file wins, never merged). */
 function pytestConfig(ctx, dir, pp) {
-  const words = (v) => [].concat(v || []).flatMap((x) => String(x).split(/\s+/)).filter(Boolean);
-  const conf = (s, file) => ({ file, testpaths: words(s.testpaths), python_files: words(s.python_files),
+  const list = (v) => [].concat(v || []).flatMap(words);
+  const conf = (s, file) => ({ file, testpaths: list(s.testpaths), python_files: list(s.python_files),
     addopts: s.addopts ? [].concat(s.addopts).join(' ') : null });
   for (const f of ['pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini']) {
     const t = f.endsWith('.toml') ? ctx.toml(J(dir, f)) : ctx.ini(J(dir, f));
@@ -1414,25 +1398,16 @@ function summarize(projects) {
   return parts.length ? parts.join(' · ') : 'no projects detected';
 }
 
-/** Default branch and how it was found (§7.4 base chain); `inRepo`: git already listed the files. */
+/**
+ * Default branch and how it was found (the §7.4 base chain without the merge base, which detection
+ * does not need); without a base ref, the current branch. `inRepo`: git already listed the files.
+ */
 function gitInfo(root, inRepo) {
   if (!inRepo) return { default_branch: null, base_source: null };
-  const current = () => gitTry(root, ['symbolic-ref', '-q', '--short', 'HEAD']);
-  try {
-    const b = resolveBase(root, null);
-    if (b.source === 'empty' || b.source === 'HEAD') return { default_branch: current(), base_source: b.source };
-    return { default_branch: b.ref.replace(/^origin\//, ''), base_source: b.source };
-  } catch (err) {
-    // No merge base (shallow clone, unrelated history): the branch name is still known.
-    const base_error = err.code || 'GIT_FAILED';
-    const sym = gitTry(root, ['symbolic-ref', '-q', 'refs/remotes/origin/HEAD']);
-    if (sym && revParse(root, sym)) {
-      return { default_branch: sym.replace(/^refs\/remotes\/origin\//, ''), base_source: 'origin/HEAD', base_error };
-    }
-    const name = ['main', 'master'].find((n) => revParse(root, `refs/heads/${n}`)
-      || revParse(root, `refs/remotes/origin/${n}`));
-    return { default_branch: name || current(), base_source: name || null, base_error };
-  }
+  const b = baseRef(root, null);
+  if (b) return { default_branch: b.ref.replace(/^origin\//, ''), base_source: b.source };
+  const current = gitTry(root, ['symbolic-ref', '-q', '--short', 'HEAD']);
+  return { default_branch: current, base_source: headSha(root) ? 'HEAD' : 'empty' };
 }
 
 function derive(g, { platform, tools }) {
@@ -1524,7 +1499,6 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
   if (c?.schema === DETECT_SCHEMA && c.cache_key === key && Array.isArray(c.projects) && isObj(c.tools)
     && Object.entries(c.tools).every(([n, v]) => tools.has(n) === v)
     && Object.entries(c.probes || {}).every(([rel, v]) => dirExists(g, rel) === v)) {
-    delete c.base_error;
     // Redacted again: a credential set after the cache was written must not come back from it.
     return done(redactResult({ ...c, ...live }, env), { hit: true, written: false });
   }
@@ -1541,25 +1515,18 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
   return done(result, { hit: false, written, ...(error ? { error } : {}) });
 }
 
-export { DEFAULT_TEST_GLOBS, projectForFile } from './markers.mjs';
-
-/** Is `file` a test file by its project's test globs (DEFAULT_TEST_GLOBS without one)? `content`: Rust inline tests. */
-export const isTestFile = (file, detectResult, opts = {}) => M.isTestFile(file, detectResult,
-  { ...opts, heuristic: false });
-
 // ---------------------------------------------------------------------------
 // Command
 
-const USAGE = `usage: node <skill>/scripts/adc.mjs detect [--refresh] [--json] [--cwd <dir>] [--state-dir <dir>]
-                                          [--dry-run]
-
-Detects projects (monorepo-aware), package managers with their frozen install, test runners
-with report and retries-off flags, test-file globs, type checkers, linters, the CI system and
-the test commands CI runs, and the default branch. Reads files only; never runs project code.
-The result is cached in .adc/detect.json (keyed by a digest of every detection input).
-
-  --refresh    ignore the cache and detect again
-  --dry-run    read the cache but write nothing (no .adc/ is created)`;
+const USAGE = [
+  'detect [--refresh] [--json] [--cwd <dir>] [--state-dir <dir>] [--dry-run]',
+  'Projects (monorepo-aware), package managers with their frozen install, test runners with report and',
+  'retries-off flags, test-file globs, type checkers, linters, the CI system and the test commands CI runs, and',
+  'the default branch. Reads files only, never runs project code. Cached in .adc/detect.json, keyed by a digest',
+  'of every detection input.',
+  '--refresh  ignore the cache',
+  '--dry-run  read the cache, write nothing (no .adc/ is created)',
+].join('\n');
 
 // The terminal view (`--json` or a pipe prints the full result).
 const human = (res) => [`detect: ${res.summary}`, ...res.projects.flatMap((p) => [

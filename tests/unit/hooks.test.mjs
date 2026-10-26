@@ -2,76 +2,44 @@
 // by the fixture files through `adc.mjs hook-run` (directly and through the rendered pwsh / sh /
 // exec-form launchers), fail-open behavior with missing, crashing and too-old Node, rendering
 // snapshots, and registration (merge, backup, record, list, remove) including the CLI.
-import { describe, test, after } from 'node:test';
+import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import * as markers from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
 import * as dialects from '../../skills/agentic-developer-companion/scripts/lib/hook-dialects.mjs';
 import * as hookRun from '../../skills/agentic-developer-companion/scripts/lib/hook-run.mjs';
 import * as hooksRender from '../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs';
+import { AWS_KEY, FIX, fixtureJson, git, hostFreeEnv, makeRepo as newRepo, readJsonStrict, removeAfter, runAdc, spawnAsync, tmpDir } from './helpers.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FIX = path.join(HERE, '..', 'fixtures');
-const SNAP = path.join(HERE, '..', 'snapshots');
+const SNAP = path.join(FIX, '..', 'snapshots');
 const ADC = core.ADC_SCRIPT;
 const SKILL = core.SKILL_DIR;
 const PWSH = core.which('pwsh') || (fs.existsSync('/usr/local/bin/pwsh') ? '/usr/local/bin/pwsh' : null);
 const SH = core.IS_WINDOWS ? null : core.which('sh');
 const BASH = core.IS_WINDOWS ? null : core.which('bash');
 const NODE_OLD = ['/opt/node22/bin/node', '/opt/node20/bin/node'].find((p) => fs.existsSync(p)) || null;
-const AWS_KEY = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
 const TOKEN = ['hunter', '2abc', 'Zq9x'].join('');
 const ENV_TOKEN = ['opaque', 'Env7', 'Value3'].join(''); // a second, environment-only value (leak matrix, plan §13)
 const UPDATE = process.env.UPDATE_SNAPSHOTS === '1';
 const POOL = Math.max(1, Math.min(4, os.availableParallelism ? os.availableParallelism() : os.cpus().length));
-const cleanup = [];
-after(() => { for (const d of cleanup) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} } });
-
-const tmp = (prefix = 'adc-hooks-') => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); cleanup.push(d); return d; };
-const HOME = tmp('adc-home-');
+const HOME = tmpDir('adc-home-');
 
 /** Process env without host or CI markers (the suite may itself run inside an agent session). */
-function baseEnv(extra = {}) {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (/^(CLAUDE|COPILOT|CODEX|GITHUB_COPILOT|ADC_|VSCODE_)/.test(k) || ['CI', 'GITHUB_ACTIONS', 'TERM_PROGRAM'].includes(k)) continue;
-    env[k] = v;
-  }
-  env.HOME = HOME;
-  env.USERPROFILE = HOME;
-  return { ...env, ...extra };
-}
-
-const git = (cwd, ...args) => {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: baseEnv() });
-  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-  return r.stdout.trim();
-};
+const baseEnv = (extra = {}) => hostFreeEnv({ HOME, USERPROFILE: HOME, ...extra });
 
 let templateRepo = null;
 function makeRepo() {
-  if (!templateRepo) {
-    templateRepo = tmp('adc-hooks-template-');
-    git(templateRepo, 'init', '-q', '-b', 'main');
-    git(templateRepo, 'config', 'user.email', 't@example.com');
-    git(templateRepo, 'config', 'user.name', 'Test');
-    git(templateRepo, 'config', 'commit.gpgsign', 'false');
-    fs.writeFileSync(path.join(templateRepo, 'README.md'), '# fixture\n');
-    git(templateRepo, 'add', '-A');
-    git(templateRepo, 'commit', '-q', '-m', 'init');
-  }
-  const dir = tmp();
+  templateRepo ||= newRepo({ 'README.md': '# fixture\n' }, { prefix: 'adc-hooks-template-' }).dir;
+  const dir = tmpDir('adc-hooks-', { real: true });
   fs.cpSync(templateRepo, dir, { recursive: true });
-  const real = fs.realpathSync(dir);
-  cleanup.push(core.tmpRoot(real)); // the tracked-state cache the hooks keep in the OS temp dir
-  return real;
+  removeAfter(core.tmpRoot(dir)); // the tracked-state cache the hooks keep in the OS temp dir
+  return dir;
 }
 
 const get = (obj, dotted) => dotted.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -125,27 +93,6 @@ function applySetup(repo, setup = {}) {
   }
 }
 
-function spawnAsync(cmd, args, { input = '', env, cwd, timeoutMs = 20_000, closeStdin = true } = {}) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const child = spawn(cmd, args, { env, cwd, windowsHide: true });
-    const out = [];
-    const err = [];
-    child.stdout.on('data', (c) => out.push(c));
-    child.stderr.on('data', (c) => err.push(c));
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: null, stdout: '', stderr: String(e), ms: Date.now() - t0, bytes: Buffer.alloc(0) }); });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const bytes = Buffer.concat(out);
-      resolve({ code, stdout: bytes.toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), ms: Date.now() - t0, bytes });
-    });
-    child.stdin.on('error', () => {});
-    if (input) child.stdin.write(input);
-    if (closeStdin) child.stdin.end();
-  });
-}
-
 async function pool(items, fn, size = POOL) {
   const results = new Array(items.length);
   let next = 0;
@@ -157,7 +104,7 @@ async function pool(items, fn, size = POOL) {
 
 /** Exactly one ASCII-only JSON object on stdout and exit 0; returns the parsed object. */
 function assertHookOutput(res, label) {
-  assert.equal(res.code, 0, `${label}: exit ${res.code}, stderr: ${res.stderr}`);
+  assert.equal(res.status, 0, `${label}: exit ${res.status}, stderr: ${res.stderr}`);
   assert.ok(/^[\x20-\x7e]+\r?\n$/.test(res.stdout), `${label}: stdout must be one ASCII line, got ${JSON.stringify(res.stdout).slice(0, 300)}`);
   const obj = JSON.parse(res.stdout);
   assert.ok(obj && typeof obj === 'object' && !Array.isArray(obj), `${label}: not an object`);
@@ -183,9 +130,7 @@ function checkExpect(obj, res, expect, label, repo, sid, vars) {
   }
 }
 
-function loadFixtures(name) {
-  return JSON.parse(fs.readFileSync(path.join(FIX, 'hooks', `${name}.json`), 'utf8'));
-}
+const loadFixtures = (name) => fixtureJson(`hooks/${name}`);
 
 // Launchers: how a host would start the handler for a step.
 const rendered = new Map();
@@ -234,8 +179,8 @@ async function runStep(mode, step, { env, cwd, input }) {
 /** Run one fixture case (and its `then` steps) in a fresh repository through one launcher. */
 async function runCase(c, mode) {
   const noGit = c.setup && c.setup.no_git;
-  const repo = noGit ? fs.realpathSync(tmp('adc-nogit-')) : makeRepo();
-  const outside = fs.realpathSync(tmp('adc-outside-'));
+  const repo = noGit ? tmpDir('adc-nogit-', { real: true }) : makeRepo();
+  const outside = tmpDir('adc-outside-', { real: true });
   const vars = { '<REPO>': core.toPosix(repo), '<AWS_KEY>': AWS_KEY, '<TOKEN>': TOKEN };
   if (!noGit) applySetup(repo, c.setup || {});
   const steps = [c, ...(c.then || [])];
@@ -314,6 +259,16 @@ test('extractPaths and parsePatch cover every dialect, apply_patch headers and o
   assert.deepEqual(content, [{ path: 'a.js', op: 'update', text: 'one\ntwo', fragment: true }]);
   assert.deepEqual(dialects.extractContent({ tool_name: 'Write', tool_input: { file_path: 'b.js', content: 'x' } }), [{ path: 'b.js', op: 'write', text: 'x' }]);
   assert.deepEqual(dialects.extractPatterns({ tool_input: { pattern: '.adc/**', path: '.' } }), ['.adc/**']);
+});
+
+test('parsePatch parses a repeated tool input once and a new input afresh', () => {
+  const input = { command: ['*** Begin Patch', '*** Add File: a.js', '+x', '*** End Patch'].join('\n') };
+  const first = dialects.parsePatch(input);
+  assert.equal(dialects.parsePatch(input), first, 'the same input returns the cached result');
+  assert.deepEqual(dialects.extractPaths({ tool_name: 'apply_patch', tool_input: input }), ['a.js']);
+  const other = { command: input.command.replace('a.js', 'b.js') };
+  assert.deepEqual(dialects.parsePatch(other).map((f) => f.path), ['b.js']);
+  assert.deepEqual(dialects.parsePatch('no patch here'), []);
 });
 
 test('formatOutput: the decision shapes per host, and Codex output uses only documented keys', () => {
@@ -405,7 +360,7 @@ test('extractPaths reads Copilot grep/rg/glob `paths` as a string or an array; p
 });
 
 test('lastAssistantMessage reads the tail of Copilot and Claude transcripts (bounded, partial lines skipped)', () => {
-  const dir = tmp('adc-transcript-');
+  const dir = tmpDir('adc-transcript-');
   const copilotFile = path.join(dir, 'events.jsonl');
   const filler = JSON.stringify({ type: 'tool.execution_complete', data: { result: 'x'.repeat(5000) } });
   fs.writeFileSync(copilotFile, [
@@ -425,7 +380,7 @@ test('lastAssistantMessage reads the tail of Copilot and Claude transcripts (bou
 });
 
 test('newestLedger picks the newest created_at among recently written ledgers and skips foreign JSON', () => {
-  const dir = tmp('adc-evidence-');
+  const dir = tmpDir('adc-evidence-');
   const write = (name, doc, mtimeS) => {
     const f = path.join(dir, name);
     fs.writeFileSync(f, JSON.stringify(doc));
@@ -444,7 +399,7 @@ test('newestLedger picks the newest created_at among recently written ledgers an
 
 test('locateRepo resolves linked worktrees, and the hook exclude entry lands in the common git dir', () => {
   const repo = makeRepo();
-  const wt = path.join(tmp('adc-wt-'), 'wt');
+  const wt = path.join(tmpDir('adc-wt-'), 'wt');
   git(repo, 'worktree', 'add', '-q', wt, 'HEAD');
   const found = state.locateRepo(path.join(wt));
   assert.equal(found.root, fs.realpathSync(wt));
@@ -482,6 +437,9 @@ test('hookRunCommand in-process: an injected stream yields the same decision', a
 /** One in-process hook call with a JSON payload; returns the decision object. */
 const inproc = (argv, payload, env = {}) =>
   hookRun.hookRunCommand(argv, { stdin: Readable.from([Buffer.from(JSON.stringify(payload))]), env: baseEnv(env) });
+const GUARD_ARGV = ['pre-guard', '--dialect', 'claude', '--level', 'guard'];
+/** The guard's decision ('deny', 'ask' or null) on a Claude Bash call. */
+const guardBash = async (cwd, command) => decisionOf(await inproc(GUARD_ARGV, claudeBash(cwd, command)));
 const claudeBash = (repo, command, extra = {}) => ({ session_id: 'g', cwd: repo, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, ...extra });
 const decisionOf = (out) => (out.hookSpecificOutput ? out.hookSpecificOutput.permissionDecision : out.permissionDecision) || null;
 
@@ -502,7 +460,7 @@ test('post-edit scans code files only, and flags a manifest test script or runne
   const sessionFile = state.sessionFile(path.join(repo, '.adc'), 'pe');
   const before = core.readJson(sessionFile).edits.count;
   // The host's own plan or memory files and temp files are outside the change: no note, no gate epoch.
-  const outside = fs.realpathSync(tmp('adc-outside-'));
+  const outside = tmpDir('adc-outside-', { real: true });
   const planFile = { session_id: 'pe', cwd: repo, hook_event_name: 'PostToolUse', tool_name: 'Write', tool_input: { file_path: `${outside}/plans/x.test.js`, content: "it.only('x', () => {})\n" }, tool_response: {} };
   assert.deepEqual(await inproc(['post-edit', '--dialect', 'claude'], planFile), {});
   assert.equal(core.readJson(sessionFile).edits.count, before);
@@ -510,7 +468,7 @@ test('post-edit scans code files only, and flags a manifest test script or runne
 
 test('guard: `git add -f` of a pathspec, glob or -A that covers .adc/ is denied once .adc/ exists', async () => {
   const repo = makeRepo();
-  const guard = async (command, cwd = repo) => decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(cwd, command)));
+  const guard = (command, cwd = repo) => guardBash(cwd, command);
   assert.equal(await guard('git add -f .'), null, 'nothing to pick up before .adc/ exists');
   fs.mkdirSync(path.join(repo, '.adc'));
   fs.mkdirSync(path.join(repo, 'sub'));
@@ -524,7 +482,7 @@ test('guard: `git add -f` of a pathspec, glob or -A that covers .adc/ is denied 
 
 test('guard: shell access to .env.live by glob, other letter case or a recursive read of .adc/ is denied; untracking stays allowed', async () => {
   const repo = makeRepo();
-  const guard = async (command) => decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(repo, command)));
+  const guard = (command) => guardBash(repo, command);
   for (const c of ['cat .adc/.e*', 'cat ./.adc/*', 'cat .ADC/.ENV.LIVE', 'type .adc\\.env.live', 'grep -r TOKEN .adc', 'rg --hidden TOKEN ./.adc/',
     'cp -r .adc /tmp/backup', 'tar czf s.tgz .adc', 'find .adc -type f -exec cat {} +', 'Select-String -Path .adc/* -Pattern TOKEN', 'cat .env.live']) {
     assert.equal(await guard(c), 'deny', c);
@@ -537,7 +495,7 @@ test('guard: shell access to .env.live by glob, other letter case or a recursive
 
 test('guard: Windows backslash paths, inline scripts behind flag clusters and leading redirections are seen through', async () => {
   const repo = makeRepo();
-  const guard = async (command) => inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(repo, command));
+  const guard = async (command) => inproc(GUARD_ARGV, claudeBash(repo, command));
   for (const c of ['Get-Content .adc\\*', 'Select-String -Path .adc\\* -Pattern TOKEN', `type ${repo.replace(/\//g, '\\')}\\.adc\\.env.live`,
     '>/dev/null git push --force', '2>&1 git reset --hard', 'bash -ec "git push -f"', 'pwsh -NoProfile -Command "git push --force"']) {
     assert.equal(decisionOf(await guard(c)), 'deny', c);
@@ -552,8 +510,8 @@ test('guard: a call that starts two Claude handlers (two matching `if` rules) is
   const repo = makeRepo();
   const p = claudeBash(repo, 'cat .adc/.env.live', { session_id: 'dup', tool_use_id: 'toolu_dup1' });
   // The session lock serializes the two handler processes; in-process the calls run one after the other.
-  for (let i = 0; i < 2; i++) assert.equal(decisionOf(await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], p)), 'deny');
-  await inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], { ...p, tool_use_id: 'toolu_dup2' });
+  for (let i = 0; i < 2; i++) assert.equal(decisionOf(await inproc(GUARD_ARGV, p)), 'deny');
+  await inproc(GUARD_ARGV, { ...p, tool_use_id: 'toolu_dup2' });
   assert.equal(core.readJson(state.sessionFile(path.join(repo, '.adc'), 'dup')).guard.denials, 2);
 });
 
@@ -647,24 +605,25 @@ const editPayload = (repo, file = 'tests/x.test.js', text = "it.only('x', () => 
   JSON.stringify({ sessionId: 'fo-1', timestamp: 1761400000000, cwd: repo, toolName: 'edit', toolArgs: { path: file, new_str: text } });
 
 function fakeNodeDir(script) {
-  const dir = tmp('adc-fakenode-');
+  const dir = tmpDir('adc-fakenode-');
   const f = path.join(dir, 'node');
   fs.writeFileSync(f, `#!/bin/sh\n${script}\n`);
   fs.chmodSync(f, 0o755);
   return dir;
 }
+/** PATH with `dir` first, then only the system directories (no real node). */
+const sysPathWith = (dir) => [dir, '/usr/bin', '/bin'].join(path.delimiter);
 
 test('Copilot guards print {} with exit 0 when node is missing, crashes or is too old', { skip: core.IS_WINDOWS ? 'POSIX fake executables' : false, timeout: 120_000 }, async () => {
   const repo = makeRepo();
   const h = handlerFor('copilot', 'guard', 'pre-guard');
   const input = JSON.stringify({ sessionId: 'fo-1', cwd: repo, toolName: 'bash', toolArgs: { command: 'git push --force' } });
-  const sysPath = ['/usr/bin', '/bin'].join(path.delimiter);
   const variants = [
-    ['missing node', tmp('adc-empty-path-')],
-    ['crashing node', `${fakeNodeDir('echo "Segmentation fault" >&2; exit 139')}${path.delimiter}${sysPath}`],
-    ['node that prints garbage and fails', `${fakeNodeDir('echo "{not json"; exit 3')}${path.delimiter}${sysPath}`],
+    ['missing node', tmpDir('adc-empty-path-')],
+    ['crashing node', sysPathWith(fakeNodeDir('echo "Segmentation fault" >&2; exit 139'))],
+    ['node that prints garbage and fails', sysPathWith(fakeNodeDir('echo "{not json"; exit 3'))],
   ];
-  if (NODE_OLD) variants.push(['node too old', `${path.dirname(NODE_OLD)}${path.delimiter}${sysPath}`]);
+  if (NODE_OLD) variants.push(['node too old', sysPathWith(path.dirname(NODE_OLD))]);
   for (const [label, PATH] of variants) {
     const env = { ...baseEnv(), PATH };
     if (PWSH) {
@@ -688,11 +647,10 @@ test('Codex commands fail open under pwsh -Command and sh -c: missing or crashin
   const repo = makeRepo();
   const h = handlerFor('codex', 'guard', 'pre-guard');
   const input = JSON.stringify({ session_id: 'cx-fo', turn_id: 't', cwd: repo, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push --force' } });
-  const sysPath = ['/usr/bin', '/bin'].join(path.delimiter);
   const variants = [
-    ['missing node', tmp('adc-empty-path-')],
-    ['crashing node', `${fakeNodeDir('echo "Segmentation fault" >&2; exit 139')}${path.delimiter}${sysPath}`],
-    ['node exiting 2', `${fakeNodeDir('echo "fatal" >&2; exit 2')}${path.delimiter}${sysPath}`],
+    ['missing node', tmpDir('adc-empty-path-')],
+    ['crashing node', sysPathWith(fakeNodeDir('echo "Segmentation fault" >&2; exit 139'))],
+    ['node exiting 2', sysPathWith(fakeNodeDir('echo "fatal" >&2; exit 2'))],
   ];
   for (const [label, PATH] of variants) {
     const env = { ...baseEnv(), PATH };
@@ -700,15 +658,15 @@ test('Codex commands fail open under pwsh -Command and sh -c: missing or crashin
     if (PWSH) launches.push(['pwsh', await spawnAsync(PWSH, ['-NoProfile', '-Command', h.commandWindows], { input, env, cwd: repo })]);
     if (SH) launches.push(['sh', await spawnAsync(SH, ['-c', h.command], { input, env, cwd: repo })]);
     for (const [launcher, res] of launches) {
-      assert.notEqual(res.code, 0, `${launcher} ${label}: must not look like a decision`);
+      assert.notEqual(res.status, 0, `${launcher} ${label}: must not look like a decision`);
       assert.equal(res.stdout.trim().startsWith('{'), false, `${launcher} ${label}: no JSON on stdout`);
       // pwsh -Command collapses every failure to 1 (openai/codex#54072); sh passes the code through,
       // and a node that really exits 2 would block under sh, which is why adc.mjs always exits 0.
-      if (launcher === 'pwsh') assert.equal(res.code, 1, `pwsh ${label}: exit ${res.code}`);
+      if (launcher === 'pwsh') assert.equal(res.status, 1, `pwsh ${label}: exit ${res.status}`);
     }
   }
   if (NODE_OLD) {
-    const env = { ...baseEnv(), PATH: `${path.dirname(NODE_OLD)}${path.delimiter}${sysPath}` };
+    const env = { ...baseEnv(), PATH: sysPathWith(path.dirname(NODE_OLD)) };
     if (PWSH) assert.deepEqual(assertHookOutput(await spawnAsync(PWSH, ['-NoProfile', '-Command', h.commandWindows], { input, env, cwd: repo }), 'pwsh old node'), {});
     if (SH) assert.deepEqual(assertHookOutput(await spawnAsync(SH, ['-c', h.command], { input, env, cwd: repo }), 'sh old node'), {});
   }
@@ -762,7 +720,7 @@ test('session-start on an uncached repository finishes under 500 ms', async () =
 
 test('a host that never closes stdin still gets {} and exit 0 within the watchdog', async () => {
   const repo = makeRepo();
-  const res = await spawnAsync(process.execPath, [ADC, 'hook-run', 'stop', '--dialect', 'copilot'], { input: '{"sessionId":"open",', env: baseEnv(), cwd: repo, closeStdin: false, timeoutMs: 8000 });
+  const res = await spawnAsync(process.execPath, [ADC, 'hook-run', 'stop', '--dialect', 'copilot'], { input: '{"sessionId":"open",', env: baseEnv(), cwd: repo, closeStdin: false, timeout: 8000 });
   assert.deepEqual(assertHookOutput(res, 'open stdin'), {});
   assert.ok(res.ms < 3500, `took ${res.ms} ms`);
 });
@@ -804,9 +762,21 @@ test('hooks create .adc/ only with the exclude entry, and only when there is som
   if (!core.IS_WINDOWS) assert.equal(fs.statSync(path.join(repo, '.adc')).mode & 0o077, 0);
 });
 
+test('guard: a relocated state dir (ADC_HOME) is protected, including a child named `..x`', async () => {
+  const repo = makeRepo();
+  const home = tmpDir('adc-guardhome-', { real: true });
+  const read = async (file) => decisionOf(await inproc(GUARD_ARGV,
+    { session_id: 'gh', cwd: repo, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: file } },
+    { ADC_HOME: home }));
+  assert.equal(await read(path.join(home, 'budget.json')), 'deny');
+  assert.equal(await read(path.join(home, '..x')), 'deny', 'a name starting with `..` is inside the state dir');
+  assert.equal(await read(`${home}-sibling/a.txt`), null, 'a sibling with the same prefix is outside');
+  assert.equal(await read(path.join(repo, 'README.md')), null);
+});
+
 test('--state-dir and ADC_HOME relocate hook state', async () => {
   const repo = makeRepo();
-  const home = tmp('adc-statehome-');
+  const home = tmpDir('adc-statehome-');
   const payload = JSON.stringify({ session_id: 'rel', cwd: repo, hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: 'src/a.js', new_string: 'a' } });
   await spawnAsync(process.execPath, [ADC, 'hook-run', 'post-edit', '--dialect', 'claude'], { input: payload, env: baseEnv({ ADC_HOME: home }), cwd: repo });
   assert.ok(fs.existsSync(path.join(home, 'sessions', 'rel.json')));
@@ -909,9 +879,9 @@ async function startFakeModel(steps) {
 
 /** Register this skill's hooks for `host` (guard level) with the real CLI command, in a temp HOME. */
 function registerForHost(host, repo, env) {
-  const r = spawnSync(process.execPath, [ADC, 'setup', 'hooks', '--host', host, '--level', 'guard', '--write', '--json', '--cwd', repo], { encoding: 'utf8', env });
+  const r = runAdc(['setup', 'hooks', '--host', host, '--level', 'guard', '--write'], { cwd: repo, env });
   assert.equal(r.status, 0, `setup hooks --host ${host}: ${r.stderr}`);
-  assert.equal(JSON.parse(r.stdout).written, true, `setup hooks --host ${host} wrote nothing`);
+  assert.equal(r.json.written, true, `setup hooks --host ${host} wrote nothing`);
 }
 
 /** The latest request body that carried tools, and the session file the hooks wrote. */
@@ -953,7 +923,7 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
   }, async () => {
     const repo = makeRepo();
     fs.mkdirSync(path.join(repo, 'tests')); // Copilot's create tool needs the parent directory
-    const home = tmp('adc-host-copilot-');
+    const home = tmpDir('adc-host-copilot-');
     const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, COPILOT_HOME: path.join(home, '.copilot') });
     registerForHost('copilot', repo, env);
     const model = await startFakeModel([
@@ -969,10 +939,10 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     ]);
     try {
       const res = await spawnAsync(HOST_BIN.copilot, ['-p', 'run the scripted task', '--allow-all', '--no-ask-user'], {
-        cwd: repo, timeoutMs: 80_000,
+        cwd: repo, timeout: 80_000,
         env: { ...env, ADC_LIVE_TOKEN: ENV_TOKEN, COPILOT_OFFLINE: 'true', COPILOT_PROVIDER_BASE_URL: `${model.url}/v1`, COPILOT_PROVIDER_API_KEY: 'fake', COPILOT_MODEL: 'gpt-4.1', COPILOT_AUTO_UPDATE: 'false', COPILOT_CLI_DIST_DIR: COPILOT_DIST },
       });
-      assert.equal(res.code, 0, `copilot exit ${res.code}: ${res.stderr.slice(-800)}`);
+      assert.equal(res.status, 0, `copilot exit ${res.status}: ${res.stderr.slice(-800)}`);
       const { body, session } = hostResult(model, repo);
       const ch = channels(body);
       // Copilot injects the brief and the stop block as user messages and appends post-edit notes to the tool result.
@@ -997,7 +967,7 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     skip: hostSkip('claude'), timeout: 90_000,
   }, async () => {
     const repo = makeRepo();
-    const home = tmp('adc-host-claude-');
+    const home = tmpDir('adc-host-claude-');
     const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') });
     registerForHost('claude', repo, env);
     const model = await startFakeModel([
@@ -1014,10 +984,10 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     ]);
     try {
       const res = await spawnAsync(HOST_BIN.claude, ['-p', 'run the scripted task', '--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,Read,Write,Edit', '--output-format', 'json'], {
-        cwd: repo, timeoutMs: 80_000,
+        cwd: repo, timeout: 80_000,
         env: { ...env, ANTHROPIC_BASE_URL: model.url, ANTHROPIC_API_KEY: 'sk-fake', DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
       });
-      assert.equal(res.code, 0, `claude exit ${res.code}: ${res.stderr.slice(-800)} ${res.stdout.slice(-400)}`);
+      assert.equal(res.status, 0, `claude exit ${res.status}: ${res.stderr.slice(-800)} ${res.stdout.slice(-400)}`);
       const { body, session } = hostResult(model, repo);
       const ch = channels(body);
       // Claude Code passes hook context as system messages and stop feedback as a user message.
@@ -1039,7 +1009,7 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     skip: hostSkip('codex'), timeout: 90_000,
   }, async () => {
     const repo = makeRepo();
-    const home = tmp('adc-host-codex-');
+    const home = tmpDir('adc-host-codex-');
     const codexHome = path.join(home, '.codex');
     const env = baseEnv({ ...OFFLINE, HOME: home, USERPROFILE: home, CODEX_HOME: codexHome, SHELL: '/bin/bash' });
     registerForHost('codex', repo, env);
@@ -1057,9 +1027,9 @@ describe('real hosts with the registered hooks (offline, scripted fake model)', 
     ].join('\n'));
     try {
       const res = await spawnAsync(HOST_BIN.codex, ['exec', '--skip-git-repo-check', '--dangerously-bypass-hook-trust', '-s', 'workspace-write', '--json', 'run the scripted task'], {
-        cwd: repo, timeoutMs: 80_000, env: { ...env, FAKE_API_KEY: 'fake' },
+        cwd: repo, timeout: 80_000, env: { ...env, FAKE_API_KEY: 'fake' },
       });
-      assert.equal(res.code, 0, `codex exit ${res.code}: ${res.stderr.slice(-800)}`);
+      assert.equal(res.status, 0, `codex exit ${res.status}: ${res.stderr.slice(-800)}`);
       const { body, session } = hostResult(model, repo);
       const ch = channels(body);
       // Codex passes hook context as developer messages and the stop block as a user message.
@@ -1148,25 +1118,25 @@ for (const host of hooksRender.HOSTS) {
       fs.mkdirSync(SNAP, { recursive: true });
       fs.writeFileSync(file, `${JSON.stringify(actual, null, 2)}\n`);
     }
-    const expected = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const expected = readJsonStrict(file);
     for (const name of Object.keys(actual)) assert.deepEqual(actual[name], expected[name], `${host}/${name} differs from tests/snapshots/${host}.json (UPDATE_SNAPSHOTS=1 regenerates)`);
   });
 }
 
 test('the default render equals the shipped template with <SKILL> substituted (minus the opt-in guard entries)', () => {
   for (const host of ['copilot', 'claude', 'codex']) {
-    const tpl = JSON.parse(fs.readFileSync(path.join(core.ASSETS_DIR, 'hooks', { copilot: 'copilot.hooks.json', claude: 'claude.settings.hooks.json', codex: 'codex.hooks.json' }[host]), 'utf8'));
+    const tpl = readJsonStrict(path.join(core.ASSETS_DIR, 'hooks', { copilot: 'copilot.hooks.json', claude: 'claude.settings.hooks.json', codex: 'codex.hooks.json' }[host]));
     const r = hooksRender.renderHooks({ host, skillDir: SNAP_SKILL, home: SNAP_HOME, env: {} });
     const expected = JSON.parse(JSON.stringify(tpl).split('<SKILL>').join(SNAP_SKILL));
     delete expected.hooks[host === 'copilot' ? 'preToolUse' : 'PreToolUse'];
     assert.deepEqual(r.config, expected, host);
   }
-  const cloud = JSON.parse(fs.readFileSync(path.join(core.ASSETS_DIR, 'hooks', 'copilot.cloud.hooks.json'), 'utf8'));
+  const cloud = readJsonStrict(path.join(core.ASSETS_DIR, 'hooks', 'copilot.cloud.hooks.json'));
   assert.ok(Object.values(cloud.hooks).flat().every((e) => e.bash && e.powershell && !e.command));
 });
 
 test('rendered strings quote paths with spaces and shell metacharacters correctly in bash and pwsh', { skip: core.IS_WINDOWS ? 'POSIX paths' : false, timeout: 60_000 }, async () => {
-  const base = path.join(tmp('adc-quote-'), 'we$ird `dir` "q" x');
+  const base = path.join(tmpDir('adc-quote-'), 'we$ird `dir` "q" x');
   const skill = path.join(base, 'agentic-developer-companion');
   fs.mkdirSync(skill, { recursive: true });
   for (const p of ['SKILL.md', 'scripts', 'assets']) fs.cpSync(path.join(SKILL, p), path.join(skill, p), { recursive: true });
@@ -1228,7 +1198,7 @@ test('renderHooks validates its inputs and resolves targets per host and scope',
 // Registration
 
 function freshHome() {
-  const home = tmp('adc-reg-home-');
+  const home = tmpDir('adc-reg-home-');
   return { home, env: { HOME: home } };
 }
 
@@ -1244,7 +1214,7 @@ test('writeHooks merges into existing configs, keeps foreign entries and keys, b
   const w1 = hooksRender.writeHooks(r1, { root });
   assert.equal(w1.written, true);
   assert.ok(fs.existsSync(w1.backup_file));
-  let data = JSON.parse(fs.readFileSync(claudeFile, 'utf8'));
+  let data = readJsonStrict(claudeFile);
   assert.deepEqual(data.permissions, { allow: ['Bash(npm test)'] });
   assert.equal(data.theme, 'dark');
   assert.deepEqual(data.hooks.PreToolUse, [foreign]);
@@ -1252,7 +1222,7 @@ test('writeHooks merges into existing configs, keeps foreign entries and keys, b
   // Level change: our entries are replaced, never duplicated.
   hooksRender.writeHooks(hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SKILL, home, env, root }), { root });
   hooksRender.writeHooks(hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SKILL, home, env, root }), { root });
-  data = JSON.parse(fs.readFileSync(claudeFile, 'utf8'));
+  data = readJsonStrict(claudeFile);
   assert.equal(data.hooks.PreToolUse.length, 4, 'the foreign group plus Bash, PowerShell and the file tools');
   assert.deepEqual(data.hooks.PreToolUse[0], foreign);
   assert.equal(data.hooks.Stop.length, 1);
@@ -1263,11 +1233,11 @@ test('writeHooks merges into existing configs, keeps foreign entries and keys, b
   assert.equal(wc.created, true);
   assert.equal(wc.backup_file, null);
   const cfile = path.join(home, '.copilot', 'hooks', 'agentic-developer-companion.json');
-  const cdata = JSON.parse(fs.readFileSync(cfile, 'utf8'));
+  const cdata = readJsonStrict(cfile);
   cdata.hooks.sessionStart.push({ type: 'command', bash: 'echo {}', powershell: "'{}'" });
   fs.writeFileSync(cfile, JSON.stringify(cdata));
   hooksRender.writeHooks(rc, { root });
-  const c2 = JSON.parse(fs.readFileSync(cfile, 'utf8'));
+  const c2 = readJsonStrict(cfile);
   assert.equal(c2.hooks.sessionStart.length, 2);
   assert.equal(c2.hooks.sessionStart[1].bash, hooksRender.renderHooks({ host: 'copilot', skillDir: SKILL, home, env }).config.hooks.sessionStart[0].bash);
   // Codex: an existing description is kept.
@@ -1275,7 +1245,7 @@ test('writeHooks merges into existing configs, keeps foreign entries and keys, b
   fs.mkdirSync(path.dirname(xfile), { recursive: true });
   fs.writeFileSync(xfile, JSON.stringify({ description: 'mine', hooks: {} }));
   hooksRender.writeHooks(hooksRender.renderHooks({ host: 'codex', skillDir: SKILL, home, env, root }), { root });
-  assert.equal(JSON.parse(fs.readFileSync(xfile, 'utf8')).description, 'mine');
+  assert.equal(readJsonStrict(xfile).description, 'mine');
   // Records.
   const rec = core.readJson(path.join(root, '.adc', 'hooks-installed.json'));
   assert.deepEqual(rec.entries.map((e) => `${e.host}:${e.scope}:${e.level}`).sort(), ['claude:user:guard', 'codex:user:advise', 'copilot:user:advise']);
@@ -1290,6 +1260,11 @@ test('writeHooks refuses an unparsable target and leaves it untouched; dry runs 
   const r = hooksRender.renderHooks({ host: 'claude', skillDir: SKILL, home, env });
   assert.throws(() => hooksRender.writeHooks(r, {}), (e) => e.exit === 3 && e.code === 'CONFIG_UNPARSABLE');
   assert.equal(fs.readFileSync(file, 'utf8'), '{ "hooks": { // comment\n');
+  fs.writeFileSync(file, '[]\n');
+  assert.throws(() => hooksRender.writeHooks(r, {}), (e) => e.code === 'CONFIG_UNPARSABLE' && /top level is not an object/.test(e.message));
+  fs.writeFileSync(file, ' \n');
+  assert.ok(hooksRender.writeHooks(r, {}).written, 'an empty file counts as an empty config');
+  assert.ok(readJsonStrict(file).hooks.Stop);
   const { home: h2, env: e2 } = freshHome();
   const d = hooksRender.writeHooks(hooksRender.renderHooks({ host: 'codex', skillDir: SKILL, home: h2, env: e2 }), { dryRun: true });
   assert.equal(d.written, false);
@@ -1304,7 +1279,7 @@ test('Claude project scope writes settings.local.json, keeps it git-ignored and 
   const w = hooksRender.writeHooks(r, { root });
   assert.equal(w.target_file, core.toPosix(path.join(root, '.claude', 'settings.local.json')));
   assert.equal(git(root, 'status', '--porcelain'), '');
-  const h = JSON.parse(fs.readFileSync(path.join(root, '.claude', 'settings.local.json'), 'utf8')).hooks.Stop[0].hooks[0];
+  const h = readJsonStrict(path.join(root, '.claude', 'settings.local.json')).hooks.Stop[0].hooks[0];
   assert.equal(h.args, undefined);
   assert.match(h.command, /^node ".*\/scripts\/adc\.mjs" hook-run stop --dialect auto --level gate$/);
   // Copilot runs this file too and ignores `if` (measured): the guard's Bash handlers collapse into one.
@@ -1340,21 +1315,21 @@ test('listRegisteredHooks reports host, scope, level and drift; removeHooks dele
   assert.ok(list.every((x) => x.recorded && x.present));
   // Drift: an edited command no longer matches the current render.
   const cfile = path.join(home, '.copilot', 'hooks', 'agentic-developer-companion.json');
-  const c = JSON.parse(fs.readFileSync(cfile, 'utf8'));
+  const c = readJsonStrict(cfile);
   c.hooks.sessionStart[0].bash = c.hooks.sessionStart[0].bash.replace('session-start', 'session-start ');
   fs.writeFileSync(cfile, JSON.stringify(c));
   list = hooksRender.listRegisteredHooks({ root, home, env, skillDir: SKILL });
   assert.equal(by('copilot').matches_current, false);
   // Remove one host; the others stay.
   const xfile = path.join(home, '.codex', 'hooks.json');
-  const x = JSON.parse(fs.readFileSync(xfile, 'utf8'));
+  const x = readJsonStrict(xfile);
   x.hooks.Stop.push({ hooks: [{ type: 'command', command: 'notify-me' }] });
   fs.writeFileSync(xfile, JSON.stringify(x));
   const rm = hooksRender.removeHooks({ host: 'codex', root, home, env });
   assert.equal(rm.source, 'record');
   assert.equal(rm.removed[0].entries, 6);
   assert.equal(rm.removed[0].deleted_file, false);
-  assert.deepEqual(JSON.parse(fs.readFileSync(xfile, 'utf8')).hooks, { Stop: [{ hooks: [{ type: 'command', command: 'notify-me' }] }] });
+  assert.deepEqual(readJsonStrict(xfile).hooks, { Stop: [{ hooks: [{ type: 'command', command: 'notify-me' }] }] });
   list = hooksRender.listRegisteredHooks({ root, home, env, skillDir: SKILL });
   assert.equal(list.filter((l) => l.host === 'codex').length, 0);
   // Remove everything; our dedicated Copilot file is deleted.
@@ -1374,70 +1349,65 @@ test('removeHooks without a record scans the host files for adc.mjs hook-run ent
   const res = hooksRender.removeHooks({ host: 'claude', home, env });
   assert.equal(res.source, 'scan');
   assert.equal(res.removed[0].entries, 5);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { model: 'opus' });
+  assert.deepEqual(readJsonStrict(file), { model: 'opus' });
 });
 
 // ---------------------------------------------------------------------------
 // CLI end to end
 
-function cli(args, { env = {}, cwd } = {}) {
-  const r = spawnSync(process.execPath, [ADC, ...args], { encoding: 'utf8', env: baseEnv(env), cwd });
-  let json = null;
-  try { json = JSON.parse(r.stdout); } catch {}
-  return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
-}
+const cli = (args, { env = {}, cwd } = {}) => runAdc(args, { cwd, env: baseEnv(env) });
 
 test('CLI: hooks render, setup hooks --write, headless refusal, list and --remove', () => {
   const repo = makeRepo();
   const { home } = freshHome();
   const env = { HOME: home, USERPROFILE: home };
-  let r = cli(['hooks', 'render', '--host', 'copilot', '--json', '--cwd', repo], { env });
-  assert.equal(r.code, 0, r.stderr);
+  let r = cli(['hooks', 'render', '--host', 'copilot'], { cwd: repo, env });
+  assert.equal(r.status, 0, r.stderr);
   assert.ok(r.json.config.hooks.sessionStart[0].powershell);
   assert.equal(r.json.written, false);
   assert.ok(/^[\x00-\x7e]*$/.test(r.stdout));
-  r = cli(['setup', 'hooks', '--host', 'codex', '--write', '--dry-run', '--json', '--cwd', repo], { env });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['setup', 'hooks', '--host', 'codex', '--write', '--dry-run'], { cwd: repo, env });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(r.json.written, false);
   assert.ok(r.json.would_write.hooks.SessionStart);
   assert.ok(!fs.existsSync(path.join(home, '.codex', 'hooks.json')));
-  r = cli(['setup', 'hooks', '--host', 'codex', '--level', 'gate', '--write', '--json', '--cwd', repo], { env });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['setup', 'hooks', '--host', 'codex', '--level', 'gate', '--write'], { cwd: repo, env });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(r.json.written, true);
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')));
-  r = cli(['setup', 'hooks', '--host', 'claude', '--write', '--json', '--cwd', repo], { env: { ...env, CI: 'true' } });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['setup', 'hooks', '--host', 'claude', '--write'], { cwd: repo, env: { ...env, CI: 'true' } });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(r.json.written, false);
   assert.match(r.json.refused, /headless hosts: print only/);
   assert.ok(!fs.existsSync(path.join(home, '.claude', 'settings.json')));
-  r = cli(['hooks', 'list', '--json', '--cwd', repo], { env });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['hooks', 'list'], { cwd: repo, env });
+  assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.json.hooks.map((h) => `${h.host}:${h.level}`), ['codex:gate']);
-  r = cli(['setup', 'hooks', '--remove', '--json', '--cwd', repo], { env: { ...env, GITHUB_ACTIONS: 'true' } });
+  r = cli(['setup', 'hooks', '--remove'], { cwd: repo, env: { ...env, GITHUB_ACTIONS: 'true' } });
   assert.match(r.json.refused, /print only/);
   assert.ok(fs.existsSync(path.join(home, '.codex', 'hooks.json')));
-  r = cli(['setup', 'hooks', '--remove', '--json', '--cwd', repo], { env });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['setup', 'hooks', '--remove'], { cwd: repo, env });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(r.json.removed.length, 1);
   assert.ok(!fs.existsSync(path.join(home, '.codex', 'hooks.json')));
 });
 
 test('CLI: usage errors exit 2 with a JSON error; the host is guessed from the environment', () => {
   const repo = makeRepo();
-  let r = cli(['hooks', 'render', '--host', 'cursor', '--json', '--cwd', repo]);
-  assert.equal(r.code, 2);
+  let r = cli(['hooks', 'render', '--host', 'cursor'], { cwd: repo });
+  assert.equal(r.status, 2);
   assert.equal(r.json.error.code, 'USAGE');
-  r = cli(['hooks', 'render', '--json', '--cwd', repo]);
-  assert.equal(r.code, 2);
+  r = cli(['hooks', 'render'], { cwd: repo });
+  assert.equal(r.status, 2);
   assert.match(r.json.error.message, /--host/);
-  r = cli(['hooks', 'render', '--json', '--cwd', repo], { env: { CLAUDECODE: '1' } });
-  assert.equal(r.code, 0, r.stderr);
+  r = cli(['hooks', 'render'], { cwd: repo, env: { CLAUDECODE: '1' } });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(r.json.host, 'claude');
-  r = cli(['hooks', 'render', '--host', 'claude', '--scope', 'project', '--json', '--cwd', fs.realpathSync(tmp('adc-norepo-'))]);
-  assert.equal(r.code, 3);
-  r = cli(['hooks', 'bogus', '--json', '--cwd', repo]);
-  assert.equal(r.code, 2);
-  r = cli(['hooks', 'render', '--host', 'copilot', '--node-path', '--json', '--cwd', repo]);
+  r = cli(['hooks', 'render', '--host', 'claude', '--scope', 'project'], { cwd: tmpDir('adc-norepo-', { real: true }) });
+  assert.equal(r.status, 3);
+  r = cli(['hooks', 'bogus'], { cwd: repo });
+  assert.equal(r.status, 2);
+  r = cli(['hooks', 'render', '--host', 'copilot', '--node-path'], { cwd: repo });
   assert.equal(r.json.node, core.toPosix(process.execPath));
 });
 
@@ -1445,7 +1415,7 @@ const CLAUDE = core.which('claude');
 
 test('rendered Claude hooks pass Claude Code\'s own hook validation (claude plugin validate, local and free)', { skip: CLAUDE ? false : 'claude not installed', timeout: 60_000 }, () => {
   for (const [scope, level] of [['user', 'advise'], ['user', 'guard'], ['project', 'gate']]) {
-    const dir = path.join(tmp('adc-claude-validate-'), 'adc-hooks-probe');
+    const dir = path.join(tmpDir('adc-claude-validate-'), 'adc-hooks-probe');
     fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'adc-hooks-probe', version: '0.0.1', description: 'hook validation probe' }));
@@ -1461,10 +1431,7 @@ test('rendered Claude hooks pass Claude Code\'s own hook validation (claude plug
 });
 
 test('shell edits arm the stop gate; companion runs and temp-dir writes do not', () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-shellwrite-'));
-  const g = (...a) => spawnSync('git', a, { cwd: repo, encoding: 'utf8' });
-  g('init', '-q'); g('config', 'user.email', 'a@b'); g('config', 'user.name', 'a');
-  fs.writeFileSync(path.join(repo, 'a.js'), 'x\n'); g('add', '-A'); g('commit', '-qm', 'base');
+  const { dir: repo } = newRepo({ 'a.js': 'x\n' }, { prefix: 'adc-shellwrite-', message: 'base' });
   const sid = 'shellwrite-session';
   const run = (event, payload, level = 'gate') => {
     const r = spawnSync(process.execPath, [core.ADC_SCRIPT, 'hook-run', event, '--dialect', 'claude', '--level', level], {

@@ -4,12 +4,12 @@
 
 import path from 'node:path';
 import {
-  EXIT, usageError, defineCommand, sha256, toPosix, relPosix, truncate, run, which, writeJsonAtomic, asciiJson,
-  toArray, mdCell, statOrNull, readInput, readJsonInput, makeCheck,
+  EXIT, usageError, defineCommand, sha256, toPosix, displayPath, truncate, run, which, writeJsonAtomic, asciiJson,
+  toArray, mdCell, statOrNull, readInput, readJsonInput, makeCheck, oneLine, stripBom, tryJson, isObj,
 } from './core.mjs';
 import { emptyTree, showFile, diffLines } from './git.mjs';
 import { prepareTarget } from './state.mjs';
-import { isTestFile as isTestPath, makeRedactor, redactDeep } from './markers.mjs';
+import { isTestFile, makeRedactor, redactDeep } from './markers.mjs';
 
 export const TRACE_SCHEMA = 'adc-trace/1';
 const MAX_SPEC_BYTES = 1024 * 1024;
@@ -17,7 +17,7 @@ const MAX_REQUIREMENTS = 200;
 const MAX_HUNKS = 500;
 const REQ_STATUSES = ['implemented', 'partial', 'missing', 'unknown', 'dismissed'];
 
-export const MATRIX_INSTRUCTIONS = Object.freeze([
+const MATRIX_INSTRUCTIONS = Object.freeze([
   'For every requirement set status to implemented, partial, missing or unknown (weak candidates may be dismissed).',
   'List implementing code in evidence[] and the tests that exercise it in tests[], each as "path:line" or '
     + '"path:start-end" in the snapshot.',
@@ -51,12 +51,10 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
     if (m && gh) {
       const res = run(gh, [m[3] === 'pull' ? 'pr' : 'issue', 'view', value, '--json', 'title,body'],
         { timeoutMs: 30_000 });
-      if (res.exit === 0) {
-        try {
-          const doc = JSON.parse(res.stdout);
-          const text = `# ${doc.title || ''}\n\n${doc.body || ''}`;
-          return { ref: value, text: text.slice(0, MAX_SPEC_BYTES), kind: 'url' };
-        } catch {}
+      const doc = res.exit === 0 ? tryJson(res.stdout) : null;
+      if (doc) {
+        const text = `# ${doc.title || ''}\n\n${doc.body || ''}`;
+        return { ref: value, text: text.slice(0, MAX_SPEC_BYTES), kind: 'url' };
       }
     }
     const how = m ? (gh ? ' with gh' : ' (gh is not installed)') : '';
@@ -66,19 +64,18 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
   const file = path.resolve(cwd, value);
   if (statOrNull(file)?.isFile() === false) throw usageError(`spec is not a file: ${toPosix(file)}`);
   const text = readInput(file, cwd, { what: 'spec file' });
-  const rel = root ? relPosix(root, file) : null;
-  return { ref: rel && rel !== '.' ? rel : toPosix(file), text: text.slice(0, MAX_SPEC_BYTES), kind: 'file' };
+  return { ref: root ? displayPath(root, file) : toPosix(file), text: text.slice(0, MAX_SPEC_BYTES), kind: 'file' };
 }
 
 // ---------------------------------------------------------------------------
 // Requirement extraction
 
-const words = (list) => new RegExp(`\\b(${list.join('|')})\\b`, 'i');
-const EXCLUDED_SECTION = words(['steps? to reproduce', 'reproduc\\w*', 'environment', 'versions?', 'logs?',
+const anyWord = (list) => new RegExp(`\\b(${list.join('|')})\\b`, 'i');
+const EXCLUDED_SECTION = anyWord(['steps? to reproduce', 'reproduc\\w*', 'environment', 'versions?', 'logs?',
   'stack ?traces?', 'screenshots?', 'background', 'context', 'motivation', 'references?', 'links?', 'notes?',
   'alternatives?', 'out[- ]of[- ]scope', 'non[- ]?goals?', 'related', 'faq', 'questions?', 'discussion', 'changelog',
   'history', 'appendix']);
-const REQUIREMENT_SECTION = words(['acceptance', 'requirements?', 'criteria', 'definition of done', 'dod',
+const REQUIREMENT_SECTION = anyWord(['acceptance', 'requirements?', 'criteria', 'definition of done', 'dod',
   'deliverables?', 'tasks?', 'to-?dos?', 'checklist', 'expected', 'goals?', 'user stor(?:y|ies)', 'specification',
   'spec', 'behaviou?r', 'features?', 'scope', 'must', 'should', 'changes?', 'proposal', 'solution']);
 const STRONG_KEYWORD = /\b(must|shall|required|is required to|are required to)\b/i;
@@ -86,13 +83,11 @@ const SOFT_KEYWORD = /\b(should|needs? to|has to|have to)\b/i;
 const ID_PREFIX = /^(?:\*\*|__)?\[?([A-Z][A-Z0-9]{0,9}-\d{1,5})\]?(?:\*\*|__)?\s*(?:[:.)-]|–|—)?\s+/;
 
 function cleanText(s) {
-  return String(s)
+  return oneLine(String(s)
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/(\*\*|__)/g, '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/<[^>]+>/g, ''));
 }
 
 function sectionKind(title) {
@@ -103,7 +98,7 @@ function sectionKind(title) {
 
 /** Requirement candidates (numbered lists, checkboxes, must/should, acceptance sections, Gherkin). */
 export function extractRequirements(text) {
-  const lines = String(text || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
+  const lines = stripBom(String(text || '')).replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   const seen = new Set();
   let section = { title: null, kind: 'neutral' };
@@ -414,10 +409,8 @@ function hits(cit, hunk) {
  * from the skeleton count as unknown, unmapped non-trivial hunks are extra functionality.
  * Returns { requirements, extras, counts, status, reason, summary, findings }, redacted.
  */
-export function evaluateMatrix({
-  root, base, commit, tree, matrix, skeleton = null, isTestFile = (f) => isTestPath(f),
-}) {
-  if (!matrix || typeof matrix !== 'object' || !Array.isArray(matrix.requirements)) {
+export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = null }) {
+  if (!isObj(matrix) || !Array.isArray(matrix.requirements)) {
     throw usageError('a traceability matrix needs a "requirements" array');
   }
   const check = citationChecker(root, tree);
@@ -550,10 +543,10 @@ export function evaluateMatrix({
 
 /** Markdown matrix for a skeleton or an evaluated matrix. */
 export function renderTraceMarkdown(m) {
-  const reqs = Array.isArray(m && m.requirements) ? m.requirements : [];
-  const extras = Array.isArray(m && m.extras) ? m.extras : [];
+  const reqs = Array.isArray(m?.requirements) ? m.requirements : [];
+  const extras = Array.isArray(m?.extras) ? m.extras : [];
   const out = ['# Traceability matrix', ''];
-  if (m && m.status) out.push(`CK-TRACE: **${m.status}**${m.reason ? ` (${m.reason})` : ''}. ${m.summary || ''}`, '');
+  if (m?.status) out.push(`CK-TRACE: **${m.status}**${m.reason ? ` (${m.reason})` : ''}. ${m.summary || ''}`, '');
   out.push('| Req | Requirement | Status | Implementation | Tests |', '|---|---|---|---|---|');
   for (const r of reqs) {
     const cells = [`${mdCell(r.id)}${r.strength === 'weak' ? ' (weak)' : ''}`, mdCell(r.text), mdCell(r.status),
@@ -566,8 +559,8 @@ export function renderTraceMarkdown(m) {
     out.push('', '## Missing functionality', '');
     for (const r of missing) out.push(`- ${r.id}: ${mdCell(r.text)}${r.note ? ` (${mdCell(r.note)})` : ''}`);
   }
-  const listed = m && m.status ? extras : extras.filter((e) => !e.requirement);
-  out.push('', m && m.status ? '## Extra functionality (hunks mapped to no requirement)' : '## Diff hunks to map', '');
+  const listed = m?.status ? extras : extras.filter((e) => !e.requirement);
+  out.push('', m?.status ? '## Extra functionality (hunks mapped to no requirement)' : '## Diff hunks to map', '');
   if (!listed.length) out.push('None.');
   else {
     out.push('| Hunk | Kind | Preview | Hint |', '|---|---|---|---|');

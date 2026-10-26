@@ -5,21 +5,21 @@
 
 import path from 'node:path';
 import {
-  EXIT, AdcError, usageError, defineCommand, toPosix, relPosix, truncate, ADC_SCRIPT, writeFileAtomic,
+  EXIT, AdcError, usageError, defineCommand, toPosix, displayPath, truncate, ADC_SCRIPT, writeFileAtomic,
   writeJsonAtomic, ensureDir, makeCheck, numberOption, readInput, toArray,
 } from './core.mjs';
 import { requireRepo, resolveBase, createSnapshot, statusPorcelain } from './git.mjs';
-import { prepareStateDir, prepareTarget, appendMetrics, snapshotExcludes } from './state.mjs';
+import { prepareStateDir, prepareTarget, appendMetrics, snapshotExcludes, resolveSession } from './state.mjs';
 import {
   initLedger, addChecks, setClaims, finalizeLedger, deriveVerdict, checkRows, verdictExit, readLedgerFile,
-  renderMarkdown, markdownPath, artifactsDir, detectTool, checkTool, metricsFor, resolveSession, allocateLedgerPath,
+  renderMarkdown, markdownPath, artifactsDir, detectTool, checkTool, metricsFor, allocateLedgerPath, claimsView,
   CHECK_FM,
 } from './evidence.mjs';
 import { readSpecInput, specPaths, renderTraceMarkdown } from './trace.mjs';
 
 const DIFF_SCOPE_IDS = ['CK-SCOPE', 'CK-TEST-DEL', 'CK-SKIP', 'CK-ASSERT', 'CK-TEST-CFG', 'CK-SUPPRESS', 'CK-CI',
   'CK-SWALLOW', 'CK-SECRETS'];
-// Checks a quoted spec may waive (evidence.mjs refuses the others).
+// Checks next_steps offers to waive when the spec asks for it (evidence.mjs decides what is waivable).
 const WAIVABLE = ['CK-TEST-DEL', 'CK-SKIP', 'CK-ASSERT', 'CK-TEST-CFG', 'CK-SUPPRESS', 'CK-CI', 'CK-SCOPE', 'CK-TRACE'];
 
 // Options every worktree-based step shares: --no-install and --keep apply to all of them.
@@ -153,7 +153,7 @@ function storeTrace(res, checks, s) {
   writeJsonAtomic(json, doc);
   writeJsonAtomic(work, doc);
   writeFileAtomic(md, renderTraceMarkdown(doc));
-  const ref = (f) => relPosix(s.target.root, f) || toPosix(f);
+  const ref = (f) => displayPath(s.target.root, f);
   for (const c of checks) if (c.id === 'CK-TRACE') c.artifacts = [ref(json), ref(md)];
   s.traceMatrix = ref(work);
 }
@@ -289,9 +289,9 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
   const target = await prepareTarget(ctx, { base: values.base || null });
   const before = statusPorcelain(target.root);
   const tool = opts.tool || detectTool();
-  const session = resolveSession(target.state, values.session || null);
+  const session = resolveSession(target.state.dir, values.session || null);
   const ledgerFile = allocateLedgerPath(target.state, target.snapshot.tree);
-  const ledgerRef = relPosix(target.root, ledgerFile) || toPosix(ledgerFile);
+  const ledgerRef = displayPath(target.root, ledgerFile);
   // The scratch folder next_steps names for review answers must exist before the model writes there.
   ensureDir(artifactsDir(ledgerFile));
   const s = {
@@ -356,12 +356,11 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
     derived, ledger, tool, ledgerRef: abs(ledgerRef), matrixRef: abs(s.traceMatrix),
     scratchDir: toPosix(artifactsDir(ledgerFile)), finalized, finalizeError, porcelainChanged,
   });
-  const markdown = markdownPath(ledgerFile);
   const result = {
-    ledger: ledgerRef, markdown: relPosix(target.root, markdown) || toPosix(markdown),
+    ledger: ledgerRef, markdown: displayPath(target.root, markdownPath(ledgerFile)),
     verdict: derived.verdict, finalized, needs_human_triage: derived.needs_human_triage,
     tree_digest: target.snapshot.tree, base: target.base, tool, session_id: session.id, session_source: session.source,
-    checks: rows, claims: derived.claims.map(({ seq, ...c }) => c), reasons: derived.reasons, next_steps: next,
+    checks: rows, claims: claimsView(derived), reasons: derived.reasons, next_steps: next,
     trace_matrix: s.traceMatrix, steps: ledger.steps, worktree_unchanged: !porcelainChanged, duration_ms: durationMs,
     ...(finalizeError ? { finalize_error: finalizeError } : {}),
     summary_markdown: renderMarkdown(ledger, { short: true }),

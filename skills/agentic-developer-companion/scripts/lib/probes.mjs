@@ -6,8 +6,9 @@ import { randomInt } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  defineCommand, usageError, readJson, readText, writeFileAtomic, ensureDir, nonce, toPosix, relPosix, quoteArg,
-  tmpRoot, which, IS_WINDOWS, truncate, log, numberOption, listFiles, toArray, uniq, isAbsolutePath,
+  defineCommand, usageError, readJson, readText, writeFileAtomic, ensureDir, toPosix, relPosix, displayPath, quoteArg,
+  tmpPath, which, IS_WINDOWS, truncate, log, numberOption, listFiles, toArray, uniq, isAbsolutePath, subPath, joinRel,
+  listDir,
 } from './core.mjs';
 import { diffLines, emptyTree, diffNameStatus, git } from './git.mjs';
 import { parseCoverage, detectCoverageFormat, isTestPath, rootVariants, normalizeReportPath } from './reports.mjs';
@@ -15,7 +16,7 @@ import { detect } from './detect.mjs';
 import * as M from './markers.mjs';
 import {
   resolveRunner, acquireWorktree, releaseWorktrees, runProject, storeArtifacts, makeCheck, projectSlug, exitFor,
-  testMatchesFile, runStep, runEnv, installProject, artifactPath, repoRelativeEntries, parseRedGreenSpec, redact,
+  testMatchesFile, runStep, runEnv, installProject, repoRelativeEntries, parseRedGreenSpec, redact,
   redactAll, commandSetup, COMMON_OPTIONS, DEFAULT_TIMEOUT_S, fileEcosystem, goModuleOf, projectDir,
 } from './clean-run.mjs';
 
@@ -27,17 +28,17 @@ const ROOT_PROJECT = Object.freeze({ root: '.', managers: [], runners: [] });
 // Shared
 
 const isTest = (f, det) => M.isTestFile(f, det) || isTestPath(f);
-const subPath = (prel, f) => (prel === '.' ? f : f.slice(prel.length + 1));
-const repoPath = (prel, f) => (f && prel !== '.' ? `${prel}/${f}` : f);
 const score = (detected, valid) => (valid ? Math.round((detected / valid) * 1000) / 10 : null);
-const diffOf = (target, ...paths) => git(target.root, ['diff', '--no-color', '--no-ext-diff',
-  target.base.sha || emptyTree(target.root), target.snapshot.commit, ...(paths.length ? ['--', ...paths] : [])]) + '\n';
+// The diff origin: the merge base, or the empty tree in a repository without a base commit.
+const fromOf = (target) => target.base.sha || emptyTree(target.root);
+const diffOf = (target, ...paths) => git(target.root, ['diff', '--no-color', '--no-ext-diff', fromOf(target),
+  target.snapshot.commit, ...(paths.length ? ['--', ...paths] : [])]) + '\n';
 
 /** Added lines per changed source file (not tests, not generated): `[{ file, lines: [n...] }]`. */
 function changedSourceLines(target, det) {
   const source = (f) => f.status !== 'D' && !f.binary && f.path && M.isCodeFile(f.path) && !isTest(f.path, det)
     && !M.classifyPath(f.path).generated;
-  return diffLines(target.root, target.base.sha || emptyTree(target.root), target.snapshot.commit).filter(source)
+  return diffLines(target.root, fromOf(target), target.snapshot.commit).filter(source)
     .map((f) => ({ file: toPosix(f.path), lines: f.added.filter((a) => a.text.trim() !== '').map((a) => a.line) }))
     .filter((f) => f.lines.length);
 }
@@ -97,9 +98,9 @@ function tally() {
 }
 
 /** Append the probe's single check to `out` (findings and data computed now) and release worktrees. */
-function finishProbe(out, { id, fm, root, keep, findings, data }, status, reason, summary, acc = tally()) {
+function finishProbe(out, { id, root, keep, findings, data }, status, reason, summary, acc = tally()) {
   out.status = status;
-  out.checks.push(makeCheck({ id, fm, status, reason, summary, command: acc.command, exit_code: acc.exit_code,
+  out.checks.push(makeCheck({ id, status, reason, summary, command: acc.command, exit_code: acc.exit_code,
     duration_ms: acc.duration_ms, output_sha256: acc.output_sha256, artifacts: acc.artifacts,
     findings: findings(status), data: data() }));
   if (!keep) releaseWorktrees({ root });
@@ -154,7 +155,7 @@ export function computeChangedCoverage(changed, coverageFiles) {
  */
 function runCoveragePath(p, prel, wtRoots) {
   const s = toPosix(p);
-  return isAbsolutePath(s) ? normalizeReportPath(s, { roots: wtRoots }) : repoPath(prel, s);
+  return isAbsolutePath(s) ? normalizeReportPath(s, { roots: wtRoots }) : joinRel(prel, s);
 }
 
 /**
@@ -247,7 +248,7 @@ export async function coverageDelta({
     checks: [] };
   const extraData = {};
   const finish = (...a) => finishProbe(out, {
-    id: 'CK-COVERAGE', fm: ['FM-03'], root, keep,
+    id: 'CK-COVERAGE', root, keep,
     findings: (status) => out.uncovered.slice(0, 100).map((u) => ({ id: 'CK-COVERAGE',
       severity: threshold != null && status === 'fail' ? 'finding' : 'info', file: u.file, line: u.lines[0],
       message: `changed lines not covered: ${u.ranges.join(', ')}`, evidence: '' })),
@@ -273,7 +274,7 @@ export async function coverageDelta({
       return finish('skipped', 'NO_RUNNER',
         'no detected project owns the changed source files; pass --report <coverage file>');
     }
-    const outRoot = path.join(tmpRoot(root), `cov-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+    const outRoot = tmpPath(root, 'cov', tree);
     const tools = [];
     const reasons = [];
     for (const g of groups) {
@@ -313,7 +314,7 @@ export async function coverageDelta({
       let files = cached && cached.schema === 'adc-coverage-map/1' && cached.runner === r.name
         && cached.runner_cmd === runnerCmd ? cached.files : null;
       let rec = null;
-      if (files) acc.artifacts.push(artifactPath(root, cacheFile));
+      if (files) acc.artifacts.push(displayPath(root, cacheFile));
       else {
         const wt = acquireWorktree(root, target.snapshot.commit, 'head', { keep });
         const pdir = projectDir(wt, project);
@@ -476,7 +477,7 @@ function mutationToolFor(project, dir) {
   if (langs.includes('rust') || fs.existsSync(path.join(dir, 'Cargo.toml'))) {
     return which('cargo-mutants') ? 'cargo-mutants' : null;
   }
-  if (langs.includes('csharp') || fs.readdirSync(dir).some((f) => /\.(?:sln|slnx|csproj)$/.test(f))) {
+  if (langs.includes('csharp') || listDir(dir).some((f) => /\.(?:sln|slnx|csproj)$/.test(f))) {
     return which('dotnet-stryker') ? 'stryker-net' : null;
   }
   if (langs.includes('python') || ['pyproject.toml', 'setup.cfg'].some((f) => fs.existsSync(path.join(dir, f)))) {
@@ -546,7 +547,7 @@ export async function mutationScope({
   const out = { tool: null, mutants: 0, killed: 0, survived: 0, score: null, survivors: [], budget_min: budget,
     projects: [], checks: [] };
   const finish = (...a) => finishProbe(out, {
-    id: 'CK-MUTATION', fm: ['FM-03', 'FM-16'], root, keep,
+    id: 'CK-MUTATION', root, keep,
     findings: () => out.survivors.slice(0, 100).map((s) => ({ id: 'CK-MUTATION', severity: 'info', file: s.file,
       line: s.line, evidence: s.status, message: `surviving mutant${s.mutator ? ` (${s.mutator})` : ''}`
         + `${s.replacement != null ? `: ${truncate(String(s.replacement), 120)}` : ''}` })),
@@ -561,11 +562,11 @@ export async function mutationScope({
   const tools = [];
   const acc = tally();
   const deadline = Date.now() + budget * 60_000;
-  const outRoot = path.join(tmpRoot(root), `mut-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+  const outRoot = tmpPath(root, 'mut', tree);
   let partial = false;
   for (const project of owners) {
     const prel = toPosix(project.root || '.');
-    const files = changed.filter((c) => ownerOf.get(c.file) === project).map((c) => subPath(prel, c.file));
+    const files = changed.filter((c) => ownerOf.get(c.file) === project).map((c) => subPath(c.file, prel));
     const tool = mutationToolFor(project, path.join(root, project.root || '.'));
     const row = { root: prel, tool: tool === 'mutmut-windows' ? 'mutmut' : tool };
     const remaining = deadline - Date.now();
@@ -608,7 +609,7 @@ export async function mutationScope({
       continue;
     }
     for (const k of ['mutants', 'killed', 'survived', 'timeout', 'no_coverage']) totals[k] += parsed[k] || 0;
-    out.survivors.push(...parsed.survivors.map((s) => ({ ...s, file: repoPath(prel, s.file) })));
+    out.survivors.push(...parsed.survivors.map((s) => ({ ...s, file: joinRel(prel, s.file) })));
     tools.push(tool);
     out.projects.push({ ...row, status: 'measured', mutants: parsed.mutants, killed: parsed.killed,
       survived: parsed.survived, score: parsed.score, ...(res.timedOut ? { partial: true } : {}) });
@@ -681,12 +682,12 @@ export async function flakeProbe({
   const det = detectResult || await detect({ root, stateInfo: dryRun ? null : target.state });
   const n = Math.max(1, Math.min(1000, Number.parseInt(times, 10) || DEFAULT_TIMES));
   const specs = tests && toArray(tests).length ? parseRedGreenSpec(tests)
-    : diffNameStatus(root, target.base.sha || emptyTree(root), target.snapshot.commit)
+    : diffNameStatus(root, fromOf(target), target.snapshot.commit)
       .filter((f) => f.status !== 'D' && isTest(f.path, det)).map((f) => ({ file: toPosix(f.path), name: null }));
   const out = { runs: 0, shuffle: false, seeds: [], failures: [], suspect_tests: [], consistent_failures: [],
     tests_probed: specs.map((s) => s.file + (s.name ? `::${s.name}` : '')), projects: [], checks: [] };
   const finish = (...a) => finishProbe(out, {
-    id: 'CK-FLAKE', fm: ['FM-13'], root, keep,
+    id: 'CK-FLAKE', root, keep,
     findings: () => out.suspect_tests.slice(0, 100).map((s) => ({ id: 'CK-FLAKE', severity: 'finding',
       file: s.file || null, line: null, evidence: '',
       message: `flaky: ${s.id} (${s.passed} passed, ${s.failed} failed, ${s.flaky} flaky of ${s.runs} runs)` })),
@@ -701,7 +702,7 @@ export async function flakeProbe({
     return finish('unverified', 'NO_RUNNER', 'no detected project owns the test files; pass --runner');
   }
   const acc = tally();
-  const outRoot = path.join(tmpRoot(root), `flake-${tree.slice(0, 12)}-${nonce().slice(0, 6)}`);
+  const outRoot = tmpPath(root, 'flake', tree);
   const allRuns = [];
   let unverified = null;
   for (const g of groups) {
@@ -712,7 +713,7 @@ export async function flakeProbe({
       continue;
     }
     const slug = groupSlug(groups, g);
-    const select = { files: items.map((s) => subPath(prel, s.file)), names: uniq(items.map((s) => s.name)) };
+    const select = { files: items.map((s) => subPath(s.file, prel)), names: uniq(items.map((s) => s.name)) };
     let shuffle = Boolean(r.shuffle) && dependsOn(path.join(root, project.root || '.'), r.shuffleRequires);
     const prow = { root: prel, runner: r.name, runs: 0, shuffle,
       retries_disabled: (r.retries_off || {}).coverage || 'unknown', status: 'pending' };
@@ -752,7 +753,7 @@ export async function flakeProbe({
       const run = allRuns.length + 1;
       const runSeed = seeds[0] || null;
       allRuns.push({ run, project: prel, seed: runSeed,
-        tests: picked.map((t) => ({ ...t, file: t.file ? repoPath(prel, t.file) : null })) });
+        tests: picked.map((t) => ({ ...t, file: t.file ? joinRel(prel, t.file) : null })) });
       for (const t of picked.filter((x) => ['failed', 'error', 'flaky'].includes(x.status))) {
         if (out.failures.length >= 200) break;
         out.failures.push({ run, project: prel, seed: runSeed, id: t.id, status: t.status,

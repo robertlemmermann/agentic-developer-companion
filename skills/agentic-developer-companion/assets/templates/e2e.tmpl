@@ -1,9 +1,5 @@
-# e2e scaffolds (plan §10.2): Playwright web projects, HTTP API tests and spawn-based CLI harnesses.
-# Rendered by scripts/lib/scaffold.mjs. Section attributes: kind=web|api|cli, lang, when=<feature>,
-# scope=repo (path relative to the repository root, else to --out), mode=lines (additive merge),
-# part=fragment name=<id> (inserted into other sections, never written on its own).
-# GitHub expressions pass through untouched; {{var}} placeholders must all be provided.
-# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
+# e2e (plan §10.2): Playwright web projects, HTTP API tests and spawn-based CLI harnesses
+# (kind=web|api|cli). Attributes: see scripts/lib/scaffold.mjs (renderFiles).
 
 @@@ file: package.json kind=web lang=ts @@@
 {
@@ -585,7 +581,7 @@ export function expectContract(name: string, value: unknown): void {
   assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the response shape changed (${name}.json); review it, then UPDATE_CONTRACTS=1 accepts it`);
 }
 
-@@@ file: api.e2e.test.ts kind=api lang=ts @@@
+@@@ file: api.e2e.test.{{ext}} kind=api lang=ts|js @@@
 {{test_header}}
 import assert from 'node:assert/strict';
 import { api, API_BASE_URL } from '{{client_import}}';
@@ -595,7 +591,7 @@ import { expectContract } from '{{contract_import}}';
 const HEALTH = process.env.E2E_API_HEALTH_PATH || '{{health_path}}';
 // ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b); one negative
 // auth test is generated per path.
-const PROTECTED_PATHS: string[] = (process.env.E2E_API_PROTECTED_PATHS || '').split(',').map((p) => p.trim()).filter(Boolean);
+const PROTECTED_PATHS = (process.env.E2E_API_PROTECTED_PATHS || '').split(',').map((p) => p.trim()).filter(Boolean);
 
 describe(`API ${API_BASE_URL}`, () => {
   it('the health endpoint answers 2xx/3xx', async () => {
@@ -684,42 +680,6 @@ export function expectContract(name, value) {
   assert.ok(fs.existsSync(file), `contract ${name}.json is missing: run the tests locally (or with UPDATE_CONTRACTS=1) and commit it`);
   assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the response shape changed (${name}.json); review it, then UPDATE_CONTRACTS=1 accepts it`);
 }
-
-@@@ file: api.e2e.test.mjs kind=api lang=js @@@
-{{test_header}}
-import assert from 'node:assert/strict';
-import { api, API_BASE_URL } from '{{client_import}}';
-import { expectContract } from '{{contract_import}}';
-
-// Black-box API tests against E2E_API_BASE_URL (default {{base_url}}).
-const HEALTH = process.env.E2E_API_HEALTH_PATH || '{{health_path}}';
-// ADAPT: endpoints that require credentials (or E2E_API_PROTECTED_PATHS=/a,/b); one negative
-// auth test is generated per path.
-const PROTECTED_PATHS = (process.env.E2E_API_PROTECTED_PATHS || '').split(',').map((p) => p.trim()).filter(Boolean);
-
-describe(`API ${API_BASE_URL}`, () => {
-  it('the health endpoint answers 2xx/3xx', async () => {
-    const res = await api('GET', HEALTH);
-    assert.ok(res.status >= 200 && res.status < 400, `GET ${HEALTH} -> ${res.status}: ${res.text.slice(0, 200)}`);
-  });
-
-  it('the health response keeps its contract', async () => {
-    const res = await api('GET', HEALTH);
-    expectContract('get-health', res.body);
-  });
-
-  it('an unknown route is a client error, not a server error', async () => {
-    const res = await api('GET', '/__e2e_unknown_route__');
-    assert.ok(res.status >= 400 && res.status < 500, `expected 4xx, got ${res.status}`);
-  });
-
-  for (const protectedPath of PROTECTED_PATHS) {
-    it(`${protectedPath} rejects requests without credentials`, async () => {
-      const res = await api('GET', protectedPath, { token: null });
-      assert.ok([401, 403].includes(res.status), `expected 401/403 without credentials, got ${res.status}`);
-    });
-  }
-});
 
 @@@ file: pact/{{consumer}}-{{provider}}.pact.test.{{ext}} kind=api lang=ts|js when=pact @@@
 {{test_header}}
@@ -1111,7 +1071,7 @@ export function expectGolden(name: string, actual: string): void {
   assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the output differs from ${name}.golden; review it, then UPDATE_GOLDEN=1 accepts it`);
 }
 
-@@@ file: cli.e2e.test.ts kind=cli lang=ts @@@
+@@@ file: cli.e2e.test.{{ext}} kind=cli lang=ts|js @@@
 {{test_header}}
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -1232,51 +1192,6 @@ export function expectGolden(name, actual) {
   assert.ok(fs.existsSync(file), `golden file ${name}.golden is missing: run the tests locally (or with UPDATE_GOLDEN=1) and commit it`);
   assert.equal(actual, fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'), `the output differs from ${name}.golden; review it, then UPDATE_GOLDEN=1 accepts it`);
 }
-
-@@@ file: cli.e2e.test.mjs kind=cli lang=js @@@
-{{test_header}}
-import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { PROJECT_ROOT, runCli, normalize, expectGolden } from '{{harness_import}}';
-
-// End-to-end tests for the {{cli_name}} CLI: a real process, real exit codes, golden output.
-// ADAPT: an invocation the CLI must reject.
-const INVALID_ARGS = ['--definitely-not-an-option'];
-
-describe('{{cli_name}} CLI (end-to-end)', () => {
-  it('--help exits 0 and prints usage on stdout', () => {
-    const r = runCli(['--help']);
-    assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
-    assert.match(r.stdout, /\S/, 'usage text expected on stdout');
-  });
-
-  it('--help output matches golden/help.golden', () => {
-    expectGolden('help', normalize(runCli(['--help']).stdout));
-  });
-
-  it('rejects an invalid invocation with a non-zero exit and a message on stderr', () => {
-    const r = runCli(INVALID_ARGS);
-    assert.notEqual(r.code, 0, 'an invalid invocation must fail');
-    assert.match(r.stderr, /\S/, 'the error message belongs on stderr');
-  });
-
-  it('runs from any working directory', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-e2e-'));
-    try {
-      const r = runCli(['--help'], { cwd: dir });
-      assert.equal(r.code, 0, `exit ${r.code}: ${r.stderr}`);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('normalize() masks roots, line endings, timestamps and durations', () => {
-    const sample = `wrote ${path.join(PROJECT_ROOT, 'out', 'a.txt')}\r\nat 2026-01-02T03:04:05.678Z in 12ms\r\n`;
-    assert.equal(normalize(sample), 'wrote <ROOT>/out/a.txt\nat <TIMESTAMP> in <DURATION>\n');
-  });
-});
 
 @@@ file: harness.py kind=cli lang=python @@@
 """Harness for end-to-end CLI tests: runs the CLI as a real child process and normalizes its output

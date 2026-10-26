@@ -2,74 +2,33 @@
 // documented loss list, scaffolds per kind and host, trigger sets (fake host CLIs; nothing is
 // spent), the modify baseline/compare loop and the migrations, and plugin init/check/test/release.
 
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import * as P from '../../skills/agentic-developer-companion/scripts/lib/tooling-port.mjs';
+import * as T from '../../skills/agentic-developer-companion/scripts/lib/tooling.mjs';
+import * as TL from '../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs';
+import * as FM from '../../skills/agentic-developer-companion/scripts/lib/frontmatter.mjs';
+import { SKILL_DIR as SKILL, which } from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/formats.mjs';
+import { git, has, makeRepo, read, runAdc, tmpDir, writeFile } from './helpers.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SKILL = path.resolve(HERE, '..', '..', 'skills', 'agentic-developer-companion');
-const ADC = path.join(SKILL, 'scripts', 'adc.mjs');
-const P = await import('../../skills/agentic-developer-companion/scripts/lib/tooling-port.mjs');
-const T = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs');
-const { which } = await import('../../skills/agentic-developer-companion/scripts/lib/core.mjs');
-const FM = await import('../../skills/agentic-developer-companion/scripts/lib/frontmatter.mjs');
-const { parseToml } = await import('../../skills/agentic-developer-companion/scripts/lib/formats.mjs');
 const fmOf = (text) => FM.parseFrontmatter(text);
 const tomlOf = (text) => parseToml(text, { lenient: true });
 const CLAUDE = which('claude');
 // Real host CLIs run their free load checks when they are on PATH (nothing is installed or spent).
 const COPILOT = which('copilot');
 const CODEX = which('codex');
-const TL = await import('../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs');
 
-const dirs = [];
-after(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); });
-
-function write(dir, rel, content) {
-  const f = path.join(dir, ...rel.split('/'));
-  fs.mkdirSync(path.dirname(f), { recursive: true });
-  fs.writeFileSync(f, typeof content === 'string' ? content : JSON.stringify(content, null, 2) + '\n');
-  return f;
-}
-const read = (dir, rel) => fs.readFileSync(path.join(dir, ...rel.split('/')), 'utf8');
-const has = (dir, rel) => fs.existsSync(path.join(dir, ...rel.split('/')));
-const git = (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
-
-function tmpRepo(files = {}) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-tooling-')));
-  dirs.push(dir);
-  git(dir, ['init', '-q']);
-  git(dir, ['config', 'user.email', 'test@example.invalid']);
-  git(dir, ['config', 'user.name', 'Test']);
-  for (const [rel, content] of Object.entries(files)) write(dir, rel, content);
-  return dir;
-}
-
-function commitAll(dir) {
-  git(dir, ['add', '-A']);
-  git(dir, ['commit', '-qm', 'fixture', '--no-gpg-sign']);
-}
-
-function adc(cwd, ...args) {
-  return adcEnv(null, cwd, ...args);
-}
+const tmpRepo = (files = {}) => makeRepo(files, { prefix: 'adc-tooling-', real: true, commit: false }).dir;
+const commitAll = (dir) => { git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'fixture'); };
 
 /** adc.mjs with extra environment variables (e.g. ADC_COPILOT_CLI pointing at a fake host CLI). */
-function adcEnv(env, cwd, ...args) {
-  const res = spawnSync(process.execPath, [ADC, ...args, '--json', '--cwd', cwd], { encoding: 'utf8', timeout: 120_000, env: env ? { ...process.env, ...env } : process.env });
-  let json = null;
-  try { json = JSON.parse(res.stdout); } catch {}
-  return { exit: res.status, json, stdout: res.stdout, stderr: res.stderr };
-}
-
-/** In-process call of the tooling group (faster than a subprocess). */
-async function tool(cwd, ...args) {
-  return T.toolingCommand([...args, '--cwd', cwd]);
-}
+const adcEnv = (env, cwd, ...args) => runAdc(args, { cwd, env: env ? { ...process.env, ...env } : process.env });
+const adc = (cwd, ...args) => adcEnv(null, cwd, ...args);
 
 const SKILL_MD = (name, description, extra = '') => `---\nname: ${name}\ndescription: ${description}\n${extra}metadata:\n  version: "0.1.0"\n---\n\n# ${name}\n\nSteps for ${name}.\n`;
 
@@ -166,7 +125,7 @@ process.stderr.write('unsupported\\n'); process.exit(2);
 `;
 
 function fakeCli(dir, name, src) {
-  return write(dir, `.fake/${name}.mjs`, src);
+  return writeFile(dir, `.fake/${name}.mjs`, src);
 }
 
 const POSITIVE = ['write release notes for version two', 'summarize merged pull requests for the release', 'prepare release notes for customers',
@@ -448,10 +407,10 @@ describe('tooling port', () => {
     assert.equal(r.written[0].action, 'would-create');
     assert.equal(has(dir, '.claude/agents/a.md'), false);
     const e2e = adc(dir, 'tooling', 'port', '.github/agents/a.agent.md', '--to', 'claude');
-    assert.equal(e2e.exit, 0, e2e.stderr);
+    assert.equal(e2e.status, 0, e2e.stderr);
     assert.equal(e2e.json.written[0].path, '.claude/agents/a.md');
-    assert.equal(adc(dir, 'tooling', 'port', 'README.md').exit, 2);
-    assert.equal(adc(dir, 'tooling', 'port', '.github/agents/a.agent.md', '--to', 'cursor').exit, 2);
+    assert.equal(adc(dir, 'tooling', 'port', 'README.md').status, 2);
+    assert.equal(adc(dir, 'tooling', 'port', '.github/agents/a.agent.md', '--to', 'cursor').status, 2);
   });
 });
 
@@ -484,11 +443,11 @@ describe('tooling cost', () => {
     assert.ok(r.totals.claude.budgets.some((b) => b.id === 'claude-skill-listing' && b.ok));
     assert.equal(r.findings.length, 0, JSON.stringify(r.findings));
     // Without the import, Claude Code skips AGENTS.md when CLAUDE.md exists.
-    write(dir, 'CLAUDE.md', '# Claude only\n');
+    writeFile(dir, 'CLAUDE.md', '# Claude only\n');
     const r2 = T.toolingCost({ root: dir });
     assert.ok(!r2.files.find((x) => x.path === 'AGENTS.md').hosts.includes('claude'));
     // AGENTS.override.md shadows AGENTS.md for Codex.
-    write(dir, 'AGENTS.override.md', '- local override\n');
+    writeFile(dir, 'AGENTS.override.md', '- local override\n');
     const r3 = T.toolingCost({ root: dir });
     assert.ok(!r3.files.find((x) => x.path === 'AGENTS.md').hosts.includes('codex'));
   });
@@ -510,23 +469,23 @@ describe('tooling cost', () => {
     assert.ok(r.findings.some((x) => x.id === 'STALE_COMMAND' && /does not define/.test(x.message)));
     assert.ok(r.findings.some((x) => x.id === 'STALE_PATH' && x.evidence === 'docs/missing.md'));
     // No STALE_PATH for state files, ignored build output, directories or reference documentation.
-    write(dir, '.gitignore', 'dist/\n');
-    write(dir, 'AGENTS.md', '- Read `.adc/detect.json`, `dist/bundle.js` and `docs/`.\n');
-    write(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Formats release notes. Use for release notes.'));
-    write(dir, '.claude/skills/notes/references/more.md', '- Example: `src/example/file.ts`\n');
+    writeFile(dir, '.gitignore', 'dist/\n');
+    writeFile(dir, 'AGENTS.md', '- Read `.adc/detect.json`, `dist/bundle.js` and `docs/`.\n');
+    writeFile(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Formats release notes. Use for release notes.'));
+    writeFile(dir, '.claude/skills/notes/references/more.md', '- Example: `src/example/file.ts`\n');
     assert.deepEqual(T.toolingCost({ root: dir }).findings.filter((x) => x.id === 'STALE_PATH'), []);
   });
 
   test('CLI: --max-tokens turns an over-budget host into exit 1', () => {
     const dir = tmpRepo({ 'AGENTS.md': '- rule\n'.repeat(200) });
     const ok = adc(dir, 'tooling', 'cost');
-    assert.equal(ok.exit, 0, ok.stderr);
+    assert.equal(ok.status, 0, ok.stderr);
     assert.ok(ok.json.totals.codex.always_on_tokens > 100);
     const over = adc(dir, 'tooling', 'cost', '--max-tokens', '50');
-    assert.equal(over.exit, 1);
+    assert.equal(over.status, 1);
     // No CLAUDE.md, so Claude Code reads AGENTS.md as well (v2.1.277+).
     assert.deepEqual(over.json.over_max.sort(), ['claude', 'codex', 'copilot']);
-    assert.equal(adc(dir, 'tooling', 'cost', '--host', 'cursor').exit, 2);
+    assert.equal(adc(dir, 'tooling', 'cost', '--host', 'cursor').status, 2);
   });
 });
 
@@ -644,12 +603,12 @@ describe('tooling scaffold', () => {
   test('CLI: scaffold kinds, name validation and plugin delegation', () => {
     const dir = tmpRepo({});
     const r = adc(dir, 'tooling', 'scaffold', 'agent', '--for', 'copilot', '--name', 'triage', '--write');
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.ok(has(dir, '.github/agents/triage.agent.md'));
-    assert.equal(adc(dir, 'tooling', 'scaffold', 'skill', '--name', 'Bad_Name').exit, 2);
-    assert.equal(adc(dir, 'tooling', 'scaffold', 'widget').exit, 2);
+    assert.equal(adc(dir, 'tooling', 'scaffold', 'skill', '--name', 'Bad_Name').status, 2);
+    assert.equal(adc(dir, 'tooling', 'scaffold', 'widget').status, 2);
     const p = adc(dir, 'tooling', 'scaffold', 'plugin', '--for', 'claude', '--name', 'demo-kit');
-    assert.equal(p.exit, 0, p.stderr);
+    assert.equal(p.status, 0, p.stderr);
     assert.equal(p.json.dry_run, true);
     assert.ok(p.json.files.includes('plugins/demo-kit/.claude-plugin/plugin.json'));
   });
@@ -693,17 +652,17 @@ describe('tooling trigger-set', () => {
     const dir = tmpRepo({ '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes and changelog summaries from merged pull requests.') });
     const fake = fakeCli(dir, 'claude', FAKE_CLAUDE);
     const init = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--init');
-    assert.equal(init.exit, 0, init.stderr);
+    assert.equal(init.status, 0, init.stderr);
     assert.equal(init.json.ready, false);
     assert.equal(init.json.queries.length, 20);
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake).exit, 2, 'TODO queries are refused');
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', 'no-such-cli-xyz').exit, 2);
-    write(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake).status, 2, 'TODO queries are refused');
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', 'no-such-cli-xyz').status, 2);
+    writeFile(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
     const dry = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--dry-run');
-    assert.deepEqual([dry.exit, dry.json.suite_score, has(dir, '.adc')], [0, null, false], '--dry-run never runs (paid) nor writes');
+    assert.deepEqual([dry.status, dry.json.suite_score, has(dir, '.adc')], [0, null, false], '--dry-run never runs (paid) nor writes');
     assert.ok(dry.json.warnings.some((w) => /dry run/.test(w)));
     const run = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4');
-    assert.equal(run.exit, 0, run.stderr);
+    assert.equal(run.status, 0, run.stderr);
     assert.equal(run.json.suite_score, 1);
     assert.equal(run.json.results.length, 20);
     assert.ok(run.json.results.every((r) => r.runs.length === 3));
@@ -712,11 +671,11 @@ describe('tooling trigger-set', () => {
     assert.deepEqual([run.json.cost.measured_runs, run.json.cost.estimated_runs, run.json.cost.measured_usd], [30, 30, 0.03]);
     assert.ok(has(dir, run.json.results_path));
     assert.match(read(dir, '.adc/metrics.jsonl'), /tooling-trigger-set/);
-    assert.equal(git(dir, ['status', '--porcelain', '--', '.adc']).stdout, '', '.adc stays excluded');
+    assert.equal(git(dir, 'status', '--porcelain', '--', '.adc'), '', '.adc stays excluded');
     // A description that loses its keywords drops below the threshold: exit 1.
-    write(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Helps with documents.'));
+    writeFile(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Helps with documents.'));
     const bad = adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4');
-    assert.equal(bad.exit, 1);
+    assert.equal(bad.status, 1);
     assert.equal(bad.json.suite_score, 0.5);
     assert.equal(bad.json.iteration, 2);
     // Re-score saved results without spending anything.
@@ -727,7 +686,7 @@ describe('tooling trigger-set', () => {
 
   test('runs that fail count as errors (exit 4); Codex and Copilot fakes are scored', async () => {
     const dir = tmpRepo({ '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes and changelog summaries from merged pull requests.') });
-    write(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
+    writeFile(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
     const fake = fakeCli(dir, 'claude', FAKE_CLAUDE);
     process.env.FAKE_FAIL = '1';
     let res;
@@ -749,7 +708,7 @@ describe('tooling trigger-set', () => {
 describe('tooling modify', () => {
   async function measuredSkill() {
     const dir = tmpRepo({ '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes and changelog summaries from merged pull requests. Use when the user asks for release notes.') });
-    write(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
+    writeFile(dir, '.claude/skills/notes/evals/trigger-set.json', triggerSetFile('notes'));
     commitAll(dir);
     const fake = fakeCli(dir, 'claude', FAKE_CLAUDE);
     return { dir, fake };
@@ -757,19 +716,19 @@ describe('tooling modify', () => {
 
   test('rejects a change that lowers the trigger score; --restore brings the baseline back', async () => {
     const { dir, fake } = await measuredSkill();
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').exit, 0);
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').status, 0);
     const base = adc(dir, 'tooling', 'modify', 'baseline', '.claude/skills/notes');
-    assert.equal(base.exit, 0, base.stderr);
+    assert.equal(base.status, 0, base.stderr);
     assert.equal(base.json.trigger.status, 'measured');
     assert.equal(base.json.trigger.suite_score, 1);
     const original = read(dir, '.claude/skills/notes/SKILL.md');
-    write(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Helps with documents.'));
+    writeFile(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Helps with documents.'));
     const unverified = adc(dir, 'tooling', 'modify', 'compare', '.claude/skills/notes');
-    assert.equal(unverified.exit, 4, 'description changed but triggering was not re-measured');
+    assert.equal(unverified.status, 4, 'description changed but triggering was not re-measured');
     assert.equal(unverified.json.verdict, 'unverified');
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').exit, 1);
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').status, 1);
     const cmp = adc(dir, 'tooling', 'modify', 'compare', '.claude/skills/notes', '--accept', '--restore');
-    assert.equal(cmp.exit, 1);
+    assert.equal(cmp.status, 1);
     assert.equal(cmp.json.verdict, 'reject');
     assert.ok(cmp.json.failing.some((f) => /^trigger: score fell from 1 to 0\.5/.test(f)));
     assert.ok(cmp.json.recorded.refused);
@@ -779,12 +738,12 @@ describe('tooling modify', () => {
 
   test('accepts a change that only cuts tokens; --accept writes the changelog, bumps the version, re-baselines', async () => {
     const { dir, fake } = await measuredSkill();
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').exit, 0);
-    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', '.claude/skills/notes').exit, 0);
-    write(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Formats release notes and changelog summaries from merged pull requests.'));
-    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').exit, 0);
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').status, 0);
+    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', '.claude/skills/notes').status, 0);
+    writeFile(dir, '.claude/skills/notes/SKILL.md', SKILL_MD('notes', 'Formats release notes and changelog summaries from merged pull requests.'));
+    assert.equal(adc(dir, 'tooling', 'trigger-set', '.claude/skills/notes', '--host', 'claude', '--run', '--cli', fake, '--concurrency', '4').status, 0);
     const cmp = adc(dir, 'tooling', 'modify', 'compare', '.claude/skills/notes', '--accept', '--note', 'shorter description');
-    assert.equal(cmp.exit, 0, JSON.stringify(cmp.json?.failing));
+    assert.equal(cmp.status, 0, JSON.stringify(cmp.json?.failing));
     assert.equal(cmp.json.verdict, 'accept');
     assert.ok(cmp.json.deltas.tokens.per_host.claude.delta < 0);
     assert.equal(cmp.json.deltas.trigger.status, 'measured');
@@ -799,23 +758,23 @@ describe('tooling modify', () => {
   test('token increases need a change note; instructions use the same loop', async () => {
     const dir = tmpRepo({ 'AGENTS.md': '# Rules\n\n- Run the whole suite.\n' });
     const dryBase = adc(dir, 'tooling', 'modify', 'baseline', 'AGENTS.md', '--dry-run');
-    assert.deepEqual([dryBase.exit, dryBase.json.baseline_dir, has(dir, '.adc')], [0, null, false], 'a dry-run baseline stores nothing');
-    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', 'AGENTS.md').exit, 0);
-    write(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Also run the linter before every commit, and the type checker.\n');
+    assert.deepEqual([dryBase.status, dryBase.json.baseline_dir, has(dir, '.adc')], [0, null, false], 'a dry-run baseline stores nothing');
+    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', 'AGENTS.md').status, 0);
+    writeFile(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Also run the linter before every commit, and the type checker.\n');
     const noNote = adc(dir, 'tooling', 'modify', 'compare', 'AGENTS.md');
     assert.equal(noNote.json.verdict, 'reject');
     assert.ok(noNote.json.failing.some((f) => /tokens/.test(f)));
     const withNote = adc(dir, 'tooling', 'modify', 'compare', 'AGENTS.md', '--note', 'adds the lint rule');
     assert.equal(withNote.json.verdict, 'accept');
     assert.equal(withNote.json.deltas.tokens.justified_by_note, true);
-    write(dir, 'AGENTS.md', '# Rules\n');
+    writeFile(dir, 'AGENTS.md', '# Rules\n');
     const cut = adc(dir, 'tooling', 'modify', 'compare', 'AGENTS.md');
     assert.equal(cut.json.verdict, 'accept');
     assert.equal(cut.json.deltas.tokens.decreased, true);
     const restored = adc(dir, 'tooling', 'modify', 'restore', 'AGENTS.md');
-    assert.equal(restored.exit, 0);
+    assert.equal(restored.status, 0);
     assert.equal(read(dir, 'AGENTS.md'), '# Rules\n\n- Run the whole suite.\n');
-    assert.equal(adc(dir, 'tooling', 'modify', 'compare', 'CLAUDE.md').exit, 2, 'missing artifact');
+    assert.equal(adc(dir, 'tooling', 'modify', 'compare', 'CLAUDE.md').status, 2, 'missing artifact');
   });
 
   test('--external snapshots the host-rendered context and diffs it (fake Copilot and Codex CLIs)', () => {
@@ -823,12 +782,12 @@ describe('tooling modify', () => {
     const env = { ADC_COPILOT_CLI: fakeCli(dir, 'copilot-list', FAKE_COPILOT_LIST), ADC_CODEX_CLI: fakeCli(dir, 'codex-host', FAKE_CODEX_HOST), CODEX_HOME: path.join(dir, '.fake', 'codex-home') };
     fs.mkdirSync(env.CODEX_HOME, { recursive: true });
     const b = adcEnv(env, dir, 'tooling', 'modify', 'baseline', 'AGENTS.md', '--external');
-    assert.equal(b.exit, 0, b.stderr);
+    assert.equal(b.status, 0, b.stderr);
     assert.deepEqual(b.json.external.map((e) => [e.name, e.exit]), [['copilot instruction list --json', 0], ['codex debug prompt-input (skills and AGENTS.md)', 0]]);
     const saved = fs.readFileSync(path.join(dir, b.json.baseline_dir, 'external-1.txt'), 'utf8');
     assert.match(saved, /# AGENTS\.md instructions for <repo>/, 'machine paths are scrubbed');
     assert.ok(!/current_date/.test(saved), 'only the skills and AGENTS.md parts are kept');
-    write(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Run the linter.\n');
+    writeFile(dir, 'AGENTS.md', '# Rules\n\n- Run the whole suite.\n- Run the linter.\n');
     const c = adcEnv(env, dir, 'tooling', 'modify', 'compare', 'AGENTS.md', '--external', '--note', 'adds the lint rule');
     assert.equal(c.json.verdict, 'accept');
     const d = c.json.deltas.external['codex debug prompt-input (skills and AGENTS.md)'];
@@ -856,6 +815,10 @@ describe('tooling modify', () => {
       '.vscode/mcp.json': { servers: { docs: { type: 'stdio', command: 'npx', args: ['-y', 'docs-mcp@1.2.3'] } } },
       '.github/hooks/legacy.json': { hooks: { PostToolUse: [{ matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'node scripts/check.mjs', timeout: 10 }] }] } },
     });
+    const dry = adc(dir, 'tooling', 'modify', '.github/prompts/release.prompt.md', '--migrate', 'prompt-to-skill',
+      '--dry-run');
+    assert.equal(dry.json?.verdict, 'unverified', dry.stderr);
+    assert.ok(!has(dir, '.adc') && !has(dir, '.github/skills/release'), 'a dry run writes nothing, not even .adc/');
     const expect = {
       'prompt-to-skill': ['.github/prompts/release.prompt.md', '.github/skills/release'],
       'chatmode-to-agent': ['.github/chatmodes/planner.chatmode.md', '.github/agents/planner.agent.md'],
@@ -865,7 +828,7 @@ describe('tooling modify', () => {
     };
     for (const [kind, [src, produced]] of Object.entries(expect)) {
       const r = adc(dir, 'tooling', 'modify', src, '--migrate', kind);
-      assert.ok([0, 4].includes(r.exit), `${kind}: exit ${r.exit} ${r.stderr}`);
+      assert.ok([0, 4].includes(r.status), `${kind}: exit ${r.status} ${r.stderr}`);
       const res = r.json.results.find((x) => x.artifact === produced);
       assert.ok(res, `${kind}: ${JSON.stringify(r.json.results.map((x) => x.artifact))}`);
       assert.equal(res.equivalence.equal, true, `${kind}: ${res.equivalence.reason}`);
@@ -878,7 +841,7 @@ describe('tooling modify', () => {
     assert.deepEqual(Object.keys(hooks.hooks), ['postToolUse']);
     assert.equal(hooks.hooks.postToolUse[0].matcher, 'edit|create');
     assert.ok(has(dir, '.claude/skills/frontend-component/SKILL.md'));
-    assert.equal(adc(dir, 'tooling', 'modify', '.mcp.json', '--migrate', 'prompt-to-skill').exit, 2, 'wrong source kind');
+    assert.equal(adc(dir, 'tooling', 'modify', '.mcp.json', '--migrate', 'prompt-to-skill').status, 2, 'wrong source kind');
   });
 });
 
@@ -892,11 +855,11 @@ describe('tooling plugin', () => {
       '.mcp.json': { mcpServers: { docs: { command: 'npx', args: ['-y', 'docs-mcp@1.2.3'], env: { DOCS_TOKEN: '${DOCS_TOKEN}' } } } },
     });
     const dry = adc(dir, 'tooling', 'plugin', 'init', '--for', 'all', '--name', 'demo-tools', '--include-hooks', '--include-mcp', '--owner', 'Example Team');
-    assert.equal(dry.exit, 0, dry.stderr);
+    assert.equal(dry.status, 0, dry.stderr);
     assert.equal(dry.json.dry_run, true);
     assert.equal(has(dir, 'plugins/demo-tools/plugin.json'), false);
     const init = adc(dir, 'tooling', 'plugin', 'init', '--for', 'all', '--name', 'demo-tools', '--include-hooks', '--include-mcp', '--owner', 'Example Team', '--write');
-    assert.equal(init.exit, 0, init.stderr);
+    assert.equal(init.status, 0, init.stderr);
     for (const f of ['plugin.json', '.claude-plugin/plugin.json', 'skills/notes/SKILL.md', 'agents/reviewer.md', 'com.github.copilot/agents/reviewer.agent.md',
       'hooks/hooks.json', 'com.github.copilot/hooks/hooks.json', 'hooks/codex.hooks.json', 'hooks/scripts/check.mjs', 'mcp.json', '.mcp.json',
       'evals/notes-basic/prompt.md', 'README.md', 'CHANGELOG.md']) assert.ok(has(dir, `plugins/demo-tools/${f}`), f);
@@ -916,7 +879,7 @@ describe('tooling plugin', () => {
     const mkt = JSON.parse(read(dir, '.claude-plugin/marketplace.json'));
     assert.deepEqual(mkt.plugins[0], { name: 'demo-tools', source: './plugins/demo-tools', description: ap.description, version: '0.1.0' });
     const check = adc(dir, 'tooling', 'plugin', 'check', 'plugins/demo-tools');
-    assert.equal(check.exit, 0, JSON.stringify(check.json.findings.filter((f) => f.severity === 'error')));
+    assert.equal(check.status, 0, JSON.stringify(check.json.findings.filter((f) => f.severity === 'error')));
     assert.equal(check.json.errors, 0);
     if (CLAUDE) {
       const v = check.json.validators.filter((x) => x.name.startsWith('claude plugin validate'));
@@ -932,14 +895,14 @@ describe('tooling plugin', () => {
       else assert.equal(v.status, 'skipped');
     }
     const t = adc(dir, 'tooling', 'plugin', 'test', 'plugins/demo-tools', '--run');
-    assert.equal(t.exit, 0, t.stderr);
+    assert.equal(t.status, 0, t.stderr);
     assert.ok(t.json.local_test_commands.some((c) => c.host === 'copilot' && c.cost === 'paid' && /COPILOT_PLUGIN_DIR_ONLY=true copilot --plugin-dir/.test(c.bash) && /\$env:COPILOT_PLUGIN_DIR_ONLY/.test(c.powershell)));
     assert.ok(t.json.local_test_commands.some((c) => c.host === 'codex' && /codex plugin marketplace add/.test(c.bash)));
     if (CLAUDE) assert.ok(t.json.ran.some((r) => /claude plugin validate/.test(r.cmd) && r.status === 'pass'));
     commitAll(dir);
-    git(dir, ['remote', 'add', 'origin', 'https://github.com/example-org/demo-repo.git']);
+    git(dir, 'remote', 'add', 'origin', 'https://github.com/example-org/demo-repo.git');
     const rel = adc(dir, 'tooling', 'plugin', 'release', 'plugins/demo-tools', '--version', '0.2.0', '--write');
-    assert.equal(rel.exit, 0, rel.stderr);
+    assert.equal(rel.status, 0, rel.stderr);
     assert.deepEqual(rel.json.updated.map((u) => [u.file, u.from, u.to]), [['plugins/demo-tools/plugin.json', '0.1.0', '0.2.0'],
       ['plugins/demo-tools/.claude-plugin/plugin.json', '0.1.0', '0.2.0'], ['.claude-plugin/marketplace.json', '0.1.0', '0.2.0']]);
     assert.match(rel.json.pin.sha, /^[0-9a-f]{40}$/);
@@ -953,16 +916,16 @@ describe('tooling plugin', () => {
   test('host load checks run in throwaway homes (fake Copilot and Codex CLIs) and fail on missing skills', async () => {
     const dir = tmpRepo({ '.agents/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes from merged pull requests. Use for release notes.') });
     const env = { ADC_COPILOT_CLI: fakeCli(dir, 'copilot-list', FAKE_COPILOT_LIST), ADC_CODEX_CLI: fakeCli(dir, 'codex-host', FAKE_CODEX_HOST), ADC_CLAUDE_CLI: path.join(dir, 'no-claude.mjs') };
-    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--for', 'copilot,codex', '--name', 'kit', '--write').exit, 0);
+    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--for', 'copilot,codex', '--name', 'kit', '--write').status, 0);
     const homeBefore = fs.readdirSync(os.tmpdir()).filter((n) => /^adc-(copilot|codex)-/.test(n)).length;
     const ok = adcEnv(env, dir, 'tooling', 'plugin', 'check', 'plugins/kit');
-    assert.equal(ok.exit, 0, JSON.stringify(ok.json?.findings));
+    assert.equal(ok.status, 0, JSON.stringify(ok.json?.findings));
     const by = Object.fromEntries(ok.json.validators.map((v) => [v.name.split(' ')[0], v]));
     assert.deepEqual([by.copilot.status, by.copilot.loaded_skills], ['pass', ['notes']]);
     assert.deepEqual([by.codex.status, by.codex.loaded_skills, by.codex.marketplace], ['pass', ['notes'], 'kit-marketplace']);
     assert.equal(fs.readdirSync(os.tmpdir()).filter((n) => /^adc-(copilot|codex)-/.test(n)).length, homeBefore, 'throwaway homes are removed');
     const bad = adcEnv({ ...env, FAKE_EMPTY: '1' }, dir, 'tooling', 'plugin', 'check', 'plugins/kit');
-    assert.equal(bad.exit, 1);
+    assert.equal(bad.status, 1);
     assert.ok(bad.json.findings.some((f) => f.rule === 'COPILOT_LOAD' && /notes/.test(f.message)));
     const t = adcEnv(env, dir, 'tooling', 'plugin', 'test', 'plugins/kit');
     assert.deepEqual(t.json.ran, [], 'without --run nothing is executed');
@@ -980,7 +943,7 @@ describe('tooling plugin', () => {
       '.codex/skills/reviewer/SKILL.md': SKILL_MD('reviewer', 'Reviews diffs for missing tests. Use for reviews.'),
     });
     const r = adc(dir, 'tooling', 'plugin', 'init', '--for', 'all', '--name', 'kit');
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.ok(r.json.files.includes('plugins/kit/evals/real-case/prompt.md'));
     assert.ok(r.json.files.includes('plugins/kit/evals/real-case/graders/used.md'));
     assert.ok(!r.json.files.some((f) => /skills\/notes\/evals\//.test(f)), 'skill evals are not shipped inside the skill');
@@ -1011,9 +974,9 @@ describe('tooling plugin', () => {
 
   test('refuses reserved names and the companion skill as a target', async () => {
     const dir = tmpRepo({});
-    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--name', 'claude-helpers').exit, 2);
-    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--name', 'ok-name', '--out', path.join(SKILL, 'tmp-plugin')).exit, 2);
-    assert.equal(adc(dir, 'tooling', 'plugin', 'publish').exit, 2);
+    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--name', 'claude-helpers').status, 2);
+    assert.equal(adc(dir, 'tooling', 'plugin', 'init', '--name', 'ok-name', '--out', path.join(SKILL, 'tmp-plugin')).status, 2);
+    assert.equal(adc(dir, 'tooling', 'plugin', 'publish').status, 2);
   });
 });
 
@@ -1021,21 +984,20 @@ describe('paths, secrets and file fidelity', () => {
   test('a cwd reached through a symlink still resolves repository paths (macOS /var -> /private/var)', (t) => {
     const dir = tmpRepo({ 'AGENTS.md': '- Run the whole suite before reporting success.\n', 'package.json': { name: 'demo' },
       '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes. Use for release notes.') });
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-tooling-link-'));
-    dirs.push(parent);
+    const parent = tmpDir('adc-tooling-link-');
     const link = path.join(parent, 'repo');
     try { fs.symlinkSync(dir, link, 'junction'); } catch { return t.skip('symlinks are not available'); }
     const port = adc(link, 'tooling', 'port', 'AGENTS.md', '--to', 'claude', '--dry-run');
-    assert.equal(port.exit, 0, port.stderr);
+    assert.equal(port.status, 0, port.stderr);
     assert.deepEqual([port.json.source.path, port.json.source.kind], ['AGENTS.md', 'instructions']);
     assert.deepEqual(port.json.written.map((w) => w.path), ['CLAUDE.md']);
     const base = adc(link, 'tooling', 'modify', 'baseline', 'AGENTS.md');
-    assert.equal(base.exit, 0, base.stderr);
+    assert.equal(base.status, 0, base.stderr);
     assert.equal(base.json.artifact, 'AGENTS.md');
-    assert.equal(adc(link, 'tooling', 'trigger-set', '.claude/skills/notes', '--init').exit, 0);
+    assert.equal(adc(link, 'tooling', 'trigger-set', '.claude/skills/notes', '--init').status, 0);
     assert.ok(has(dir, '.claude/skills/notes/evals/trigger-set.json'));
     const plugin = adc(link, 'tooling', 'plugin', 'init', '--out', 'kit');
-    assert.equal(plugin.exit, 0, plugin.stderr);
+    assert.equal(plugin.status, 0, plugin.stderr);
     assert.equal(plugin.json.plugin_dir, 'kit');
     const cost = adc(link, 'tooling', 'cost', 'AGENTS.md');
     assert.deepEqual(cost.json.files.map((f) => f.path), ['AGENTS.md']);
@@ -1051,8 +1013,8 @@ describe('paths, secrets and file fidelity', () => {
     const token = ['gh', 'p_', 'Ab3'.repeat(12)].join('');
     const server = (env) => ({ mcpServers: { docs: { command: 'npx', args: ['-y', 'docs-mcp@1.2.3'], ...env } } });
     const dir = tmpRepo({ '.mcp.json': server({}) });
-    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', '.mcp.json').exit, 0);
-    write(dir, '.mcp.json', server({ env: { DOCS_TOKEN: token } }));
+    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', '.mcp.json').status, 0);
+    writeFile(dir, '.mcp.json', server({ env: { DOCS_TOKEN: token } }));
     const cmp = adc(dir, 'tooling', 'modify', 'compare', '.mcp.json', '--note', 'add a token');
     assert.ok(cmp.json?.deltas, cmp.stderr);
     assert.ok(cmp.json.deltas.context.added > 0, 'the change is still visible');
@@ -1071,7 +1033,7 @@ describe('paths, secrets and file fidelity', () => {
       '.env': 'EXAMPLE_SETTING=1\n',
     });
     const r = adc(dir, 'tooling', 'plugin', 'init', '--for', 'claude', '--name', 'kit', '--include-hooks');
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     const files = r.json.written.map((w) => w.path);
     assert.ok(files.includes('plugins/kit/hooks/scripts/check.mjs'), files.join(', '));
     assert.ok(!files.some((f) => f.endsWith('.env')), files.join(', '));
@@ -1082,7 +1044,7 @@ describe('paths, secrets and file fidelity', () => {
     const description = 'Café notes — résumés';
     const dir = tmpRepo({ 'my kit/.claude-plugin/plugin.json': { name: 'kit', version: '0.1.0', description } });
     const r = adc(dir, 'tooling', 'plugin', 'release', 'my kit', '--version', '0.2.0', '--write');
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     const text = read(dir, 'my kit/.claude-plugin/plugin.json');
     assert.ok(text.includes(description), text);
     assert.equal(JSON.parse(text).version, '0.2.0');
@@ -1097,16 +1059,16 @@ describe('group, lint delegation, state guard', () => {
   test('tooling lint delegates to tooling-lint.mjs', () => {
     const dir = tmpRepo({ '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes. Use for release notes.') });
     const r = adc(dir, 'tooling', 'lint', '.claude/skills/notes');
-    assert.equal(r.exit, 0, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
     assert.ok(Array.isArray(r.json.files));
   });
 
   test('every tooling subcommand refuses a tracked .adc/ with exit 3', () => {
     const dir = tmpRepo({ '.adc/budget.json': '{}', 'AGENTS.md': '- rule\n' });
-    git(dir, ['add', '-f', '.adc/budget.json']);
+    git(dir, 'add', '-f', '.adc/budget.json');
     for (const args of [['cost'], ['port', 'AGENTS.md', '--to', 'claude'], ['scaffold', 'skill', '--name', 'x'], ['modify', 'baseline', 'AGENTS.md'], ['plugin', 'check', '.'], ['trigger-set', '.']]) {
       const r = adc(dir, 'tooling', ...args);
-      assert.equal(r.exit, 3, `${args.join(' ')}: ${r.stdout}`);
+      assert.equal(r.status, 3, `${args.join(' ')}: ${r.stdout}`);
       assert.equal(r.json.error.code, 'STATE_TRACKED');
     }
   });
@@ -1114,8 +1076,8 @@ describe('group, lint delegation, state guard', () => {
   test('the group prints usage and rejects unknown subcommands', () => {
     const dir = tmpRepo({});
     const r = adc(dir, 'tooling');
-    assert.equal(r.exit, 2);
+    assert.equal(r.status, 2);
     assert.deepEqual(r.json.subcommands, ['lint', 'cost', 'port', 'trigger-set', 'modify', 'plugin', 'scaffold']);
-    assert.equal(adc(dir, 'tooling', 'nope').exit, 2);
+    assert.equal(adc(dir, 'tooling', 'nope').status, 2);
   });
 });

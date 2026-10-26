@@ -1,16 +1,17 @@
 // `adc.mjs hook-run <event>`: the hook handler (§8). Reads one JSON payload from stdin and
 // returns one decision object; adc.mjs prints it exactly once and exits 0 (2 s watchdog).
-// Performance contract: no git (except one `git ls-files` for the tracked-state check in
-// session-start and before `git commit`/`git push` in the guard), no filesystem scans, no
-// network; it reads `.adc/detect.json`, the newest ledger and the session file only, and
-// imports only core, state, hook-dialects, markers and reports.
+// Performance contract: no git except one `git ls-files` (the tracked-state check in session-start
+// and before `git commit`/`git push` in the guard), no filesystem scans, no network. It reads
+// `.adc/detect.json`, the newest ledgers and the session file only, and imports only core, state,
+// hook-dialects, markers and reports.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import {
-  SKILL_DIR, globToRegExp, hostFromEnv, isAbsolutePath, nowIso, readJson, realPath, redactLiveToken, relPosix, sha256,
-  splitShell, tmpRoot, toPosix, truncate, writeJsonAtomic,
+  SKILL_DIR, globToRegExp, hostFromEnv, isAbsolutePath, isObj, isUnder, isWithin, normRel, nowIso, readFilePart,
+  readJson, realPath, redactLiveToken, relPosix, sha256, splitShell, stripBom, tmpRoot, toPosix, truncate, tryJson,
+  writeJsonAtomic,
 } from './core.mjs';
 import {
   STATE_DIR_NAME, createStateDir, ensureExcluded, hookLog, listLedgers, locateRepo, readSession, resolveStateDir,
@@ -68,8 +69,7 @@ export function decodeStdin(buf) {
   if (!buf || !buf.length) return '';
   if (buf[0] === 0xff && buf[1] === 0xfe) return buf.subarray(2).toString('utf16le');
   if (buf[0] === 0xfe && buf[1] === 0xff) return Buffer.from(buf.subarray(2)).swap16().toString('utf16le');
-  const text = buf.toString('utf8');
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  return stripBom(buf.toString('utf8'));
 }
 
 const PAYLOAD_KEYS = ['sessionId', 'session_id', 'hook_event_name', 'toolName', 'tool_name', 'cwd', 'timestamp',
@@ -78,14 +78,8 @@ const PAYLOAD_KEYS = ['sessionId', 'session_id', 'hook_event_name', 'toolName', 
 /** The payload object, or null for empty, malformed, non-object or unrecognizable input (`{}`). */
 export function parsePayload(text) {
   const t = String(text || '').trim();
-  if (!t || t[0] !== '{') return null;
-  try {
-    const v = JSON.parse(t);
-    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
-    return PAYLOAD_KEYS.some((k) => Object.hasOwn(v, k)) ? v : null;
-  } catch {
-    return null;
-  }
+  const v = t[0] === '{' ? tryJson(t) : null;
+  return isObj(v) && PAYLOAD_KEYS.some((k) => Object.hasOwn(v, k)) ? v : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,18 +177,20 @@ const TEST_COMMAND_LINE = new RegExp('(?:^|[^\\w-])(?:tests?|spec|jest|vitest|mo
 // ---------------------------------------------------------------------------
 // Paths and the state dir
 
-/** Absolute, symlink-resolved form of a tool path (relative paths resolve against the payload cwd). */
-const absPath = (h, p) => realPath(isAbsolutePath(p) ? p : path.resolve(h.norm.cwd || h.root, p));
-
-/** Is `abs` the state dir or inside it? (`path.relative` is case-insensitive on Windows.) */
-function inStateDir(abs, st) {
-  const r = path.relative(st.canonicalDir, abs);
-  return r === '' || (!r.startsWith('..') && !path.isAbsolute(r));
+/**
+ * A tool path resolved against the payload cwd: `abs` (symlinks resolved), `inRepo` (repo-relative
+ * POSIX, null outside the repository) and `rel` (`inRepo`, else the path as given).
+ */
+function toolPath(h, p) {
+  const abs = realPath(isAbsolutePath(p) ? p : path.resolve(h.norm.cwd || h.root, p));
+  const inRepo = relPosix(h.root, abs);
+  return { p, abs, inRepo, rel: inRepo || toPosix(p) };
 }
 
+/** Is a tool path (repo-relative `rel`, absolute `abs`) the state dir or inside it? */
 function underState(rel, abs, st) {
-  if (rel && [STATE_DIR_NAME, st.rel].some((n) => n && (rel === n || rel.startsWith(`${n}/`)))) return true;
-  return Boolean(abs) && inStateDir(abs, st);
+  if (rel && [STATE_DIR_NAME, st.rel].some((n) => n && isUnder(rel, n))) return true;
+  return Boolean(abs) && isWithin(st.canonicalDir, abs);
 }
 
 /**
@@ -296,8 +292,7 @@ function forceAddCoversState(h, g) {
     if (/[*?[]/.test(s)) return true;
     const top = /^:(?:\/|\(top\))/.exec(s);
     const target = top ? path.resolve(h.root, s.slice(top[0].length) || '.') : path.resolve(base, s);
-    const r = path.relative(realPath(target), h.st.canonicalDir);
-    return r === '' || (!r.startsWith('..') && !path.isAbsolute(r));
+    return isWithin(realPath(target), h.st.canonicalDir);
   });
 }
 
@@ -340,23 +335,9 @@ const RUN_CLASSES = [
 // `git apply`) instead of the host's edit tools, which would otherwise never arm the stop gate.
 // The result is `{ paths, unknown }`: target paths when the command names them, `unknown` when a
 // command writes somewhere we cannot tell (an inline script, a formatter run on the whole tree).
-const WRITE_EXES = {
-  tee: (a) => a.filter((t) => !t.startsWith('-')),
-  touch: (a) => a.filter((t) => !t.startsWith('-')),
-  truncate: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
-  cp: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
-  mv: (a) => a.filter((t) => !t.startsWith('-')),
-  install: (a) => a.filter((t) => !t.startsWith('-')).slice(-1),
-  patch: () => null,
-  apply_patch: () => null,
-  'set-content': (a) => psPath(a), 'add-content': (a) => psPath(a), 'out-file': (a) => psPath(a),
-  'new-item': (a) => psPath(a), 'remove-item': (a) => psPath(a), 'move-item': (a) => psPath(a),
-  'copy-item': (a) => psPath(a, '-Destination'), 'rename-item': (a) => psPath(a), 'clear-content': (a) => psPath(a),
-  sc: (a) => psPath(a), ac: (a) => psPath(a), ni: (a) => psPath(a), mi: (a) => psPath(a), ri: (a) => psPath(a),
-  ren: (a) => psPath(a), copy: (a) => a.filter((t) => !t.startsWith('/')).slice(-1),
-  move: (a) => a.filter((t) => !t.startsWith('/')).slice(-1),
-};
-for (const del of DELETERS) WRITE_EXES[del] ??= (a) => a.filter((t) => !t.startsWith('-') && !/^\/[a-z]$/i.test(t));
+const operands = (a) => a.filter((t) => !t.startsWith('-'));
+const lastOperand = (a) => operands(a).slice(-1);
+const cmdTarget = (a) => a.filter((t) => !t.startsWith('/')).slice(-1); // cmd.exe: `/y` style switches
 /** The value of `-Path`/`-LiteralPath`/`-FilePath` (or `flag`), else the first positional argument. */
 function psPath(args, flag = null) {
   const names = flag ? [flag.toLowerCase()] : ['-path', '-literalpath', '-filepath', '-destination'];
@@ -365,6 +346,14 @@ function psPath(args, flag = null) {
   const pos = args.filter((t, j) => !t.startsWith('-') && !(j > 0 && args[j - 1].startsWith('-')));
   return pos.slice(0, 1);
 }
+const WRITE_EXES = {
+  tee: operands, touch: operands, mv: operands, truncate: lastOperand, cp: lastOperand, install: lastOperand,
+  patch: () => null, apply_patch: () => null, copy: cmdTarget, move: cmdTarget,
+  'copy-item': (a) => psPath(a, '-Destination'),
+};
+for (const ps of ['set-content', 'add-content', 'out-file', 'new-item', 'remove-item', 'move-item', 'rename-item',
+  'clear-content', 'sc', 'ac', 'ni', 'mi', 'ri', 'ren']) WRITE_EXES[ps] = psPath;
+for (const del of DELETERS) WRITE_EXES[del] ??= (a) => a.filter((t) => !t.startsWith('-') && !/^\/[a-z]$/i.test(t));
 const GIT_WRITES = /^(?:apply|am|checkout|restore|switch|stash|merge|cherry-pick|revert|reset|rebase|pull|mv|rm)$/;
 const PKG_WRITES = new RegExp('^(?:(?:npm|pnpm|yarn|bun)\\s+(?:i|install|add|remove|rm|uninstall|un|update|up|upgrade)'
   + '|cargo\\s+(?:add|remove|update)|go\\s+(?:get|mod\\s+tidy)|dotnet\\s+(?:add|remove)|poetry\\s+(?:add|remove|lock)'
@@ -375,7 +364,7 @@ const FORMAT_WRITES = new RegExp('^(?:(?:npx|pnpm\\s+exec|yarn|bunx)\\s+)?(?:pre
 const INLINE_WRITE = /writeFile|appendFile|write_text|write_bytes|open\([^)]*['"][wa]b?\+?['"]|WriteAllText|Set-Content/;
 
 /** Files a shell command line writes (best effort; see WRITE_EXES). */
-export function shellWrites(cmd) {
+function shellWrites(cmd) {
   const paths = [];
   let unknown = false;
   for (const raw of shellSegments(cmd)) {
@@ -450,35 +439,24 @@ export function classifyRun(cmd, secretCheck = null) {
  */
 export function lastAssistantMessage(file, { maxBytes = 256 * 1024 } = {}) {
   if (typeof file !== 'string' || !file) return null;
-  let fd;
-  try {
-    fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size;
-    const len = Math.min(size, maxBytes);
-    if (!len) return null;
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, size - len);
-    const lines = buf.toString('utf8').split('\n');
-    if (size > len) lines.shift();
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const l = lines[i].trim();
-      if (!l.startsWith('{') || !l.includes('assistant')) continue;
-      let e;
-      try { e = JSON.parse(l); } catch { continue; }
-      if (e?.type === 'assistant.message' && typeof e.data?.content === 'string' && e.data.content.trim()) {
-        return e.data.content;
-      }
-      const content = e?.type === 'assistant' ? e.message?.content : null;
-      if (Array.isArray(content)) {
-        const text = content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text)
-          .join('\n');
-        if (text.trim()) return text;
-      }
+  const tail = readFilePart(file, maxBytes, { fromEnd: true });
+  if (!tail?.text) return null;
+  const lines = tail.text.split('\n');
+  if (tail.size > maxBytes) lines.shift(); // the first line is cut
+  // Newest first, so the scan stops at the last message instead of parsing the whole tail.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i].trim();
+    if (!l.startsWith('{') || !l.includes('assistant')) continue;
+    const e = tryJson(l);
+    if (e?.type === 'assistant.message' && typeof e.data?.content === 'string' && e.data.content.trim()) {
+      return e.data.content;
     }
-  } catch {
-    return null;
-  } finally {
-    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+    const content = e?.type === 'assistant' ? e.message?.content : null;
+    if (Array.isArray(content)) {
+      const text = content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text)
+        .join('\n');
+      if (text.trim()) return text;
+    }
   }
   return null;
 }
@@ -486,6 +464,15 @@ export function lastAssistantMessage(file, { maxBytes = 256 * 1024 } = {}) {
 function hostTool(dialect, env) {
   if (dialect !== 'copilot') return dialect === 'claude' ? 'claude-code' : 'codex';
   return hostFromEnv(env).candidates.find((c) => c.startsWith('copilot') || c === 'vscode') || 'unknown';
+}
+
+/** Count one edit event at `now` touching `files` (repo-relative) into the session's `edits`. */
+function addEditEpoch(e, files, now) {
+  e.count += 1;
+  e.first = e.first || now;
+  e.last = now;
+  e.times = [...(e.times || []), now].slice(-KEEP);
+  e.files = [...(e.files || []).filter((f) => !files.includes(f)), ...files].slice(-KEEP);
 }
 
 function baseSession(cur, h) {
@@ -531,9 +518,10 @@ async function record(h, mutate, { create = true } = {}) {
   }
 }
 
+/** hooks.log entry (`verbose`: only with ADC_DEBUG); an existing state dir is made usable on first use. */
 function log(h, entry, verbose = false) {
   if (verbose && !debugOn(h.env)) return;
-  if (!h.st.ready || h.noWrite) {
+  if (h.noWrite || !(h.st.ready ?? (fs.existsSync(h.st.dir) && ensureHookState(h.st, h.repo)))) {
     if (debugOn(h.env)) process.stderr.write(`adc hook-run: ${JSON.stringify(entry)}\n`);
     return;
   }
@@ -647,9 +635,7 @@ async function postEdit(h) {
   let stateEdits = 0;
   let outside = 0;
   for (const p of paths) {
-    const abs = absPath(h, p);
-    const inRepo = relPosix(h.root, abs);
-    const rel = inRepo || toPosix(p);
+    const { abs, inRepo, rel } = toolPath(h, p);
     if (underState(rel, abs, h.st)) {
       stateEdits++;
       notes.push(`- ${rel}: companion state under ${h.st.rel || STATE_DIR_NAME}/ (evidence, budget, credentials);`
@@ -672,11 +658,7 @@ async function postEdit(h) {
     await record(h, (s) => {
       const e = s.edits;
       if (files.length) {
-        e.count += 1;
-        e.first = e.first || now;
-        e.last = now;
-        e.times = [...(e.times || []), now].slice(-KEEP);
-        e.files = [...(e.files || []).filter((f) => !files.includes(f)), ...files].slice(-KEEP);
+        addEditEpoch(e, files, now);
         for (const [k, v] of Object.entries(classes)) e.classes[k] = (e.classes[k] || 0) + v;
         e.findings = (e.findings || 0) + findings;
       }
@@ -686,8 +668,8 @@ async function postEdit(h) {
   log(h, { tool: norm.tool_name, files: paths.length, outside, classes, findings, keys: norm.keys, bytes: h.bytes,
     ms: Date.now() - h.t0 }, true);
   if (!notes.length) return {};
-  return { context: truncate(`agentic-developer-companion notes on this edit (notes, not verdicts; verify records`
-    + ` evidence):\n${notes.join('\n')}`, 2000) };
+  return { context: 'agentic-developer-companion notes on this edit (notes, not verdicts; verify records evidence):'
+    + `\n${notes.join('\n')}` };
 }
 
 /**
@@ -699,21 +681,15 @@ async function recordShellWrites(h, cmd) {
   const files = [];
   for (const p of w.paths) {
     if (/^(?:nul|\$null)$/i.test(p) || /[$`*?]/.test(p)) continue;
-    const abs = absPath(h, p);
-    const rel = relPosix(h.root, abs);
-    if (rel == null || rel === '.' || underState(rel, abs, h.st)) continue;
-    files.push(rel);
+    const { abs, inRepo } = toolPath(h, p);
+    if (inRepo == null || inRepo === '.' || underState(inRepo, abs, h.st)) continue;
+    files.push(inRepo);
   }
   if (!files.length && !w.unknown) return;
   const now = nowIso();
   await record(h, (s) => {
-    const e = s.edits;
-    e.count += 1;
-    e.first = e.first || now;
-    e.last = now;
-    e.times = [...(e.times || []), now].slice(-KEEP);
-    e.files = [...(e.files || []).filter((f) => !files.includes(f)), ...files].slice(-KEEP);
-    e.classes.shell = (e.classes.shell || 0) + 1;
+    addEditEpoch(s.edits, files, now);
+    s.edits.classes.shell = (s.edits.classes.shell || 0) + 1;
   });
   log(h, { condition: 'SHELL_WRITE', files: files.length, unknown: w.unknown }, true);
 }
@@ -826,7 +802,7 @@ const askDeleteTests = (victims) => ({
     + ' (CK-TEST-DEL) unless the spec asks for them. Confirm the deletion is intended.',
   rule: 'delete-test',
 });
-const testVictims = (h, args) => args.filter((a) => !a.startsWith('-')).map((a) => toPosix(a).replace(/^\.\//, ''))
+const testVictims = (h, args) => args.filter((a) => !a.startsWith('-')).map(normRel)
   .filter((a) => classify(a, h.detect).test);
 
 /** The guard's verdict on a git command, or null. */
@@ -910,8 +886,8 @@ function guardFiles(h) {
   const patterns = norm.tool_kind === 'read' ? extractPatterns(norm) : [];
   if (!paths.length && !patterns.length) return null;
   const where = h.st.rel || STATE_DIR_NAME;
-  const resolved = paths.map((p) => { const abs = absPath(h, p); return { p, abs, rel: relPosix(h.root, abs) }; });
-  if (resolved.some((r) => underState(r.rel, r.abs, h.st))) {
+  const resolved = paths.map((p) => toolPath(h, p));
+  if (resolved.some((r) => underState(r.inRepo, r.abs, h.st))) {
     return norm.tool_kind === 'read'
       ? { deny: `${GUARD_PREFIX} ${where}/ holds the live-test credential, the budget ledger and the evidence ledger;`
         + ' the guard level denies reading or searching it with host tools.', rule: 'state-read' }
@@ -924,13 +900,9 @@ function guardFiles(h) {
   }
   if (norm.tool_kind !== 'edit') return null;
   const ops = new Map(parsePatch(norm.tool_input).map((f) => [f.path, f.op]));
-  for (const { p, rel: inRepo } of resolved) {
-    const rel = inRepo || toPosix(p);
+  for (const { p, rel } of resolved) {
     const c = classify(rel, h.detect);
-    if (ops.get(p) === 'delete' && c.test) {
-      return { ask: `${GUARD_PREFIX} this deletes a test file (${rel}); verify flags test deletions (CK-TEST-DEL)`
-        + ' unless the spec asks for them. Confirm the deletion is intended.', rule: 'delete-test' };
-    }
+    if (ops.get(p) === 'delete' && c.test) return askDeleteTests([rel]);
     if (c.ci) {
       return { ask: `${GUARD_PREFIX} this edits CI configuration (${rel}); CI edits that weaken test steps fail verify`
         + ' (CK-CI). Confirm the change is intended.', rule: 'ci-edit' };
@@ -1016,8 +988,6 @@ export async function hookRunCommand(argv = [], { stdin = process.stdin, env = p
     if (!repo) { debug(`${event}: no git work tree for cwd ${norm.cwd || process.cwd()}`); return {}; }
     const level = LEVELS.includes(values.level) ? values.level : 'advise';
     const st = hookStateInfo(repo, { stateDir: str('state-dir'), env });
-    // An existing state dir is usable for logging right away; a missing one is created lazily.
-    if (fs.existsSync(st.dir)) ensureHookState(st, repo);
     h = { event, dialect, norm, repo, root: repo.root, level, st, env, t0, bytes: buf ? buf.length : 0,
       noWrite: false };
     // A tracked state dir (cached by the last session-start or guard check): stay silent and write
