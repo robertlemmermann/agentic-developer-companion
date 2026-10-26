@@ -285,6 +285,19 @@ test('ledger: input checks are validated; stale input, CK-CLAIMS and matrix-less
   assert.equal(added[0].source, 'input');
 });
 
+test('ledger: a completed matrix is refused when the stored trace skeleton was edited', async () => {
+  const { dir } = makeRepo({ 'a.txt': 'a\n' });
+  const skeleton = (strength) => JSON.stringify({ requirements: [{ id: 'R1', text: 'limit requests', strength, kind: 'bullet' }] });
+  write(dir, { '.adc/sk/trace.json': skeleton('strong') });
+  const { file } = await ledgerWith(dir, [ck('CK-TRACE', 'unverified', { pending: true, artifacts: ['.adc/sk/trace.json'] })]);
+  const matrix = ck('CK-TRACE', 'pass', { data: { matrix: { requirements: [{ id: 'R1', status: 'dismissed' }] } } });
+  write(dir, { '.adc/sk/trace.json': skeleton('weak') });
+  await assert.rejects(ev.addChecks(file, [matrix], { source: 'input', root: dir }), (e) => e.exit === 4 && e.code === 'LEDGER_TAMPERED');
+  write(dir, { '.adc/sk/trace.json': skeleton('strong') });
+  const { added } = await ev.addChecks(file, [matrix], { source: 'input', root: dir });
+  assert.deepEqual([added[0].status, added[0].data.requirements[0].status], ['unverified', 'unknown'], 'a strong requirement cannot be dismissed');
+});
+
 test('ledger: secrets and the live token never reach the ledger or its Markdown', async () => {
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
   const token = ['hunter2', 'abcXYZ'].join('');

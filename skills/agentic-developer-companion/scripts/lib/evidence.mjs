@@ -391,7 +391,12 @@ async function traceEntry(ledger, raw, { root, file, dryRun }) {
   if (!matrix) throw usageError('CK-TRACE entries must carry the completed matrix (requirements[] with file:line citations); its status is derived, never accepted');
   const placeholder = ledger.checks.find((c) => c.id === 'CK-TRACE' && c.pending);
   const skeletonRef = placeholder && placeholder.artifacts.find((a) => /(^|\/)trace\.json$/.test(a));
-  const skeleton = skeletonRef ? readJson(path.resolve(root, skeletonRef), null) : null;
+  const skeletonFile = skeletonRef ? path.resolve(root, skeletonRef) : null;
+  // The skeleton decides which requirements are strong; an edited copy must not judge the matrix.
+  if (skeletonFile && placeholder.artifact_sha256?.[skeletonRef] !== hashArtifact(skeletonFile)) {
+    throw unverifiable('LEDGER_TAMPERED', `${skeletonRef} changed after verify recorded it; fill the trace_matrix copy instead and re-run verify`);
+  }
+  const skeleton = skeletonFile ? readJson(skeletonFile, null) : null;
   const ev = await evaluateMatrix({ root, base: ledger.base, commit: ledger.snapshot_commit, tree: ledger.tree_digest, matrix, skeleton });
   const dir = artifactsDir(file);
   const jsonOut = path.join(dir, 'trace-completed.json');
