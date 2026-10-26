@@ -13,6 +13,7 @@ import * as reports from '../../skills/agentic-developer-companion/scripts/lib/r
 import * as cr from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
 import * as probes from '../../skills/agentic-developer-companion/scripts/lib/probes.mjs';
 import { prepareTarget } from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import { detect } from '../../skills/agentic-developer-companion/scripts/lib/detect.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const fixture = (name) => fs.readFileSync(path.join(FIX, 'reports', name), 'utf8');
@@ -98,10 +99,10 @@ const NODE_PROJECT = {
 const nodeTest = (name, body, imports = "import { add, div } from '../src/math.mjs';") => [
   "import { test } from 'node:test';", "import assert from 'node:assert/strict';", imports, `test(${JSON.stringify(name)}, () => { ${body} });`, '',
 ].join('\n');
-const fallback = (dir) => cr.fallbackDetect(dir);
-/** fallbackDetect with the pytest command this machine can run (pytest on PATH or uv). */
-const pyDetect = (dir) => {
-  const det = cr.fallbackDetect(dir);
+const detectAt = (dir) => detect({ root: dir });
+/** detect with the pytest command this machine can run (pytest on PATH or uv). */
+const pyDetect = async (dir) => {
+  const det = await detect({ root: dir });
   for (const p of det.projects) for (const r of p.runners) if (r.name === 'pytest') r.cmd = PYTEST_CMD;
   return det;
 };
@@ -482,19 +483,22 @@ describe('clean-run helpers', () => {
       for (const k of ['PYTEST_ADDOPTS', 'ADC_LIVE_TOKEN']) if (!(k in saved)) delete process.env[k];
     }
   });
-  test('fallbackDetect recognizes node --test, go, cargo and pytest projects', () => {
+  test('resolveRunners: one runner per ecosystem from detect; wrappers and e2e runners only as a last resort', async () => {
     const d = tmp('adc-wpd-detect-');
     fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ scripts: { test: 'node --test test/' } }));
     fs.writeFileSync(path.join(d, 'package-lock.json'), '{}');
     fs.writeFileSync(path.join(d, 'go.mod'), 'module x\n');
-    const det = cr.fallbackDetect(d);
-    const names = det.projects[0].runners.map((r) => r.name);
-    assert.deepEqual(names, ['node-test', 'go']);
-    assert.equal(det.projects[0].runners[0].cmd, 'node --test test/');
-    fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ scripts: { test: 'node --test --test-reporter=spec --test-reporter-destination stdout test/' } }));
-    assert.equal(cr.fallbackDetect(d).projects[0].runners[0].cmd, 'node --test test/');
-    assert.equal(det.projects[0].managers[0].install, 'npm ci');
-    assert.equal(cr.fallbackDetect(tmp('adc-wpd-empty-')).projects.length, 0);
+    const p = (await detectAt(d)).projects[0];
+    assert.deepEqual(cr.resolveRunners(p).map((r) => [r.name, r.ecosystem, r.cmd]), [['node-test', 'node', 'node --test test/'], ['go', 'go', 'go test ./...']]);
+    assert.equal(cr.resolveRunner(p).name, 'node-test');
+    assert.equal(cr.resolveRunner(p, null, { ecosystem: 'go' }).name, 'go');
+    assert.equal(p.managers.find((m) => m.ecosystem === 'node').install, 'npm ci');
+    const mixed = cr.resolveRunners({ runners: [{ name: 'make', kind: 'wrapper', ecosystem: 'make', cmd: 'make test' },
+      { name: 'pytest', ecosystem: 'python', cmd: 'pytest' }, { name: 'playwright', kind: 'e2e', ecosystem: 'node', cmd: 'npx playwright test' },
+      { name: 'vitest', ecosystem: 'node', cmd: 'npx vitest run' }] });
+    assert.deepEqual(mixed.map((r) => r.name), ['pytest', 'vitest']);
+    assert.deepEqual(cr.resolveRunners({ runners: [{ name: 'make', kind: 'wrapper', cmd: 'make test' }] }).map((r) => r.name), ['make']);
+    assert.equal((await detectAt(tmp('adc-wpd-empty-'))).projects.length, 0);
   });
 });
 
@@ -540,7 +544,7 @@ describe('clean-run end to end', () => {
   test('failing test in the snapshot: FAIL with the failing id; exit 1', async () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': 'export function add(a, b) { return a - b; }\nexport function div(a, b) { return b === 0 ? 0 : a / b; }\n' });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir) });
     assert.equal(res.status, 'fail');
     assert.equal(res.checks[0].reason, 'TESTS_FAILED');
     assert.ok(res.checks[0].findings.some((f) => /failed: .*adds/.test(f.message)));
@@ -551,10 +555,10 @@ describe('clean-run end to end', () => {
     const repo = makeRepo({ ...NODE_PROJECT, 'test/old.test.mjs': nodeTest('legacy', 'assert.ok(true);') });
     repo.write({ 'test/old.test.mjs': null });
     const t = await target(repo);
-    const res = await cr.cleanRun({ target: t, detectResult: fallback(repo.dir), detectFn: fallback });
+    const res = await cr.cleanRun({ target: t, detectResult: await detectAt(repo.dir) });
     assert.equal(res.status, 'fail');
     assert.equal(res.checks[0].reason, 'COUNT_SHORTFALL');
-    const waived = await cr.cleanRun({ target: t, detectResult: fallback(repo.dir), detectFn: fallback, waivers: [{ check: 'CK-TEST-DEL', file: 'test/old.test.mjs' }] });
+    const waived = await cr.cleanRun({ target: t, detectResult: await detectAt(repo.dir), waivers: [{ check: 'CK-TEST-DEL', file: 'test/old.test.mjs' }] });
     assert.equal(waived.status, 'finding');
     assert.equal(waived.checks[0].reason, 'SHORTFALL_WAIVED');
     assert.equal(waived.checks[0].data.shortfall_explained, 1);
@@ -565,7 +569,7 @@ describe('clean-run end to end', () => {
     const pkg = JSON.parse(NODE_PROJECT['package.json']);
     pkg.scripts.test = 'node --test test/math.test.mjs';
     repo.write({ 'package.json': JSON.stringify(pkg) });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir) });
     assert.equal(res.projects[0].run.executed, 2);
     assert.equal(res.projects[0].base_counts.executed, 3);
     assert.equal(res.checks[0].reason, 'COUNT_SHORTFALL');
@@ -575,10 +579,10 @@ describe('clean-run end to end', () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'test/math.test.mjs': NODE_PROJECT['test/math.test.mjs'].replace("test('divides', ()", "test('divides', { skip: true }, ()") });
     const t = await target(repo);
-    const res = await cr.cleanRun({ target: t, detectResult: fallback(repo.dir), detectFn: fallback });
+    const res = await cr.cleanRun({ target: t, detectResult: await detectAt(repo.dir) });
     assert.equal(res.status, 'finding');
     assert.equal(res.checks[0].reason, 'SKIP_INCREASE');
-    const fired = await cr.cleanRun({ target: t, detectResult: fallback(repo.dir), detectFn: fallback, firedChecks: ['CK-SKIP'] });
+    const fired = await cr.cleanRun({ target: t, detectResult: await detectAt(repo.dir), firedChecks: ['CK-SKIP'] });
     assert.equal(fired.status, 'fail');
   });
 
@@ -587,7 +591,7 @@ describe('clean-run end to end', () => {
     repo.write({ 'src/extra.mjs': 'export const x = 1;\n' });
     const countsFile = path.join(repo.state, 'base-counts.json');
     fs.writeFileSync(countsFile, JSON.stringify({ projects: [{ root: '.', run: { executed: 2, passed: 2, failed: 0, errors: 0, skipped: 0, flaky: 0 } }] }));
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), runner: 'node run-tests.cjs', baseCountsFile: countsFile });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), runner: 'node run-tests.cjs', baseCountsFile: countsFile });
     const p = res.projects[0];
     assert.equal(p.run.runner, 'custom');
     assert.equal(p.run.count_source, 'summary-text');
@@ -620,7 +624,7 @@ describe('clean-run end to end', () => {
     const scriptFile = path.join(repo.state, 'hang.cjs');
     fs.writeFileSync(scriptFile, script);
     const started = Date.now();
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), runner: `node ${core.quoteArg(scriptFile)}`, noBase: true, timeoutS: 1 });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), runner: `node ${core.quoteArg(scriptFile)}`, noBase: true, timeoutS: 1 });
     assert.ok(Date.now() - started < 15_000);
     assert.equal(res.checks[0].reason, 'TIMEOUT');
     const pid = Number(fs.readFileSync(pidFile, 'utf8'));
@@ -637,7 +641,7 @@ describe('clean-run end to end', () => {
     fs.writeFileSync(printer, "console.log('token=' + (process.env.ADC_LIVE_TOKEN || 'absent')); console.log(['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('')); console.log('# pass 1'); console.log('# fail 0');\n");
     process.env.ADC_LIVE_TOKEN = token;
     try {
-      const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), runner: `node ${core.quoteArg(printer)}`, noBase: true });
+      const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), runner: `node ${core.quoteArg(printer)}`, noBase: true });
       const log = fs.readFileSync(res.checks[0].artifacts.find((a) => a.endsWith('run.log')), 'utf8');
       assert.ok(log.includes('token=absent'));
       assert.ok(!log.includes(token));
@@ -673,7 +677,7 @@ describe('clean-run --red-green', () => {
   test('a test that passes on the base does not reproduce the bug: NOT_RED', async () => {
     const repo = makeRepo(BUGGY);
     repo.write({ 'src/math.mjs': FIXED, 'test/regress.test.mjs': nodeTest('adds', 'assert.equal(add(1, 1), 2);') });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
     assert.equal(res.red_green.status, 'fail');
     assert.equal(res.red_green.reason, 'NOT_RED');
   });
@@ -681,7 +685,7 @@ describe('clean-run --red-green', () => {
   test('a test that cannot load on the base (new module) is not a red', async () => {
     const repo = makeRepo(BUGGY);
     repo.write({ 'src/math.mjs': FIXED, 'src/newmod.mjs': 'export const half = (x) => x / 2;\n', 'test/regress.test.mjs': nodeTest('halves', 'assert.equal(half(4), 2);', "import { half } from '../src/newmod.mjs';") });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
     assert.equal(res.red_green.status, 'fail');
     assert.ok(['WRONG_FAILURE_KIND', 'NOT_EXECUTED_LOAD_ERROR'].includes(res.red_green.reason), res.red_green.reason);
   });
@@ -689,7 +693,7 @@ describe('clean-run --red-green', () => {
   test('a test that still fails in the snapshot: NOT_GREEN', async () => {
     const repo = makeRepo(BUGGY);
     repo.write({ 'test/regress.test.mjs': nodeTest('divides by two', 'assert.equal(div(8, 2), 4);') });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noBase: true, redGreen: ['test/regress.test.mjs'] });
     assert.equal(res.red_green.reason, 'NOT_GREEN');
   });
 
@@ -700,7 +704,7 @@ describe('clean-run --red-green', () => {
       'calc/calc_test.go': 'package calc\n\nimport "testing"\n\nfunc TestZero(t *testing.T) { if Half(0) != 0 { t.Fatal("zero") } }\n',
     });
     repo.write({ 'calc/calc.go': 'package calc\n\nfunc Half(x int) int { return x / 2 }\n', 'calc/half_test.go': 'package calc\n\nimport "testing"\n\nfunc TestHalfOfSix(t *testing.T) {\n\tif got := Half(6); got != 3 {\n\t\tt.Errorf("Half(6) = %d, want 3", got)\n\t}\n}\n' });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, redGreen: ['calc/half_test.go'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), redGreen: ['calc/half_test.go'] });
     assert.equal(res.projects[0].status, 'pass', JSON.stringify(res.projects[0]));
     assert.equal(res.projects[0].run.executed, 2);
     assert.equal(res.red_green.status, 'pass', JSON.stringify(res.red_green));
@@ -710,7 +714,7 @@ describe('clean-run --red-green', () => {
   test('pytest: red-green on a new test file; the clean run counts against the base', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
     const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'def double(x):\n    return x + x + 1\n', 'tests/test_app.py': 'from app import double\n\ndef test_zero():\n    assert double(0) in (0, 1)\n' });
     repo.write({ 'app.py': 'def double(x):\n    return x + x\n', 'tests/test_double.py': 'from app import double\n\ndef test_two():\n    assert double(2) == 4\n' });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: pyDetect(repo.dir), detectFn: pyDetect, redGreen: ['tests/test_double.py'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await pyDetect(repo.dir), detectFn: pyDetect, redGreen: ['tests/test_double.py'] });
     assert.equal(res.projects[0].run.runner, 'pytest');
     assert.equal(res.projects[0].status, 'pass', JSON.stringify(res.projects[0]));
     assert.equal(res.projects[0].run.executed, 2);
@@ -723,7 +727,7 @@ describe('clean-run --red-green', () => {
   test('pytest flake-probe: no pytest-randomly dependency -> sequential runs, shuffle false, suspect found', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
     const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'X = 1\n' });
     repo.write({ 'tests/test_flip.py': 'import pathlib\n\ndef test_flip():\n    p = pathlib.Path(__file__).with_name("counter")\n    n = int(p.read_text()) if p.exists() else 0\n    p.write_text(str(n + 1))\n    assert n % 2 == 0\n\ndef test_steady():\n    assert True\n' });
-    const res = await probes.flakeProbe({ target: await target(repo), detectResult: pyDetect(repo.dir), times: 2 });
+    const res = await probes.flakeProbe({ target: await target(repo), detectResult: await pyDetect(repo.dir), times: 2 });
     assert.equal(res.shuffle, false);
     assert.equal(res.runs, 2);
     assert.deepEqual(res.seeds, []);
@@ -734,7 +738,7 @@ describe('clean-run --red-green', () => {
   test('pytest: an import error on the base is a collection error, not a red', { skip: !HAS_PYTEST && 'pytest not available' }, async () => {
     const repo = makeRepo({ 'pytest.ini': '[pytest]\npythonpath = .\n', 'app.py': 'def double(x):\n    return x * 2\n' });
     repo.write({ 'app.py': 'def double(x):\n    return x * 2\n\ndef triple(x):\n    return x * 3\n', 'tests/test_triple.py': 'from app import triple\n\ndef test_three():\n    assert triple(1) == 3\n' });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: pyDetect(repo.dir), noBase: true, redGreen: ['tests/test_triple.py'] });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await pyDetect(repo.dir), noBase: true, redGreen: ['tests/test_triple.py'] });
     assert.equal(res.red_green.status, 'fail');
     assert.ok(['WRONG_FAILURE_KIND', 'NOT_EXECUTED_LOAD_ERROR'].includes(res.red_green.reason), JSON.stringify(res.red_green));
   });
@@ -782,7 +786,7 @@ describe('typecheck', () => {
   test('go vet: a new vet error in the snapshot fails', { skip: !HAS_GO && 'go not installed' }, async () => {
     const repo = makeRepo({ 'go.mod': 'module example.com/v\n\ngo 1.21\n', 'main.go': 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("ok") }\n' });
     repo.write({ 'main.go': 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Printf("%d\\n", "text") }\n' });
-    const res = await cr.typecheck({ target: await target(repo), detectResult: fallback(repo.dir) });
+    const res = await cr.typecheck({ target: await target(repo), detectResult: await detectAt(repo.dir) });
     assert.equal(res.status, 'fail', JSON.stringify(res.checkers));
     assert.equal(res.checkers[0].name, 'go-vet');
     assert.ok(res.new_errors.some((e) => e.file === 'main.go'));
@@ -835,7 +839,7 @@ describe('coverage-delta', () => {
   test('no changed source lines: skipped', async () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'README.md': 'docs only\n', 'test/math.test.mjs': NODE_PROJECT['test/math.test.mjs'] + '// note\n' });
-    const res = await probes.coverageDelta({ target: await target(repo), detectResult: fallback(repo.dir) });
+    const res = await probes.coverageDelta({ target: await target(repo), detectResult: await detectAt(repo.dir) });
     assert.equal(res.status, 'skipped');
     assert.equal(res.checks[0].reason, 'NO_CHANGED_CODE');
   });
@@ -911,16 +915,16 @@ describe('flake-probe', () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'test/more.test.mjs': nodeTest('more', 'assert.equal(add(2, 2), 4);') });
     const t = await target(repo);
-    const res = await probes.flakeProbe({ target: t, detectResult: fallback(repo.dir), times: 2 });
+    const res = await probes.flakeProbe({ target: t, detectResult: await detectAt(repo.dir), times: 2 });
     assert.equal(res.status, 'pass', JSON.stringify(res.checks[0]));
     assert.equal(res.runs, 2);
     assert.deepEqual(res.tests_probed, ['test/more.test.mjs']);
-    const explicit = await probes.flakeProbe({ target: t, detectResult: fallback(repo.dir), times: 1, tests: ['test/math.test.mjs'] });
+    const explicit = await probes.flakeProbe({ target: t, detectResult: await detectAt(repo.dir), times: 1, tests: ['test/math.test.mjs'] });
     assert.equal(explicit.status, 'pass');
     assert.equal(explicit.tests_seen, 2);
     const clean = makeRepo(NODE_PROJECT);
     clean.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
-    const none = await probes.flakeProbe({ target: await target(clean), detectResult: fallback(clean.dir) });
+    const none = await probes.flakeProbe({ target: await target(clean), detectResult: await detectAt(clean.dir) });
     assert.equal(none.checks[0].reason, 'NO_CHANGED_TESTS');
   });
 });
@@ -988,11 +992,11 @@ describe('outcomes, exits and command plumbing', () => {
     }
     assert.ok(!cr.runnerMissing('AssertionError: user not found in list'));
   });
-  test('dropNodeTestPaths removes path arguments only', () => {
-    assert.equal(cr.dropNodeTestPaths('node --test test/'), 'node --test');
-    assert.equal(cr.dropNodeTestPaths('node --test --test-concurrency=1 test/*.test.mjs'), 'node --test --test-concurrency=1');
-    assert.equal(cr.dropNodeTestPaths('node --test'), 'node --test');
-    assert.equal(cr.dropNodeTestPaths('node --test --test-reporter spec'), 'node --test --test-reporter spec');
+  test('splitNodeTestCmd removes path arguments only', () => {
+    assert.equal(cr.splitNodeTestCmd('node --test test/').head, 'node --test');
+    assert.equal(cr.splitNodeTestCmd('node --test --test-concurrency=1 test/*.test.mjs').head, 'node --test --test-concurrency=1');
+    assert.equal(cr.splitNodeTestCmd('node --test').head, 'node --test');
+    assert.equal(cr.splitNodeTestCmd('node --test --test-reporter spec').head, 'node --test --test-reporter spec');
     const b = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test test/' }] }), { dir: tmp('adc-wpd-b-'), outDir: tmp('adc-wpd-o-'), select: { files: ['test/x.test.mjs'], names: [] } });
     assert.match(b.cmd, /^node --test --test-reporter=junit .* test\/x\.test\.mjs$/);
     assert.ok(!/ test\/ /.test(b.cmd));
@@ -1027,7 +1031,7 @@ describe('clean-run options and layouts', () => {
     const dep = { 'node_modules/leftish/package.json': '{"name":"leftish","version":"1.0.0","type":"module","main":"index.js"}\n', 'node_modules/leftish/index.js': "export const pad = (s) => ' ' + s;\n" };
     const repo = makeRepo({ ...NODE_PROJECT, '.gitignore': 'node_modules/\n', ...dep, 'test/pad.test.mjs': nodeTest('pads', "assert.equal(pad('a'), ' a');", "import { pad } from 'leftish';") });
     repo.write({ 'test/more.test.mjs': nodeTest('pads twice', "assert.equal(pad(pad('a')), '  a');", "import { pad } from 'leftish';") });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, noInstall: true });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noInstall: true });
     const p = res.projects[0];
     assert.equal(res.status, 'pass', JSON.stringify(p));
     assert.deepEqual(p.install.linked, ['node_modules']);
@@ -1042,7 +1046,7 @@ describe('clean-run options and layouts', () => {
     pkg.dependencies = { leftish: '1.0.0' };
     repo.write({ 'package.json': JSON.stringify(pkg) });
     fs.rmSync(path.join(repo.state, 'cache', 'counts'), { recursive: true, force: true });
-    const diff = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), detectFn: fallback, noInstall: true });
+    const diff = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noInstall: true });
     assert.equal(diff.projects[0].base_counts.install.not_linked[0].reason, 'dependencies differ between the base and the working tree');
     assert.ok(fs.existsSync(path.join(repo.dir, 'node_modules', 'leftish', 'index.js')));
   });
@@ -1050,7 +1054,7 @@ describe('clean-run options and layouts', () => {
   test('a failing frozen install is UNVERIFIED INSTALL_FAILED with the --no-install hint; tests do not run', async () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
-    const det = fallback(repo.dir);
+    const det = await detectAt(repo.dir);
     det.projects[0].managers = [{ name: 'npm', lockfile: null, install: 'node -e "process.exit(3)"' }];
     const res = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true });
     assert.equal(res.status, 'unverified');
@@ -1064,7 +1068,7 @@ describe('clean-run options and layouts', () => {
   test('--keep keeps the worktree and the raw outputs; default prunes them', async () => {
     const repo = makeRepo(NODE_PROJECT);
     repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
-    const res = await cr.cleanRun({ target: await target(repo), detectResult: fallback(repo.dir), noBase: true, keep: true });
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: await detectAt(repo.dir), noBase: true, keep: true });
     const wt = res.projects[0].worktree;
     assert.ok(wt && fs.existsSync(path.join(wt, 'src', 'math.mjs')));
     assert.ok(!wt.startsWith(core.toPosix(repo.dir)), 'worktrees live in the OS temp dir, not in the repository');
@@ -1141,8 +1145,9 @@ describe('Cargo end to end', { skip: !core.which('cargo') && 'cargo not installe
       'src/lib.rs': 'pub fn half(x: i32) -> i32 { x / 3 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn zero() { assert_eq!(half(0), 0); }\n    #[test]\n    #[ignore = "slow"]\n    fn slow() {}\n}\n',
     });
     repo.write({ 'src/lib.rs': 'pub fn half(x: i32) -> i32 { x / 2 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn zero() { assert_eq!(half(0), 0); }\n    #[test]\n    #[ignore = "slow"]\n    fn slow() {}\n}\n', 'tests/half.rs': 'use demo::half;\n\n#[test]\nfn half_of_six() {\n    assert_eq!(half(6), 3);\n}\n' });
-    const det = cr.fallbackDetect(repo.dir);
+    const det = await detectAt(repo.dir);
     for (const r of det.projects[0].runners) if (r.name === 'nextest') Object.assign(r, { name: 'cargo', cmd: 'cargo test' });
+    det.projects[0].managers = []; // `cargo fetch` without a lockfile could reach the network
     // A dependency-free crate needs nothing from ~/.cargo; keep cargo's locks and caches in the temp dir.
     const savedHome = process.env.CARGO_HOME;
     process.env.CARGO_HOME = tmp('adc-wpd-cargo-home-');
@@ -1352,5 +1357,78 @@ describe('review regressions', () => {
       if (saved === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = saved;
     }
+  });
+});
+
+// ===========================================================================
+// Round 3: detect's requests and review fixes
+
+describe('round 3 fixes', () => {
+  const plan = (runner, extra = {}) => cr.buildRunCommand(runner, { dir: os.tmpdir(), outDir: path.join(os.tmpdir(), 'adc-wpd-plan'), plan: true, ...extra });
+
+  test('node --test: base_cmd + flags + paths from detect; a name filter goes before the file paths', () => {
+    const r = cr.resolveRunner({ runners: [{ name: 'node-test', ecosystem: 'node', cmd: 'node --import tsx --test "t/**/*.ts"', base_cmd: 'node --import tsx --test', paths: ['"t/**/*.ts"'] }] });
+    assert.match(plan(r).cmd, /^node --import tsx --test --test-reporter=junit .* "t\/\*\*\/\*\.ts"$/);
+    const named = plan(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test' }] }), { select: { files: ['test/a.test.mjs'], names: ['adds'] } });
+    assert.match(named.cmd, /--test-name-pattern=adds test\/a\.test\.mjs$/);
+    const jest = plan(cr.resolveRunner({}, 'jest'), { select: { files: ['a.test.js'], names: ['x.y'] } });
+    assert.match(jest.cmd, /-t ['"]?x\\\.y['"]? a\.test\.js$/);
+    // node ignores options after the first file path: prove the filter is applied by a real run.
+    const dir = tmp('adc-wpd-name-');
+    fs.writeFileSync(path.join(dir, 'a.test.mjs'), "import test from 'node:test';\ntest('adds', () => {});\ntest('other', () => {});\n");
+    const out = tmp('adc-wpd-name-out-');
+    const built = cr.buildRunCommand(cr.resolveRunner({ runners: [{ name: 'node-test', cmd: 'node --test' }] }), { dir, outDir: out, select: { files: ['a.test.mjs'], names: ['adds'] } });
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const ran = core.runShell(built.cmd.replace(/^node\b/, core.quoteArg(process.execPath)), { cwd: dir, env, timeoutMs: 60_000 });
+    assert.equal(ran.exit, 0, ran.stderr);
+    const parsed = cr.parseRunOutput(built.report, ran.stdout, ran.stderr, [dir]);
+    assert.deepEqual(parsed.tests.filter((t) => t.status !== 'skipped').map((t) => t.id), ['a.test.mjs::adds']);
+  });
+
+  test('multi-module Maven/Gradle: every report dir is read and stored', () => {
+    const dir = tmp('adc-wpd-mm-');
+    const files = ['a', 'b'].map((m) => {
+      const f = path.join(dir, m, 'target', 'surefire-reports', 'TEST-T.xml');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, `<testsuite name="${m}"><testcase classname="${m}.T" name="t"/></testsuite>`);
+      return f;
+    });
+    const runner = cr.resolveRunner({ runners: [{ name: 'maven', ecosystem: 'jvm', cmd: 'mvn -B test',
+      report: { dir: 'target/surefire-reports', glob: 'TEST-*.xml', format: 'junit', dirs: ['a/target/surefire-reports', 'b/target/surefire-reports'] } }] });
+    const built = cr.buildRunCommand(runner, { dir, outDir: tmp('adc-wpd-o-'), plan: true });
+    assert.equal(built.report.dirs.length, 3);
+    const parsed = cr.parseRunOutput(built.report, '', '', [dir]);
+    assert.deepEqual([parsed.source, parsed.counts.executed, parsed.tests.map((t) => t.id).sort()], ['report', 2, ['a.T::t', 'b.T::t']]);
+    const state = tmp('adc-wpd-st-');
+    const stored = cr.storeArtifacts({ root: state, state: { paths: { cache: path.join(state, 'cache') } } }, 'f'.repeat(40), 'root', { report_files: files });
+    assert.match(stored.report_path, /\/reports$/);
+    assert.deepEqual(fs.readdirSync(path.join(state, stored.report_path)).sort(), ['0-TEST-T.xml', '1-TEST-T.xml']);
+  });
+
+  test('two ecosystems in one project: one suite each, each with its own install and check', async () => {
+    const FAKE_PYTEST = [
+      "const a = process.argv.slice(2); const out = (a.find((x) => x.startsWith('--junit-xml=')) || '').slice('--junit-xml='.length);",
+      "require('node:fs').writeFileSync(out, '<testsuite name=\"pytest\"><testcase classname=\"test_x\" name=\"test_ok\"/></testsuite>');", '',
+    ].join('\n');
+    const repo = makeRepo({ ...NODE_PROJECT, 'tools/pytest.cjs': FAKE_PYTEST, 'test_x.py': '' });
+    repo.write({ 'src/math.mjs': '// c\n' + NODE_PROJECT['src/math.mjs'] });
+    const managers = [{ name: 'npm', ecosystem: 'node', install: 'node -e "process.exit(0)"' }, { name: 'uv', ecosystem: 'python', install: 'node -e "0"' }];
+    const runners = [{ name: 'node-test', ecosystem: 'node', cmd: 'node --test' }, { name: 'pytest', ecosystem: 'python', cmd: 'node tools/pytest.cjs' }];
+    const det = { projects: [{ root: '.', managers, runners }] };
+    const res = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true });
+    assert.deepEqual(res.projects.map((p) => [p.root, p.run.runner, p.status, p.run.executed]), [['.', 'node-test', 'pass', 2], ['.', 'pytest', 'pass', 1]], JSON.stringify(res.checks[1]));
+    assert.deepEqual(res.checks.map((c) => c.id), ['CK-CLEANRUN', 'CK-CLEANRUN']);
+    assert.ok(res.checks[1].artifacts.every((a) => a.includes('/root-pytest/')), res.checks[1].artifacts.join());
+    // The python manager's install is not run for the node suite (and vice versa).
+    managers[1].install = 'node -e "process.exit(5)"';
+    const broken = await cr.cleanRun({ target: await target(repo), detectResult: det, noBase: true });
+    assert.deepEqual(broken.projects.map((p) => p.status), ['pass', 'unverified']);
+    assert.equal(broken.checks[1].reason, 'INSTALL_FAILED');
+    assert.equal(broken.status, 'unverified');
+  });
+
+  test('a runner exiting 127 is RUNNER_NOT_FOUND even when stale counts were parsed', () => {
+    assert.equal(cr.evaluateRun({ exit: 127, counts: { executed: 1, passed: 1, failed: 0, errors: 0, skipped: 0, flaky: 0 } }, null).reason, 'RUNNER_NOT_FOUND');
   });
 });

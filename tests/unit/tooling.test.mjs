@@ -16,6 +16,10 @@ const ADC = path.join(SKILL, 'scripts', 'adc.mjs');
 const P = await import('../../skills/agentic-developer-companion/scripts/lib/tooling-port.mjs');
 const T = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs');
 const { which } = await import('../../skills/agentic-developer-companion/scripts/lib/core.mjs');
+const FM = await import('../../skills/agentic-developer-companion/scripts/lib/frontmatter.mjs');
+const { parseToml } = await import('../../skills/agentic-developer-companion/scripts/lib/formats.mjs');
+const fmOf = (text) => FM.parseFrontmatter(text);
+const tomlOf = (text) => parseToml(text, { lenient: true });
 const LINT_AVAILABLE = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'tooling-lint.mjs'));
 const CLAUDE = which('claude');
 // Real host CLIs run their free load checks when they are on PATH (nothing is installed or spent).
@@ -184,7 +188,7 @@ function triggerSetFile(name) {
 describe('frontmatter and YAML subset', () => {
   test('parses maps, lists, flow, quoted, folded, literal and multi-line plain scalars', () => {
     const y = 'name: x\ndescription: >-\n  one\n  two\n\n  three\ntools: [\'read\', "search", edit]\nlist:\n  - a\n  - "b: c"\nnested:\n  version: "0.1.0"\n  k: v\nlit: |\n  a\n    b\nplain: is\n  continued\nflag: true\nnone:\nd2: Build for AWS: ECS # comment\nhandoffs:\n  - label: Plan\n    send: true\n';
-    const r = P.parseYamlLocal(y);
+    const r = FM.parseYamlDocument(y);
     assert.deepEqual(r.errors, []);
     assert.equal(r.value.description, 'one two\nthree');
     assert.deepEqual(r.value.tools, ['read', 'search', 'edit']);
@@ -200,24 +204,24 @@ describe('frontmatter and YAML subset', () => {
 
   test('stringify round-trips and quotes what plain YAML would change', () => {
     const data = { name: 'x', description: 'a'.repeat(50) + ' ' + 'b'.repeat(60), version: '1.10', yes: 'yes', glob: '**/*.ts', applyTo: 'src/**', paths: ['src/**'], meta: { 'short-description': 'Hi: there' }, list: ['read'], multi: 'l1\nl2' };
-    const text = P.stringifyFrontmatter(data, { flowKeys: ['list'] }) + 'body\n';
+    const text = FM.stringifyFrontmatter(data, { flowKeys: ['list'] }) + 'body\n';
     assert.match(text, /version: "1\.10"/);
     assert.match(text, /yes: "yes"/);
     assert.match(text, /glob: "\*\*\/\*\.ts"/);
     assert.match(text, /applyTo: "src\/\*\*"/);
     assert.match(text, /- "src\/\*\*"/);
     assert.match(text, /description: >-/);
-    const back = P.readFrontmatter(text);
+    const back = fmOf(text);
     assert.deepEqual(back.data, data);
     assert.equal(back.body, 'body\n');
   });
 
   test('reports bad YAML and unterminated frontmatter', () => {
-    assert.ok(P.parseYamlLocal('a: [unclosed').errors.length > 0);
-    assert.ok(P.parseYamlLocal('a: b\n   c: d\n').errors.length > 0);
-    assert.ok(P.readFrontmatter('---\nname: x\n').errors.length > 0);
-    assert.equal(P.readFrontmatter('# no frontmatter\n').hasFrontmatter, false);
-    assert.equal(P.readFrontmatter('\ufeff---\r\nname: x\r\n---\r\nbody').data.name, 'x');
+    assert.ok(FM.parseYamlDocument('a: [unclosed').errors.length > 0);
+    assert.ok(FM.parseYamlDocument('a: b\n   c: d\n').warnings.some((w) => w.code === 'UNQUOTED_COLON'));
+    assert.ok(fmOf('---\nname: x\n').errors.length > 0);
+    assert.equal(fmOf('# no frontmatter\n').hasFrontmatter, false);
+    assert.equal(fmOf('\ufeff---\r\nname: x\r\n---\r\nbody').data.name, 'x');
   });
 });
 
@@ -285,7 +289,7 @@ describe('tooling port', () => {
     // Codex gets a skill in .codex/skills: Copilot also reads .agents/skills and would see it twice.
     assert.deepEqual(r.written.map((w) => w.path).sort(), ['.claude/agents/reviewer.md', '.codex/skills/reviewer/SKILL.md', '.codex/skills/reviewer/agents/openai.yaml']);
     assert.ok(r.dropped_fields.some((d) => d.field === 'handoffs' && /Claude/.test(d.reason)));
-    const claude = P.readFrontmatter(read(dir, '.claude/agents/reviewer.md'));
+    const claude = fmOf(read(dir, '.claude/agents/reviewer.md'));
     assert.equal(claude.data.tools, 'Read, Grep, Glob, Edit, Write');
     assert.equal(claude.data.omitClaudeMd, true);
     assert.equal(claude.body.trim(), 'You review diffs.');
@@ -294,7 +298,7 @@ describe('tooling port', () => {
     // back to Copilot in a separate output tree
     const back = await P.port({ path: '.claude/agents/reviewer.md', root: dir, to: 'copilot', out: 'rt' });
     assert.deepEqual(back.written.map((w) => w.path), ['.github/agents/reviewer.agent.md']);
-    const cp = P.readFrontmatter(read(dir, 'rt/.github/agents/reviewer.agent.md'));
+    const cp = fmOf(read(dir, 'rt/.github/agents/reviewer.agent.md'));
     assert.deepEqual(cp.data.tools, ['read', 'search', 'edit']);
     assert.equal(cp.data.model, 'GPT-5');
     assert.equal(cp.data['user-invocable'], true);
@@ -370,14 +374,14 @@ describe('tooling port', () => {
   test('scoped rules: applyTo <-> paths round trip; Codex gets directory AGENTS.md sections', async () => {
     const dir = tmpRepo({ '.github/instructions/api.instructions.md': '---\napplyTo: "src/api/**/*.ts,src/api/**"\ndescription: API rules\nexcludeAgent: "code-review"\n---\n\n- Validate request bodies.\n' });
     const r = await P.port({ path: '.github/instructions/api.instructions.md', root: dir, to: 'claude,codex' });
-    const rule = P.readFrontmatter(read(dir, '.claude/rules/api.md'));
+    const rule = fmOf(read(dir, '.claude/rules/api.md'));
     assert.deepEqual(rule.data.paths, ['src/api/**/*.ts', 'src/api/**']);
     assert.ok(r.dropped_fields.some((d) => d.field === 'excludeAgent'));
     assert.ok(r.dropped_fields.some((d) => d.field === 'applyTo' && d.value === 'src/api/**/*.ts' && /directory only/.test(d.reason)));
     assert.match(read(dir, 'src/api/AGENTS.md'), /<!-- adc:port begin \.github\/instructions\/api\.instructions\.md -->[\s\S]*Validate request bodies/);
     const back = await P.port({ path: '.claude/rules/api.md', root: dir, to: 'copilot', out: 'rt' });
     assert.equal(back.written.length, 1);
-    const cp = P.readFrontmatter(read(dir, 'rt/.github/instructions/api.instructions.md'));
+    const cp = fmOf(read(dir, 'rt/.github/instructions/api.instructions.md'));
     assert.equal(cp.data.applyTo, 'src/api/**/*.ts,src/api/**');
     assert.equal(cp.data.description, 'API rules');
     assert.equal(cp.body.trim(), '- Validate request bodies.');
@@ -404,7 +408,7 @@ describe('tooling port', () => {
     assert.match(toml, /\[mcp_servers\.docs\]\ncommand = "npx"\nargs = \["-y", "docs-mcp@1\.2\.3"\]\nenv_vars = \["API_KEY"\]/);
     assert.match(toml, /bearer_token_env_var = "API_KEY"/);
     assert.match(toml, /http_headers = \{ X-Tenant = "public" \}/);
-    const parsed = P.parseTomlLite(toml).value;
+    const parsed = tomlOf(toml).value;
     assert.deepEqual(parsed.mcp_servers.docs.args, ['-y', 'docs-mcp@1.2.3']);
     const back = await P.port({ path: '.codex/config.toml', root: dir, to: 'claude', out: 'rt' });
     assert.equal(back.written.length, 1);
@@ -424,7 +428,7 @@ describe('tooling port', () => {
       '.claude/skills/user-only/SKILL.md': SKILL_MD('user-only', 'Runs the release checklist on request.', 'disable-model-invocation: true\nwhen_to_use: on request\n'),
     });
     const r = await P.port({ path: '.github/prompts/release.prompt.md', root: dir, to: 'copilot' });
-    const sk = P.readFrontmatter(read(dir, '.github/skills/release/SKILL.md'));
+    const sk = fmOf(read(dir, '.github/skills/release/SKILL.md'));
     assert.equal(sk.data['disable-model-invocation'], true);
     assert.equal(sk.data['argument-hint'], 'version');
     assert.deepEqual(r.dropped_fields.map((d) => d.field).sort(), ['agent', 'model', 'tools']);
@@ -546,10 +550,10 @@ describe('tooling scaffold', () => {
           const text = fs.readFileSync(file, 'utf8');
           assert.ok(!/\{\{[A-Za-z_]+\}\}/.test(text), `unrendered placeholder in ${w.path}`);
           if (file.endsWith('.json')) JSON.parse(text);
-          if (file.endsWith('.toml')) assert.deepEqual(P.parseTomlLite(text).errors, []);
-          if (/\.md$/.test(file) && text.startsWith('---')) assert.deepEqual(P.readFrontmatter(text).errors, [], w.path);
+          if (file.endsWith('.toml')) assert.deepEqual(tomlOf(text).errors, []);
+          if (/\.md$/.test(file) && text.startsWith('---')) assert.deepEqual(fmOf(text).errors, [], w.path);
           if (file.endsWith('SKILL.md')) {
-            const fm = P.readFrontmatter(text);
+            const fm = fmOf(text);
             assert.equal(fm.data.name, path.basename(path.dirname(file)), 'name == directory');
             assert.ok(String(fm.data.description).length <= 1024);
           }
@@ -568,7 +572,7 @@ describe('tooling scaffold', () => {
     assert.ok(fs.existsSync(path.join(all, '.claude', 'skills', 'demo-skill', 'evals', 'demo-skill-basic', 'graders', 'skill-used.md')));
     assert.match(fs.readFileSync(path.join(dir, 'out-instructions-all', 'CLAUDE.md'), 'utf8'), /^@AGENTS\.md$/m);
     assert.match(fs.readFileSync(path.join(dir, 'out-instructions-all', 'AGENTS.md'), 'utf8'), /`npm test`/);
-    assert.equal(P.readFrontmatter(fs.readFileSync(path.join(dir, 'out-prompt-claude', '.claude', 'skills', 'demo-prompt', 'SKILL.md'), 'utf8')).data['disable-model-invocation'], true);
+    assert.equal(fmOf(fs.readFileSync(path.join(dir, 'out-prompt-claude', '.claude', 'skills', 'demo-prompt', 'SKILL.md'), 'utf8')).data['disable-model-invocation'], true);
     assert.ok(fs.existsSync(path.join(dir, 'out-agent-codex', '.codex', 'skills', 'demo-agent', 'agents', 'openai.yaml')));
   });
 
@@ -608,12 +612,12 @@ describe('tooling scaffold', () => {
     assert.ok(Array.isArray(ev.evals) && ev.evals[0].prompt && Array.isArray(ev.evals[0].expectations));
     assert.ok(has(dir, '.claude/skills/notes/evals/notes-basic/prompt.md'), 'claude plugin eval case next to it');
     await T.scaffoldTooling('instructions', { values: { for: 'copilot', topic: 'api', 'apply-to': 'src/api/**', 'exclude-agent': 'code-review', write: true, cwd: dir } });
-    const fm = P.readFrontmatter(read(dir, '.github/instructions/api.instructions.md'));
+    const fm = fmOf(read(dir, '.github/instructions/api.instructions.md'));
     assert.deepEqual([fm.data.applyTo, fm.data.excludeAgent], ['src/api/**', 'code-review']);
     await assert.rejects(T.scaffoldTooling('instructions', { values: { for: 'copilot', 'exclude-agent': 'everyone', cwd: dir } }), /exclude-agent/);
     await T.scaffoldTooling('agent', { values: { for: 'copilot,claude', name: 'triage', description: desc, skills: 'notes', write: true, cwd: dir } });
-    assert.deepEqual(P.readFrontmatter(read(dir, '.github/agents/triage.agent.md')).data.skills, ['notes']);
-    assert.deepEqual(P.readFrontmatter(read(dir, '.claude/agents/triage.md')).data.skills, ['notes']);
+    assert.deepEqual(fmOf(read(dir, '.github/agents/triage.agent.md')).data.skills, ['notes']);
+    assert.deepEqual(fmOf(read(dir, '.claude/agents/triage.md')).data.skills, ['notes']);
   });
 
   test('the generated hook handler passes its own fixture tests', async () => {
@@ -1002,8 +1006,11 @@ describe('tooling plugin', () => {
     const r = await T.toolingCommand(['plugin', 'check', 'plugins/bad', '--cwd', dir]);
     assert.equal(r.exit, 1);
     const rules = new Set(r.result.findings.filter((f) => f.severity === 'error').map((f) => f.rule));
-    for (const rule of ['AP_SCHEMA', 'CLAUDE_NAME', 'CLAUDE_PATH', 'AP_MCP_COMMAND', 'AP_MCP_VARIANT', 'SKILL_NAME_DIR', 'SKILL_NAME', 'CODEX_CAMEL', 'NAME_MISMATCH', 'VERSION_MISMATCH']) assert.ok(rules.has(rule), rule);
-    assert.ok(r.result.findings.some((f) => f.rule === 'AP_FIELD' && /commands/.test(f.message)));
+    // Cross-manifest and schema-variant rules are the check's own; the per-file rules come from tooling lint.
+    for (const rule of ['NAME_MISMATCH', 'VERSION_MISMATCH', 'AP_MCP_VARIANT', 'PL-AP-SCHEMA', 'PL-CL-NAME', 'PL-CL-PATH', 'PL-AP-MCP', 'SK-NAME-DIR', 'PL-CX-FIELD']) {
+      assert.ok(rules.has(rule), rule);
+    }
+    assert.ok(r.result.findings.some((f) => f.rule === 'PL-AP-FIELD' && /commands/.test(f.message)));
   });
 
   test('refuses reserved names and the companion skill as a target', async () => {

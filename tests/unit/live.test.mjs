@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import * as markers from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
 import * as live from '../../skills/agentic-developer-companion/scripts/lib/live.mjs';
 import * as doctor from '../../skills/agentic-developer-companion/scripts/lib/doctor.mjs';
 
@@ -244,9 +245,9 @@ test('loadCredentials: environment wins, every value is a redaction literal, uni
   if (c.file.ignored === false) assert.deepEqual([c.token, c.error], [null, 'ENV_FILE_NOT_IGNORED']);
 });
 
-test('makeRedactor replaces raw, URL-encoded and base64 token forms, the env-line shape and secret shapes', async () => {
+test('the runner\'s redactor (markers.makeRedactor) replaces raw, URL-encoded and base64 token forms and shapes', () => {
   const tok = 'hunter2abc';
-  const redact = await live.makeRedactor([{ name: 'ADC_LIVE_TOKEN', value: tok }]);
+  const redact = markers.makeRedactor({ literals: [{ name: 'ADC_LIVE_TOKEN', value: tok }], env: {} });
   const aws = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
   const text = `a ${tok} b ${Buffer.from(tok).toString('base64')} c ${encodeURIComponent(tok + '/x')} ADC_LIVE_TOKEN=other-value key ${aws}`;
   const out = redact(text);
@@ -254,25 +255,7 @@ test('makeRedactor replaces raw, URL-encoded and base64 token forms, the env-lin
   assert.ok(!out.includes('other-value'));
   assert.ok(!out.includes(aws));
   assert.match(out, /\[REDACTED:ADC_LIVE_TOKEN\]/);
-  assert.deepEqual(live.redactValue({ a: [tok], output_sha256: 'abc', [tok]: 1 }, redact), { a: ['[REDACTED:ADC_LIVE_TOKEN]'], output_sha256: 'abc', '[REDACTED:ADC_LIVE_TOKEN]': 1 });
-});
-
-test('spawnCapture captures both streams and the exit code', async () => {
-  const r = await live.spawnCapture(process.execPath, ['-e', 'console.log("out"); console.error("err"); process.exit(3)']);
-  assert.deepEqual([r.exit, r.stdout.trim(), r.stderr.trim(), r.timedOut], [3, 'out', 'err', false]);
-  const missing = await live.spawnCapture('adc-no-such-binary-xyz', []);
-  assert.equal(missing.exit, null);
-  assert.ok(missing.error);
-});
-
-test('spawnCapture kills the whole process tree on timeout', { skip: !POSIX && 'process groups are POSIX; Windows uses taskkill /T' }, async () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-kill-'));
-  const marker = path.join(d, 'grandchild-survived');
-  const script = `require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => require("fs").writeFileSync(process.argv[1], "x"), 1200)', ${JSON.stringify(marker)}], { stdio: 'ignore' }); setTimeout(() => {}, 10000);`;
-  const r = await live.spawnCapture(`"${process.execPath}" -e ${core.quoteArg(script)}`, [], { shell: true, timeoutMs: 400 });
-  assert.equal(r.timedOut, true);
-  await new Promise((res) => setTimeout(res, 1800));
-  assert.equal(fs.existsSync(marker), false, 'the grandchild was killed with the group');
+  assert.deepEqual(markers.redactDeep({ a: [tok], output_sha256: 'abc', [tok]: 1 }, redact, { keys: true }), { a: ['[REDACTED:ADC_LIVE_TOKEN]'], output_sha256: 'abc', '[REDACTED:ADC_LIVE_TOKEN]': 1 });
 });
 
 test('liveSpendRecorded reads today\'s live spend from metrics.jsonl', () => {
@@ -419,9 +402,10 @@ test('cost accounting: cumulative headers use the recorded baseline, reported co
   assert.equal(r.run_spent, 7.5);
 });
 
-test('timeouts fail the probe, a missing runner is UNVERIFIED, HTTP 401 is AUTH_REJECTED', async () => {
+test('timeouts fail the probe and kill its tree, a missing runner is UNVERIFIED, HTTP 401 is AUTH_REJECTED', async () => {
+  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-kill-')), 'grandchild-survived');
   const { dir } = liveRepo([
-    P('slow', '--sleep=5000', { timeout_s: 0.5 }),
+    P('slow', `--sleep=5000 --marker=${marker}`, { timeout_s: 0.5 }),
     { id: 'norunner', kind: 'readonly', cmd: 'adc-no-such-runner-xyz --x', cost: 1 },
     P('denied', '--status=401 --fail'),
   ]);
@@ -432,6 +416,21 @@ test('timeouts fail the probe, a missing runner is UNVERIFIED, HTTP 401 is AUTH_
   else assert.notEqual(by.norunner.status, 'pass');
   assert.deepEqual([by.denied.status, by.denied.reason, by.denied.http_status], ['fail', 'AUTH_REJECTED', 401]);
   assert.equal(r.exit, 1);
+  if (POSIX) {
+    await new Promise((res) => setTimeout(res, 1800));
+    assert.equal(fs.existsSync(marker), false, 'the probe\'s grandchild was killed with its process group');
+  }
+});
+
+test('regression: an environment token with a trailing newline is redacted after the probe trims it', async () => {
+  const { dir } = liveRepo([{ id: 'trim', kind: 'readonly', cost: 1,
+    cmd: `"${process.execPath}" -e "console.log('t=' + process.env.ADC_LIVE_TOKEN.trim() + ' end'); throw new Error(process.env.ADC_LIVE_TOKEN.trim())"` }], { token: null });
+  const tok = 'zz-ci-secret-4711';
+  const { r, st } = await runLive(dir, { env: { ADC_LIVE_TOKEN: `${tok}\n` } });
+  assert.equal(r.probes[0].status, 'fail');
+  const log = fs.readFileSync(path.join(st.root, r.probes[0].log), 'utf8');
+  assert.match(log, /t=\[REDACTED:ADC_LIVE_TOKEN\] end/);
+  assert.ok(!JSON.stringify(r).includes(tok) && !log.includes(tok));
 });
 
 test('a missing or broken budget.json: recreated when no spend is recorded or interactively, BUDGET_UNVERIFIED headless otherwise', async () => {
@@ -457,6 +456,9 @@ test('dry run writes nothing and simulates the caps across probes', async () => 
   const { r } = await runLive(dir, { dryRun: true });
   assert.deepEqual(r.probes.map((p) => p.status), ['would-run', 'not-run']);
   assert.equal(r.stopped_reason, 'BUDGET_EXHAUSTED');
+  assert.equal(r.warnings.filter((w) => /a real run would recreate/.test(w)).length, 1, 'each notice once');
+  const raised = (await runLive(dir, { dryRun: true, creditsOverride: 5000, runClass: 'interactive', interactive: true })).r;
+  assert.deepEqual(raised.probes.map((p) => p.status), ['would-run', 'would-run'], 'a dry run simulates the override');
   assert.equal(fs.existsSync(st.paths.budget), false);
   assert.equal(fs.existsSync(st.paths.metrics), false);
   assert.equal(r.ledger, null);
@@ -559,6 +561,21 @@ test('cli: budget show, reset and prune', () => {
   assert.equal(pr.status, 0);
   assert.equal(Object.keys(readBudget(st).sessions).length, 50);
   assert.ok(readBudget(st).sessions['kept-1']);
+});
+
+test('regression: budget show reports the caps an agent run gets; prune keeps the open hook session', () => {
+  const { dir, st } = liveRepo([P('a')]);
+  const sessions = { 'hook-open': { started: '2020-01-01T00:00:00.000Z', spent: 7, probes: [] } };
+  for (let i = 0; i < 55; i++) sessions[`n-${i}`] = { started: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), spent: 0, probes: [] };
+  fs.writeFileSync(st.paths.budget, JSON.stringify({ schema: 'adc-budget/1', max_per_session: 9000, max_per_day: 9000, warn_at: 2000, days: { [core.today()]: { spent: 100 } }, sessions }));
+  const show = adc(['budget', 'show'], { cwd: dir });
+  assert.deepEqual([show.json.max_per_day, show.json.effective.max_per_day, show.json.today.remaining], [9000, 2500, 2400]);
+  core.ensureDir(st.paths.sessions);
+  fs.writeFileSync(path.join(st.paths.sessions, 'hook-open.json'), JSON.stringify({ schema: 'adc-session/1', session_id: 'hook-open' }));
+  assert.equal(adc(['budget', 'prune'], { cwd: dir }).status, 0);
+  const b = readBudget(st);
+  assert.equal(Object.keys(b.sessions).length, 51);
+  assert.equal(b.sessions['hook-open'].spent, 7, 'the session in progress keeps its spend');
 });
 
 test('human output for terminals: live run, budget show and doctor render without JSON', async () => {

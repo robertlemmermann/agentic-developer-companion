@@ -1,1330 +1,593 @@
-// `tooling lint`: validate instructions, skills, agents, prompt files, hooks, plugins and MCP
-// configs against each host's documented rules (plan §11.2). Every rule has an id, the hosts
-// it applies to with a severity per host, and a source citation; the catalog is `RULES`.
-// The hosts' own validators (skills-ref, claude plugin validate, gh skill publish --dry-run,
-// copilot skill/instruction list, codex debug prompt-input and doctor, waza) are merged when
+// `tooling lint`: checks instructions, skills, agents, prompt files, hooks, plugins, marketplaces and MCP
+// configs against each host's documented rules (plan §11.2). The rule catalog (ids, hosts with a severity
+// each, source keys) and the sources live in references/tooling-lint.md and are parsed at load, so the
+// reference the model reads and the linter cannot drift apart. The hosts' own validators are merged when
 // installed; none of them runs a model turn. Read-only: lint writes nothing.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  defineCommand, usageError, EXIT, readText, toPosix, globToRegExp, which, run, runShell, quoteArg, toolVersion,
-  versionGte, truncate, IS_WINDOWS,
+  defineCommand, usageError, envError, EXIT, readText, toPosix, globToRegExp, which, runTool, toolVersion,
+  versionGte, truncate, isObj, lineOf, statOrNull, findUp, hostHomes, samePath, listFiles, firstLine, SKILL_DIR,
 } from './core.mjs';
 import { repoRoot } from './git.mjs';
 import { resolveStateDir, assertStateUntracked } from './state.mjs';
-import { parseFrontmatter, parseYamlDocument, INSTALL_METADATA_KEY } from './frontmatter.mjs';
+import { parseJson, parseToml } from './formats.mjs';
+import { scanSecrets, redactSecrets } from './markers.mjs';
+import {
+  parseFrontmatter, parseYamlDocument, INSTALL_METADATA_KEY, markdownLines, markdownLinks, isExternalLink, linkPath,
+} from './frontmatter.mjs';
 
 export const HOSTS = Object.freeze(['spec', 'copilot', 'claude', 'codex']);
-const HOST_LABEL = { spec: 'Agent Skills spec', copilot: 'Copilot', claude: 'Claude Code', codex: 'Codex' };
-const SEVERITIES = new Set(['error', 'warning', 'note']);
+const LABEL = { spec: 'Agent Skills spec', copilot: 'Copilot', claude: 'Claude Code', codex: 'Codex' };
+const W = (s) => s.trim().split(/\s+/);
+const S = (s) => new Set(W(s));
 
 // ---------------------------------------------------------------------------
-// Sources cited by the rules (research digests, checked 2026-10-24/25)
+// Catalog: the reference's `| \`ID\` | spec E, copilot W; strict: spec E | checks | \`source\` ... |` rows
+// and its `- Group: \`key\` citation; \`key\` citation.` source bullets.
 
-export const SOURCES = Object.freeze({
-  'spec': 'Agent Skills specification - agentskills/agentskills docs/specification.mdx (https://agentskills.io/specification)',
-  'skills-ref': 'skills-ref validator - agentskills/agentskills skills-ref/src/skills_ref/validator.py and parser.py',
-  'cp-skills': 'GitHub Docs: agent skills - data/reusables/copilot/creating-adding-skills.md, concepts/customizations/agent-skills.md',
-  'cp-cli': 'GitHub Docs: Copilot CLI command reference - reference/copilot-cli-reference/cli-command-reference.md',
-  'cp-listing': 'GitHub Docs: Copilot SDK skills (related-files listing: 100 files, folders >50 summarized) - how-tos/copilot-sdk/features/skills.md',
-  'vsc-skills': 'VS Code: agent skills - microsoft/vscode-docs docs/agent-customization/agent-skills.md (2026-10-21)',
-  'cl-skills': 'Claude Code: skills - https://code.claude.com/docs/en/skills',
-  'cl-bp': 'Claude platform: skill authoring best practices - https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices',
-  'cx-skills': 'Codex skill parser and loader - openai/codex codex-rs/skills/src/parser.rs, ext/skills/src/loader/mod.rs @970111f',
-  'cx-yaml': 'Codex agents/openai.yaml - openai/codex skills/src/metadata.rs and skill-creator/references/openai_yaml.md @970111f',
-  'cx-config': 'Codex config.toml - openai/codex codex-rs/config/src/skills_config.rs, config.schema.json @970111f',
-  'ac-contrib': 'github/awesome-copilot CONTRIBUTING.md and eng/validate-skills.mjs (assets under 5 MB)',
-  'cp-instr': 'GitHub Docs: custom instructions - reference/custom-instructions-support.md, how-tos/.../add-custom-instructions.md',
-  'cp-cr': 'GitHub Docs: Copilot code review customization tutorial (instruction files up to about 1,000 lines)',
-  'cp-dist': 'GitHub Docs: Copilot CLI custom instructions and @imports - how-tos/copilot-cli/customize-copilot/add-custom-instructions.md',
-  'vsc-instr': 'VS Code: custom instructions - docs/agent-customization/custom-instructions.md (sources are additive)',
-  'cl-memory': 'Claude Code: memory (CLAUDE.md, AGENTS.md, @imports, rules) - https://code.claude.com/docs/en/memory',
-  'cx-agentsmd': 'Codex AGENTS.md loading - openai/codex codex-rs/core/src/agents_md.rs, config/src/config_toml.rs (32 KiB) @970111f',
-  'cp-agents': 'GitHub Docs: custom agents configuration - reference/custom-agents-configuration.md',
-  'vsc-agents': 'VS Code: custom agent file reference - docs/agents/reference/custom-agent-file-reference.md',
-  'cl-agents': 'Claude Code: subagents - https://code.claude.com/docs/en/sub-agents',
-  'cp-prompts': 'VS Code: prompt files (Local harness only) - docs/agent-customization/prompt-files.md; GitHub customization cheat sheet',
-  'cp-hooks': 'GitHub Docs: hooks reference - reference/hooks-reference.md (2026-10-20)',
-  'cp-hooks-howto': 'GitHub Docs: Copilot CLI hooks how-to - how-tos/copilot-cli/customize-copilot/use-hooks.md',
-  'vsc-hooks': 'VS Code: hooks (Copilot harness vs Local harness) - docs/agent-customization/hooks.md',
-  'cl-hooks': 'Claude Code: hooks reference and guide - https://code.claude.com/docs/en/hooks',
-  'cx-hooks': 'Codex hooks - openai/codex codex-rs/hooks/src/engine/{discovery,matcher,command_runner}.rs, protocol/src/hooks.rs @970111f',
-  'cx-54072': 'openai/codex issue #54072 (PowerShell -Command collapses exit code 2 to 1 on Windows)',
-  'cp-2540': 'github/copilot-cli issue #2540 (plugin preToolUse hooks need "cwd": "${PLUGIN_ROOT}")',
-  'cp-plugins': 'GitHub Docs: Copilot CLI plugin reference - reference/copilot-cli-reference/cli-plugin-reference.md',
-  'ap-spec': 'Agent Plugins 1.0 specification - agentplugins/agent-plugins-spec spec/1.0.0.md',
-  'cl-plugins': 'Claude Code: plugin manifest reference and components - https://code.claude.com/docs/en/plugins-reference',
-  'cl-mkt': 'Claude Code: plugin marketplaces - https://code.claude.com/docs/en/plugin-marketplaces',
-  'cl-validate': 'claude plugin validate - https://code.claude.com/docs/en/plugins/cli-reference',
-  'cx-plugins': 'Codex plugins - openai/codex codex-rs/core-plugins/src/{manifest,marketplace}.rs @970111f',
-  'cp-mcp': 'GitHub Docs: MCP for Copilot CLI and cloud agent - how-tos/copilot-cli/customize-copilot/add-mcp-servers.md, configure-mcp-servers.md',
-  'vsc-mcp': 'VS Code: MCP configuration and migration - docs/agents/reference/mcp-configuration.md, migrate-customizations.md',
-  'ac-hooks': 'github/awesome-copilot instructions/hooks.instructions.md (hook anti-patterns)',
-  'anti-patterns': 'Tooling anti-pattern catalog (research digest tooling-authoring.md section f: secrets, hostnames, paths, Windows, pinning)',
-  'measured': 'Measured in the build container 2026-10-25: skills-ref @69ef37e (strictyaml), gh 2.99.0, Claude Code 2.1.310, Copilot CLI 1.0.103, Codex 0.164.0',
-});
+const REF = String(readText(path.join(SKILL_DIR, 'references', 'tooling-lint.md'), '')).replace(/\r\n/g, '\n');
+const SEV = { E: 'error', W: 'warning', N: 'note' };
+const KINDS = { 'CX-YAML': 'codex-skill-meta', CX: 'codex-config', SK: 'skill', CM: 'command', PR: 'prompt',
+  MD: 'markdown', IN: 'instructions', AG: 'agent', HK: 'hooks', PL: 'plugin', MK: 'marketplace', MC: 'mcp',
+  SEC: 'security', EXT: 'external' };
+const sevMap = (s) => Object.freeze(Object.fromEntries(s.split(', ').map((x) => x.trim().split(' '))
+  .map(([h, l]) => [h, SEV[l]])));
+const ROW = /^\| `([A-Z]+(?:-[A-Z0-9]+)+)` \| ([^|\n]+) \| (.+) \| ((?:`[\w-]+` ?)+) \|$/gm;
 
-// ---------------------------------------------------------------------------
-// Rule catalog
-
-const R = (id, kind, hosts, title, sources, extra = {}) => {
-  const h = {};
-  for (const pair of hosts.split(/\s+/).filter(Boolean)) {
-    const [host, sev] = pair.split('=');
-    h[host] = sev;
-  }
-  return Object.freeze({ id, kind, hosts: Object.freeze(h), title, sources: sources.split(/\s+/), ...extra });
-};
-const ALL4 = (sev) => `spec=${sev} copilot=${sev} claude=${sev} codex=${sev}`;
-const SEC = (id, title, sources, severity = 'warning') =>
-  Object.freeze({ id, kind: 'security', group: 'security', hosts: Object.freeze({}), severity, title, sources: sources.split(/\s+/) });
-
-/** Every rule: { id, kind, hosts: {host: 'error'|'warning'|'note'}, title, sources[], strict? }. */
-export const RULES = Object.freeze([
-  // SKILL.md
-  R('SK-FILENAME', 'skill', ALL4('error'), 'The skill file is named exactly SKILL.md (Codex matches it case-sensitively)', 'cx-skills cp-skills'),
-  R('SK-FM-LINE1', 'skill', ALL4('error'), 'Frontmatter opens with "---" on line 1', 'skills-ref cx-skills cl-skills'),
-  R('SK-FM-BOM', 'skill', 'spec=warning codex=warning', 'No UTF-8 byte-order mark before the opening "---"', 'skills-ref cx-skills'),
-  R('SK-FM-YAML', 'skill', ALL4('error'), 'Frontmatter is valid YAML (Claude Code loads a malformed block with no fields)', 'cl-skills skills-ref cx-skills'),
-  R('SK-FM-COLON', 'skill', 'spec=error copilot=error claude=error codex=warning', 'No unquoted ": " inside a scalar (only Codex auto-repairs it)', 'cx-skills cl-skills'),
-  R('SK-FM-STRICTYAML', 'skill', 'spec=warning', 'Block-style YAML only: skills-ref parses with strictyaml, which rejects flow collections, anchors, aliases and tags', 'skills-ref measured', { strict: Object.freeze({ spec: 'error' }) }),
-  R('SK-NAME-REQUIRED', 'skill', 'spec=error copilot=error', '`name` is present (Claude Code and Codex default to the directory name)', 'spec cp-skills'),
-  R('SK-NAME-LENGTH', 'skill', 'spec=error copilot=error claude=warning codex=error', '`name` is 1-64 characters', 'spec skills-ref cx-skills'),
-  R('SK-NAME-FORMAT', 'skill', 'spec=error copilot=error claude=warning codex=warning', '`name` uses lowercase letters, digits and single inner hyphens (VS Code silently skips other names)', 'spec vsc-skills cl-bp'),
-  R('SK-NAME-DIR', 'skill', 'spec=error copilot=error claude=warning', '`name` equals the skill directory name', 'skills-ref vsc-skills'),
-  R('SK-NAME-RESERVED', 'skill', 'claude=warning', '`name` does not contain "claude" or "anthropic" (claude.ai and the Skills API reject it)', 'cl-skills cl-bp'),
-  R('SK-NAME-CLAUDE-DIR', 'skill', 'claude=error', 'The skill folder is not named "synced" or "anthropic-skills*" (reserved by Claude Code)', 'cl-skills'),
-  R('SK-DESC-REQUIRED', 'skill', 'spec=error copilot=error claude=warning codex=error', '`description` is present and non-empty (Codex does not load a skill without one)', 'spec cx-skills cl-skills'),
-  R('SK-DESC-TYPE', 'skill', ALL4('error'), '`description` is a string', 'spec cx-skills'),
-  R('SK-DESC-LENGTH', 'skill', 'spec=error copilot=error', '`description` is at most 1,024 characters', 'spec cp-cli vsc-skills'),
-  R('SK-DESC-LISTING', 'skill', 'claude=warning', '`description` plus `when_to_use` stays under the 1,536-character listing cap', 'cl-skills'),
-  R('SK-DESC-XML', 'skill', 'spec=warning claude=warning', '`description` contains no XML/HTML tags', 'cl-bp'),
-  R('SK-DESC-PERSON', 'skill', 'claude=warning', '`description` is written in the third person (not "I ..." or "You can ...")', 'cl-bp'),
-  R('SK-FIELD-NONSPEC', 'skill', 'spec=warning', 'Only the six spec fields are portable (skills-ref, gh skill publish and claude.ai uploads reject others)', 'skills-ref cl-skills', { strict: Object.freeze({ spec: 'error' }) }),
-  R('SK-FIELD-IGNORED', 'skill', 'copilot=warning claude=warning codex=note', 'A frontmatter field the host does not read', 'cp-cli vsc-skills cl-skills cx-skills'),
-  R('SK-METADATA-MAP', 'skill', 'spec=error codex=warning', '`metadata` is a mapping', 'spec cx-skills'),
-  R('SK-METADATA-STRING', 'skill', 'spec=warning', '`metadata` values are strings (quote versions such as "1.0")', 'spec'),
-  R('SK-SHORTDESC', 'skill', 'codex=note', '`metadata.short-description` is 25-64 characters (skill-creator guidance; Codex\'s own skills deviate)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
-  R('SK-COMPAT-LENGTH', 'skill', 'spec=error claude=warning', '`compatibility` is 1-500 characters', 'spec cl-skills'),
-  R('SK-ALLOWED-TOOLS-TYPE', 'skill', 'spec=warning', '`allowed-tools` is a space-separated string in the spec', 'spec'),
-  R('SK-BODY-LINES', 'skill', 'spec=warning claude=warning', 'The body stays under 500 lines', 'spec cl-skills'),
-  R('SK-BODY-TOKENS', 'skill', 'spec=warning claude=warning', 'The body stays under about 5,000 tokens (Claude keeps the first 5,000 after compaction)', 'spec cl-skills'),
-  R('SK-BODY-EMPTY', 'skill', 'copilot=warning claude=warning codex=warning', 'The body contains instructions', 'spec'),
-  R('SK-SUBST', 'skill', 'spec=warning copilot=warning codex=warning', 'No $ARGUMENTS, ${CLAUDE_*} or !`cmd` substitutions in a skill meant for every host', 'cp-skills cx-skills cl-skills'),
-  R('SK-SUBST-POSITIONAL', 'skill', 'claude=warning', '$0-$9 in the body are replaced with arguments by Claude Code (write \\$1 for a literal)', 'cl-skills'),
-  R('SK-LINK-MISSING', 'skill', 'copilot=error claude=error codex=error', 'Every relative link in SKILL.md resolves to a file in the skill', 'vsc-skills cl-skills'),
-  R('SK-LINK-BACKSLASH', 'skill', 'copilot=error claude=error codex=error', 'Links use forward slashes', 'vsc-skills cl-bp'),
-  R('SK-LINK-ABSOLUTE', 'skill', 'copilot=warning claude=warning codex=warning', 'Links are relative and stay inside the skill folder (no absolute local paths)', 'cl-bp'),
-  R('SK-REF-UNLINKED', 'skill', 'copilot=warning claude=warning', 'Every file under references/ is linked from SKILL.md (VS Code loads only referenced files)', 'vsc-skills cl-skills'),
-  R('SK-REF-DEPTH', 'skill', 'spec=warning claude=warning', 'Reference files are one level deep (references/<file>)', 'spec cl-bp'),
-  R('SK-FOOTPRINT-FILES', 'skill', 'copilot=warning', 'The skill folder holds at most 100 files (Copilot lists no more)', 'cp-listing'),
-  R('SK-FOOTPRINT-FOLDER', 'skill', 'copilot=warning', 'No folder in the skill has more than 50 entries (Copilot summarizes it)', 'cp-listing'),
-  R('SK-ASSET-SIZE', 'skill', 'copilot=warning', 'No file in the skill is larger than 5 MB', 'ac-contrib'),
-  // agents/openai.yaml (Codex sidecar)
-  R('CX-YAML-PARSE', 'codex-skill-meta', 'codex=error', 'agents/openai.yaml is valid YAML', 'cx-yaml'),
-  R('CX-YAML-FIELD', 'codex-skill-meta', 'codex=warning', 'agents/openai.yaml uses only interface, dependencies and policy keys', 'cx-yaml'),
-  R('CX-YAML-SHORTDESC', 'codex-skill-meta', 'codex=note', '`interface.short_description` is 25-64 characters (guidance)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
-  R('CX-YAML-PROMPT', 'codex-skill-meta', 'codex=note', '`interface.default_prompt` mentions the skill as $<skill-name> (guidance)', 'cx-yaml measured', { strict: Object.freeze({ codex: 'warning' }) }),
-  R('CX-YAML-POLICY', 'codex-skill-meta', 'codex=error', '`policy.allow_implicit_invocation` is a boolean', 'cx-yaml'),
-  R('CX-YAML-DEPS', 'codex-skill-meta', 'codex=warning', '`dependencies.tools[].type` is "mcp" and names a server', 'cx-yaml'),
-  // Legacy Claude commands and prompt files
-  R('CM-FIELD', 'command', 'claude=warning copilot=warning', 'Command files accept skill fields except `name` and `paths`', 'cl-skills cp-cli'),
-  R('CM-LEGACY', 'command', 'claude=note', '.claude/commands is the legacy format; new work belongs in skills', 'cl-skills'),
-  R('PR-HARNESS', 'prompt', 'copilot=note', 'Prompt files run only in the VS Code Local harness and Visual Studio (not Copilot CLI, cloud agent or the Copilot harness)', 'cp-prompts'),
-  R('PR-FIELD', 'prompt', 'copilot=warning', 'Prompt-file frontmatter uses description, name, argument-hint, agent, model, tools', 'cp-prompts'),
-  R('MD-FM-YAML', 'markdown', 'copilot=error claude=error codex=error', 'Frontmatter of instruction, agent, command and prompt files is valid YAML', 'cl-agents cp-agents cp-instr'),
-  // Instructions
-  R('IN-APPLYTO-MISSING', 'instructions', 'copilot=warning', 'A .instructions.md file declares `applyTo`', 'cp-instr ac-contrib'),
-  R('IN-APPLYTO-GLOB', 'instructions', 'copilot=error claude=error', '`applyTo` / `paths` globs are valid, relative and use forward slashes', 'cp-instr cl-memory'),
-  R('IN-EXCLUDEAGENT', 'instructions', 'copilot=error', '`excludeAgent` is "code-review" or "cloud-agent"', 'cp-instr'),
-  R('IN-FIELD', 'instructions', 'copilot=warning claude=warning', 'Instruction frontmatter uses only documented keys', 'cp-instr cl-memory'),
-  R('IN-LENGTH', 'instructions', 'copilot=warning', 'An instruction file stays under about 1,000 lines', 'cp-cr'),
-  R('IN-CLAUDE-LENGTH', 'instructions', 'claude=warning', 'CLAUDE.md stays under 200 lines', 'cl-memory'),
-  R('IN-AGENTS-BUDGET', 'instructions', 'codex=warning', 'AGENTS.md files from the root to a directory total at most 32 KiB (Codex truncates)', 'cx-agentsmd'),
-  R('IN-DUPLICATE', 'instructions', 'copilot=warning claude=warning codex=warning', 'The same directive is not repeated across always-on instruction files', 'vsc-instr cl-memory'),
-  R('IN-CONFLICT', 'instructions', 'copilot=warning claude=warning codex=warning', 'Always-on instruction files do not contradict each other', 'vsc-instr cl-memory'),
-  R('IN-ABS-PATH', 'instructions', 'copilot=warning claude=warning codex=warning', 'No user-specific or absolute local paths', 'anti-patterns'),
-  R('IN-HOSTNAME', 'instructions', 'copilot=warning claude=warning codex=warning', 'No internal hostnames or private IP addresses', 'anti-patterns'),
-  R('IN-BASH-ONLY', 'instructions', 'copilot=warning claude=warning codex=warning', 'Shell commands have a Windows equivalent', 'cp-hooks-howto anti-patterns'),
-  R('IN-CLAUDE-LOCAL', 'instructions', 'claude=warning', 'No CLAUDE.local.md next to AGENTS.md (it stops AGENTS.md from loading)', 'cl-memory'),
-  R('IN-CLAUDE-AGENTS', 'instructions', 'claude=warning', 'A CLAUDE.md next to AGENTS.md imports it with @AGENTS.md (Claude ignores AGENTS.md otherwise)', 'cl-memory'),
-  R('IN-IMPORT-MISSING', 'instructions', 'copilot=error claude=error', 'Every @import target exists', 'cl-memory cp-dist'),
-  R('IN-IMPORT-UNSUPPORTED', 'instructions', 'copilot=warning codex=warning', '@imports only in files that expand them (not GEMINI.md, *.instructions.md, or Codex AGENTS.md)', 'cp-dist cx-agentsmd'),
-  R('IN-IMPORT-ABSOLUTE', 'instructions', 'copilot=note', 'Absolute or ~/ @imports: the Copilot docs disagree on support; prefer relative paths', 'cp-dist cp-cli'),
-  R('IN-EMPTY', 'instructions', 'copilot=note claude=note codex=note', 'The instruction file has content', 'cp-instr'),
-  // Agents
-  R('AG-FM-MISSING', 'agent', 'copilot=error claude=error', 'An agent file starts with YAML frontmatter', 'cp-agents cl-agents'),
-  R('AG-DESC-REQUIRED', 'agent', 'copilot=error claude=error', '`description` is present', 'cp-agents cl-agents'),
-  R('AG-NAME-REQUIRED', 'agent', 'claude=error', '`name` is present (Claude Code skips the agent otherwise)', 'cl-agents'),
-  R('AG-NAME-FORMAT', 'agent', 'claude=error', '`name` is at most 256 characters with no colon', 'cl-agents'),
-  R('AG-FILENAME', 'agent', 'copilot=error', 'Agent file names use only . - _ a-z A-Z 0-9', 'cp-agents'),
-  R('AG-BODY-LENGTH', 'agent', 'copilot=error', 'The agent prompt is at most 30,000 characters', 'cp-agents'),
-  R('AG-FIELD', 'agent', 'copilot=warning claude=warning', 'Agent frontmatter uses only documented fields', 'cp-agents vsc-agents cl-agents'),
-  R('AG-FIELD-SURFACE', 'agent', 'copilot=warning', 'Fields that some Copilot surfaces ignore (handoffs, argument-hint in the cloud agent; retired infer; mcp-servers, metadata in VS Code as a note)', 'cp-agents'),
-  R('AG-TOOLS', 'agent', 'copilot=warning', '`tools` entries are known aliases, server/tool, server/* or "*"', 'cp-agents'),
-  R('AG-ENUM', 'agent', 'copilot=error claude=error', 'Enumerated agent fields use documented values', 'cp-agents cl-agents'),
-  R('AG-PLUGIN-FIELDS', 'agent', 'claude=warning', 'Plugin subagents cannot use hooks, mcpServers, permissionMode or initialPrompt', 'cl-plugins'),
-  R('AG-CODEX', 'agent', 'codex=note', 'Codex has no Markdown agents; port to a skill with a default prompt', 'cx-skills'),
-  // Copilot hooks
-  R('HK-CP-JSON', 'hooks', 'copilot=error', 'The hooks file is valid JSON (an invalid file is rejected)', 'cp-hooks'),
-  R('HK-CP-VERSION-MISSING', 'hooks', 'copilot=warning', '`version: 1` is present (files without it load since CLI 1.0.5)', 'cp-hooks'),
-  R('HK-CP-VERSION', 'hooks', 'copilot=error', '`version` is 1 (any other value rejects the file)', 'cp-hooks'),
-  R('HK-CP-SHAPE', 'hooks', 'copilot=error', '`hooks` maps event names to arrays of entries', 'cp-hooks'),
-  R('HK-CP-EVENT', 'hooks', 'copilot=error', 'Event names are documented Copilot events in one casing', 'cp-hooks'),
-  R('HK-CP-EVENT-UNDOC', 'hooks', 'copilot=warning', 'PascalCase names without a documented Copilot alias', 'cp-hooks'),
-  R('HK-CP-MIXED-CASE', 'hooks', 'copilot=warning', 'One file does not mix camelCase and PascalCase events (payload dialects differ)', 'cp-hooks'),
-  R('HK-CP-TYPE', 'hooks', 'copilot=error', '`type` is command, http or prompt', 'cp-hooks'),
-  R('HK-CP-COMMAND', 'hooks', 'copilot=error', 'A command entry has bash and/or powershell, command, or exec', 'cp-hooks'),
-  R('HK-CP-NO-WINDOWS', 'hooks', 'copilot=warning', 'A bash entry also has powershell (or a cross-shell command) for Windows', 'cp-hooks-howto'),
-  R('HK-CP-PS-ONLY', 'hooks', 'copilot=warning', 'PowerShell-only entries are ignored by the cloud agent', 'cp-hooks'),
-  R('HK-CP-PS-COMPAT', 'hooks', 'copilot=warning', 'The powershell string also runs under Windows PowerShell 5.1 (no && or ||)', 'cp-hooks-howto'),
-  R('HK-CP-EXEC-MIX', 'hooks', 'copilot=error', '`exec` is not combined with bash, powershell or command', 'cp-hooks'),
-  R('HK-CP-EXEC', 'hooks', 'copilot=warning', '`exec`/`args` run only in Copilot CLI (not the cloud agent or VS Code)', 'cp-hooks'),
-  R('HK-CP-TIMEOUT', 'hooks', 'copilot=warning', '`timeoutSec` at most 30 and not combined with `timeout`; a missing one is a note (warning with --strict)', 'cp-hooks'),
-  R('HK-CP-TIMEOUT-TYPE', 'hooks', 'copilot=error', '`timeoutSec` is a positive number', 'cp-hooks'),
-  R('HK-CP-MATCHER', 'hooks', 'copilot=error', '`matcher` compiles as a regular expression (an invalid one skips the hook)', 'cp-hooks'),
-  R('HK-CP-ASK', 'hooks', 'copilot=warning', 'No permissionDecision "ask" (it becomes deny in the cloud agent and autopilot)', 'cp-hooks'),
-  R('HK-CP-HTTP', 'hooks', 'copilot=error', 'HTTP hooks use https (localhost only with COPILOT_HOOK_ALLOW_LOCALHOST=1, never for preToolUse)', 'cp-hooks'),
-  R('HK-CP-PROMPT', 'hooks', 'copilot=error', 'Prompt hooks only on sessionStart', 'cp-hooks'),
-  R('HK-CP-LOCAL-KEYS', 'hooks', 'copilot=warning', 'No VS Code Local-harness keys (windows, linux, osx, hookSpecificOutput) in .github/hooks', 'vsc-hooks'),
-  R('HK-CP-FIELD', 'hooks', 'copilot=warning', 'Entries and the file use only documented keys', 'cp-hooks'),
-  R('HK-CP-CLOUD-EVENT', 'hooks', 'copilot=warning', 'notification and permissionRequest do not work in the cloud agent (.github/hooks is read there)', 'cp-hooks'),
-  R('HK-CP-OUTPUT-IGNORED', 'hooks', 'copilot=note', 'Output of errorOccurred, sessionEnd, preCompact and userPromptSubmitted command hooks is not processed', 'cp-hooks'),
-  R('HK-CP-DISABLED', 'hooks', 'copilot=warning', '`disableAllHooks: true` turns the file off', 'cp-hooks'),
-  R('HK-CP-PLUGIN-CWD', 'hooks', 'copilot=warning', 'Plugin preToolUse entries set "cwd": "${PLUGIN_ROOT}"', 'cp-2540'),
-  R('HK-CP-PLUGIN-PATHS', 'hooks', 'copilot=warning', 'Plugin hooks reach their scripts through ${PLUGIN_ROOT} (relative paths resolve against the project) and keep state in ${PLUGIN_DATA}', 'cp-2540 cp-plugins'),
-  R('HK-XS-COMMAND', 'hooks', 'copilot=error', 'A Copilot `command` string parses in both bash and PowerShell (it is copied to both)', 'cp-hooks'),
-  // Claude hooks
-  R('HK-CL-JSON', 'hooks', 'claude=error', 'The settings or hooks file is valid JSON', 'cl-hooks'),
-  R('HK-CL-SHAPE', 'hooks', 'claude=error', 'Events map to arrays of matcher groups with a `hooks` array; plugin files keep the "hooks" wrapper', 'cl-hooks cl-plugins'),
-  R('HK-CL-EVENT', 'hooks', 'claude=warning', 'Event names are among the 33 Claude Code events (others are ignored at runtime)', 'cl-hooks cl-validate'),
-  R('HK-CL-MATCHER-IGNORED', 'hooks', 'claude=warning', 'No matcher on events that ignore it', 'cl-hooks'),
-  R('HK-CL-MATCHER', 'hooks', 'claude=error', 'A regex matcher compiles', 'cl-hooks'),
-  R('HK-CL-TYPE', 'hooks', 'claude=error', 'The handler type exists and is supported on its event', 'cl-hooks'),
-  R('HK-CL-FIELD', 'hooks', 'claude=warning', 'Handlers use only documented fields', 'cl-hooks'),
-  R('HK-CL-IF', 'hooks', 'claude=error', '`if` only on tool events (elsewhere the hook never runs)', 'cl-hooks'),
-  R('HK-CL-EXEC-SHIM', 'hooks', 'claude=warning', 'Exec form does not start a .cmd/.bat shim (Windows cannot spawn it); use node + script', 'cl-hooks'),
-  R('HK-CL-UNQUOTED-VAR', 'hooks', 'claude=warning', '${CLAUDE_PROJECT_DIR} and ${CLAUDE_PLUGIN_ROOT} are double-quoted in shell form', 'cl-hooks cl-validate'),
-  R('HK-CL-ONFAILURE', 'hooks', 'claude=error', '`onFailure` is continue or block (needs Claude Code 2.1.295+; no effect on Stop-type or async hooks)', 'cl-hooks'),
-  R('HK-CL-SHELL', 'hooks', 'claude=error', '`shell` is bash or powershell', 'cl-hooks'),
-  R('HK-CL-ONCE', 'hooks', 'claude=warning', '`once` is honored only in skill frontmatter', 'cl-hooks'),
-  R('HK-CL-REPO-EXEC', 'hooks', 'claude=warning copilot=warning', 'Exec-form entries in a repository .claude/settings*.json are also run by Copilot CLI and VS Code; prefer a shell string', 'cp-hooks'),
-  R('HK-CL-PLUGIN-ROOT', 'hooks', 'claude=warning', 'Plugin hooks reference their files through ${CLAUDE_PLUGIN_ROOT}', 'cl-plugins'),
-  R('HK-CL-PLUGIN-DATA', 'hooks', 'claude=warning', 'Plugin hooks keep state in ${CLAUDE_PLUGIN_DATA}, not under the plugin root', 'cl-plugins'),
-  // Codex hooks and config.toml
-  R('HK-CX-JSON', 'hooks', 'codex=error', 'hooks.json is valid JSON', 'cx-hooks'),
-  R('HK-CX-SHAPE', 'hooks', 'codex=error', '{"hooks": {Event: [{"matcher"?, "hooks": [handler]}]}}', 'cx-hooks'),
-  R('HK-CX-EVENT', 'hooks', 'codex=error', 'Event names are the 14 PascalCase Codex events', 'cx-hooks'),
-  R('HK-CX-MATCHER-IGNORED', 'hooks', 'codex=warning', 'No matcher on UserPromptSubmit, Stop, Interrupt, Pre/PostModelRequest', 'cx-hooks'),
-  R('HK-CX-MATCHER', 'hooks', 'codex=error', 'A regex matcher compiles', 'cx-hooks'),
-  R('HK-CX-TYPE', 'hooks', 'codex=error', 'Handler type is command or mcp_tool (prompt and agent are parsed but not run)', 'cx-hooks'),
-  R('HK-CX-FIELD', 'hooks', 'codex=warning', 'Handlers use only command, commandWindows, timeout, async, statusMessage, additionalContextLimit (no args, cwd, env)', 'cx-hooks'),
-  R('HK-CX-WINDOWS', 'hooks', 'codex=warning', '`commandWindows` is set when `command` is not valid under cmd.exe', 'cx-hooks'),
-  R('HK-CX-EXIT2', 'hooks', 'codex=warning', 'Decisions are JSON on exit 0 (exit 2 becomes 1 under PowerShell on Windows)', 'cx-54072'),
-  R('HK-CX-OUTPUT', 'hooks', 'codex=warning', 'The handler prints no Copilot-only output fields (Codex rejects unknown fields)', 'cx-hooks'),
-  R('HK-CX-SESSIONEND', 'hooks', 'codex=warning', 'SessionEnd/Interrupt timeouts are capped at 3 s and async is not honored there', 'cx-hooks'),
-  R('HK-CX-BOTH', 'hooks', 'codex=warning', 'One config layer does not define hooks in both hooks.json and config.toml', 'cx-hooks'),
-  R('HK-CX-TRUST', 'hooks', 'codex=note', 'Project .codex hooks need a trusted project and a one-time review in /hooks', 'cx-hooks'),
-  R('CX-TOML', 'codex-config', 'codex=error', 'config.toml is valid TOML', 'cx-config'),
-  R('CX-SKILLS-CONFIG', 'codex-config', 'codex=error', '[[skills.config]] entries have exactly one of path or name, plus enabled', 'cx-config'),
-  R('CX-MCP', 'codex-config', 'codex=warning', '[mcp_servers.<name>] entries have a command or a url', 'cx-config'),
-  // Plugins and marketplaces
-  R('PL-JSON', 'plugin', 'copilot=error claude=error codex=error', 'The plugin manifest is valid JSON', 'cp-plugins cl-plugins cx-plugins'),
-  R('PL-AP-SCHEMA', 'plugin', 'copilot=error codex=error', 'The Agent Plugins $schema is 1.0.0 or 1.1.0 (other versions are rejected)', 'cp-plugins ap-spec'),
-  R('PL-AP-FIELD', 'plugin', 'copilot=warning codex=warning', 'Only the closed Agent Plugins field set (others are reported and ignored)', 'ap-spec cp-plugins'),
-  R('PL-AP-NAME', 'plugin', 'copilot=error codex=error', 'Plugin name: 1-64 of a-z 0-9 - ., alphanumeric at both ends, no -- or ..', 'ap-spec'),
-  R('PL-AP-SKILLS', 'plugin', 'copilot=warning codex=warning', 'Skills are immediate subdirectories of skills/ (no root SKILL.md fallback)', 'ap-spec cp-plugins'),
-  R('PL-AP-MCP', 'plugin', 'copilot=error codex=error', 'mcp.json declares the Agent Plugins schema, only mcpServers, single-token commands and valid cwd', 'ap-spec'),
-  R('PL-CP-MANIFEST', 'plugin', 'copilot=error', 'Copilot plugin.json: kebab-case name up to 64, description up to 1,024, existing component paths', 'cp-plugins'),
-  R('PL-CP-FIELD', 'plugin', 'copilot=warning', 'Copilot plugin.json uses only documented fields', 'cp-plugins'),
-  R('PL-CL-NAME', 'plugin', 'claude=error', 'Claude plugin name: kebab-case, not reserved (claude-*, anthropic-*, anthropics-*, cc-plugin-*, claude, anthropic, claude-code, claude-mods)', 'cl-plugins'),
-  R('PL-CL-NAME-WORD', 'plugin', 'claude=warning', 'Plugin name does not contain "claude" or "anthropic" as a word', 'cl-plugins'),
-  R('PL-CL-PATH', 'plugin', 'claude=error', 'Component paths start with ./, exist and stay inside the plugin root', 'cl-plugins'),
-  R('PL-CL-FIELD', 'plugin', 'claude=warning', 'Claude plugin.json uses only documented fields', 'cl-plugins'),
-  R('PL-CL-META', 'plugin', 'claude=note', 'version, description and author are set (claude plugin validate warns without them)', 'cl-validate'),
-  R('PL-CL-CLAUDEMD', 'plugin', 'claude=warning', 'A CLAUDE.md at the plugin root is not loaded; put instructions in a skill', 'cl-plugins'),
-  R('PL-CX-FIELD', 'plugin', 'codex=warning', '.codex-plugin/plugin.json uses the documented camelCase fields', 'cx-plugins'),
-  R('PL-SKILL-COLLISION', 'plugin', 'copilot=warning claude=warning', 'A plugin skill is not shadowed by a same-named project skill', 'cp-plugins cl-skills'),
-  R('MK-JSON', 'marketplace', 'copilot=error claude=error codex=error', 'The marketplace manifest is valid JSON', 'cl-mkt cp-plugins cx-plugins'),
-  R('MK-SHAPE', 'marketplace', 'copilot=error claude=error codex=error', 'A marketplace has name, owner.name (Copilot, Claude) and plugins[]', 'cl-mkt cp-plugins cx-plugins'),
-  R('MK-NAME-RESERVED', 'marketplace', 'claude=error', 'The marketplace name is not reserved', 'cl-mkt'),
-  R('MK-ENTRY', 'marketplace', 'copilot=error claude=error codex=error', 'Entries have name and source; relative sources never use .. (and start with ./ for Claude)', 'cl-mkt cp-plugins cx-plugins'),
-  R('MK-UNPINNED', 'marketplace', 'copilot=note claude=note codex=note', 'Remote sources are pinned (40-character sha, npm version or archive sha256); a warning with --strict', 'cp-plugins cl-mkt anti-patterns', { strict: Object.freeze({ copilot: 'warning', claude: 'warning', codex: 'warning' }) }),
-  R('MK-HOOKS-PATH', 'marketplace', 'claude=error', 'Marketplace entries inline hooks as an object (paths are not supported)', 'cl-mkt'),
-  R('MK-FIELD', 'marketplace', 'claude=warning copilot=warning', 'Marketplaces use only documented top-level keys', 'cl-mkt cp-plugins'),
-  // MCP
-  R('MC-JSON', 'mcp', 'copilot=error claude=error codex=error', 'The MCP config is valid JSON (JSONC only in .vscode/mcp.json)', 'cp-mcp vsc-mcp'),
-  R('MC-TOPKEY', 'mcp', 'copilot=error claude=error', 'The top-level key matches the host: mcpServers (.mcp.json, Copilot CLI, Claude) or servers (.vscode/mcp.json)', 'cp-mcp vsc-mcp'),
-  R('MC-SERVER', 'mcp', 'copilot=error claude=error codex=error', 'A local server has a command, a remote one a url, and the type is valid for the host', 'cp-mcp vsc-mcp ap-spec'),
-  R('MC-INPUT', 'mcp', 'copilot=warning claude=warning', '${input:...} is literal outside .vscode/mcp.json (a note there: not forwarded to the Copilot harness)', 'vsc-mcp'),
-  R('MC-VSCODE-CLI', 'mcp', 'copilot=note', 'Copilot CLI does not read .vscode/mcp.json (use .mcp.json)', 'cp-mcp'),
-  R('MC-HTTP', 'mcp', 'copilot=warning claude=warning', 'Remote servers use https unless they are on loopback', 'cl-validate'),
-  R('MC-CLOUD', 'mcp', 'copilot=note', 'Cloud-agent MCP JSON needs `type` and `tools` on every server', 'cp-mcp'),
-  // Security group (reported separately in `security[]`)
-  SEC('SEC-ALLOWED-TOOLS', '`allowed-tools` pre-approves shell or every tool for whoever installs the skill', 'cp-skills cp-cli'),
-  SEC('SEC-HTTP-HOOK', 'An HTTP hook posts to a host that is not on the allowlist', 'cp-hooks ac-hooks'),
-  SEC('SEC-PIPE-SHELL', 'Download-and-execute (curl | sh, iwr | iex) in a skill, instruction, agent or prompt', 'anti-patterns'),
-  SEC('SEC-BASE64', 'A long base64 blob in a skill, instruction, agent or prompt', 'anti-patterns'),
-  SEC('SEC-DISABLE-GUARDS', 'Text that turns off hooks, permissions or sandboxes', 'anti-patterns ac-hooks'),
-  SEC('SEC-MCP-SECRET', 'An MCP server carries a literal credential in env or headers', 'cl-validate cp-mcp', 'error'),
-  SEC('SEC-SECRET', 'A secret-shaped literal in a tooling file', 'anti-patterns', 'error'),
-  SEC('SEC-UNPINNED', 'An MCP server or hook runs an unpinned remote package (npx -y pkg, @latest, :latest)', 'anti-patterns'),
-  // External validators (merged when installed)
-  R('EXT-SKILLS-REF', 'external', 'spec=error', '`skills-ref validate` passes', 'skills-ref'),
-  R('EXT-CLAUDE-VALIDATE', 'external', 'claude=error', '`claude plugin validate --strict --json` reports no errors (warnings merged as warnings; a bare skills directory is not applicable)', 'cl-validate measured'),
-  R('EXT-GH-SKILL', 'external', 'spec=error', '`gh skill publish --dry-run` validation passes (its warnings are merged as notes)', 'cp-skills measured'),
-  R('EXT-COPILOT-SKILL', 'external', 'copilot=warning', '`copilot skill list --json` lists the skill from its location as enabled (a same-named copy elsewhere is a note)', 'cp-cli measured'),
-  R('EXT-COPILOT-INSTRUCTION', 'external', 'copilot=warning', '`copilot instruction list --json` lists the instruction file', 'cp-cli measured'),
-  R('EXT-CODEX-SKILL', 'external', 'codex=warning', '`codex debug prompt-input` lists the skill in <skills_instructions> (no model call)', 'cx-skills measured'),
-  R('EXT-CODEX-CONFIG', 'external', 'codex=warning', '`codex doctor --json` reports no unrecognized config.toml settings (no model call)', 'cx-config measured'),
-  R('EXT-WAZA', 'external', 'copilot=warning', '`waza spec verify` passes for the skill eval', 'cp-skills'),
-]);
-
+/** Every rule: { id, kind, hosts{host: severity}, strict?{host: severity}, title, sources[] }; security: severity. */
+export const RULES = Object.freeze([...REF.matchAll(ROW)].map(([, id, hostCol, title, src]) => {
+  const kind = KINDS[id.split('-').slice(0, 2).join('-')] || KINDS[id.split('-')[0]];
+  const [base, strict] = hostCol.trim().split('; strict: ');
+  const r = { id, kind, title: title.replace(/\\\|/g, '|'), sources: src.match(/[\w-]+/g) };
+  return Object.freeze(kind === 'security' ? { ...r, group: 'security', hosts: {}, severity: SEV[base.split(' ')[1]] }
+    : { ...r, hosts: sevMap(base), ...(strict && { strict: sevMap(strict) }) });
+}));
 const RULE_INDEX = new Map(RULES.map((r) => [r.id, r]));
+
+/** Source key → citation (the research digests, checked 2026-10-24/25). */
+export const SOURCES = Object.freeze(Object.fromEntries((REF.split(/^## Sources$/m)[1] || '').split('\n')
+  .map((l) => /^- ([^:`]+): (.*)$/.exec(l)).filter(Boolean)
+  .flatMap(([, group, rest]) => rest.split(/; (?=`)/).map((p) => /^`([\w-]+)` (.+?)\.?$/.exec(p)).filter(Boolean)
+    .map(([, key, text]) => [key, `${group}: ${text}`]))));
 
 // ---------------------------------------------------------------------------
 // Host facts used by the rules
 
-const SPEC_FIELDS = ['name', 'description', 'license', 'compatibility', 'metadata', 'allowed-tools'];
+const SPEC_FIELDS = W('name description license compatibility metadata allowed-tools');
 const SKILL_FIELDS = {
-  copilot: new Set([...SPEC_FIELDS, 'argument-hint', 'user-invocable', 'disable-model-invocation', 'context']),
-  claude: new Set([...SPEC_FIELDS, 'when_to_use', 'argument-hint', 'arguments', 'disable-model-invocation', 'user-invocable',
-    'disallowed-tools', 'model', 'effort', 'context', 'agent', 'background', 'hooks', 'paths', 'shell']),
-  codex: new Set(['name', 'description', 'metadata']),
+  copilot: S(`${SPEC_FIELDS.join(' ')} argument-hint user-invocable disable-model-invocation context`),
+  claude: S(`${SPEC_FIELDS.join(' ')} when_to_use argument-hint arguments disable-model-invocation user-invocable
+    disallowed-tools model effort context agent background hooks paths shell`),
+  codex: S(SPEC_FIELDS.join(' ')),
 };
 const COMMAND_FIELDS = new Set([...SKILL_FIELDS.claude].filter((f) => f !== 'name' && f !== 'paths'));
-const PROMPT_FIELDS = new Set(['description', 'name', 'argument-hint', 'agent', 'model', 'tools', 'mode']);
-const INSTRUCTION_FIELDS = new Set(['applyTo', 'excludeAgent', 'name', 'description']);
-const RULES_FILE_FIELDS = new Set(['paths', 'applyTo', 'description', 'name']);
-
-const COPILOT_AGENT_FIELDS = new Set(['name', 'description', 'target', 'tools', 'model', 'disable-model-invocation',
-  'user-invocable', 'infer', 'mcp-servers', 'metadata', 'include-custom-instructions', 'models', 'modelPolicy',
-  'reasoningEffort', 'skills', 'hooks', 'argument-hint', 'agents', 'reasoning-effort', 'handoffs']);
-const COPILOT_TOOL_ALIASES = new Set(['execute', 'shell', 'Bash', 'bash', 'powershell', 'read', 'Read', 'NotebookRead', 'edit', 'Edit',
-  'MultiEdit', 'Write', 'NotebookEdit', 'search', 'Grep', 'Glob', 'agent', 'custom-agent', 'Task', 'web', 'WebSearch', 'WebFetch',
-  'todo', 'TodoWrite', '*']);
-const CLAUDE_AGENT_FIELDS = new Set(['name', 'description', 'tools', 'disallowedTools', 'model', 'permissionMode', 'maxTurns',
-  'autoCompactWindow', 'skills', 'mcpServers', 'hooks', 'memory', 'background', 'omitClaudeMd', 'effort', 'isolation', 'color',
-  'initialPrompt', 'experimental']);
-const CLAUDE_AGENT_ENUMS = {
-  permissionMode: ['default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan', 'manual'],
-  memory: ['user', 'project', 'local'],
-  isolation: ['worktree'],
-  effort: ['low', 'medium', 'high', 'xhigh', 'max'],
+const AGENT_FIELDS = {
+  copilot: S(`name description target tools model disable-model-invocation user-invocable infer mcp-servers metadata
+    include-custom-instructions models modelPolicy reasoningEffort skills hooks argument-hint agents reasoning-effort
+    handoffs`),
+  claude: S(`name description tools disallowedTools model permissionMode maxTurns autoCompactWindow skills mcpServers
+    hooks memory background omitClaudeMd effort isolation color initialPrompt experimental`),
 };
-
-const CP_EVENTS_CAMEL = ['sessionStart', 'sessionEnd', 'userPromptSubmitted', 'userPromptTransformed', 'preToolUse', 'postToolUse',
-  'postToolUseFailure', 'agentStop', 'subagentStart', 'subagentStop', 'errorOccurred', 'preCompact', 'permissionRequest', 'notification'];
-const CP_EVENTS_PASCAL = ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop',
-  'SubagentStop', 'ErrorOccurred', 'PreCompact', 'PermissionRequest'];
-const CP_EVENTS_PASCAL_UNDOC = ['SubagentStart', 'Notification', 'UserPromptTransformed'];
-const CP_ENTRY_FIELDS = new Set(['type', 'bash', 'powershell', 'command', 'exec', 'args', 'cwd', 'env', 'timeoutSec', 'timeout',
-  'matcher', 'url', 'headers', 'allowedEnvVars', 'prompt', 'hooks', 'comment', 'description']);
-const CP_FILE_FIELDS = new Set(['version', 'disableAllHooks', 'hooks', 'description', '$schema']);
-
-const CL_EVENTS = ['SessionStart', 'Setup', 'SessionEnd', 'UserPromptSubmit', 'UserPromptExpansion', 'Stop', 'StopFailure',
-  'PreToolUse', 'PermissionRequest', 'PermissionDenied', 'PostToolUse', 'PostToolUseFailure', 'PostToolBatch', 'SubagentStart',
-  'SubagentStop', 'TaskCreated', 'TaskCompleted', 'TeammateIdle', 'PreCompact', 'PostCompact', 'PreModelSwitch', 'PostModelSwitch',
-  'Elicitation', 'ElicitationResult', 'Notification', 'MessageDisplay', 'InstructionsLoaded', 'ConfigChange', 'CwdChanged',
-  'DirectoryAdded', 'FileChanged', 'WorktreeCreate', 'WorktreeRemove'];
-const CL_NO_MATCHER = new Set(['UserPromptSubmit', 'PostToolBatch', 'Stop', 'TeammateIdle', 'TaskCreated', 'TaskCompleted',
-  'CwdChanged', 'WorktreeCreate', 'WorktreeRemove', 'MessageDisplay']);
-const CL_IF_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied']);
-const CL_ALL_TYPES = new Set(['PermissionDenied', 'PostToolBatch', 'PostToolUse', 'PostToolUseFailure', 'PreToolUse', 'Stop',
-  'SubagentStop', 'TaskCompleted', 'TaskCreated', 'TeammateIdle', 'UserPromptExpansion', 'UserPromptSubmit']);
-const CL_ONFAILURE_NOEFFECT = new Set(['Stop', 'SubagentStop', 'TaskCompleted', 'TeammateIdle']);
-const CL_HANDLER_FIELDS = new Set(['type', 'if', 'timeout', 'statusMessage', 'once', 'command', 'args', 'shell', 'async', 'asyncRewake',
-  'onFailure', 'url', 'headers', 'allowedEnvVars', 'server', 'tool', 'input', 'prompt', 'model', 'continueOnBlock']);
-const claudeTypesFor = (event) => {
-  if (CL_ALL_TYPES.has(event)) return ['command', 'http', 'mcp_tool', 'prompt', 'agent'];
-  if (event === 'PermissionRequest') return ['command', 'http', 'mcp_tool', 'prompt'];
-  if (event === 'SessionStart' || event === 'Setup') return ['command', 'mcp_tool'];
-  return ['command', 'http', 'mcp_tool'];
+const AGENT_ENUMS = {
+  copilot: { target: W('vscode github-copilot'), modelPolicy: W('preferred required') },
+  claude: { permissionMode: W('default acceptEdits auto dontAsk bypassPermissions plan manual'),
+    memory: W('user project local'), isolation: ['worktree'], effort: W('low medium high xhigh max') },
 };
+const CP_TOOL_ALIASES = S(`execute shell Bash bash powershell read Read NotebookRead edit Edit MultiEdit Write
+  NotebookEdit search Grep Glob agent custom-agent Task web WebSearch WebFetch todo TodoWrite *`);
 
-const CX_EVENTS = ['PreModelRequest', 'PostModelRequest', 'PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact',
-  'PostCompact', 'SessionStart', 'SessionEnd', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'Stop', 'Interrupt'];
-const CX_NO_MATCHER = new Set(['UserPromptSubmit', 'Stop', 'Interrupt', 'PreModelRequest', 'PostModelRequest']);
+const CP_EVENTS = W(`sessionStart sessionEnd userPromptSubmitted userPromptTransformed preToolUse postToolUse
+  postToolUseFailure agentStop subagentStart subagentStop errorOccurred preCompact permissionRequest notification`);
+const CP_EVENTS_PASCAL = W(`SessionStart SessionEnd UserPromptSubmit PreToolUse PostToolUse PostToolUseFailure Stop
+  SubagentStop ErrorOccurred PreCompact PermissionRequest`);
+const CP_EVENTS_UNDOC = W('SubagentStart Notification UserPromptTransformed');
+const CP_OUTPUT_IGNORED = S(`errorOccurred sessionEnd preCompact userPromptSubmitted ErrorOccurred SessionEnd
+  PreCompact UserPromptSubmit`);
+const CP_ENTRY_FIELDS = S(`type bash powershell command exec args cwd env timeoutSec timeout matcher url headers
+  allowedEnvVars prompt hooks comment description`);
+const CL_EVENTS = W(`SessionStart Setup SessionEnd UserPromptSubmit UserPromptExpansion Stop StopFailure PreToolUse
+  PermissionRequest PermissionDenied PostToolUse PostToolUseFailure PostToolBatch SubagentStart SubagentStop
+  TaskCreated TaskCompleted TeammateIdle PreCompact PostCompact PreModelSwitch PostModelSwitch Elicitation
+  ElicitationResult Notification MessageDisplay InstructionsLoaded ConfigChange CwdChanged DirectoryAdded FileChanged
+  WorktreeCreate WorktreeRemove`);
+const CL_NO_MATCHER = S(`UserPromptSubmit PostToolBatch Stop TeammateIdle TaskCreated TaskCompleted CwdChanged
+  WorktreeCreate WorktreeRemove MessageDisplay`);
+const CL_IF_EVENTS = S('PreToolUse PostToolUse PostToolUseFailure PermissionRequest PermissionDenied');
+const CL_ALL_TYPES = S(`PermissionDenied PostToolBatch PostToolUse PostToolUseFailure PreToolUse Stop SubagentStop
+  TaskCompleted TaskCreated TeammateIdle UserPromptExpansion UserPromptSubmit`);
+const CL_HANDLER_FIELDS = S(`type if timeout statusMessage once command args shell async asyncRewake onFailure url
+  headers allowedEnvVars server tool input prompt model continueOnBlock`);
+const claudeTypes = (e) => W(CL_ALL_TYPES.has(e) ? 'command http mcp_tool prompt agent'
+  : e === 'PermissionRequest' ? 'command http mcp_tool prompt'
+    : e === 'SessionStart' || e === 'Setup' ? 'command mcp_tool' : 'command http mcp_tool');
+const CX_EVENTS = W(`PreModelRequest PostModelRequest PreToolUse PermissionRequest PostToolUse PreCompact PostCompact
+  SessionStart SessionEnd UserPromptSubmit SubagentStart SubagentStop Stop Interrupt`);
+const CX_NO_MATCHER = S('UserPromptSubmit Stop Interrupt PreModelRequest PostModelRequest');
 const CX_HANDLER_FIELDS = {
-  command: new Set(['type', 'command', 'commandWindows', 'command_windows', 'timeout', 'async', 'statusMessage', 'additionalContextLimit']),
-  mcp_tool: new Set(['type', 'server', 'tool', 'input', 'timeout', 'statusMessage']),
+  command: S('type command commandWindows command_windows timeout async statusMessage additionalContextLimit'),
+  mcp_tool: S('type server tool input timeout statusMessage'),
 };
 
-const AP_SCHEMAS = ['https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', 'https://agent-plugins.org/schemas/1.1.0/plugin.schema.json'];
-const AP_MCP_SCHEMAS = ['https://agent-plugins.org/schemas/1.0.0/mcp.schema.json', 'https://agent-plugins.org/schemas/1.1.0/mcp.schema.json'];
-const AP_FIELDS = new Set(['$schema', 'name', 'version', 'description', 'author', 'homepage', 'repository', 'license', 'keywords', 'extensions']);
-const CP_PLUGIN_FIELDS = new Set(['name', 'description', 'version', 'author', 'homepage', 'repository', 'license', 'keywords', 'category',
-  'tags', 'agents', 'skills', 'commands', 'hooks', 'mcpServers', 'lspServers', 'extensions', '$schema']);
-const CL_PLUGIN_FIELDS = new Set(['$schema', 'name', 'displayName', 'version', 'description', 'author', 'homepage', 'repository',
-  'license', 'keywords', 'metadata', 'defaultEnabled', 'dependencies', 'settings', 'userConfig', 'types', 'channels', 'skills',
-  'commands', 'agents', 'hooks', 'mcpServers', 'lspServers', 'outputStyles', 'workflows', 'experimental', 'icon', 'documentationUrl',
-  'supportUrl', 'privacyPolicyUrl', 'termsOfServiceUrl']);
-const CL_PLUGIN_PATH_FIELDS = ['skills', 'commands', 'agents', 'hooks', 'mcpServers', 'lspServers', 'outputStyles', 'workflows'];
-const CX_PLUGIN_FIELDS = new Set(['name', 'version', 'description', 'keywords', 'skills', 'mcpServers', 'apps', 'hooks', 'interface',
-  'extensions', 'author', 'homepage', 'repository', 'license']);
-const CX_PLUGIN_SNAKE = { mcp_servers: 'mcpServers', default_prompt: 'defaultPrompt', display_name: 'displayName' };
-const CL_RESERVED_PLUGIN_NAMES = new Set(['claude', 'anthropic', 'anthropics', 'claude-code', 'claude-mods']);
-const CL_RESERVED_PLUGIN_PREFIXES = ['claude-', 'anthropic-', 'anthropics-', 'cc-plugin-'];
-const CL_RESERVED_MARKETPLACES = new Set(['claude-plugins-official', 'claude-code-plugins', 'anthropic-marketplace', 'npm', 'pip', 'uv',
-  'cargo', 'github', 'gh', 'inline', 'builtin', 'skills-dir', 'synced', 'claude-plugin-test']);
-const CL_MKT_FIELDS = new Set(['$schema', 'name', 'owner', 'plugins', 'description', 'version', 'metadata', 'forceRemoveDeletedPlugins',
-  'allowCrossMarketplaceDependenciesOn', 'renames']);
-const CP_MKT_FIELDS = new Set(['$schema', 'name', 'owner', 'plugins', 'metadata', 'description', 'version']);
-const CX_MKT_FIELDS = new Set(['name', 'interface', 'plugins']);
-
-const NPM_SHIMS = new Set(['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'eslint', 'prettier', 'tsc', 'jest', 'vitest', 'ts-node', 'tsx', 'playwright']);
-const SHA40 = /^[0-9a-f]{40}$/i;
+const AP_SCHEMA = (kind) => ['1.0.0', '1.1.0'].map((v) => `https://agent-plugins.org/schemas/${v}/${kind}.schema.json`);
+const PLUGIN_FIELDS = {
+  'agent-plugins': S('$schema name version description author homepage repository license keywords extensions'),
+  copilot: S(`name description version author homepage repository license keywords category tags agents skills
+    commands hooks mcpServers lspServers extensions $schema`),
+  claude: S(`$schema name displayName version description author homepage repository license keywords metadata
+    defaultEnabled dependencies settings userConfig types channels experimental icon documentationUrl supportUrl
+    privacyPolicyUrl termsOfServiceUrl skills commands agents hooks mcpServers lspServers outputStyles workflows`),
+  codex: S(`name version description keywords skills mcpServers apps hooks interface extensions author homepage
+    repository license`),
+};
+const CL_PATH_FIELDS = W('skills commands agents hooks mcpServers lspServers outputStyles workflows');
+const CX_SNAKE = { mcp_servers: 'mcpServers', default_prompt: 'defaultPrompt', display_name: 'displayName' };
+const CL_RESERVED = S('claude anthropic anthropics claude-code claude-mods');
+const CL_RESERVED_MKT = S(`claude-plugins-official claude-code-plugins anthropic-marketplace npm pip uv cargo github gh
+  inline builtin skills-dir synced claude-plugin-test`);
+const MKT_FIELDS = {
+  claude: S(`$schema name owner plugins description version metadata forceRemoveDeletedPlugins
+    allowCrossMarketplaceDependenciesOn renames`),
+  copilot: S('$schema name owner plugins metadata description version'),
+};
+const NPM_SHIMS = S('npm npx pnpm pnpx yarn eslint prettier tsc jest vitest ts-node tsx playwright');
+const LOOPBACK = S('localhost 127.0.0.1 [::1] ::1');
+const WIN_ABS = /^[a-zA-Z]:[\\/]/;
 
 // ---------------------------------------------------------------------------
 // Small helpers
 
-const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
-const lineOf = (text, index) => (index <= 0 ? 1 : text.slice(0, index).split('\n').length);
+const readNorm = (p) => readText(p)?.replace(/\r\n/g, '\n') ?? null;
+const keyLine = (text, key) => { const i = text.indexOf(`"${key}"`); return i < 0 ? null : lineOf(text, i); };
+const badRegex = (re) => { try { new RegExp(re); return null; } catch (err) { return err; } };
+const strs = (...xs) => xs.flat().filter((x) => typeof x === 'string');
+const subdirs = (d) => {
+  try { return fs.readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()); } catch { return []; }
+};
+const guess = (list, name, pre = ' (did you mean ', post = '?)') => {
+  const g = list.find((e) => e.toLowerCase() === String(name).toLowerCase());
+  return g ? `${pre}${g}${post}` : '';
+};
 
-function statSafe(p) {
-  try { return fs.statSync(p); } catch { return null; }
+const XS = [[/&&|\|\|/, '&& / || (not valid in Windows PowerShell 5.1)'], [/\bcommand\s+-v\b/, '`command -v` (POSIX)'],
+  [/\$env:/i, '$env: (PowerShell only)'], [/\/dev\/null/, '/dev/null (no such path on Windows)'],
+  [/(?:^|[;\s])export\s+[A-Za-z_]\w*=/, '`export VAR=` (POSIX)'], [/^\s*[A-Za-z_]\w*=\S*\s+\S/, 'a VAR=value prefix (POSIX)'],
+  [/\bif\s+\[|;\s*then\b|\bfi\b|\bdone\b|\besac\b/, 'POSIX shell control syntax'],
+  [/\|\s*(?:grep|sed|awk|xargs)\b/, 'a pipe into a POSIX tool'], [/(?:^|\s)~\//, '~/ (not expanded by PowerShell)']];
+
+/** Reasons a Copilot `command` string would not run the same in bash and PowerShell (it is copied to both). */
+function crossShellProblems(s) {
+  const out = new Set(XS.filter(([re]) => re.test(s)).map(([, why]) => why));
+  const v = s.match(/\$\{[^}]*\}|\$[A-Za-z_]\w*/g)?.find((t) => !/^\$\{(?:CLAUDE_|COPILOT_)?PLUGIN_(?:ROOT|DATA)\}$/.test(t)
+    && !/^\$(?:HOME|true|false|null)$/i.test(t));
+  if (v) out.add(`${v} (a variable in both shells)`);
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q === "'") { if (ch === "'") q = null; continue; }
+    if (q === '"' && ch === '\\' && /["\\$`]/.test(s[i + 1] || '')) out.add('a backslash escape inside double quotes');
+    if (!q && ch === '\\') out.add('a backslash outside quotes (escape in bash, path separator in PowerShell)');
+    if (ch === '`') out.add('a backtick (substitution in bash, escape in PowerShell)');
+    if (q === '"' && ch === '"') q = null;
+    else if (!q && (ch === "'" || ch === '"')) q = ch;
+  }
+  return [...out];
 }
 
-function readTextNormalized(abs) {
-  const t = readText(abs);
-  return t == null ? null : t.replace(/\r\n/g, '\n');
-}
-
-/** JSON.parse with the line of the failure; `jsonc` strips comments and trailing commas first. */
-function parseJson(text, { jsonc = false } = {}) {
-  const attempt = (src) => {
-    try { return { value: JSON.parse(src) }; } catch (err) { return { error: err.message }; }
-  };
-  const strict = attempt(text);
-  if (!strict.error) return { value: strict.value, jsonc: false };
-  const loose = attempt(stripJsonc(text));
-  const m = /line (\d+)/.exec(strict.error) || null;
-  const pos = /position (\d+)/.exec(strict.error);
-  const line = m ? Number(m[1]) : pos ? lineOf(text, Number(pos[1])) : 1;
-  if (!loose.error) return jsonc ? { value: loose.value, jsonc: true } : { error: 'comments or trailing commas are not valid JSON here', line, looseValue: loose.value };
-  return { error: strict.error.replace(/^Unexpected token/, 'unexpected token'), line };
-}
-
-function stripJsonc(text) {
-  let out = '';
-  let inStr = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      out += ch;
-      if (ch === '\\') { out += text[i + 1] ?? ''; i++; } else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') { inStr = true; out += ch; continue; }
-    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; out += '\n'; continue; }
-    if (ch === '/' && text[i + 1] === '*') {
-      const end = text.indexOf('*/', i + 2);
-      const chunk = text.slice(i, end < 0 ? text.length : end + 2);
-      out += chunk.replace(/[^\n]/g, ' ');
-      i = end < 0 ? text.length : end + 1;
-      continue;
-    }
-    out += ch;
-  }
-  return out.replace(/,(\s*[}\]])/g, '$1');
-}
-
-/** Line number of the first `"key"` occurrence in JSON text (best effort for findings). */
-function jsonKeyLine(text, key, from = 0) {
-  if (!text) return null;
-  const idx = text.indexOf(`"${key}"`, from);
-  return idx < 0 ? null : lineOf(text, idx);
-}
-
-/** Markdown lines with code-fence state; inline code spans are blanked in `prose`. */
-function markdownLines(text) {
-  const out = [];
-  let fence = null;
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const m = /^\s*(`{3,}|~{3,})(.*)$/.exec(raw);
-    if (fence) {
-      if (m && m[1][0] === fence.ch && m[1].length >= fence.len && m[2].trim() === '') {
-        out.push({ n: i + 1, raw, code: true, fenceEnd: true, lang: fence.lang });
-        fence = null;
-      } else out.push({ n: i + 1, raw, code: true, lang: fence.lang });
-      continue;
-    }
-    if (m) {
-      fence = { ch: m[1][0], len: m[1].length, lang: m[2].trim().split(/\s+/)[0] || '' };
-      out.push({ n: i + 1, raw, code: true, fenceStart: true, lang: fence.lang });
-      continue;
-    }
-    out.push({ n: i + 1, raw, code: false, prose: raw.replace(/(`+)[^`]*?\1/g, (s) => ' '.repeat(s.length)) });
-  }
-  return out;
-}
-
-/** Relative and absolute Markdown link targets outside code: [{line, target}]. */
-function markdownLinks(text) {
-  const links = [];
-  for (const l of markdownLines(text)) {
-    if (l.code) continue;
-    const re = /!?\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>]*>|[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)(?:\s+["'(][^)]*)?\)/g;
-    let m;
-    while ((m = re.exec(l.prose))) links.push({ line: l.n, target: m[1].replace(/^<|>$/g, '') });
-    const ref = /^\s{0,3}\[[^\]]+\]:\s*(\S+)/.exec(l.prose);
-    if (ref) links.push({ line: l.n, target: ref[1].replace(/^<|>$/g, '') });
-  }
-  return links;
-}
-
-const SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
-const WIN_ABS_RE = /^[a-zA-Z]:[\\/]/;
-
-function isExternalTarget(t) {
-  return (SCHEME_RE.test(t) && !WIN_ABS_RE.test(t) && !/^file:/i.test(t)) || t.startsWith('#') || t.startsWith('//');
-}
-
-function linkPathOf(target) {
-  let t = target.split('#')[0].split('?')[0];
-  try { t = decodeURIComponent(t); } catch {}
-  return t;
-}
-
-/** Shell-like quote context scan: returns tokens outside quotes and flags for the cross-shell rules. */
-function scanShell(cmd) {
-  const issues = [];
-  let quote = null;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    if (quote === "'") { if (ch === "'") quote = null; continue; }
-    if (quote === '"') {
-      if (ch === '\\' && /["\\$`]/.test(cmd[i + 1] || '')) issues.push('a backslash escape inside double quotes (PowerShell escapes with a backtick)');
-      if (ch === '"') quote = null;
-      if (ch === '`') issues.push('a backtick (command substitution in bash, escape character in PowerShell)');
-      continue;
-    }
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === '\\') issues.push('a backslash outside quotes (an escape in bash, a path separator in PowerShell)');
-    if (ch === '`') issues.push('a backtick (command substitution in bash, escape character in PowerShell)');
-  }
-  return [...new Set(issues)];
-}
-
-const BRACED_ALLOWED = /^\$\{(?:PLUGIN_ROOT|PLUGIN_DATA|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA|COPILOT_PLUGIN_ROOT|COPILOT_PLUGIN_DATA)\}$/;
-
-/** Reasons a Copilot `command` string would not run the same in bash and PowerShell. */
-export function crossShellProblems(cmd) {
-  const s = String(cmd);
-  const out = [];
-  if (/&&|\|\|/.test(s)) out.push('&& / || (not valid in Windows PowerShell 5.1)');
-  if (/\bcommand\s+-v\b/.test(s)) out.push('`command -v` (a POSIX shell builtin)');
-  if (/\$env:/i.test(s)) out.push('$env: (PowerShell-only syntax)');
-  if (/\/dev\/null/.test(s)) out.push('/dev/null (no such path on Windows)');
-  if (/(?:^|[;\s])export\s+[A-Za-z_]\w*=/.test(s)) out.push('`export VAR=` (POSIX shell only)');
-  if (/^\s*[A-Za-z_]\w*=\S*\s+\S/.test(s)) out.push('a leading VAR=value prefix (POSIX shell only)');
-  if (/\bif\s+\[|;\s*then\b|\bfi\b|\bdone\b|\besac\b/.test(s)) out.push('POSIX shell control syntax');
-  if (/\|\s*(?:grep|sed|awk|xargs)\b/.test(s)) out.push('a pipe into a POSIX tool');
-  if (/(?:^|\s)~\//.test(s)) out.push('~/ (not expanded for native commands in PowerShell)');
-  for (const m of s.matchAll(/\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*/g)) {
-    const tok = m[0];
-    if (BRACED_ALLOWED.test(tok) || /^\$(?:HOME|true|false|null)$/i.test(tok)) continue;
-    out.push(`${tok} (a shell variable in bash, a PowerShell variable in PowerShell)`);
-    break;
-  }
-  out.push(...scanShell(s));
-  return [...new Set(out)];
-}
-
-const POSIX_ONLY_CMD = /(?:^|[\s;|&(])(?:export\s+\w+=|rm\s+-[a-z]*r[a-z]*f|chmod\s|chown\s|ln\s+-s|source\s|sudo\s|grep\s|sed\s|awk\s|xargs\s|cp\s+-[a-zA-Z]*R|ls\s+-l|cat\s+<<|\$\(|\/dev\/null|mkdir\s+-p\s)/;
-const SHELL_LANGS = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'shellsession', 'terminal']);
-const WIN_LANGS = new Set(['powershell', 'pwsh', 'ps1', 'ps', 'cmd', 'bat', 'batch', 'bat', 'dos']);
-
-/** Secret scanning: markers.mjs (shared with diff-scope and selftest) when present, else a built-in set. */
-let secretScanner;
-async function getSecretScanner() {
-  if (secretScanner) return secretScanner;
-  try {
-    const m = await import('./markers.mjs');
-    if (typeof m.scanSecrets === 'function') {
-      secretScanner = (text) => m.scanSecrets(text).map((f) => ({ id: f.id, line: f.line, redacted: f.redacted }));
-      return secretScanner;
-    }
-  } catch {}
-  const patterns = [
-    ['aws-access-key-id', new RegExp('\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b')],
-    ['github-token', new RegExp('\\bgh[pousr]_[A-Za-z0-9]{36,}\\b')],
-    ['github-fine-grained-pat', new RegExp('\\bgithub_pat_[A-Za-z0-9_]{60,}\\b')],
-    ['slack-token', new RegExp('\\bxox[abposr]-[A-Za-z0-9-]{10,}')],
-    ['private-key', new RegExp(['-----BEGIN', '(?:[A-Z]+ )?PRIVATE', 'KEY-----'].join(' '))],
-    ['google-api-key', new RegExp('\\bAIza[0-9A-Za-z_-]{35}\\b')],
-    ['stripe-live-key', new RegExp('\\b[sr]k_live_[0-9A-Za-z]{24,}\\b')],
-    ['llm-api-key', new RegExp('\\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}\\b')],
-    ['jwt', new RegExp('\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}')],
-  ];
-  secretScanner = (text) => {
-    const found = [];
-    text.split('\n').forEach((line, i) => {
-      for (const [id, re] of patterns) {
-        const m = re.exec(line);
-        if (m) found.push({ id, line: i + 1, redacted: `${m[0].slice(0, 4)}...[REDACTED]` });
-      }
-    });
-    return found;
-  };
-  return secretScanner;
-}
-
-// ---------------------------------------------------------------------------
-// TOML (the subset Codex config.toml uses: tables, arrays of tables, dotted keys, strings,
-// numbers, booleans, dates, arrays, inline tables)
-
-class TomlParser {
-  constructor(s) {
-    this.s = s.replace(/\r\n/g, '\n');
-    this.p = 0;
-    this.root = {};
-    this.cur = this.root;
-    this.keyLines = {};
-    this.prefix = '';
-  }
-
-  fail(msg) {
-    const e = new Error(msg);
-    e.line = lineOf(this.s, this.p);
-    throw e;
-  }
-
-  ws() { while (this.s[this.p] === ' ' || this.s[this.p] === '\t') this.p++; }
-
-  skipTrivia() {
-    for (;;) {
-      this.ws();
-      if (this.s[this.p] === '#') while (this.p < this.s.length && this.s[this.p] !== '\n') this.p++;
-      if (this.s[this.p] === '\n') { this.p++; continue; }
-      return;
-    }
-  }
-
-  endLine() {
-    this.ws();
-    if (this.s[this.p] === '#') while (this.p < this.s.length && this.s[this.p] !== '\n') this.p++;
-    if (this.p < this.s.length && this.s[this.p] !== '\n') this.fail(`unexpected text: ${this.s.slice(this.p, this.p + 20)}`);
-  }
-
-  parse() {
-    for (;;) {
-      this.skipTrivia();
-      if (this.p >= this.s.length) return this.root;
-      if (this.s[this.p] === '[') {
-        const isArray = this.s[this.p + 1] === '[';
-        this.p += isArray ? 2 : 1;
-        this.ws();
-        const keys = this.keyPath();
-        this.ws();
-        if (isArray ? this.s.slice(this.p, this.p + 2) !== ']]' : this.s[this.p] !== ']') this.fail('unterminated table header');
-        this.p += isArray ? 2 : 1;
-        this.endLine();
-        this.prefix = keys.join('.');
-        this.keyLines[this.prefix] ??= lineOf(this.s, this.p);
-        if (isArray) {
-          const parent = this.walk(this.root, keys.slice(0, -1));
-          const k = keys[keys.length - 1];
-          if (parent[k] === undefined) parent[k] = [];
-          if (!Array.isArray(parent[k])) this.fail(`${keys.join('.')} is already a table`);
-          const t = {};
-          parent[k].push(t);
-          this.cur = t;
-        } else this.cur = this.walk(this.root, keys);
-        continue;
-      }
-      const keys = this.keyPath();
-      this.ws();
-      if (this.s[this.p] !== '=') this.fail('expected "=" after a key');
-      this.p++;
-      this.ws();
-      const line = lineOf(this.s, this.p);
-      const value = this.value();
-      this.endLine();
-      const parent = this.walk(this.cur, keys.slice(0, -1));
-      const k = keys[keys.length - 1];
-      if (own(parent, k)) this.fail(`duplicate key "${k}"`);
-      parent[k] = value;
-      this.keyLines[[this.prefix, ...keys].filter(Boolean).join('.')] = line;
-    }
-  }
-
-  walk(base, keys) {
-    let t = base;
-    for (const k of keys) {
-      if (t[k] === undefined) t[k] = {};
-      t = Array.isArray(t[k]) ? t[k][t[k].length - 1] : t[k];
-      if (!isObj(t)) this.fail(`"${k}" is not a table`);
-    }
-    return t;
-  }
-
-  keyPath() {
-    const keys = [];
-    for (;;) {
-      this.ws();
-      const ch = this.s[this.p];
-      if (ch === '"') keys.push(this.basicString());
-      else if (ch === "'") keys.push(this.literalString());
-      else {
-        const m = /^[A-Za-z0-9_-]+/.exec(this.s.slice(this.p));
-        if (!m) this.fail('expected a key');
-        keys.push(m[0]);
-        this.p += m[0].length;
-      }
-      this.ws();
-      if (this.s[this.p] !== '.') return keys;
-      this.p++;
-    }
-  }
-
-  basicString() {
-    const multi = this.s.startsWith('"""', this.p);
-    this.p += multi ? 3 : 1;
-    if (multi && this.s[this.p] === '\n') this.p++;
-    let out = '';
-    for (;;) {
-      if (this.p >= this.s.length) this.fail('unterminated string');
-      const ch = this.s[this.p];
-      if (multi ? this.s.startsWith('"""', this.p) : ch === '"') { this.p += multi ? 3 : 1; return out; }
-      if (!multi && ch === '\n') this.fail('newline in a basic string');
-      if (ch === '\\') {
-        const e = this.s[this.p + 1];
-        const map = { b: '\b', t: '\t', n: '\n', f: '\f', r: '\r', '"': '"', '\\': '\\', e: '\x1b' };
-        if (e in map) { out += map[e]; this.p += 2; continue; }
-        if (e === 'u' || e === 'U') {
-          const n = e === 'u' ? 4 : 8;
-          const hex = this.s.slice(this.p + 2, this.p + 2 + n);
-          if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length !== n) this.fail('invalid unicode escape');
-          out += String.fromCodePoint(parseInt(hex, 16));
-          this.p += 2 + n;
-          continue;
-        }
-        if (multi && /[ \t\n]/.test(e)) {
-          this.p++;
-          while (/[ \t\n]/.test(this.s[this.p] || '')) this.p++;
-          continue;
-        }
-        this.fail(`invalid escape \\${e}`);
-      }
-      out += ch;
-      this.p++;
-    }
-  }
-
-  literalString() {
-    const multi = this.s.startsWith("'''", this.p);
-    this.p += multi ? 3 : 1;
-    if (multi && this.s[this.p] === '\n') this.p++;
-    const end = this.s.indexOf(multi ? "'''" : "'", this.p);
-    if (end < 0) this.fail('unterminated string');
-    const out = this.s.slice(this.p, end);
-    if (!multi && out.includes('\n')) this.fail('newline in a literal string');
-    this.p = end + (multi ? 3 : 1);
-    return out;
-  }
-
-  value() {
-    const ch = this.s[this.p];
-    if (ch === '"') return this.basicString();
-    if (ch === "'") return this.literalString();
-    if (ch === '[') {
-      this.p++;
-      const arr = [];
-      for (;;) {
-        this.skipTrivia();
-        if (this.s[this.p] === ']') { this.p++; return arr; }
-        arr.push(this.value());
-        this.skipTrivia();
-        if (this.s[this.p] === ',') { this.p++; continue; }
-        if (this.s[this.p] !== ']') this.fail('expected "," or "]" in an array');
-      }
-    }
-    if (ch === '{') {
-      this.p++;
-      const t = {};
-      this.ws();
-      if (this.s[this.p] === '}') { this.p++; return t; }
-      for (;;) {
-        const keys = this.keyPath();
-        this.ws();
-        if (this.s[this.p] !== '=') this.fail('expected "=" in an inline table');
-        this.p++;
-        this.ws();
-        const parent = this.walk(t, keys.slice(0, -1));
-        parent[keys[keys.length - 1]] = this.value();
-        this.ws();
-        if (this.s[this.p] === ',') { this.p++; this.ws(); continue; }
-        if (this.s[this.p] === '}') { this.p++; return t; }
-        this.fail('expected "," or "}" in an inline table');
-      }
-    }
-    const rest = this.s.slice(this.p);
-    let m = /^(?:true|false)(?![A-Za-z0-9_-])/.exec(rest);
-    if (m) { this.p += m[0].length; return m[0] === 'true'; }
-    m = /^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?)?|^\d{2}:\d{2}:\d{2}(?:\.\d+)?/.exec(rest);
-    if (m) { this.p += m[0].length; return m[0]; }
-    m = /^[+-]?(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|inf|nan|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?)(?![A-Za-z0-9_.:-])/.exec(rest);
-    if (m) {
-      this.p += m[0].length;
-      const t = m[0].replace(/_/g, '');
-      if (/inf$/.test(t)) return t.startsWith('-') ? -Infinity : Infinity;
-      if (/nan$/.test(t)) return NaN;
-      if (/^[+-]?0[xob]/.test(t)) return Number(t.replace(/^\+/, ''));
-      return Number(t);
-    }
-    this.fail(`invalid value: ${rest.slice(0, 20)}`);
-    return null;
-  }
-}
-
-/** Parse TOML text. Returns { value, error: null | { line, message }, keyLines }. */
-export function parseToml(text) {
-  const p = new TomlParser(String(text ?? ''));
-  try {
-    return { value: p.parse(), error: null, keyLines: p.keyLines };
-  } catch (err) {
-    return { value: null, error: { line: err.line || 1, message: err.message }, keyLines: p.keyLines };
-  }
-}
+const UNPINNED = [[/\bnpx\s+(?:--yes\s+|-y\s+)(?:--?[\w-]+\s+)*(@?[\w./-]+?)(?=\s|$)/, (p) => /@\d/.test(p.replace(/^@/, ''))],
+  [/\bnpx\s+[^\n]*@latest\b/], [/\buvx\s+(?!--from)([\w.-]+)(?=\s|$)/, (p) => /==|@\d/.test(p)],
+  [/\bdocker\s+run\b[^\n]*\s([\w./-]+:latest)\b/]];
+/** The package a command runs without a pinned version (npx -y pkg, @latest, uvx pkg, image:latest), or null. */
+const unpinned = (s) => UNPINNED.map(([re, ok]) => [re.exec(s), ok]).filter(([m, ok]) => m && !ok?.(m[1] || m[0]))
+  .map(([m]) => m[1] || m[0])[0] || null;
 
 // ---------------------------------------------------------------------------
 // Discovery and classification
 
-function homeDirs(env = process.env, home = os.homedir()) {
-  const h = toPosix(home);
-  return {
-    home: h,
-    copilot: toPosix(env.COPILOT_HOME || `${h}/.copilot`),
-    claude: toPosix(env.CLAUDE_CONFIG_DIR || `${h}/.claude`),
-    codex: toPosix(env.CODEX_HOME || `${h}/.codex`),
-  };
-}
-
 const under = (abs, dir) => abs === dir || abs.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
+const homes = (env, home) => Object.fromEntries(Object.entries(hostHomes({ env, home })).map(([k, v]) => [k, toPosix(v)]));
+const INSTRUCTION_FILES = { 'copilot-instructions.md': 'copilot-instructions copilot',
+  'AGENTS.md': 'agents-md copilot claude codex', 'AGENTS.override.md': 'agents-override codex',
+  'CLAUDE.md': 'claude-md claude copilot', 'CLAUDE.local.md': 'claude-local claude', 'GEMINI.md': 'gemini-md copilot' };
+const SKILL_READERS = { claude: 'spec claude copilot', github: 'spec copilot', agents: 'spec copilot codex',
+  codex: 'spec codex' };
 
 /**
- * Hosts that load a SKILL.md from where it lies (plan section 3.1): Claude Code reads only
- * .claude/skills, Codex .agents/skills and its own folders, Copilot (CLI, VS Code, cloud) the
- * .github, .agents and .claude skill folders. A skill anywhere else (a source tree such as
- * skills/<name>/, a plugin) is linted for every host.
+ * `{ kind, sub, scope, reads[], plugin? }` for a tooling file, or null. `reads` are the hosts that load it from
+ * where it lies (plan §3.1): a skill in .claude/skills is read by Claude Code and Copilot, .github/skills by
+ * Copilot, .agents/skills by Copilot and Codex; one anywhere else (a source tree, a plugin) by every host.
+ * `sniff` classifies an explicitly named file outside the conventional locations by its content.
  */
-function skillReaders(abs, H) {
-  const parentOf = path.posix.dirname(path.posix.dirname(abs));
-  const inUser = (dir) => parentOf === dir;
-  if (inUser(`${H.claude}/skills`)) return ['spec', 'claude', 'copilot'];
-  if (inUser(`${H.copilot}/skills`)) return ['spec', 'copilot'];
-  if (inUser(`${H.codex}/skills`)) return ['spec', 'codex'];
-  if (/(?:^|\/)\.claude\/skills$/.test(parentOf)) return ['spec', 'claude', 'copilot'];
-  if (/(?:^|\/)\.github\/skills$/.test(parentOf)) return ['spec', 'copilot'];
-  if (/(?:^|\/)\.agents\/skills$/.test(parentOf)) return ['spec', 'copilot', 'codex'];
-  if (/(?:^|\/)\.codex\/skills$/.test(parentOf)) return ['spec', 'codex'];
-  return ['spec', 'copilot', 'claude', 'codex'];
-}
-
-function findUp(startDir, rel, stopAt) {
-  let d = startDir;
-  for (let i = 0; i < 12; i++) {
-    if (fs.existsSync(path.join(d, rel))) return d;
-    if (stopAt && path.resolve(d) === path.resolve(stopAt)) return null;
-    const parent = path.dirname(d);
-    if (parent === d) return null;
-    d = parent;
-  }
-  return null;
-}
-
-/**
- * Kind of a tooling file from its path: { kind, sub, scope, reads[] } or null when the path is
- * not a known tooling location. `sniff` also looks at content for explicitly named files.
- */
-export function classifyToolingPath(absPath, { root = null, env = process.env, home, sniff = false } = {}) {
+function classify(absPath, { root = null, env = process.env, home, sniff = false } = {}) {
   const abs = toPosix(path.resolve(absPath));
   const b = path.posix.basename(abs);
-  const dir = path.posix.dirname(abs);
-  const parent = path.posix.basename(dir);
-  const H = homeDirs(env, home);
-  const userScope = under(abs, H.home) && (under(abs, H.copilot) || under(abs, H.claude) || under(abs, H.codex) ||
-    under(abs, `${H.home}/.agents`));
-  const scope = userScope ? 'user' : 'project';
+  const parent = path.posix.basename(path.posix.dirname(abs));
+  const H = homes(env, home);
+  const user = under(abs, H.home) && [H.copilot, H.claude, H.codex, `${H.home}/.agents`].some((d) => under(abs, d));
+  const res = (kind, sub, reads, extra) => ({ kind, sub, scope: user ? 'user' : 'project', reads: W(reads), ...extra });
   const has = (re) => re.test(abs);
-  const pluginRoot = (marker) => findUp(path.dirname(absPath), marker, root);
-  const res = (kind, sub, reads, extra = {}) => ({ kind, sub, scope, reads, ...extra });
-
-  if (b === 'SKILL.md' || b.toLowerCase() === 'skill.md') return res('skill', 'skill', skillReaders(abs, H));
-  if (b === 'openai.yaml' && parent === 'agents' && fs.existsSync(path.join(path.dirname(path.dirname(absPath)), 'SKILL.md'))) {
-    return res('codex-skill-meta', 'openai-yaml', ['codex']);
+  const up = (marker) => findUp(path.dirname(absPath), marker, { stopAt: root, maxDepth: 12 });
+  const clPlugin = () => up(path.join('.claude-plugin', 'plugin.json'));
+  const near = (n) => fs.existsSync(path.join(path.dirname(absPath), n));
+  if (b.toLowerCase() === 'skill.md') {
+    const d = path.posix.dirname(path.posix.dirname(abs));
+    const at = { [`${H.claude}/skills`]: 'claude', [`${H.copilot}/skills`]: 'github', [`${H.codex}/skills`]: 'codex' }[d]
+      || /(?:^|\/)\.(claude|github|agents|codex)\/skills$/.exec(d)?.[1];
+    return res('skill', 'skill', SKILL_READERS[at] || 'spec copilot claude codex');
   }
-  if (b.endsWith('.agent.md') || has(/(?:^|\/)\.github\/agents\/.+\.md$/) || under(abs, `${H.copilot}/agents`) ||
-      has(/(?:^|\/)com\.github\.copilot\/agents\/.+\.md$/)) {
-    return res('agent', 'copilot', ['copilot', 'codex']);
+  if (b === 'openai.yaml' && parent === 'agents' && fs.existsSync(path.join(absPath, '..', '..', 'SKILL.md'))) {
+    return res('codex-skill-meta', 'openai-yaml', 'codex');
   }
-  if (has(/(?:^|\/)\.claude\/agents\/.+\.md$/)) return res('agent', 'claude', ['claude', 'copilot', 'codex']);
-  if (b.endsWith('.md') && parent === 'agents') {
-    const pr = pluginRoot(path.join('.claude-plugin', 'plugin.json'));
-    if (pr) return res('agent', 'claude', ['claude', 'codex'], { plugin: toPosix(pr) });
+  if (b.endsWith('.agent.md') || has(/(?:^|\/)(?:\.github|com\.github\.copilot)\/agents\/.+\.md$/)
+    || under(abs, `${H.copilot}/agents`)) return res('agent', 'copilot', 'copilot codex');
+  if (has(/(?:^|\/)\.claude\/agents\/.+\.md$/)) return res('agent', 'claude', 'claude copilot codex');
+  if (b.endsWith('.md') && parent === 'agents' && clPlugin()) {
+    return res('agent', 'claude', 'claude codex', { plugin: toPosix(clPlugin()) });
   }
-  if (b.endsWith('.instructions.md')) return res('instructions', 'path-specific', ['copilot']);
-  if (b === 'copilot-instructions.md') return res('instructions', 'copilot-instructions', ['copilot']);
-  if (b === 'AGENTS.md') return res('instructions', 'agents-md', ['copilot', 'claude', 'codex']);
-  if (b === 'AGENTS.override.md') return res('instructions', 'agents-override', ['codex']);
-  if (b === 'CLAUDE.md') return res('instructions', 'claude-md', ['claude', 'copilot']);
-  if (b === 'CLAUDE.local.md') return res('instructions', 'claude-local', ['claude']);
-  if (b === 'GEMINI.md') return res('instructions', 'gemini-md', ['copilot']);
-  if (has(/(?:^|\/)\.claude\/rules\/.+\.md$/)) return res('instructions', 'claude-rules', ['claude', 'copilot']);
-  if (b.endsWith('.prompt.md')) return res('prompt', 'prompt', ['copilot']);
-  if (has(/(?:^|\/)\.claude\/commands\/.+\.md$/)) return res('command', 'claude-command', ['claude', 'copilot']);
-
-  if (has(/(?:^|\/)\.github\/hooks\/[^/]+\.json$/)) return res('hooks', 'copilot', ['copilot']);
-  if (under(abs, `${H.copilot}/hooks`) && b.endsWith('.json')) return res('hooks', 'copilot', ['copilot'], { scope: 'user' });
-  if (has(/(?:^|\/)com\.github\.copilot\/hooks\/hooks\.json$/)) return res('hooks', 'copilot', ['copilot'], { plugin: toPosix(path.dirname(path.dirname(path.dirname(absPath)))) });
-  if (has(/(?:^|\/)\.codex\/hooks\.json$/) || abs === `${H.codex}/hooks.json`) return res('hooks', 'codex', ['codex']);
+  if (b.endsWith('.instructions.md')) return res('instructions', 'path-specific', 'copilot');
+  if (INSTRUCTION_FILES[b]) return res('instructions', ...INSTRUCTION_FILES[b].split(/ (.*)/));
+  if (has(/(?:^|\/)\.claude\/rules\/.+\.md$/)) return res('instructions', 'claude-rules', 'claude copilot');
+  if (b.endsWith('.prompt.md')) return res('prompt', 'prompt', 'copilot');
+  if (has(/(?:^|\/)\.claude\/commands\/.+\.md$/)) return res('command', 'claude-command', 'claude copilot');
+  if (has(/(?:^|\/)\.github\/hooks\/[^/]+\.json$/)) return res('hooks', 'copilot', 'copilot');
+  if (under(abs, `${H.copilot}/hooks`) && b.endsWith('.json')) return res('hooks', 'copilot', 'copilot', { scope: 'user' });
+  if (has(/(?:^|\/)com\.github\.copilot\/hooks\/hooks\.json$/)) {
+    return res('hooks', 'copilot', 'copilot', { plugin: toPosix(path.resolve(absPath, '..', '..', '..')) });
+  }
+  if (has(/(?:^|\/)\.codex\/hooks\.json$/) || abs === `${H.codex}/hooks.json`) return res('hooks', 'codex', 'codex');
   if (has(/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/) || abs === `${H.claude}/settings.json`) {
-    const isUser = abs === `${H.claude}/settings.json` || abs === `${H.claude}/settings.local.json`;
-    return res('settings', 'claude', isUser ? ['claude'] : ['claude', 'copilot'], { scope: isUser ? 'user' : 'project' });
+    const u = abs === `${H.claude}/settings.json` || abs === `${H.claude}/settings.local.json`;
+    return res('settings', 'claude', u ? 'claude' : 'claude copilot', { scope: u ? 'user' : 'project' });
   }
-  if (has(/(?:^|\/)\.github\/copilot\/settings(?:\.local)?\.json$/) || abs === `${H.copilot}/settings.json`) return res('settings', 'copilot', ['copilot']);
-  if (b === 'hooks.json') {
-    const pr = pluginRoot(path.join('.claude-plugin', 'plugin.json'));
-    if (parent === 'hooks' && pr) return res('hooks', 'claude-plugin', ['claude'], { plugin: toPosix(pr) });
-    const cp = pluginRoot('plugin.json');
-    if (cp) return res('hooks', 'copilot', ['copilot'], { plugin: toPosix(cp) });
+  if (has(/(?:^|\/)\.github\/copilot\/settings(?:\.local)?\.json$/) || abs === `${H.copilot}/settings.json`) {
+    return res('settings', 'copilot', 'copilot');
   }
-  if (has(/(?:^|\/)\.claude-plugin\/plugin\.json$/)) return res('plugin', 'claude', ['claude', 'copilot']);
-  if (has(/(?:^|\/)\.codex-plugin\/plugin\.json$/)) return res('plugin', 'codex', ['codex']);
-  if (b === 'plugin.json') {
-    const data = parseJson(readTextNormalized(absPath) || '').value;
-    if (isObj(data) && typeof data.$schema === 'string' && /agent-plugins\.org/.test(data.$schema)) return res('plugin', 'agent-plugins', ['copilot', 'codex']);
-    if (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/plugin\.json$/) || sniff || fs.existsSync(path.join(path.dirname(absPath), 'skills'))) {
-      return res('plugin', 'copilot', ['copilot']);
-    }
+  if (b === 'hooks.json' && parent === 'hooks' && clPlugin()) {
+    return res('hooks', 'claude-plugin', 'claude', { plugin: toPosix(clPlugin()) });
   }
-  if (has(/(?:^|\/)\.claude-plugin\/marketplace\.json$/)) return res('marketplace', 'claude', ['claude', 'copilot', 'codex']);
-  if (has(/(?:^|\/)\.agents\/plugins\/(?:api_)?marketplace\.json$/)) return res('marketplace', 'codex', ['codex']);
-  if (b === 'marketplace.json' && (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/marketplace\.json$/) || sniff)) {
-    return res('marketplace', 'copilot', ['copilot']);
+  if (b === 'hooks.json' && up('plugin.json')) return res('hooks', 'copilot', 'copilot', { plugin: toPosix(up('plugin.json')) });
+  if (has(/(?:^|\/)\.claude-plugin\/plugin\.json$/)) return res('plugin', 'claude', 'claude copilot');
+  if (has(/(?:^|\/)\.codex-plugin\/plugin\.json$/)) return res('plugin', 'codex', 'codex');
+  if (b === 'plugin.json' && /agent-plugins\.org/.test(String(parseJson(readNorm(absPath) || '').value?.$schema))) {
+    return res('plugin', 'agent-plugins', 'copilot codex');
   }
-  if (has(/(?:^|\/)\.vscode\/mcp\.json$/)) return res('mcp', 'vscode', ['copilot']);
-  if (b === '.mcp.json') return res('mcp', 'portable', ['copilot', 'claude']);
-  if (has(/(?:^|\/)\.github\/mcp\.json$/) || b === 'mcp-config.json') return res('mcp', 'copilot', ['copilot']);
-  if (b === 'mcp.json' && fs.existsSync(path.join(path.dirname(absPath), 'plugin.json'))) return res('mcp', 'agent-plugins', ['copilot', 'codex']);
-  if (has(/(?:^|\/)\.codex\/config\.toml$/) || abs === `${H.codex}/config.toml`) return res('codex-config', 'config', ['codex']);
-
-  if (!sniff) return null;
-  // Explicitly named files outside the conventional locations: decide by content.
-  const text = readTextNormalized(absPath);
+  if (b === 'plugin.json' && (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/plugin\.json$/) || sniff
+    || near('skills'))) return res('plugin', 'copilot', 'copilot');
+  if (has(/(?:^|\/)\.claude-plugin\/marketplace\.json$/)) return res('marketplace', 'claude', 'claude copilot codex');
+  if (has(/(?:^|\/)\.agents\/plugins\/(?:api_)?marketplace\.json$/)) return res('marketplace', 'codex', 'codex');
+  if (b === 'marketplace.json' && (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/marketplace\.json$/)
+    || sniff)) return res('marketplace', 'copilot', 'copilot');
+  if (has(/(?:^|\/)\.vscode\/mcp\.json$/)) return res('mcp', 'vscode', 'copilot');
+  if (b === '.mcp.json') return res('mcp', 'portable', 'copilot claude');
+  if (has(/(?:^|\/)\.github\/mcp\.json$/) || b === 'mcp-config.json') return res('mcp', 'copilot', 'copilot');
+  if (b === 'mcp.json' && near('plugin.json')) return res('mcp', 'agent-plugins', 'copilot codex');
+  if (has(/(?:^|\/)\.codex\/config\.toml$/) || abs === `${H.codex}/config.toml`) return res('codex-config', 'config', 'codex');
+  const text = sniff ? readNorm(absPath) : null;
   if (text == null) return null;
-  if (b.endsWith('.json')) {
-    const v = parseJson(text, { jsonc: true }).value;
-    if (isObj(v) && isObj(v.hooks)) {
-      const events = Object.keys(v.hooks);
-      if (own(v, 'version') || events.some((e) => CP_EVENTS_CAMEL.includes(e))) return res('hooks', 'copilot', ['copilot']);
-      if (/"commandWindows"/.test(text)) return res('hooks', 'codex', ['codex']);
-      return res('hooks', 'claude-plugin', ['claude'], { plugin: null });
+  const v = b.endsWith('.json') ? parseJson(text, { jsonc: true }).value : null;
+  if (isObj(v?.hooks)) {
+    if (Object.hasOwn(v, 'version') || Object.keys(v.hooks).some((e) => CP_EVENTS.includes(e))) {
+      return res('hooks', 'copilot', 'copilot');
     }
-    if (isObj(v) && (isObj(v.mcpServers) || isObj(v.servers))) return res('mcp', isObj(v.servers) ? 'vscode' : 'portable', isObj(v.servers) ? ['copilot'] : ['copilot', 'claude']);
+    return /"commandWindows"/.test(text) ? res('hooks', 'codex', 'codex') : res('hooks', 'claude-plugin', 'claude', { plugin: null });
   }
-  if (b.endsWith('.toml')) return res('codex-config', 'config', ['codex']);
-  if (b.endsWith('.md')) return res('instructions', 'generic', ['copilot', 'claude', 'codex']);
-  return null;
+  if (isObj(v?.servers)) return res('mcp', 'vscode', 'copilot');
+  if (isObj(v?.mcpServers)) return res('mcp', 'portable', 'copilot claude');
+  if (b.endsWith('.toml')) return res('codex-config', 'config', 'codex');
+  return b.endsWith('.md') ? res('instructions', 'generic', 'copilot claude codex') : null;
 }
 
-/** Tooling files under `dir` (skipping dependency and build folders). */
-function discover(dir, ctx) {
-  const IGNORE = new Set(['.git', 'node_modules', '.adc', '.venv', 'venv', '__pycache__', 'target', 'dist', 'build', 'obj', '.next',
-    '.turbo', '.tox', 'vendor', 'coverage', '.cache']);
-  const out = [];
-  const walk = (d, depth) => {
-    if (depth > 12 || out.length > 5000) return;
-    let entries;
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    for (const e of entries) {
-      if (IGNORE.has(e.name)) continue;
-      const full = path.join(d, e.name);
-      if (e.isDirectory()) walk(full, depth + 1);
-      else if (e.isFile()) {
-        const c = classifyToolingPath(full, ctx);
-        if (c) out.push({ abs: full, ...c });
-      }
-    }
-  };
-  walk(dir, 0);
-  return out;
-}
+const WALK_IGNORE = S(`.git node_modules .adc .venv venv __pycache__ target dist build obj .next .turbo .tox vendor
+  coverage .cache`);
+
+/** Tooling files under `dir`; linked folders are followed (a Claude Code skill folder may be a symlink). */
+const discover = (dir, ctx) => listFiles(dir, { ignore: WALK_IGNORE, followSymlinks: true })
+  .map((rel) => path.join(dir, ...rel.split('/'))).map((abs) => ({ abs, cls: classify(abs, ctx) }))
+  .filter((x) => x.cls).map(({ abs, cls }) => ({ abs, ...cls }));
 
 // ---------------------------------------------------------------------------
-// Lint run and per-file findings
+// Findings
 
-class LintRun {
-  constructor({ host = 'all', strict = false, root, env = process.env, home = os.homedir(), allowHosts = [] }) {
-    this.host = host;
-    this.selected = host === 'all' ? [...HOSTS] : strict && host !== 'spec' ? [host, 'spec'] : [host];
-    this.strict = Boolean(strict);
-    this.root = path.resolve(root);
-    this.env = env;
-    this.home = home;
-    this.allowHosts = new Set(['localhost', '127.0.0.1', '[::1]', '::1', ...allowHosts.map((h) => String(h).toLowerCase())]);
-    this.files = [];
-    this.security = [];
-    this.secSeen = new Set();
-    this.directives = [];
-  }
-
-  display(abs) {
-    const rel = path.relative(this.root, abs);
-    return !rel ? '.' : rel.startsWith('..') || path.isAbsolute(rel) ? toPosix(abs) : toPosix(rel);
-  }
-}
+const clip = (s) => truncate(redactSecrets(String(s)), 160);
 
 class FileLint {
   constructor(run, abs, cls) {
-    this.run = run;
-    this.abs = abs;
-    this.cls = cls;
-    this.path = run.display(abs);
-    this.hosts = cls.reads.filter((h) => run.selected.includes(h));
-    this.results = new Map(this.hosts.map((h) => [h, { host: h, errors: [], warnings: [], notes: [] }]));
-    this.seen = new Set();
+    Object.assign(this, { run, abs, cls, path: run.display(abs), seen: new Set() });
+    this.results = new Map(cls.reads.filter((h) => run.selected.includes(h))
+      .map((h) => [h, { host: h, errors: [], warnings: [], notes: [] }]));
   }
 
-  /** Record a finding for every selected host the rule applies to (`only` narrows the hosts). */
-  emit(id, { line = null, message, field, evidence, only, severity, strictSeverity } = {}) {
+  get text() { return (this.cached ??= readNorm(this.abs) || ''); }
+
+  /** A finding for each selected host the rule applies to (`only` narrows them); messages are redacted. */
+  emit(id, line, message, { field, evidence, only, severity, strictSeverity } = {}) {
     const rule = RULE_INDEX.get(id);
     if (!rule) throw new Error(`unknown lint rule ${id}`);
-    for (const [host, defSev] of Object.entries(rule.hosts)) {
-      if (only && !only.includes(host)) continue;
+    const msg = redactSecrets(message);
+    for (const [host, def] of Object.entries(rule.hosts)) {
       const r = this.results.get(host);
-      if (!r) continue;
-      let sev = severity && typeof severity === 'object' ? (severity[host] || defSev) : (severity || defSev);
-      if (this.run.strict && rule.strict && rule.strict[host]) sev = rule.strict[host];
-      if (this.run.strict && strictSeverity) sev = typeof strictSeverity === 'object' ? (strictSeverity[host] || sev) : strictSeverity;
-      const msg = typeof message === 'function' ? message(host) : (message || rule.title);
       const key = `${host}|${id}|${line}|${msg}`;
-      if (this.seen.has(key)) continue;
+      if (!r || (only && !only.includes(host)) || this.seen.has(key)) continue;
       this.seen.add(key);
-      const f = { rule: id, line: line ?? null, message: msg };
-      if (field) f.field = field;
-      if (evidence) f.evidence = truncate(String(evidence), 160);
-      r[sev === 'error' ? 'errors' : sev === 'warning' ? 'warnings' : 'notes'].push(f);
+      let sev = (isObj(severity) ? severity[host] : severity) || def;
+      if (this.run.strict) sev = (isObj(strictSeverity) ? strictSeverity[host] : strictSeverity) || rule.strict?.[host] || sev;
+      r[{ error: 'errors', warning: 'warnings' }[sev] || 'notes'].push({ rule: id, line: line ?? null, message: msg,
+        ...(field && { field }), ...(evidence && { evidence: clip(evidence) }) });
     }
   }
 
-  sec(id, { line = null, message, evidence, severity } = {}) {
-    const rule = RULE_INDEX.get(id);
-    const key = `${id}|${this.path}|${line}|${message}`;
+  sec(id, line, message, evidence) {
+    const msg = redactSecrets(message);
+    const key = `${id}|${this.path}|${line}|${msg}`;
     if (this.run.secSeen.has(key)) return;
     this.run.secSeen.add(key);
-    this.run.security.push({ rule: id, severity: severity || rule.severity, file: this.path, line, message: message || rule.title,
-      ...(evidence ? { evidence: truncate(String(evidence), 160) } : {}) });
+    this.run.security.push({ rule: id, severity: RULE_INDEX.get(id).severity, file: this.path, line: line ?? null,
+      message: msg, ...(evidence && { evidence: clip(evidence) }) });
+  }
+
+  secrets(text, offset = 0, where = '') {
+    for (const s of scanSecrets(text)) {
+      this.sec('SEC-SECRET', s.line + offset, `secret-shaped value (${s.id})${where}; remove it and rotate it`, s.redacted);
+    }
+  }
+
+  unpinned(list, line, label) {
+    const s = list.find((x) => unpinned(x));
+    if (s) this.sec('SEC-UNPINNED', line, `${label}runs ${unpinned(s)} without a pinned version`, s);
+  }
+
+  /** `id` for each key of `obj` outside `known`; `L(key)` gives the line. */
+  unknown(obj, known, id, L, what, { only, prefix = '' } = {}) {
+    for (const k of Object.keys(obj).filter((x) => !known.has(x))) {
+      this.emit(id, L(k), `${prefix}unknown ${what} "${k}"`, { field: k, only });
+    }
   }
 
   toJSON() {
-    return { path: this.path, kind: this.cls.kind, sub: this.cls.sub, scope: this.cls.scope, reads: this.cls.reads,
-      host_results: [...this.results.values()] };
+    const { kind, sub, scope, reads } = this.cls;
+    return { path: this.path, kind, sub, scope, reads, host_results: [...this.results.values()] };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Text checks shared by every Markdown kind
+// Markdown kinds: security text, skills, Codex sidecar, instructions, agents, commands, prompt files
 
-const PIPE_SHELL = [
-  /\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b/i,
+const PIPE_SHELL = [/\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b/i, /\b(?:ba)?sh\s+<\(\s*(?:curl|wget)\b/i,
   /\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n|]*\|\s*(?:iex|Invoke-Expression)\b/i,
-  /\b(?:iex|Invoke-Expression)\s*\(?\s*\(?\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|New-Object\s+Net\.WebClient)/i,
-  /\b(?:ba)?sh\s+<\(\s*(?:curl|wget)\b/i,
-];
-const DISABLE_GUARDS = [
-  /--dangerously-skip-permissions\b/, /--dangerously-bypass-approvals-and-sandbox\b/, /--dangerously-bypass-hook-trust\b/,
-  /--bypass-hook-trust\b/, /(?:^|\s)--yolo\b/, /--allow-all-tools\b/, /(?:^|\s)--allow-all\b/, /\bCOPILOT_ALLOW_ALL\s*=\s*["']?true/i,
-  /"?disableAllHooks"?\s*[:=]\s*true/, /\bbypassPermissions\b/, /\bdanger-full-access\b/, /approval_policy\s*=\s*["']?never/,
-  /\bgit\s+commit\b[^\n]*--no-verify\b/,
-];
-const BASE64_BLOB = /[A-Za-z0-9+/]{200,}={0,2}/;
+  /\b(?:iex|Invoke-Expression)\s*\(?\s*\(?\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|New-Object\s+Net\.WebClient)/i];
+const DISABLE_GUARDS = [/--dangerously-skip-permissions\b/, /--dangerously-bypass-approvals-and-sandbox\b/,
+  /--(?:dangerously-)?bypass-hook-trust\b/, /(?:^|\s)--yolo\b/, /--allow-all-tools\b/, /(?:^|\s)--allow-all\b/,
+  /\bCOPILOT_ALLOW_ALL\s*=\s*["']?true/i, /"?disableAllHooks"?\s*[:=]\s*true/, /\bbypassPermissions\b/,
+  /\bdanger-full-access\b/, /approval_policy\s*=\s*["']?never/, /\bgit\s+commit\b[^\n]*--no-verify\b/];
 
-async function securityText(fl, text, { lineOffset = 0, markdown = true } = {}) {
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    const n = i + 1 + lineOffset;
-    if (markdown) {
-      if (PIPE_SHELL.some((re) => re.test(l))) fl.sec('SEC-PIPE-SHELL', { line: n, message: 'downloads and executes a script; pin and verify it instead', evidence: l.trim() });
-      if (BASE64_BLOB.test(l)) fl.sec('SEC-BASE64', { line: n, message: 'a base64 blob of 200+ characters hides content from review' });
-      const g = DISABLE_GUARDS.find((re) => re.test(l));
-      if (g) fl.sec('SEC-DISABLE-GUARDS', { line: n, message: `turns off a safety control (${g.exec(l)[0].trim()})`, evidence: l.trim() });
-    }
-  }
-  const scan = await getSecretScanner();
-  for (const s of scan(text)) {
-    fl.sec('SEC-SECRET', { line: s.line + lineOffset, message: `secret-shaped value (${s.id}); remove it and rotate the credential`, evidence: s.redacted });
-  }
+function securityText(fl, text, offset = 0) {
+  text.split('\n').forEach((l, i) => {
+    const [line, g] = [i + 1 + offset, DISABLE_GUARDS.find((re) => re.test(l))];
+    if (PIPE_SHELL.some((re) => re.test(l))) fl.sec('SEC-PIPE-SHELL', line, 'downloads and runs a script; pin and verify it', l.trim());
+    if (/[A-Za-z0-9+/]{200,}={0,2}/.test(l)) fl.sec('SEC-BASE64', line, 'a base64 blob of 200+ characters hides content from review');
+    if (g) fl.sec('SEC-DISABLE-GUARDS', line, `turns off a safety control (${g.exec(l)[0].trim()})`, l.trim());
+  });
+  fl.secrets(text, offset);
+}
+
+/** `{ fm, data, L, body, offset }` of a Markdown file whose frontmatter is optional (YAML errors: MD-FM-YAML). */
+function parts(fl) {
+  const fm = fl.text.startsWith('---') ? parseFrontmatter(fl.text) : null;
+  for (const e of fm?.errors || []) fl.emit('MD-FM-YAML', e.line, `frontmatter YAML: ${e.message}`);
+  const has = Boolean(fm?.hasFrontmatter);
+  return { fm, data: fm?.data || {}, L: (k) => fm?.keyLines?.[k] || null, body: has ? fm.body : fl.text,
+    offset: has ? fm.bodyStartLine - 1 : 0 };
 }
 
 const XML_TAG = /<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?\/?>/;
-const FIRST_PERSON = /^\s*(?:i|i'm|i am|i can|i will|i'll|we|we'll|we can|we will|my|our|let me)\b/i;
-const SECOND_PERSON = /^\s*(?:you can|you should|you will|you may|your)\b/i;
-const SHELL_TOOLS = /^(?:shell|bash|Bash|powershell|PowerShell|execute|\*)$|^(?:shell|bash|Bash|powershell|PowerShell)\(\s*(?:\*|\*:\*|:\*)?\s*\)$/;
+const NOT_THIRD = /^\s*(?:i|i'm|i am|i can|i will|i'll|we|we'll|we can|we will|my|our|let me|you can|you should|you will|you may|your)\b/i;
+const SHELL_TOOL = /^(?:shell|bash|Bash|powershell|PowerShell|execute|\*)$|^(?:shell|bash|Bash|powershell|PowerShell)\(\s*(?:\*|\*:\*|:\*)?\s*\)$/;
+const STRICT_WHAT = { flow: 'a flow-style collection', anchor: 'the anchor', alias: 'the alias', tag: 'the tag' };
+const SUBST = [[/\$ARGUMENTS\b/, () => '$ARGUMENTS is substituted only by Claude Code; say "the text after the skill name"'],
+  [/\$\{CLAUDE_(?:SKILL_DIR|PROJECT_DIR|SESSION_ID|EFFORT|PLUGIN_ROOT|PLUGIN_DATA)\}/, (m) => `${m[0]} is substituted only by Claude Code`],
+  [/(?:^|\s)!`[^`]+`|^\s*(?:`{3,}|~{3,})!/, () => 'dynamic context (!`cmd`) runs only in Claude Code']];
 
-function frontmatterOf(text) {
-  return text.startsWith('---') || text.charCodeAt(0) === 0xfeff ? parseFrontmatter(text) : null;
-}
-
-/** The first other reference file that mentions `file` (by references/<name> or bare name). */
-function refMentions(refDir, file) {
-  const name = path.basename(file);
-  let entries = [];
-  try { entries = fs.readdirSync(refDir, { withFileTypes: true }); } catch { return null; }
-  for (const e of entries) {
-    const other = path.join(refDir, e.name);
-    if (!e.isFile() || other === file) continue;
-    const text = readTextNormalized(other) || '';
-    if (text.includes(`references/${name}`) || new RegExp(`(?:^|[\\s(\\[\`'"/])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(text)) return `references/${e.name}`;
+function lintSkill(fl) {
+  const raw = fs.readFileSync(fl.abs, 'utf8').replace(/\r\n/g, '\n');
+  const [dir, base] = [path.dirname(fl.abs), path.basename(fl.abs)];
+  const dirName = path.basename(dir);
+  const fm = parseFrontmatter(raw);
+  const E = (id, line, msg, o) => fl.emit(id, line, msg, o);
+  if (base !== 'SKILL.md') E('SK-FILENAME', null, `the file is named ${base}; hosts look for SKILL.md`);
+  if (fm.bom) E('SK-FM-BOM', 1, 'the file starts with a UTF-8 byte-order mark; save it without BOM');
+  if (!fm.hasFrontmatter) {
+    E('SK-FM-LINE1', fm.lateOpenLine || 1, fm.lateOpenLine ? `frontmatter starts on line ${fm.lateOpenLine}; hosts read it `
+      + 'only when "---" is line 1' : 'no YAML frontmatter ("---" on line 1)');
   }
-  return null;
+  for (const e of fm.errors) E('SK-FM-YAML', e.line, `frontmatter YAML: ${e.message}`);
+  for (const w of fm.warnings) {
+    if (w.code === 'UNQUOTED_COLON') E('SK-FM-COLON', w.line, w.message);
+    else E('SK-FM-YAML', w.line, `frontmatter YAML: ${w.message}`, { severity: w.code === 'RESERVED_INDICATOR' ? null : 'warning' });
+  }
+  for (const c of fm.errors.length ? [] : fm.constructs) {
+    E('SK-FM-STRICTYAML', c.line, `${STRICT_WHAT[c.kind]} ${c.text}${c.path ? ` in \`${c.path}\`` : ''}: skills-ref `
+      + `(strictyaml) rejects it; ${c.kind === 'flow' ? 'write one "key: value" or "- item" per line'
+        : 'write the value out in block style'}`, { field: c.path || undefined });
+  }
+  if (fm.hasFrontmatter && !fm.errors.length) skillFields(fl, fm.data, (k) => fm.keyLines[k] || null, dirName);
+  if (/^(?:synced|anthropic-skills(?::.*)?)$/.test(dirName)) E('SK-NAME-CLAUDE-DIR', null, `"${dirName}" is reserved by Claude Code`);
+  const body = fm.hasFrontmatter ? fm.body : raw;
+  const offset = fm.hasFrontmatter ? fm.bodyStartLine - 1 : 0;
+  const count = body.trim() ? body.replace(/\n+$/, '').split('\n').length : 0;
+  const tokens = Math.ceil(body.length / 4);
+  if (!count) E('SK-BODY-EMPTY', null, 'the skill has no instructions after the frontmatter');
+  if (count > 500) E('SK-BODY-LINES', null, `the body has ${count} lines (keep it under 500; move detail to references/)`);
+  if (tokens > 5000) E('SK-BODY-TOKENS', null, `the body is about ${tokens} tokens (keep it under 5,000)`);
+  body.split('\n').forEach((l, i) => {
+    for (const [re, msg] of SUBST) { const m = re.exec(l); if (m) E('SK-SUBST', i + 1 + offset, msg(m)); }
+    // $N outside currency-like text ($1,845.00, $1k, $12.3M).
+    const pos = /(?<![\\\w$])\$[0-9](?![0-9]|[.,]\d|[kKmMbB]\b)/.exec(l);
+    if (pos) E('SK-SUBST-POSITIONAL', i + 1 + offset, `${pos[0]} becomes an argument in Claude Code; write \\${pos[0]}`);
+  });
+  skillStructure(fl, dir, body, offset);
+  securityText(fl, body, offset);
+  if (fm.raw) fl.secrets(fm.raw, 1, ' in the frontmatter');
 }
 
-/** Links, references, footprint and body rules for a skill directory. */
+function skillFields(fl, data, L, dirName) {
+  const E = (id, key, msg, o) => fl.emit(id, L(key), msg, o);
+  const { name, description: d, metadata: m, compatibility: c } = data;
+  const n = String(name);
+  const why = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(n) ? null : /[A-Z]/.test(n) ? 'uppercase letters' : /^-|-$/.test(n)
+    ? 'a leading or trailing hyphen' : /--/.test(n) ? 'a double hyphen' : 'characters other than a-z, 0-9 and -';
+  if (name === undefined || name === null || name === '') fl.emit('SK-NAME-REQUIRED', 1, '`name` is missing');
+  else {
+    if (typeof name !== 'string') E('SK-NAME-FORMAT', 'name', '`name` must be a string');
+    if (n.length > 64) E('SK-NAME-LENGTH', 'name', `\`name\` has ${n.length} characters (max 64)`);
+    if (why) E('SK-NAME-FORMAT', 'name', `\`name\` "${n}" has ${why}`);
+    if (n.normalize('NFKC') !== dirName.normalize('NFKC')) E('SK-NAME-DIR', 'name', `\`name\` "${n}" is not the folder name "${dirName}"`);
+    if (/claude|anthropic/i.test(n)) E('SK-NAME-RESERVED', 'name', `\`name\` "${n}" contains a reserved word`);
+  }
+  if (d === undefined || d === null || (typeof d === 'string' && !d.trim())) {
+    fl.emit('SK-DESC-REQUIRED', L('description') || 1, '`description` is missing or empty');
+  } else if (typeof d !== 'string') E('SK-DESC-TYPE', 'description', '`description` must be a string');
+  else {
+    const listing = d.length + (typeof data.when_to_use === 'string' ? data.when_to_use.length : 0);
+    if (d.length > 1024) E('SK-DESC-LENGTH', 'description', `\`description\` has ${d.length} characters (max 1,024)`);
+    if (listing > 1536) E('SK-DESC-LISTING', 'description', `description + when_to_use is ${listing} characters (limit 1,536)`);
+    if (XML_TAG.test(d)) E('SK-DESC-XML', 'description', `\`description\` contains the tag ${XML_TAG.exec(d)[0]}`);
+    if (NOT_THIRD.test(d)) E('SK-DESC-PERSON', 'description', 'write the description in the third person ("Processes ...")');
+  }
+  for (const key of Object.keys(data)) {
+    if (!SPEC_FIELDS.includes(key)) E('SK-FIELD-NONSPEC', key, `"${key}" is not one of the six Agent Skills fields`, { field: key });
+    for (const host of ['copilot', 'claude', 'codex'].filter((h) => !SKILL_FIELDS[h].has(key))) {
+      E('SK-FIELD-IGNORED', key, `${LABEL[host]} does not read "${key}"`, { only: [host], field: key });
+    }
+  }
+  if (m !== undefined && m !== null && !isObj(m)) E('SK-METADATA-MAP', 'metadata', '`metadata` must map strings to strings');
+  for (const [k, v] of Object.entries(isObj(m) ? m : {})) {
+    // Install provenance (gh skill install) is not authored data and is stripped on publish.
+    if (INSTALL_METADATA_KEY.test(k) || typeof v === 'string') continue;
+    const type = v === null ? 'null' : Array.isArray(v) ? 'list' : typeof v;
+    E('SK-METADATA-STRING', `metadata.${k}`, `\`metadata.${k}\` is a ${type}; quote it as a string`, { field: `metadata.${k}` });
+  }
+  const sd = String(m?.['short-description'] ?? '');
+  if (isObj(m) && Object.hasOwn(m, 'short-description') && (sd.length < 25 || sd.length > 64)) {
+    E('SK-SHORTDESC', 'metadata.short-description', `\`metadata.short-description\` has ${sd.length} characters (25-64)`);
+  }
+  if (Object.hasOwn(data, 'compatibility') && (typeof c !== 'string' || c.length < 1 || c.length > 500)) {
+    E('SK-COMPAT-LENGTH', 'compatibility', `\`compatibility\` must be a 1-500 character string${typeof c === 'string'
+      ? ` (has ${c.length})` : ''}`);
+  }
+  if (!Object.hasOwn(data, 'allowed-tools')) return;
+  const at = data['allowed-tools'];
+  const tokens = (Array.isArray(at) ? at.map(String) : String(at ?? '').split(/[\s,]+/)).map((t) => t.trim()).filter(Boolean);
+  const wide = tokens.filter((t) => SHELL_TOOL.test(t));
+  if (Array.isArray(at)) E('SK-ALLOWED-TOOLS-TYPE', 'allowed-tools', '`allowed-tools` is a list; the spec defines a string');
+  if (wide.length) {
+    fl.sec('SEC-ALLOWED-TOOLS', L('allowed-tools'), `allowed-tools pre-approves ${wide.join(', ')} for every user of this `
+      + 'skill; keep it only for trusted, first-party skills', tokens.join(' '));
+  }
+}
+
+/** Links, references and footprint (as Copilot lists it: node_modules, bin, obj and dist are hidden). */
 function skillStructure(fl, dir, body, offset) {
   const linked = new Set();
+  const rel = (p) => toPosix(path.relative(dir, p));
   // A plain or backticked mention of the path also tells the model to read the file.
-  for (const m of body.matchAll(/(?:^|[\s`'"(\/{}])(references\/[\w./-]+\.\w+)/g)) linked.add(path.resolve(dir, m[1]));
-  for (const { line, target } of markdownLinks(body)) {
-    const n = line + offset;
-    if (isExternalTarget(target)) continue;
-    const t = linkPathOf(target);
-    if (!t) continue;
-    if (target.includes('\\')) { fl.emit('SK-LINK-BACKSLASH', { line: n, message: `link "${target}" uses backslashes; use forward slashes` }); continue; }
-    if (t.startsWith('/') || WIN_ABS_RE.test(t) || /^file:/i.test(target) || t.startsWith('~')) {
-      fl.emit('SK-LINK-ABSOLUTE', { line: n, message: `link "${target}" is an absolute local path` });
-      continue;
-    }
-    const resolved = path.resolve(dir, t);
-    const rel = toPosix(path.relative(dir, resolved));
-    if (rel.startsWith('..')) { fl.emit('SK-LINK-ABSOLUTE', { line: n, message: `link "${target}" points outside the skill folder; it is not installed with the skill` }); continue; }
-    if (!fs.existsSync(resolved)) fl.emit('SK-LINK-MISSING', { line: n, message: `link target ${rel} does not exist` });
-    else linked.add(resolved);
-    if (rel.startsWith('references/') && rel.split('/').length > 2) fl.emit('SK-REF-DEPTH', { line: n, message: `${rel} is nested below references/` });
+  for (const m of body.matchAll(/(?:^|[\s`'"(/{}])(references\/[\w./-]+\.\w+)/g)) linked.add(path.resolve(dir, m[1]));
+  for (const { line: n, target } of markdownLinks(body)) {
+    const [line, t] = [n + offset, linkPath(target)];
+    const [abs, r] = [path.resolve(dir, t), rel(path.resolve(dir, t))];
+    if (isExternalLink(target) || !t) continue;
+    const bad = target.includes('\\') ? ['SK-LINK-BACKSLASH', 'uses backslashes; use forward slashes']
+      : /^[/~]/.test(t) || WIN_ABS.test(t) || /^file:/i.test(target) ? ['SK-LINK-ABSOLUTE', 'is an absolute local path']
+        : r.startsWith('..') ? ['SK-LINK-ABSOLUTE', 'leaves the skill folder (not installed with it)'] : null;
+    if (bad) { fl.emit(bad[0], line, `link "${target}" ${bad[1]}`); continue; }
+    if (!fs.existsSync(abs)) fl.emit('SK-LINK-MISSING', line, `link target ${r} does not exist`);
+    else linked.add(abs);
+    if (/^references\/.+\//.test(r)) fl.emit('SK-REF-DEPTH', line, `${r} is nested below references/`);
   }
   const refDir = path.join(dir, 'references');
-  if (statSafe(refDir)?.isDirectory()) {
-    const walk = (d) => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const full = path.join(d, e.name);
-        const rel = toPosix(path.relative(dir, full));
-        if (e.isDirectory()) { fl.emit('SK-REF-DEPTH', { message: `${rel}/ nests reference files more than one level deep` }); walk(full); continue; }
-        if (!linked.has(full)) {
-          const via = refMentions(refDir, full);
-          fl.emit('SK-REF-UNLINKED', { message: via ? `${rel} is linked only from ${via}, two levels below SKILL.md; link it from SKILL.md (hosts follow references one level deep)`
-            : `${rel} is not linked from SKILL.md, so hosts may never load it` });
-        }
-      }
-    };
-    walk(refDir);
-  }
-  // Footprint as Copilot lists it (node_modules, bin, obj and dist are hidden from the listing).
+  const others = statOrNull(refDir)?.isDirectory() ? fs.readdirSync(refDir).map((n) => path.join(refDir, n)) : [];
+  const mentions = (o, name) => ((t) => t.includes(`references/${name}`)
+    || new RegExp(`(?:^|[\\s(\\[\`'"/])${RegExp.escape(name)}\\b`).test(t))(readNorm(o) || '');
+  const walkRefs = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) { fl.emit('SK-REF-DEPTH', null, `${rel(full)}/ nests references more than one level deep`); walkRefs(full); continue; }
+      if (linked.has(full)) continue;
+      const via = others.find((o) => o !== full && statOrNull(o)?.isFile() && mentions(o, e.name));
+      fl.emit('SK-REF-UNLINKED', null, via ? `${rel(full)} is linked only from ${rel(via)}; link it from SKILL.md (hosts `
+        + 'follow references one level deep)' : `${rel(full)} is not linked from SKILL.md, so hosts may never load it`);
+    }
+  };
+  if (others.length) walkRefs(refDir);
   let files = 0;
-  const HIDDEN = new Set(['.git', 'node_modules', 'bin', 'obj', 'dist']);
+  const HIDDEN = S('.git node_modules bin obj dist');
   const walk = (d) => {
-    let entries;
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    const visible = entries.filter((e) => !HIDDEN.has(e.name));
-    if (visible.length > 50) fl.emit('SK-FOOTPRINT-FOLDER', { message: `${toPosix(path.relative(dir, d)) || '.'}/ has ${visible.length} entries (Copilot summarizes folders over 50)` });
-    for (const e of visible) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }).filter((e) => !HIDDEN.has(e.name)); } catch { return; }
+    if (entries.length > 50) fl.emit('SK-FOOTPRINT-FOLDER', null, `${rel(d) || '.'}/ has ${entries.length} entries (Copilot summarizes over 50)`);
+    for (const e of entries) {
       const full = path.join(d, e.name);
       if (e.isDirectory()) walk(full);
-      else if (e.isFile()) {
-        files++;
-        const st = statSafe(full);
-        if (st && st.size > 5 * 1024 * 1024) fl.emit('SK-ASSET-SIZE', { message: `${toPosix(path.relative(dir, full))} is ${(st.size / 1048576).toFixed(1)} MB (limit 5 MB)` });
-      }
+      if (!e.isFile()) continue;
+      const size = statOrNull(full)?.size || 0;
+      files++;
+      if (size > 5 * 1024 * 1024) fl.emit('SK-ASSET-SIZE', null, `${rel(full)} is ${(size / 1048576).toFixed(1)} MB (limit 5 MB)`);
     }
   };
   walk(dir);
-  if (files > 100) fl.emit('SK-FOOTPRINT-FILES', { message: `the skill folder has ${files} files (Copilot lists at most 100)` });
-}
-
-async function lintSkillFile(fl) {
-  const raw = fs.readFileSync(fl.abs, 'utf8').replace(/\r\n/g, '\n');
-  const dir = path.dirname(fl.abs);
-  const dirName = path.basename(dir);
-  const base = path.basename(fl.abs);
-  if (base !== 'SKILL.md') fl.emit('SK-FILENAME', { message: `the file is named ${base}; hosts look for SKILL.md` });
-  const fm = parseFrontmatter(raw);
-  if (fm.bom) fl.emit('SK-FM-BOM', { line: 1, message: 'the file starts with a UTF-8 byte-order mark; save it as UTF-8 without BOM' });
-  if (!fm.hasFrontmatter) {
-    fl.emit('SK-FM-LINE1', { line: fm.lateOpenLine || 1, message: fm.lateOpenLine
-      ? `frontmatter starts on line ${fm.lateOpenLine}; hosts read it only when "---" is line 1` : 'no YAML frontmatter ("---" on line 1)' });
-  }
-  for (const e of fm.errors) fl.emit('SK-FM-YAML', { line: e.line, message: `frontmatter YAML: ${e.message}` });
-  for (const w of fm.warnings) {
-    if (w.code === 'UNQUOTED_COLON') fl.emit('SK-FM-COLON', { line: w.line, message: w.message });
-    else if (w.code === 'RESERVED_INDICATOR') fl.emit('SK-FM-YAML', { line: w.line, message: `frontmatter YAML: ${w.message}` });
-    else fl.emit('SK-FM-YAML', { line: w.line, message: `frontmatter YAML: ${w.message}`, severity: 'warning' });
-  }
-  const STRICT_WHAT = { flow: 'a flow-style collection', anchor: 'the anchor', alias: 'the alias', tag: 'the tag' };
-  for (const c of fm.errors.length ? [] : fm.constructs || []) {
-    fl.emit('SK-FM-STRICTYAML', { line: c.line, field: c.path || undefined,
-      message: `${STRICT_WHAT[c.kind]} ${c.text}${c.path ? ` in \`${c.path}\`` : ''}: skills-ref (strictyaml) rejects it; ${c.kind === 'flow' ? 'write one "key: value" or "- item" per line' : 'write the value out in block style'}` });
-  }
-  const data = fm.data || {};
-  const L = (k) => fm.keyLines[k] || null;
-  if (fm.hasFrontmatter && !fm.errors.length) {
-    const name = data.name;
-    if (name === undefined || name === null || name === '') fl.emit('SK-NAME-REQUIRED', { line: 1, message: '`name` is missing' });
-    else {
-      const n = String(name);
-      if (typeof name !== 'string') fl.emit('SK-NAME-FORMAT', { line: L('name'), message: '`name` must be a string' });
-      if (n.length > 64) fl.emit('SK-NAME-LENGTH', { line: L('name'), message: `\`name\` has ${n.length} characters (max 64)` });
-      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(n)) {
-        const why = /[A-Z]/.test(n) ? 'uppercase letters' : /^-|-$/.test(n) ? 'a leading or trailing hyphen' : /--/.test(n) ? 'a double hyphen'
-          : 'characters other than a-z, 0-9 and -';
-        fl.emit('SK-NAME-FORMAT', { line: L('name'), message: `\`name\` "${n}" has ${why}` });
-      }
-      if (n.normalize('NFKC') !== dirName.normalize('NFKC')) fl.emit('SK-NAME-DIR', { line: L('name'), message: `\`name\` "${n}" differs from the directory name "${dirName}"` });
-      if (/claude|anthropic/i.test(n)) fl.emit('SK-NAME-RESERVED', { line: L('name'), message: `\`name\` "${n}" contains a reserved word` });
-    }
-    const d = data.description;
-    if (d === undefined || d === null || (typeof d === 'string' && !d.trim())) fl.emit('SK-DESC-REQUIRED', { line: L('description') || 1, message: '`description` is missing or empty' });
-    else if (typeof d !== 'string') fl.emit('SK-DESC-TYPE', { line: L('description'), message: '`description` must be a string' });
-    else {
-      if (d.length > 1024) fl.emit('SK-DESC-LENGTH', { line: L('description'), message: `\`description\` has ${d.length} characters (max 1,024)` });
-      const listing = d.length + (typeof data.when_to_use === 'string' ? data.when_to_use.length : 0);
-      if (listing > 1536) fl.emit('SK-DESC-LISTING', { line: L('description'), message: `description + when_to_use is ${listing} characters; Claude Code truncates the listing at 1,536` });
-      const tag = XML_TAG.exec(d);
-      if (tag) fl.emit('SK-DESC-XML', { line: L('description'), message: `\`description\` contains the tag ${tag[0]}` });
-      if (FIRST_PERSON.test(d) || SECOND_PERSON.test(d)) fl.emit('SK-DESC-PERSON', { line: L('description'), message: 'write the description in the third person ("Processes ...", "Use when ...")' });
-    }
-    for (const key of Object.keys(data)) {
-      const line = L(key);
-      if (!SPEC_FIELDS.includes(key)) {
-        fl.emit('SK-FIELD-NONSPEC', { line, field: key, message: `"${key}" is not one of the six Agent Skills fields (name, description, license, compatibility, metadata, allowed-tools)` });
-      }
-      for (const host of ['copilot', 'claude', 'codex']) {
-        if (SKILL_FIELDS[host].has(key) || (host === 'codex' && SPEC_FIELDS.includes(key))) continue;
-        fl.emit('SK-FIELD-IGNORED', { only: [host], line, field: key, message: `${HOST_LABEL[host]} does not read "${key}"` });
-      }
-    }
-    if (own(data, 'metadata') && data.metadata !== null) {
-      const m = data.metadata;
-      if (!isObj(m)) fl.emit('SK-METADATA-MAP', { line: L('metadata'), message: '`metadata` must be a mapping of string keys to string values' });
-      else {
-        for (const [k, v] of Object.entries(m)) {
-          // Install provenance (gh skill install) is not authored data and is stripped on publish.
-          if (INSTALL_METADATA_KEY.test(k)) continue;
-          if (typeof v !== 'string') fl.emit('SK-METADATA-STRING', { line: L(`metadata.${k}`), field: `metadata.${k}`, message: `\`metadata.${k}\` is a ${v === null ? 'null' : Array.isArray(v) ? 'list' : typeof v}; quote it as a string` });
-        }
-        if (own(m, 'short-description')) {
-          const s = String(m['short-description'] ?? '');
-          if (s.length < 25 || s.length > 64) fl.emit('SK-SHORTDESC', { line: L('metadata.short-description'), message: `\`metadata.short-description\` has ${s.length} characters (25-64)` });
-        }
-      }
-    }
-    if (own(data, 'compatibility')) {
-      const c = data.compatibility;
-      if (typeof c !== 'string' || c.length < 1 || c.length > 500) fl.emit('SK-COMPAT-LENGTH', { line: L('compatibility'), message: `\`compatibility\` must be a 1-500 character string${typeof c === 'string' ? ` (has ${c.length})` : ''}` });
-    }
-    if (own(data, 'allowed-tools')) {
-      const at = data['allowed-tools'];
-      if (Array.isArray(at)) fl.emit('SK-ALLOWED-TOOLS-TYPE', { line: L('allowed-tools'), message: '`allowed-tools` is a list; the spec defines a space-separated string' });
-      const tokens = (Array.isArray(at) ? at.map(String) : String(at ?? '').split(/[\s,]+/)).map((t) => t.trim()).filter(Boolean);
-      const wide = tokens.filter((t) => SHELL_TOOLS.test(t));
-      if (wide.length) fl.sec('SEC-ALLOWED-TOOLS', { line: L('allowed-tools'), message: `allowed-tools pre-approves ${wide.join(', ')} for every user of this skill; keep it only for trusted, first-party skills`, evidence: tokens.join(' ') });
-    }
-  }
-  if (/^(?:synced|anthropic-skills(?::.*)?)$/.test(dirName)) fl.emit('SK-NAME-CLAUDE-DIR', { message: `the folder name "${dirName}" is reserved by Claude Code` });
-
-  const body = fm.hasFrontmatter ? fm.body : raw;
-  const offset = fm.hasFrontmatter ? fm.bodyStartLine - 1 : 0;
-  const trimmed = body.replace(/\n+$/, '');
-  const count = trimmed.trim() ? trimmed.split('\n').length : 0;
-  if (!body.trim()) fl.emit('SK-BODY-EMPTY', { message: 'the skill has no instructions after the frontmatter' });
-  if (count > 500) fl.emit('SK-BODY-LINES', { message: `the body has ${count} lines (keep it under 500; move detail to references/)` });
-  const tokens = Math.ceil(body.length / 4);
-  if (tokens > 5000) fl.emit('SK-BODY-TOKENS', { message: `the body is about ${tokens} tokens (keep it under 5,000)` });
-  body.split('\n').forEach((line, i) => {
-    const n = i + 1 + offset;
-    if (/\$ARGUMENTS\b/.test(line)) fl.emit('SK-SUBST', { line: n, message: '$ARGUMENTS is substituted only by Claude Code; refer to "the text after the skill name"' });
-    const cv = /\$\{CLAUDE_(?:SKILL_DIR|PROJECT_DIR|SESSION_ID|EFFORT|PLUGIN_ROOT|PLUGIN_DATA)\}/.exec(line);
-    if (cv) fl.emit('SK-SUBST', { line: n, message: `${cv[0]} is substituted only by Claude Code` });
-    if (/(?:^|\s)!`[^`]+`/.test(line) || /^\s*(?:`{3,}|~{3,})!/.test(line)) fl.emit('SK-SUBST', { line: n, message: 'dynamic context (!`cmd`) runs only in Claude Code' });
-    // $N outside currency-like text ($1,845.00, $1k, $12.3M).
-    const pos = /(?<![\\\w$])\$[0-9](?![0-9]|[.,]\d|[kKmMbB]\b)/.exec(line);
-    if (pos) fl.emit('SK-SUBST-POSITIONAL', { line: n, message: `${pos[0]} is replaced with an argument by Claude Code; escape it as \\${pos[0]}` });
-  });
-  skillStructure(fl, dir, body, offset);
-  await securityText(fl, body, { lineOffset: offset });
-  const fmText = fm.raw || '';
-  if (fmText) {
-    const scan = await getSecretScanner();
-    for (const s of scan(fmText)) fl.sec('SEC-SECRET', { line: s.line + 1, message: `secret-shaped value (${s.id}) in the frontmatter`, evidence: s.redacted });
-  }
-  return { data, fm };
+  if (files > 100) fl.emit('SK-FOOTPRINT-FILES', null, `the skill folder has ${files} files (Copilot lists at most 100)`);
 }
 
 function lintOpenaiYaml(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const doc = parseYamlDocument(text);
-  for (const e of doc.errors) fl.emit('CX-YAML-PARSE', { line: e.line, message: `agents/openai.yaml: ${e.message}` });
+  const doc = parseYamlDocument(fl.text);
   const v = doc.value;
-  if (doc.errors.length) return;
-  if (!isObj(v)) { fl.emit('CX-YAML-PARSE', { line: 1, message: 'agents/openai.yaml must be a mapping' }); return; }
   const L = (k) => doc.keyLines[k] || null;
-  for (const k of Object.keys(v)) {
-    if (!['interface', 'dependencies', 'policy'].includes(k)) fl.emit('CX-YAML-FIELD', { line: L(k), field: k, message: `unknown key "${k}"` });
-  }
+  const E = (id, key, msg) => fl.emit(id, L(key), msg);
+  for (const e of doc.errors) fl.emit('CX-YAML-PARSE', e.line, `agents/openai.yaml: ${e.message}`);
+  if (doc.errors.length) return;
+  if (!isObj(v)) return fl.emit('CX-YAML-PARSE', 1, 'agents/openai.yaml must be a mapping');
+  fl.unknown(v, S('interface dependencies policy'), 'CX-YAML-FIELD', L, 'key');
   const skillDir = path.dirname(path.dirname(fl.abs));
-  const skillFm = parseFrontmatter(readTextNormalized(path.join(skillDir, 'SKILL.md')) || '');
-  const skillName = typeof skillFm.data?.name === 'string' ? skillFm.data.name : path.basename(skillDir);
-  if (isObj(v.interface)) {
-    const known = ['display_name', 'short_description', 'icon_small', 'icon_large', 'brand_color', 'default_prompt'];
-    for (const k of Object.keys(v.interface)) {
-      if (!known.includes(k)) fl.emit('CX-YAML-FIELD', { line: L(`interface.${k}`), field: `interface.${k}`, message: `unknown key "interface.${k}"` });
+  const fmName = parseFrontmatter(readNorm(path.join(skillDir, 'SKILL.md')) || '').data?.name;
+  const name = typeof fmName === 'string' ? fmName : path.basename(skillDir);
+  const { interface: ui, policy, dependencies } = v;
+  const sd = ui?.short_description === undefined ? null : String(ui.short_description);
+  const tools = isObj(dependencies) ? dependencies.tools : undefined;
+  if (ui !== undefined && !isObj(ui)) E('CX-YAML-FIELD', 'interface', '`interface` must be a mapping');
+  if (isObj(ui)) {
+    const known = S('display_name short_description icon_small icon_large brand_color default_prompt');
+    fl.unknown(ui, known, 'CX-YAML-FIELD', (k) => L(`interface.${k}`), 'key', { prefix: 'interface: ' });
+    if (sd !== null && (sd.length < 25 || sd.length > 64)) {
+      E('CX-YAML-SHORTDESC', 'interface.short_description', `short_description has ${sd.length} characters (25-64)`);
     }
-    const sd = v.interface.short_description;
-    if (sd !== undefined && (String(sd).length < 25 || String(sd).length > 64)) {
-      fl.emit('CX-YAML-SHORTDESC', { line: L('interface.short_description'), message: `\`interface.short_description\` has ${String(sd).length} characters (25-64)` });
+    if (ui.default_prompt !== undefined && !String(ui.default_prompt).includes(`$${name}`)) {
+      E('CX-YAML-PROMPT', 'interface.default_prompt', `default_prompt should mention $${name}`);
     }
-    const dp = v.interface.default_prompt;
-    if (dp !== undefined && !String(dp).includes(`$${skillName}`)) {
-      fl.emit('CX-YAML-PROMPT', { line: L('interface.default_prompt'), message: `\`interface.default_prompt\` should mention $${skillName}` });
+    if (ui.brand_color !== undefined && !/^#[0-9a-fA-F]{6}$/.test(String(ui.brand_color))) {
+      E('CX-YAML-FIELD', 'interface.brand_color', 'brand_color is a #RRGGBB color');
     }
-    if (v.interface.brand_color !== undefined && !/^#[0-9a-fA-F]{6}$/.test(String(v.interface.brand_color))) {
-      fl.emit('CX-YAML-FIELD', { line: L('interface.brand_color'), message: '`interface.brand_color` is a #RRGGBB color' });
-    }
-  } else if (v.interface !== undefined) fl.emit('CX-YAML-FIELD', { line: L('interface'), message: '`interface` must be a mapping' });
-  if (isObj(v.policy)) {
-    const a = v.policy.allow_implicit_invocation;
-    if (a !== undefined && typeof a !== 'boolean') fl.emit('CX-YAML-POLICY', { line: L('policy.allow_implicit_invocation'), message: '`policy.allow_implicit_invocation` must be true or false' });
-    if (v.policy.products !== undefined && !Array.isArray(v.policy.products)) fl.emit('CX-YAML-FIELD', { line: L('policy.products'), message: '`policy.products` must be a list' });
   }
-  const tools = isObj(v.dependencies) ? v.dependencies.tools : undefined;
-  if (tools !== undefined) {
-    if (!Array.isArray(tools)) fl.emit('CX-YAML-DEPS', { line: L('dependencies.tools'), message: '`dependencies.tools` must be a list' });
-    else tools.forEach((t, i) => {
-      if (!isObj(t) || t.type !== 'mcp' || !t.value) fl.emit('CX-YAML-DEPS', { line: L(`dependencies.tools[${i}].type`) || L('dependencies.tools'), message: `dependencies.tools[${i}] needs type: mcp and a value` });
-    });
+  const allow = isObj(policy) ? policy.allow_implicit_invocation : undefined;
+  if (allow !== undefined && typeof allow !== 'boolean') E('CX-YAML-POLICY', 'policy.allow_implicit_invocation', 'must be true or false');
+  if (isObj(policy) && policy.products !== undefined && !Array.isArray(policy.products)) {
+    E('CX-YAML-FIELD', 'policy.products', '`policy.products` must be a list');
+  }
+  if (tools !== undefined && !Array.isArray(tools)) E('CX-YAML-DEPS', 'dependencies.tools', '`dependencies.tools` must be a list');
+  for (const [i, t] of (Array.isArray(tools) ? tools : []).entries()) {
+    if (isObj(t) && t.type === 'mcp' && t.value) continue;
+    fl.emit('CX-YAML-DEPS', L(`dependencies.tools[${i}].type`) || L('dependencies.tools'), `dependencies.tools[${i}] needs type: mcp and a value`);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Instructions, agents, commands, prompt files
 
 function globProblem(g) {
   if (typeof g !== 'string' || !g.trim()) return 'an empty pattern';
   if (g.includes('\\')) return 'a backslash (use forward slashes)';
-  if (g.startsWith('/') || WIN_ABS_RE.test(g) || g.startsWith('~')) return 'an absolute path (globs are relative to the repository root)';
-  let brace = 0;
-  let bracket = 0;
+  if (/^[/~]/.test(g) || WIN_ABS.test(g)) return 'an absolute path (globs are relative to the repository root)';
+  let [brace, bracket] = [0, 0];
   for (const ch of g) {
-    if (ch === '{') brace++;
-    if (ch === '}') brace--;
-    if (ch === '[') bracket++;
-    if (ch === ']') bracket--;
+    brace += { '{': 1, '}': -1 }[ch] || 0;
+    bracket += { '[': 1, ']': -1 }[ch] || 0;
     if (brace < 0 || bracket < 0) return 'unbalanced braces or brackets';
   }
   if (brace || bracket) return 'unbalanced braces or brackets';
@@ -1332,47 +595,91 @@ function globProblem(g) {
   return null;
 }
 
-const USER_PATH = [
-  /(?:^|[\s"'(=:])(\/(?:Users|home)\/(?!(?:<|\{|\$|%|USER\b|user\b|username\b|you\b|your|me\b|name\b|runner\b|example\b|\.\.\.))[A-Za-z0-9._-]+)/,
-  /(?:^|[\s"'(=])([A-Za-z]:\\(?:Users|Documents and Settings)\\(?!(?:<|\{|\$|%|USER\b|user\b|username\b|YOUR|you\b|name\b|runneradmin\b|\.\.\.))[A-Za-z0-9._ -]+)/i,
-];
+const NOT_USER = '(?!(?:<|\\{|\\$|%|USER\\b|user\\b|username\\b|you\\b|your|YOUR|me\\b|name\\b|runner\\b|runneradmin\\b|example\\b|\\.\\.\\.))';
+const USER_PATH = [new RegExp(`(?:^|[\\s"'(=:])(\\/(?:Users|home)\\/${NOT_USER}[A-Za-z0-9._-]+)`),
+  new RegExp(`(?:^|[\\s"'(=])([A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\${NOT_USER}[A-Za-z0-9._ -]+)`, 'i')];
 const INTERNAL_HOST = /(?:^|[\s"'(@/=])((?:[a-z0-9-]+\.)+(?:internal|corp|intranet|intra|lan|local|private|home\.arpa))(?![\w.-])/i;
 const PRIVATE_IP = /(?:^|[^\d.])((?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3})(?![\d.])/;
 const IMPORT_RE = /(?:^|\s)@((?:\.{1,2}\/|~\/|\/)?[\w.-]+(?:\/[\w.-]+)*\.(?:md|mdc|txt|json|ya?ml|toml))(?=$|[\s,;:)\]])/g;
+const POSIX_ONLY = new RegExp('(?:^|[\\s;|&(])(?:export\\s+\\w+=|rm\\s+-[a-z]*r[a-z]*f|chmod\\s|chown\\s|ln\\s+-s|source\\s'
+  + '|sudo\\s|grep\\s|sed\\s|awk\\s|xargs\\s|cp\\s+-[a-zA-Z]*R|ls\\s+-l|cat\\s+<<|\\$\\(|\\/dev\\/null|mkdir\\s+-p\\s)');
+const SHELL_LANGS = S('bash sh shell zsh console shellsession terminal');
+const WIN_LANGS = S('powershell pwsh ps1 ps cmd bat batch dos');
+// The hosts that expand @imports per file kind (Codex AGENTS.md has none).
+const EXPANDS = { 'agents-md': ['copilot', 'claude'], 'claude-md': ['copilot', 'claude'], 'claude-local': ['claude'],
+  'copilot-instructions': ['copilot'], 'claude-rules': ['claude'] };
+const FM_KEYS = { 'path-specific': ['copilot', 'applyTo', S('applyTo excludeAgent name description')],
+  'claude-rules': ['claude', 'paths applyTo', S('paths applyTo description name')] };
 
-function textLineChecks(fl, body, offset) {
-  const ml = markdownLines(body);
-  let firstPosix = null;
-  let hasWindowsFence = false;
-  for (const l of ml) {
-    const n = l.n + offset;
-    for (const re of USER_PATH) {
-      const m = re.exec(l.raw);
-      if (m) { fl.emit('IN-ABS-PATH', { line: n, message: `user-specific path ${m[1]}; use a repository-relative path or a placeholder`, evidence: m[1] }); break; }
+function lintInstructions(fl) {
+  const sub = fl.cls.sub;
+  if (!fl.text.trim()) return fl.emit('IN-EMPTY', null, 'the file is empty');
+  const { data, L, body, offset } = parts(fl);
+  const [host, globKeys, known] = FM_KEYS[sub] || [];
+  for (const key of host ? W(globKeys).filter((k) => Object.hasOwn(data, k)) : []) {
+    const v = data[key];
+    for (const g of Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : [v]) {
+      const p = globProblem(typeof g === 'string' ? g.trim() : g);
+      if (p) fl.emit('IN-APPLYTO-GLOB', L(key), `${key} pattern "${g}" has ${p}`, { only: host === 'copilot' ? [host] : undefined });
     }
-    const h = INTERNAL_HOST.exec(l.raw);
-    if (h && !/\.(?:md|mdc|json|ya?ml)$/i.test(h[1])) fl.emit('IN-HOSTNAME', { line: n, message: `internal hostname ${h[1]}`, evidence: h[1] });
-    const ip = PRIVATE_IP.exec(l.raw);
-    if (ip) fl.emit('IN-HOSTNAME', { line: n, message: `private IP address ${ip[1]}`, evidence: ip[1] });
-    if (l.fenceStart && WIN_LANGS.has(l.lang.toLowerCase())) hasWindowsFence = true;
-    if (l.code && !l.fenceStart && !l.fenceEnd && SHELL_LANGS.has(l.lang.toLowerCase()) && !firstPosix && POSIX_ONLY_CMD.test(l.raw)) firstPosix = { n, raw: l.raw };
   }
-  if (firstPosix && !hasWindowsFence) {
-    fl.emit('IN-BASH-ONLY', { line: firstPosix.n, message: 'POSIX-only shell commands without a PowerShell or cmd equivalent in this file', evidence: firstPosix.raw.trim() });
+  if (host) fl.unknown(data, known, 'IN-FIELD', L, 'frontmatter key', { only: [host] });
+  if (sub === 'path-specific' && !Object.hasOwn(data, 'applyTo')) fl.emit('IN-APPLYTO-MISSING', 1, 'no `applyTo`: never applied automatically');
+  for (const v of sub === 'path-specific' && Object.hasOwn(data, 'excludeAgent') ? [data.excludeAgent].flat() : []) {
+    if (!['code-review', 'cloud-agent'].includes(v)) fl.emit('IN-EXCLUDEAGENT', L('excludeAgent'), `excludeAgent "${v}" is not valid`);
   }
-  return ml;
+  const lines = body.replace(/\n+$/, '').split('\n').length;
+  if (lines > 1000) fl.emit('IN-LENGTH', null, `${lines} lines; Copilot guidance keeps instruction files under about 1,000`);
+  if (sub === 'claude-md' && lines > 200) fl.emit('IN-CLAUDE-LENGTH', null, `CLAUDE.md has ${lines} lines (guidance: under 200)`);
+  const ml = markdownLines(body);
+  let posix = null;
+  let windows = false;
+  for (const l of ml) {
+    const line = l.n + offset;
+    const [p, h, ip] = [USER_PATH.map((re) => re.exec(l.raw)).find(Boolean), INTERNAL_HOST.exec(l.raw), PRIVATE_IP.exec(l.raw)];
+    if (p) fl.emit('IN-ABS-PATH', line, `user-specific path ${p[1]}; use a repository-relative path or a placeholder`, { evidence: p[1] });
+    if (h && !/\.(?:md|mdc|json|ya?ml)$/i.test(h[1])) fl.emit('IN-HOSTNAME', line, `internal hostname ${h[1]}`, { evidence: h[1] });
+    if (ip) fl.emit('IN-HOSTNAME', line, `private IP address ${ip[1]}`, { evidence: ip[1] });
+    windows ||= Boolean(l.fenceStart && WIN_LANGS.has(l.lang.toLowerCase()));
+    if (!posix && l.code && !l.fenceStart && !l.fenceEnd && SHELL_LANGS.has(l.lang.toLowerCase()) && POSIX_ONLY.test(l.raw)) {
+      posix = { line, raw: l.raw };
+    }
+    for (const m of l.code ? [] : l.prose.matchAll(IMPORT_RE)) importCheck(fl, m[1], line);
+  }
+  if (posix && !windows) {
+    fl.emit('IN-BASH-ONLY', posix.line, 'POSIX-only shell commands and no PowerShell or cmd equivalent', { evidence: posix.raw.trim() });
+  }
+  securityText(fl, body, offset);
+  if (['agents-md', 'claude-md', 'copilot-instructions', 'gemini-md'].includes(sub)
+    || (sub === 'path-specific' && ['**', '**/*', '*'].includes(String(data.applyTo ?? '').trim()))) {
+    fl.run.directives.push({ fl, items: directives(ml, offset), dir: path.dirname(fl.abs) });
+  }
+  siblingChecks(fl);
 }
 
-/** Normalized directive sentences (for duplicate and contradiction checks). */
-function extractDirectives(ml, offset) {
+function importCheck(fl, target, line) {
+  const sub = fl.cls.sub;
+  const resolved = target.startsWith('~/') ? path.join(fl.run.home, target.slice(2)) : path.resolve(path.dirname(fl.abs), target);
+  if (sub === 'gemini-md' || sub === 'path-specific') {
+    fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Copilot does not expand imports in `
+      + `${sub === 'gemini-md' ? 'GEMINI.md' : '*.instructions.md'}`, { only: ['copilot'] });
+  }
+  if (sub === 'agents-md' || sub === 'agents-override') {
+    fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Codex has no @import; the model sees the text`, { only: ['codex'] });
+  }
+  if (/^~?\//.test(target)) fl.emit('IN-IMPORT-ABSOLUTE', line, `@${target} is absolute or home-relative`);
+  if (EXPANDS[sub] && !fs.existsSync(resolved)) fl.emit('IN-IMPORT-MISSING', line, `@${target} does not exist`, { only: EXPANDS[sub] });
+}
+
+/** Normalized directive sentences of a Markdown body (for the duplicate and contradiction checks). */
+function directives(ml, offset) {
   const out = [];
   for (const l of ml) {
-    if (l.code) continue;
-    let t = l.raw.trim();
-    if (!t || /^#{1,6}\s/.test(t) || t.startsWith('|') || t.startsWith('<!--') || /^@\S+$/.test(t)) continue;
-    t = t.replace(/^(?:>\s*)?(?:[-*+]|\d+[.)])\s+/, '').replace(/^\[[ xX]\]\s+/, '');
-    t = t.replace(/`([^`]*)`/g, '$1').replace(/\*\*|__/g, '').replace(/(^|\s)[*_]([^*_]+)[*_](?=\s|$|[.,;:])/g, '$1$2');
-    for (const sentence of t.split(/(?<=[.!?])\s+(?=[A-Z])/)) {
+    const t = l.raw.trim();
+    if (l.code || !t || /^#{1,6}\s/.test(t) || t.startsWith('|') || t.startsWith('<!--') || /^@\S+$/.test(t)) continue;
+    const plain = t.replace(/^(?:>\s*)?(?:[-*+]|\d+[.)])\s+/, '').replace(/^\[[ xX]\]\s+/, '').replace(/`([^`]*)`/g, '$1')
+      .replace(/\*\*|__/g, '').replace(/(^|\s)[*_]([^*_]+)[*_](?=\s|$|[.,;:])/g, '$1$2');
+    for (const sentence of plain.split(/(?<=[.!?])\s+(?=[A-Z])/)) {
       const norm = sentence.toLowerCase().replace(/\s+/g, ' ').replace(/[.;:!]+$/, '').trim();
       if (norm.split(' ').length >= 3) out.push({ line: l.n + offset, norm, raw: sentence.trim() });
     }
@@ -1380,1375 +687,1005 @@ function extractDirectives(ml, offset) {
   return out;
 }
 
-async function lintInstructions(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const sub = fl.cls.sub;
-  if (!text.trim()) { fl.emit('IN-EMPTY', { message: 'the file is empty' }); return; }
-  const fm = frontmatterOf(text);
-  if (fm) for (const e of fm.errors) fl.emit('MD-FM-YAML', { line: e.line, message: `frontmatter YAML: ${e.message}` });
-  const data = fm?.data || {};
-  const L = (k) => fm?.keyLines?.[k] || null;
-  if (sub === 'path-specific') {
-    if (!own(data, 'applyTo')) fl.emit('IN-APPLYTO-MISSING', { line: 1, message: 'no `applyTo`: the file is not applied automatically' });
-    else {
-      const globs = Array.isArray(data.applyTo) ? data.applyTo : String(data.applyTo ?? '').split(',');
-      for (const g of globs) {
-        const p = globProblem(typeof g === 'string' ? g.trim() : g);
-        if (p) fl.emit('IN-APPLYTO-GLOB', { only: ['copilot'], line: L('applyTo'), message: `applyTo pattern "${g}" has ${p}` });
-      }
-    }
-    if (own(data, 'excludeAgent')) {
-      const vals = Array.isArray(data.excludeAgent) ? data.excludeAgent : [data.excludeAgent];
-      for (const v of vals) if (!['code-review', 'cloud-agent'].includes(v)) fl.emit('IN-EXCLUDEAGENT', { line: L('excludeAgent'), message: `excludeAgent "${v}" is not code-review or cloud-agent` });
-    }
-    for (const k of Object.keys(data)) if (!INSTRUCTION_FIELDS.has(k)) fl.emit('IN-FIELD', { only: ['copilot'], line: L(k), field: k, message: `unknown frontmatter key "${k}"` });
-  }
-  if (sub === 'claude-rules') {
-    for (const key of ['paths', 'applyTo']) {
-      if (!own(data, key)) continue;
-      const v = data[key];
-      const globs = Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : [v];
-      for (const g of globs) {
-        const p = globProblem(typeof g === 'string' ? g.trim() : g);
-        if (p) fl.emit('IN-APPLYTO-GLOB', { line: L(key), message: `${key} pattern "${g}" has ${p}` });
-      }
-    }
-    for (const k of Object.keys(data)) if (!RULES_FILE_FIELDS.has(k)) fl.emit('IN-FIELD', { only: ['claude'], line: L(k), field: k, message: `unknown frontmatter key "${k}"` });
-  }
-  const body = fm && fm.hasFrontmatter ? fm.body : text;
-  const offset = fm && fm.hasFrontmatter ? fm.bodyStartLine - 1 : 0;
-  const lines = body.replace(/\n+$/, '').split('\n').length;
-  if (lines > 1000) fl.emit('IN-LENGTH', { message: `${lines} lines; Copilot guidance keeps instruction files under about 1,000` });
-  if (sub === 'claude-md' && lines > 200) fl.emit('IN-CLAUDE-LENGTH', { message: `CLAUDE.md has ${lines} lines (Claude Code guidance: under 200)` });
-  const ml = textLineChecks(fl, body, offset);
-  // @imports
-  const dir = path.dirname(fl.abs);
-  const expands = {
-    'agents-md': ['copilot', 'claude'], 'claude-md': ['copilot', 'claude'], 'claude-local': ['claude'],
-    'copilot-instructions': ['copilot'], 'claude-rules': ['claude'], 'agents-override': [],
-  }[sub] || [];
-  for (const l of ml) {
-    if (l.code) continue;
-    for (const m of l.prose.matchAll(IMPORT_RE)) {
-      const target = m[1];
-      const n = l.n + offset;
-      if (sub === 'gemini-md' || sub === 'path-specific') fl.emit('IN-IMPORT-UNSUPPORTED', { only: ['copilot'], line: n, message: `@${target}: Copilot does not expand imports in ${sub === 'gemini-md' ? 'GEMINI.md' : '*.instructions.md'}` });
-      if (sub === 'agents-md' || sub === 'agents-override') fl.emit('IN-IMPORT-UNSUPPORTED', { only: ['codex'], line: n, message: `@${target}: Codex has no @import; the line reaches the model as text` });
-      if (target.startsWith('/') || target.startsWith('~/')) fl.emit('IN-IMPORT-ABSOLUTE', { line: n, message: `@${target} is absolute or home-relative` });
-      const resolved = target.startsWith('~/') ? path.join(fl.run.home, target.slice(2)) : path.resolve(dir, target);
-      if (expands.length && !fs.existsSync(resolved)) fl.emit('IN-IMPORT-MISSING', { only: expands, line: n, message: `@${target} does not exist` });
-    }
-  }
-  await securityText(fl, body, { lineOffset: offset });
-  const always = ['agents-md', 'claude-md', 'copilot-instructions', 'gemini-md'].includes(sub) ||
-    (sub === 'path-specific' && ['**', '**/*', '*'].includes(String(data.applyTo ?? '').trim()));
-  if (always) fl.run.directives.push({ fl, items: extractDirectives(ml, offset), dir });
-  siblingInstructionChecks(fl);
-}
-
 const NEG_RE = /^(?:do not|don't|dont|never|avoid|must not|should not|shouldn't|no need to)\s+(.+)$/;
 const POS_RE = /^(?:always|must|you must|please)\s+(.+)$/;
-const VERB_RE = /^(?:use|run|prefer|write|add|keep|commit|call|install|put|place|name|format|indent|import|return|throw|log|test|create|edit|update|include|mention|enable|disable|set|wrap|push|merge|rebase)\b/;
-const LANG_WORD = /\b(?:typescript|javascript|python|golang|go|rust|java|c#|csharp|yaml|json|markdown|css|scss|html|ts|js|py|tsx|jsx|ruby|php|shell|bash|powershell|sql|xml|kotlin|swift|scala|terraform|makefile|dockerfile|tests?)\b/;
+const VERB_RE = new RegExp(`^(?:${W(`use run prefer write add keep commit call install put place name format indent import
+  return throw log test create edit update include mention enable disable set wrap push merge rebase`).join('|')})\\b`);
+const LANG_WORD = new RegExp(`\\b(?:${W(`typescript javascript python golang go rust java c# csharp yaml json markdown css
+  scss html ts js py tsx jsx ruby php shell bash powershell sql xml kotlin swift scala terraform makefile dockerfile tests?`)
+  .join('|')})\\b`);
+const INDENT_RE = new RegExp('\\b(\\d+)[- ]space(?:s)?\\b[^.]*\\bindent|\\bindent(?:ation|ed)?\\b[^.]*?\\b(\\d+)\\s*spaces?\\b'
+  + '|\\bindent(?:ation)?\\s+(?:with|using)\\s+(tabs)\\b|\\b(tabs)\\s+for\\s+indentation\\b');
 
-function directiveFacets(d) {
-  const f = {};
-  const neg = NEG_RE.exec(d.norm);
-  if (neg) f.neg = neg[1];
-  else {
-    const pos = POS_RE.exec(d.norm);
-    if (pos) f.pos = pos[1];
-    else if (VERB_RE.test(d.norm)) f.pos = d.norm;
-  }
-  if (!LANG_WORD.test(d.norm)) {
-    const ind = /\b(\d+)[- ]space(?:s)?\b[^.]*\bindent|\bindent(?:ation|ed)?\b[^.]*?\b(\d+)\s*spaces?\b|\bindent(?:ation)?\s+(?:with|using)\s+(tabs)\b|\b(tabs)\s+for\s+indentation\b/.exec(d.norm);
-    if (ind) f.indent = ind[1] || ind[2] || 'tabs';
-  }
-  if (!neg) {
-    const pm = /\b(?:use|prefer|always use|run|install with)\s+(npm|pnpm|yarn|bun)\b/.exec(d.norm);
-    if (pm) f.pm = pm[1];
-  }
-  return f;
+function facets(norm) {
+  const neg = NEG_RE.exec(norm)?.[1];
+  const ind = !LANG_WORD.test(norm) && INDENT_RE.exec(norm);
+  return { neg, pos: neg ? null : POS_RE.exec(norm)?.[1] || (VERB_RE.test(norm) ? norm : null),
+    indent: ind && (ind[1] || ind[2] || 'tabs'), pm: !neg && /\b(?:use|prefer|always use|run|install with)\s+(npm|pnpm|yarn|bun)\b/.exec(norm)?.[1] };
 }
 
-/** Duplicates and contradictions across always-on instruction files at one directory level. */
+const conflict = (f, d, p, at) => ((f.neg && f.neg === p.f.pos) || (f.pos && f.pos === p.f.neg) ? `"${d.raw}" contradicts "${p.d.raw}"`
+  : f.indent && p.f.indent && f.indent !== p.f.indent ? `indentation ${f.indent} here, ${p.f.indent} at ${at}`
+    : f.pm && p.f.pm && f.pm !== p.f.pm ? `package manager ${f.pm} here, ${p.f.pm} at ${at}` : null);
+
+/** Duplicates and contradictions across always-on instruction files that load together. */
 function crossInstructionChecks(run) {
-  const groups = new Map();
-  for (const entry of run.directives) {
-    // Nested AGENTS.md files intentionally refine their parent; compare files that apply together at the root.
-    const key = toPosix(path.relative(run.root, entry.dir)).split('/')[0] === '.github' || path.resolve(entry.dir) === run.root ? 'root' : entry.dir;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(entry);
-  }
+  // Nested AGENTS.md files refine their parent on purpose: compare the files that load together at the root.
+  const groups = Map.groupBy(run.directives, (e) => (toPosix(path.relative(run.root, e.dir)).split('/')[0] === '.github'
+    || path.resolve(e.dir) === run.root ? 'root' : e.dir));
   for (const entries of groups.values()) {
-    const seen = new Map();
-    const facets = [];
+    const [seen, prior] = [new Map(), []];
     for (const { fl, items } of entries) {
+      const both = (other) => fl.cls.reads.filter((h) => other.cls.reads.includes(h));
       for (const d of items) {
-        const f = directiveFacets(d);
-        if (d.norm.split(' ').length >= 5) {
-          const prev = seen.get(d.norm);
-          if (prev && prev.fl !== fl) {
-            const both = fl.cls.reads.filter((h) => prev.fl.cls.reads.includes(h));
-            fl.emit('IN-DUPLICATE', { only: both, line: d.line, message: `same directive as ${prev.fl.path}:${prev.line}`, evidence: d.raw });
-          } else if (!prev) seen.set(d.norm, { fl, line: d.line });
-        }
-        for (const p of facets) {
-          let why = null;
-          if (f.neg && p.f.pos && f.neg === p.f.pos) why = `"${d.raw}" contradicts "${p.d.raw}"`;
-          else if (f.pos && p.f.neg && f.pos === p.f.neg) why = `"${d.raw}" contradicts "${p.d.raw}"`;
-          else if (f.indent && p.f.indent && f.indent !== p.f.indent) why = `indentation ${f.indent} here, ${p.f.indent} at ${p.fl.path}:${p.d.line}`;
-          else if (f.pm && p.f.pm && f.pm !== p.f.pm) why = `package manager ${f.pm} here, ${p.f.pm} at ${p.fl.path}:${p.d.line}`;
-          if (why) {
-            const both = fl.cls.reads.filter((h) => p.fl.cls.reads.includes(h));
-            fl.emit('IN-CONFLICT', { only: both, line: d.line, message: `${why} (${p.fl.path}:${p.d.line})` });
-            break;
-          }
-        }
-        facets.push({ fl, d, f });
+        const f = facets(d.norm);
+        const long = d.norm.split(' ').length >= 5;
+        const prev = long && seen.get(d.norm);
+        if (prev && prev.fl !== fl) {
+          fl.emit('IN-DUPLICATE', d.line, `same directive as ${prev.fl.path}:${prev.line}`, { only: both(prev.fl), evidence: d.raw });
+        } else if (long && !prev) seen.set(d.norm, { fl, line: d.line });
+        const hit = prior.map((p) => [p, `${p.fl.path}:${p.d.line}`]).find(([p, at]) => conflict(f, d, p, at));
+        if (hit) fl.emit('IN-CONFLICT', d.line, `${conflict(f, d, ...hit)} (${hit[1]})`, { only: both(hit[0].fl) });
+        prior.push({ fl, d, f });
       }
     }
   }
 }
 
-function siblingInstructionChecks(fl) {
-  const dir = path.dirname(fl.abs);
-  const sub = fl.cls.sub;
+function siblingChecks(fl) {
+  const [dir, sub] = [path.dirname(fl.abs), fl.cls.sub];
   const exists = (n) => fs.existsSync(path.join(dir, n));
   if (sub === 'claude-local' && exists('AGENTS.md') && !exists('CLAUDE.md')) {
-    fl.emit('IN-CLAUDE-LOCAL', { message: 'CLAUDE.local.md stops Claude Code from loading AGENTS.md in this directory (unless Project instructions is claude-md-and-agents-md)' });
+    fl.emit('IN-CLAUDE-LOCAL', null, 'CLAUDE.local.md stops Claude Code from loading AGENTS.md here (unless Project '
+      + 'instructions is claude-md-and-agents-md)');
   }
-  if (sub === 'claude-md' && exists('AGENTS.md')) {
-    const t = readTextNormalized(fl.abs) || '';
-    if (!/(?:^|\s)@(?:\.\/)?AGENTS\.md\b/.test(t)) fl.emit('IN-CLAUDE-AGENTS', { message: 'Claude Code ignores AGENTS.md when CLAUDE.md exists; add a line "@AGENTS.md"' });
+  if (sub === 'claude-md' && exists('AGENTS.md') && !/(?:^|\s)@(?:\.\/)?AGENTS\.md\b/.test(fl.text)) {
+    fl.emit('IN-CLAUDE-AGENTS', null, 'Claude Code ignores AGENTS.md when CLAUDE.md exists; add a line "@AGENTS.md"');
   }
-  if (sub === 'agents-md' || sub === 'agents-override') {
-    // Codex concatenates one file per directory from the project root down to this one.
-    let total = 0;
-    const parts = [];
-    const rel = path.relative(fl.run.root, dir);
-    const dirs = [fl.run.root];
-    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
-      let d = fl.run.root;
-      for (const seg of rel.split(path.sep)) { d = path.join(d, seg); dirs.push(d); }
-    } else dirs.splice(0, 1, dir);
-    for (const d of dirs) {
-      for (const n of ['AGENTS.override.md', 'AGENTS.md']) {
-        const st = statSafe(path.join(d, n));
-        if (st && st.size > 0) { total += st.size; parts.push(`${toPosix(path.relative(fl.run.root, path.join(d, n))) || n} ${st.size} B`); break; }
-      }
-    }
-    if (total > 32 * 1024) fl.emit('IN-AGENTS-BUDGET', { message: `Codex loads ${total} bytes of AGENTS files for this directory (budget 32,768): ${parts.join(', ')}` });
+  if (sub !== 'agents-md' && sub !== 'agents-override') return;
+  // Codex concatenates one file per directory from the project root down to this one.
+  const rel = path.relative(fl.run.root, dir);
+  const dirs = !rel || rel.startsWith('..') || path.isAbsolute(rel) ? [dir]
+    : rel.split(path.sep).reduce((a, seg) => [...a, path.join(a.at(-1), seg)], [fl.run.root]);
+  const files = dirs.map((d) => ['AGENTS.override.md', 'AGENTS.md'].map((n) => path.join(d, n))
+    .find((p) => statOrNull(p)?.size > 0)).filter(Boolean).map((f) => [f, statOrNull(f).size]);
+  const total = files.reduce((n, [, size]) => n + size, 0);
+  if (total > 32 * 1024) {
+    fl.emit('IN-AGENTS-BUDGET', null, `Codex loads ${total} bytes of AGENTS files here (budget 32,768): `
+      + files.map(([f, size]) => `${toPosix(path.relative(fl.run.root, f))} ${size} B`).join(', '));
   }
 }
 
-const COPILOT_AGENT_ENUMS = { target: ['vscode', 'github-copilot'], modelPolicy: ['preferred', 'required'] };
+const SURFACE = { handoffs: 'VS Code-only; the cloud agent ignores it', 'argument-hint': 'VS Code-only; the cloud agent '
+  + 'ignores it', infer: 'retired; use disable-model-invocation', 'mcp-servers': '', metadata: '' };
 
-async function lintAgent(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const fm = frontmatterOf(text);
-  const sub = fl.cls.sub;
-  if (!fm || !fm.hasFrontmatter) fl.emit('AG-FM-MISSING', { line: 1, message: 'no YAML frontmatter with name and description' });
-  if (fm) for (const e of fm.errors) fl.emit('MD-FM-YAML', { line: e.line, message: `frontmatter YAML: ${e.message}` });
-  const data = fm?.data || {};
-  const L = (k) => fm?.keyLines?.[k] || null;
-  const body = fm?.hasFrontmatter ? fm.body : text;
-  fl.emit('AG-CODEX', { message: 'Codex reads no Markdown agent files' });
+function lintAgent(fl) {
+  const { fm, data, L, body, offset } = parts(fl);
+  const [host, base, name] = [fl.cls.sub, path.basename(fl.abs), data.name];
+  const E = (id, key, msg, o) => fl.emit(id, L(key), msg, { field: key, ...o });
+  if (!fm?.hasFrontmatter) fl.emit('AG-FM-MISSING', 1, 'no YAML frontmatter with name and description');
+  fl.emit('AG-CODEX', null, 'Codex reads no Markdown agent files');
   if (fm?.hasFrontmatter && !fm.errors.length) {
-    if (data.description === undefined || data.description === null || String(data.description).trim() === '') fl.emit('AG-DESC-REQUIRED', { line: 1, message: '`description` is required' });
-    if (sub === 'copilot') {
-      const base = path.basename(fl.abs);
-      if (!/^[.\-_a-zA-Z0-9]+$/.test(base)) fl.emit('AG-FILENAME', { message: `file name "${base}" has characters outside . - _ a-z A-Z 0-9` });
-      if (body.length > 30000) fl.emit('AG-BODY-LENGTH', { message: `the agent prompt has ${body.length} characters (max 30,000)` });
-      for (const k of Object.keys(data)) {
-        if (!COPILOT_AGENT_FIELDS.has(k)) fl.emit('AG-FIELD', { only: ['copilot'], line: L(k), field: k, message: `unknown agent field "${k}" (ignored)` });
-        else if (k === 'handoffs' || k === 'argument-hint') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, message: `"${k}" is VS Code-only; the cloud agent ignores it` });
-        else if (k === 'infer') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, message: '"infer" is retired; use disable-model-invocation' });
-        else if (k === 'mcp-servers' || k === 'metadata') fl.emit('AG-FIELD-SURFACE', { line: L(k), field: k, severity: 'note', message: `"${k}" is used by Copilot CLI and the cloud agent; VS Code and IDE agents ignore it` });
-      }
-      for (const [k, vals] of Object.entries(COPILOT_AGENT_ENUMS)) {
-        if (own(data, k) && !vals.includes(data[k])) fl.emit('AG-ENUM', { only: ['copilot'], line: L(k), field: k, message: `${k} "${data[k]}" is not one of ${vals.join(', ')}` });
-      }
-      if (own(data, 'tools') && data.tools !== null) {
-        const tools = Array.isArray(data.tools) ? data.tools : String(data.tools).split(',');
-        for (const t0 of tools) {
-          const t = String(t0).trim();
-          if (!t || COPILOT_TOOL_ALIASES.has(t) || /^[\w.-]+\/(?:\*|[\w.-]+)$/.test(t)) continue;
-          fl.emit('AG-TOOLS', { line: L('tools'), message: `tool "${t}" is not a known alias or server/tool (Copilot ignores it)` });
-        }
-      }
-    } else {
-      const name = data.name;
-      if (name === undefined || name === null || name === '') fl.emit('AG-NAME-REQUIRED', { line: 1, message: '`name` is required' });
-      else if (String(name).length > 256 || String(name).includes(':')) fl.emit('AG-NAME-FORMAT', { line: L('name'), message: '`name` must be at most 256 characters without ":"' });
-      for (const k of Object.keys(data)) if (!CLAUDE_AGENT_FIELDS.has(k)) fl.emit('AG-FIELD', { only: ['claude'], line: L(k), field: k, message: `unknown agent field "${k}" (ignored)` });
-      for (const [k, vals] of Object.entries(CLAUDE_AGENT_ENUMS)) {
-        if (own(data, k) && !vals.includes(data[k])) fl.emit('AG-ENUM', { only: ['claude'], line: L(k), field: k, message: `${k} "${data[k]}" is not one of ${vals.join(', ')}` });
-      }
-      if (fl.cls.plugin) {
-        for (const k of ['hooks', 'mcpServers', 'permissionMode', 'initialPrompt']) {
-          if (own(data, k)) fl.emit('AG-PLUGIN-FIELDS', { line: L(k), field: k, message: `plugin subagents ignore "${k}"` });
-        }
-      }
+    if (String(data.description ?? '').trim() === '') fl.emit('AG-DESC-REQUIRED', 1, '`description` is required');
+    fl.unknown(data, AGENT_FIELDS[host], 'AG-FIELD', L, 'agent field', { only: [host] });
+    for (const [k, vals] of Object.entries(AGENT_ENUMS[host]).filter(([k]) => Object.hasOwn(data, k) && !vals.includes(data[k]))) {
+      E('AG-ENUM', k, `${k} "${data[k]}" is not one of ${vals.join(', ')}`, { only: [host] });
+    }
+    if (host === 'copilot') copilotAgent(fl, data, L, body, base);
+    else if (name === undefined || name === null || name === '') fl.emit('AG-NAME-REQUIRED', 1, '`name` is required');
+    else if (String(name).length > 256 || String(name).includes(':')) E('AG-NAME-FORMAT', 'name', '`name` must be 256 characters at most, no ":"');
+    for (const k of host === 'claude' && fl.cls.plugin ? W('hooks mcpServers permissionMode initialPrompt') : []) {
+      if (Object.hasOwn(data, k)) E('AG-PLUGIN-FIELDS', k, `plugin subagents ignore "${k}"`);
     }
   }
-  await securityText(fl, body, { lineOffset: fm?.hasFrontmatter ? fm.bodyStartLine - 1 : 0 });
+  securityText(fl, body, offset);
 }
 
-async function lintCommandOrPrompt(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const fm = frontmatterOf(text);
-  if (fm) for (const e of fm.errors) fl.emit('MD-FM-YAML', { line: e.line, message: `frontmatter YAML: ${e.message}` });
-  const data = fm?.data || {};
-  const L = (k) => fm?.keyLines?.[k] || null;
-  if (fl.cls.kind === 'command') {
-    fl.emit('CM-LEGACY', { message: 'legacy .claude/commands file; new work belongs in .claude/skills/<name>/SKILL.md' });
-    for (const k of Object.keys(data)) {
-      if (k === 'name' || k === 'paths') fl.emit('CM-FIELD', { line: L(k), field: k, message: `command files do not accept "${k}" (the file name is the command)` });
-      else if (!COMMAND_FIELDS.has(k)) fl.emit('CM-FIELD', { line: L(k), field: k, message: `unknown command field "${k}"` });
-    }
-  } else {
-    fl.emit('PR-HARNESS', { message: 'prompt files load only in the VS Code Local harness and Visual Studio; convert it to a skill for Copilot CLI and the cloud agent' });
-    for (const k of Object.keys(data)) if (!PROMPT_FIELDS.has(k)) fl.emit('PR-FIELD', { line: L(k), field: k, message: `unknown prompt-file field "${k}"` });
+function copilotAgent(fl, data, L, body, base) {
+  if (!/^[.\-_a-zA-Z0-9]+$/.test(base)) fl.emit('AG-FILENAME', null, `file name "${base}" has characters outside . - _ a-z A-Z 0-9`);
+  if (body.length > 30000) fl.emit('AG-BODY-LENGTH', null, `the agent prompt has ${body.length} characters (max 30,000)`);
+  for (const k of Object.keys(data).filter((x) => x in SURFACE)) {
+    fl.emit('AG-FIELD-SURFACE', L(k), `"${k}" is ${SURFACE[k] || 'read by Copilot CLI and the cloud agent; VS Code and IDE '
+      + 'agents ignore it'}`, { field: k, severity: SURFACE[k] ? null : 'note' });
   }
-  await securityText(fl, fm?.hasFrontmatter ? fm.body : text, { lineOffset: fm?.hasFrontmatter ? fm.bodyStartLine - 1 : 0 });
+  const tools = data.tools == null ? [] : Array.isArray(data.tools) ? data.tools : String(data.tools).split(',');
+  for (const t of tools.map((x) => String(x).trim()).filter((x) => x && !CP_TOOL_ALIASES.has(x) && !/^[\w.-]+\/(?:\*|[\w.-]+)$/.test(x))) {
+    fl.emit('AG-TOOLS', L('tools'), `tool "${t}" is not a known alias or server/tool (Copilot ignores it)`);
+  }
+}
+
+function lintCommandOrPrompt(fl) {
+  const { data, L, body, offset } = parts(fl);
+  if (fl.cls.kind === 'command') {
+    fl.emit('CM-LEGACY', null, 'legacy .claude/commands file; new work belongs in .claude/skills/<name>/SKILL.md');
+    for (const k of Object.keys(data).filter((x) => x === 'name' || x === 'paths')) {
+      fl.emit('CM-FIELD', L(k), `command files do not accept "${k}" (the file name is the command)`, { field: k });
+    }
+    fl.unknown(data, new Set([...COMMAND_FIELDS, 'name', 'paths']), 'CM-FIELD', L, 'command field');
+  } else {
+    fl.emit('PR-HARNESS', null, 'prompt files load only in the VS Code Local harness and Visual Studio; port it to a skill');
+    fl.unknown(data, S('description name argument-hint agent model tools mode'), 'PR-FIELD', L, 'prompt-file field');
+  }
+  securityText(fl, body, offset);
 }
 
 // ---------------------------------------------------------------------------
 // Hooks (Copilot, Claude Code, Codex)
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-const SCRIPT_TOKEN = /(?:\$\{?(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PROJECT_DIR)\}?[\\/])?[\w.@~${}\\/-]*[\w-]\.(?:mjs|cjs|js|ts|py|sh|ps1|rb|pl)\b/g;
-const UNPINNED = [
-  /\bnpx\s+(?:--yes\s+|-y\s+)(?:--?[\w-]+\s+)*(@?[\w./-]+?)(?=\s|$)/,
-  /\bnpx\s+[^\n]*@latest\b/,
-  /\buvx\s+(?!--from)([\w.-]+)(?=\s|$)/,
-  /\bdocker\s+run\b[^\n]*\s([\w./-]+:latest)\b/,
-];
+const EXT = '\\.(?:mjs|cjs|js|ts|py|sh|ps1|rb|pl)\\b';
+const SCRIPT = new RegExp(`(?:\\$\\{?(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PROJECT_DIR)\\}?[\\\\/])?`
+  + `[\\w.@~\${}\\\\/-]*[\\w-]${EXT}`, 'g');
+const ROOT_VAR = '(?:PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PLUGIN_ROOT)';
+const CP_SCRIPT = new RegExp(`(\\$\\{?${ROOT_VAR}\\}?|\\$env:${ROOT_VAR}|\\$\\{?PLUGIN_DATA\\}?)?([\\\\/]?[\\w.@~-][\\w.@~\\\\/-]*${EXT})`, 'g');
+const WRITES = '(?:>>?|\\btee\\s+(?:-a\\s+)?)\\s*["\']?';
+const CP_WRITES_ROOT = new RegExp(`(?:${WRITES}|\\b(?:Out-File|Set-Content)\\b[^\\n]*\\s*["']?)(?:\\$\\{?|\\$env:)${ROOT_VAR}`
+  + `|(?:writeFile|appendFile|createWriteStream|mkdir)\\w*\\([^\\n]*${ROOT_VAR}`);
+const CL_WRITES_ROOT = new RegExp(`${WRITES}\\$\\{?CLAUDE_PLUGIN_ROOT|(?:writeFile|appendFile|createWriteStream|mkdir)\\w*\\(`
+  + '[^\\n]*CLAUDE_PLUGIN_ROOT|open\\([^\\n]*CLAUDE_PLUGIN_ROOT[^\\n]*["\'][wa]');
+const ASK = /permissionDecision["']?\s*[:=]\s*["']ask["']/;
+const EXIT2 = /process\.exit\(\s*2\s*\)|process\.exitCode\s*=\s*2\b|(?:^|[\s;&|])exit\s+2\b|sys\.exit\(\s*2\s*\)|\[Environment\]::Exit\(\s*2\s*\)/;
+const isRooted = (p) => /^\$\{?(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|COPILOT_PLUGIN_ROOT)\}?/.test(p);
+const tail = (p) => p.replace(/^\$\{?[A-Z_]+\}?[\\/]/, '');
 
-function unpinnedPackage(cmdLine) {
-  const s = String(cmdLine);
-  for (const re of UNPINNED) {
-    const m = re.exec(s);
-    if (!m) continue;
-    const pkg = m[1] || m[0];
-    if (re === UNPINNED[0] && /@\d/.test(pkg.replace(/^@/, ''))) continue;
-    if (re === UNPINNED[2] && /==|@\d/.test(pkg)) continue;
-    return pkg;
+/** Local script files a hook command refers to, read for output-shape and exit-code checks: [{ file, text }]. */
+function scriptsOf(fl, list, baseDir, pluginRoot = null) {
+  return list.flatMap((s) => [...s.matchAll(SCRIPT)].map((m) => m[0].replace(/^["']|["']$/g, '')))
+    .map((p) => (isRooted(p) ? pluginRoot && path.join(pluginRoot, tail(p)) : /^\$\{?CLAUDE_PROJECT_DIR\}?/.test(p)
+      ? path.join(fl.run.root, tail(p)) : /[<$]/.test(p) ? null : path.resolve(baseDir, p)))
+    .filter((p) => p && statOrNull(p)?.isFile() && statOrNull(p).size < 512 * 1024).map((file) => ({ file, text: readNorm(file) || '' }));
+}
+const anyText = (list, scripts, re) => list.some((s) => re.test(s)) || scripts.some((s) => re.test(s.text));
+
+function httpSecurity(fl, line, url) {
+  let u = null;
+  try { u = new URL(String(url)); } catch {}
+  if (u && !fl.run.allowHosts.has(u.hostname.toLowerCase())) {
+    fl.sec('SEC-HTTP-HOOK', line, `HTTP hook sends payloads to ${u.hostname.toLowerCase()}, which is not on the allowlist `
+      + '(--allow-host)', u.origin);
+  }
+}
+
+function lintCopilotHooks(fl, v, text, inline = false) {
+  if (!isObj(v)) return fl.emit('HK-CP-SHAPE', 1, 'the hooks file must be a JSON object');
+  const L = (k) => keyLine(text, k);
+  if (!inline && !Object.hasOwn(v, 'version')) fl.emit('HK-CP-VERSION-MISSING', 1, 'no "version": 1');
+  else if (!inline && v.version !== 1) fl.emit('HK-CP-VERSION', L('version'), `"version" is ${JSON.stringify(v.version)}; only 1 is valid`);
+  if (!inline) fl.unknown(v, S('version disableAllHooks hooks description $schema'), 'HK-CP-FIELD', L, 'top-level key');
+  if (!inline && v.disableAllHooks === true) fl.emit('HK-CP-DISABLED', L('disableAllHooks'), '"disableAllHooks": true skips every hook here');
+  if (!isObj(v.hooks)) return fl.emit('HK-CP-SHAPE', L('hooks') || 1, '"hooks" must map event names to arrays');
+  const cloud = /(?:^|\/)\.github\/hooks\//.test(toPosix(fl.abs));
+  const cases = { camel: [], pascal: [] };
+  for (const [event, entries] of Object.entries(v.hooks)) {
+    const line = L(event);
+    const kind = CP_EVENTS.includes(event) ? 'camel' : [...CP_EVENTS_PASCAL, ...CP_EVENTS_UNDOC].includes(event) ? 'pascal' : null;
+    const E = (id, msg) => fl.emit(id, line, msg);
+    if (!kind) { E('HK-CP-EVENT', `"${event}" is not a Copilot hook event${guess([...CP_EVENTS, ...CP_EVENTS_PASCAL], event)}`); continue; }
+    cases[kind].push(event);
+    if (CP_EVENTS_UNDOC.includes(event)) E('HK-CP-EVENT-UNDOC', `"${event}" is undocumented; use ${event[0].toLowerCase()}${event.slice(1)}`);
+    if (!Array.isArray(entries)) { E('HK-CP-SHAPE', `"${event}" must be an array of hook entries`); continue; }
+    if (cloud && /^(?:notification|[pP]ermissionRequest)$/.test(event)) E('HK-CP-CLOUD-EVENT', `${event} hooks do not run in the cloud agent`);
+    if (CP_OUTPUT_IGNORED.has(event)) E('HK-CP-OUTPUT-IGNORED', `Copilot does not process the output of ${event} command hooks`);
+    for (const entry of entries) {
+      if (!isObj(entry)) E('HK-CP-SHAPE', `${event}: every entry must be an object`);
+      else if (!Array.isArray(entry.hooks)) copilotEntry(fl, event, entry, line, cloud, false);
+      else {
+        copilotMatcher(fl, entry.matcher, line);
+        for (const h of entry.hooks) copilotEntry(fl, event, h, line, cloud, true);
+      }
+    }
+  }
+  if (cases.camel.length && cases.pascal.length) {
+    fl.emit('HK-CP-MIXED-CASE', null, `camelCase (${cases.camel.join(', ')}) and PascalCase (${cases.pascal.join(', ')}) `
+      + 'events get different payload shapes');
+  }
+}
+
+function copilotMatcher(fl, matcher, line) {
+  const err = matcher === undefined ? null : badRegex(`^(?:${matcher})$`);
+  if (err) fl.emit('HK-CP-MATCHER', line, `matcher "${matcher}" is not a valid regular expression (${err.message.split(':').pop().trim()})`);
+}
+
+function copilotEntry(fl, event, e, line, cloud, nested) {
+  const E = (id, msg, o) => fl.emit(id, line, `${event}: ${msg}`, o);
+  if (!isObj(e)) return E('HK-CP-SHAPE', 'every hook must be an object');
+  const type = e.type ?? 'command';
+  if (!['command', 'http', 'prompt'].includes(type)) return E('HK-CP-TYPE', `type "${type}" is not command, http or prompt`);
+  for (const k of Object.keys(e).filter((x) => !CP_ENTRY_FIELDS.has(x) || (nested && x === 'hooks'))) {
+    const local = ['windows', 'linux', 'osx', 'hookSpecificOutput'].includes(k);
+    E(local && cloud ? 'HK-CP-LOCAL-KEYS' : 'HK-CP-FIELD', local ? `"${k}" is a VS Code Local-harness key; Copilot ignores it`
+      : `unknown key "${k}"`, { field: k });
+  }
+  copilotMatcher(fl, e.matcher, line);
+  if (type === 'prompt') return /^[sS]essionStart$/.test(event) ? undefined : E('HK-CP-PROMPT', 'prompt hooks run only on sessionStart');
+  const eff = [e.timeoutSec, e.timeout].find((x) => typeof x === 'number');
+  if (e.timeoutSec !== undefined && !(typeof e.timeoutSec === 'number' && e.timeoutSec > 0)) E('HK-CP-TIMEOUT-TYPE', 'timeoutSec must be a positive number');
+  if (e.timeoutSec === undefined && e.timeout === undefined) {
+    E('HK-CP-TIMEOUT', 'no timeoutSec (Copilot waits up to 30 s)', { severity: 'note', strictSeverity: 'warning' });
+  }
+  if (e.timeoutSec !== undefined && e.timeout !== undefined) E('HK-CP-TIMEOUT', 'both timeoutSec and timeout (VS Code reads timeout first)');
+  if (eff > 30) E('HK-CP-TIMEOUT', `timeout ${eff} s is above 30 s`);
+  if (type === 'http') {
+    let u = null;
+    try { u = new URL(String(e.url)); } catch {}
+    const strict = /^(?:[pP]reToolUse|[pP]ermissionRequest)$/.test(event);
+    if (typeof e.url !== 'string') return E('HK-CP-HTTP', 'http hooks need a url');
+    if (!u) return E('HK-CP-HTTP', `invalid URL "${e.url}"`);
+    if (u.protocol === 'http:' && !LOOPBACK.has(u.hostname)) E('HK-CP-HTTP', `${u.origin} must use https`);
+    else if (u.protocol === 'http:' && strict) E('HK-CP-HTTP', 'must use https, even on localhost');
+    else if (u.protocol === 'http:') E('HK-CP-HTTP', 'http://localhost runs only with COPILOT_HOOK_ALLOW_LOCALHOST=1', { severity: 'warning' });
+    else if (u.protocol !== 'https:') E('HK-CP-HTTP', `unsupported URL scheme ${u.protocol}`);
+    return httpSecurity(fl, line, e.url);
+  }
+  const [bash, ps, cmd, exec] = [typeof e.bash === 'string', typeof e.powershell === 'string', typeof e.command === 'string', e.exec !== undefined];
+  const xs = cmd && !(bash && ps) ? crossShellProblems(e.command) : [];
+  if (exec && (bash || ps || cmd)) E('HK-CP-EXEC-MIX', 'exec cannot be combined with bash, powershell or command');
+  else if (exec) E('HK-CP-EXEC', 'exec/args entries run only in Copilot CLI');
+  if (!bash && !ps && !cmd && !exec) E('HK-CP-COMMAND', 'a command hook needs bash and powershell, command, or exec');
+  if (bash && !ps && !cmd) E('HK-CP-NO-WINDOWS', 'bash only; add a powershell entry for Windows');
+  if (ps && !bash && !cmd) E('HK-CP-PS-ONLY', 'powershell only; the cloud agent (Linux) ignores it');
+  if (xs.length) E('HK-XS-COMMAND', `"command" runs in bash and PowerShell but uses ${xs.join('; ')}`, { evidence: e.command });
+  if (ps && /&&|\|\|/.test(e.powershell)) E('HK-CP-PS-COMPAT', 'the powershell string uses && or ||, which Windows PowerShell 5.1 rejects');
+  const list = strs(e.bash, e.powershell, e.command, e.exec, Array.isArray(e.args) ? e.args : []);
+  const plugin = fl.cls.plugin || null;
+  const cwd = typeof e.cwd === 'string' && !e.cwd.includes('$') ? path.resolve(fl.run.root, e.cwd) : fl.run.root;
+  const scripts = scriptsOf(fl, list, cwd, plugin);
+  const rootCwd = typeof e.cwd === 'string' && new RegExp(`^\\$\\{?${ROOT_VAR}\\}?`).test(e.cwd);
+  const rel = plugin && !rootCwd && list.flatMap((s) => [...s.matchAll(CP_SCRIPT)].map((m) => [m, s]))
+    .find(([m]) => !m[1] && !/^[/\\~]/.test(m[2]) && !WIN_ABS.test(m[2]));
+  if (anyText(list, scripts, ASK)) E('HK-CP-ASK', 'the hook can answer permissionDecision "ask", which is deny in the cloud agent');
+  if (plugin && /^[pP]reToolUse$/.test(event) && e.cwd !== '${PLUGIN_ROOT}') {
+    E('HK-CP-PLUGIN-CWD', 'plugin preToolUse hook without "cwd": "${PLUGIN_ROOT}" may not fire');
+  }
+  const relPath = rel && rel[0][2];
+  if (rel) E('HK-CP-PLUGIN-PATHS', `"${relPath}" resolves against the project; write "\${PLUGIN_ROOT}/${relPath.replace(/^\.[\\/]/, '')}"`, { evidence: rel[1] });
+  if (plugin && anyText(list, scripts, CP_WRITES_ROOT)) E('HK-CP-PLUGIN-PATHS', 'writes under ${PLUGIN_ROOT} (replaced on update); use ${PLUGIN_DATA}');
+  fl.unpinned(list, line, `${event}: `);
+}
+
+/** Claude Code and Codex hook maps: `{ Event: [{ matcher?, hooks: [handler] }] }`. */
+function lintGroups(fl, hooks, text, dialect, handler, fromToml = false) {
+  const [EVENTS, NO_MATCHER, plain] = dialect === 'CL' ? [CL_EVENTS, CL_NO_MATCHER, /^[A-Za-z0-9_ ,|-]*$/]
+    : [CX_EVENTS, CX_NO_MATCHER, /^[A-Za-z0-9_|]+$/];
+  for (const [event, groups] of Object.entries(hooks).filter(([e]) => !fromToml || e !== 'state')) {
+    const at = fromToml ? text.indexOf(`hooks.${event}`) : -1;
+    const line = fromToml ? (at < 0 ? null : lineOf(text, at)) : keyLine(text, event);
+    const E = (id, msg) => fl.emit(`HK-${dialect}-${id}`, line, msg);
+    if (!EVENTS.includes(event)) {
+      E('EVENT', dialect === 'CL' ? `"${event}" is not a Claude Code hook event, so it is ignored${guess(EVENTS, event)}`
+        : `"${event}" is not a Codex hook event${guess(EVENTS, event, ' (Codex uses PascalCase: ', ')')}`);
+    }
+    if (!Array.isArray(groups)) { E('SHAPE', `"${event}" must be an array of matcher groups`); continue; }
+    for (const g of groups) {
+      if (!isObj(g) || (dialect === 'CX' && !Array.isArray(g.hooks))) { E('SHAPE', `${event}: every matcher group must be an object with "hooks"`); continue; }
+      if (dialect === 'CL' && Array.isArray(g.matcher)) E('SHAPE', `${event}: a matcher array invalidates every hook in this file; use "A|B"`);
+      else if (g.matcher !== undefined && g.matcher !== '' && g.matcher !== '*') {
+        if (NO_MATCHER.has(event)) E('MATCHER-IGNORED', `${event} ignores matchers; "${g.matcher}" is dropped`);
+        else if (typeof g.matcher === 'string' && !plain.test(g.matcher) && badRegex(g.matcher)) E('MATCHER', `matcher "${g.matcher}" does not compile`);
+      }
+      fl.unknown(g, S('matcher hooks'), `HK-${dialect}-FIELD`, () => line, 'matcher-group key', { prefix: `${event}: ` });
+      if (!Array.isArray(g.hooks)) { E('SHAPE', `${event}: every matcher group needs a "hooks" array`); continue; }
+      for (const h of g.hooks) handler(event, h, line);
+    }
+  }
+}
+
+function unquotedVar(cmd) {
+  let q = null;
+  for (let i = 0; i < cmd.length; i++) {
+    if (q) { if (cmd[i] === q) q = null; continue; }
+    if (cmd[i] === '"' || cmd[i] === "'") q = cmd[i];
+    const m = cmd[i] === '$' && /^\$\{?(?:CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA)\}?/.exec(cmd.slice(i));
+    if (m) return m[0];
   }
   return null;
 }
 
-/** Local script files a hook command refers to (read for output-shape and exit-code checks). */
-function referencedScripts(fl, strings, { baseDir, pluginRoot = null }) {
-  const out = [];
-  for (const s of strings) {
-    if (typeof s !== 'string') continue;
-    for (const m of s.matchAll(SCRIPT_TOKEN)) {
-      let p = m[0].replace(/^["']|["']$/g, '');
-      if (/^\$\{?(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|COPILOT_PLUGIN_ROOT)\}?/.test(p)) {
-        if (!pluginRoot) continue;
-        p = path.join(pluginRoot, p.replace(/^\$\{?[A-Z_]+\}?[\\/]/, ''));
-      } else if (/^\$\{?CLAUDE_PROJECT_DIR\}?/.test(p)) p = path.join(fl.run.root, p.replace(/^\$\{?[A-Z_]+\}?[\\/]/, ''));
-      else if (p.includes('<') || p.includes('$')) continue;
-      else p = path.resolve(baseDir, p);
-      const st = statSafe(p);
-      if (st && st.isFile() && st.size < 512 * 1024) out.push({ file: p, text: readTextNormalized(p) || '' });
-    }
-  }
-  return out;
-}
-
-function httpHookChecks(fl, ruleId, event, url, line, { strictEvents = [] } = {}) {
-  let u;
-  try { u = new URL(String(url)); } catch { fl.emit(ruleId, { line, message: `invalid URL "${url}"` }); return; }
-  const host = u.hostname.toLowerCase();
-  if (u.protocol === 'http:') {
-    if (LOOPBACK.has(host)) {
-      if (strictEvents.includes(event)) fl.emit(ruleId, { line, message: `${event} HTTP hooks must use https, even on localhost` });
-      else if (ruleId === 'HK-CP-HTTP') fl.emit(ruleId, { line, severity: 'warning', message: 'http://localhost hooks run only with COPILOT_HOOK_ALLOW_LOCALHOST=1' });
-    } else fl.emit(ruleId, { line, message: `HTTP hook URL ${u.origin} must use https` });
-  } else if (u.protocol !== 'https:') fl.emit(ruleId, { line, message: `unsupported URL scheme ${u.protocol}` });
-  if (!fl.run.allowHosts.has(host)) fl.sec('SEC-HTTP-HOOK', { line, message: `HTTP hook sends payloads to ${host}, which is not on the allowlist (--allow-host)`, evidence: u.origin });
-}
-
-const ASK_RE = /permissionDecision["']?\s*[:=]\s*["']ask["']/;
-
-function lintCopilotHooks(fl, v, text, { inline = false } = {}) {
-  if (!isObj(v)) { fl.emit('HK-CP-SHAPE', { line: 1, message: 'the hooks file must be a JSON object' }); return; }
-  if (!inline) {
-    if (!own(v, 'version')) fl.emit('HK-CP-VERSION-MISSING', { line: 1, message: 'no "version": 1' });
-    else if (v.version !== 1) fl.emit('HK-CP-VERSION', { line: jsonKeyLine(text, 'version'), message: `"version" is ${JSON.stringify(v.version)}; only 1 is valid` });
-    for (const k of Object.keys(v)) if (!CP_FILE_FIELDS.has(k)) fl.emit('HK-CP-FIELD', { line: jsonKeyLine(text, k), field: k, message: `unknown top-level key "${k}"` });
-    if (v.disableAllHooks === true) fl.emit('HK-CP-DISABLED', { line: jsonKeyLine(text, 'disableAllHooks'), message: '"disableAllHooks": true skips every hook in this file' });
-  }
-  const hooks = v.hooks;
-  if (!isObj(hooks)) { fl.emit('HK-CP-SHAPE', { line: jsonKeyLine(text, 'hooks') || 1, message: '"hooks" must be an object mapping event names to arrays' }); return; }
-  const cloudVisible = /(?:^|\/)\.github\/hooks\//.test(toPosix(fl.abs));
-  const camel = [];
-  const pascal = [];
-  for (const [event, entries] of Object.entries(hooks)) {
-    const line = jsonKeyLine(text, event);
-    if (CP_EVENTS_CAMEL.includes(event)) camel.push(event);
-    else if (CP_EVENTS_PASCAL.includes(event)) pascal.push(event);
-    else if (CP_EVENTS_PASCAL_UNDOC.includes(event)) {
-      pascal.push(event);
-      fl.emit('HK-CP-EVENT-UNDOC', { line, message: `"${event}" is not a documented PascalCase alias; use ${event[0].toLowerCase()}${event.slice(1)}` });
-    } else {
-      const guess = [...CP_EVENTS_CAMEL, ...CP_EVENTS_PASCAL].find((e) => e.toLowerCase() === event.toLowerCase());
-      fl.emit('HK-CP-EVENT', { line, message: `"${event}" is not a Copilot hook event${guess ? ` (did you mean ${guess}?)` : ''}` });
-      continue;
-    }
-    if (!Array.isArray(entries)) { fl.emit('HK-CP-SHAPE', { line, message: `"${event}" must be an array of hook entries` }); continue; }
-    if (cloudVisible && ['notification', 'permissionRequest', 'PermissionRequest'].includes(event)) {
-      fl.emit('HK-CP-CLOUD-EVENT', { line, message: `${event} hooks do not take effect in the Copilot cloud agent` });
-    }
-    if (['errorOccurred', 'sessionEnd', 'preCompact', 'userPromptSubmitted', 'ErrorOccurred', 'SessionEnd', 'PreCompact', 'UserPromptSubmit'].includes(event)) {
-      fl.emit('HK-CP-OUTPUT-IGNORED', { line, message: `Copilot does not process the output of ${event} command hooks` });
-    }
-    for (const entry of entries) {
-      if (!isObj(entry)) { fl.emit('HK-CP-SHAPE', { line, message: `${event}: every entry must be an object` }); continue; }
-      if (Array.isArray(entry.hooks)) {
-        if (entry.matcher !== undefined) copilotMatcher(fl, entry.matcher, line);
-        for (const h of entry.hooks) lintCopilotEntry(fl, event, h, line, cloudVisible, true);
-      } else lintCopilotEntry(fl, event, entry, line, cloudVisible, false);
-    }
-  }
-  if (camel.length && pascal.length) fl.emit('HK-CP-MIXED-CASE', { message: `camelCase (${camel.join(', ')}) and PascalCase (${pascal.join(', ')}) events in one file receive different payload shapes` });
-}
-
-function copilotMatcher(fl, matcher, line) {
-  try { new RegExp(`^(?:${matcher})$`); } catch (err) { fl.emit('HK-CP-MATCHER', { line, message: `matcher "${matcher}" is not a valid regular expression (${err.message.split(':').pop().trim()})` }); }
-}
-
-function lintCopilotEntry(fl, event, e, line, cloudVisible, nested) {
-  if (!isObj(e)) { fl.emit('HK-CP-SHAPE', { line, message: `${event}: every hook must be an object` }); return; }
-  const type = e.type ?? 'command';
-  if (!['command', 'http', 'prompt'].includes(type)) { fl.emit('HK-CP-TYPE', { line, message: `${event}: type "${type}" is not command, http or prompt` }); return; }
-  for (const k of Object.keys(e)) {
-    if (CP_ENTRY_FIELDS.has(k) && !(nested && k === 'hooks')) continue;
-    if (['windows', 'linux', 'osx', 'hookSpecificOutput'].includes(k)) {
-      fl.emit(cloudVisible ? 'HK-CP-LOCAL-KEYS' : 'HK-CP-FIELD', { line, field: k, message: `"${k}" is a VS Code Local-harness key; Copilot ignores it` });
-    } else fl.emit('HK-CP-FIELD', { line, field: k, message: `${event}: unknown key "${k}"` });
-  }
-  if (e.matcher !== undefined) copilotMatcher(fl, e.matcher, line);
-  if (type === 'prompt') {
-    if (!['sessionStart', 'SessionStart'].includes(event)) fl.emit('HK-CP-PROMPT', { line, message: `prompt hooks run only on sessionStart, not ${event}` });
-    return;
-  }
-  if (e.timeoutSec !== undefined && !(typeof e.timeoutSec === 'number' && e.timeoutSec > 0)) {
-    fl.emit('HK-CP-TIMEOUT-TYPE', { line, message: `${event}: timeoutSec must be a positive number` });
-  }
-  if (e.timeoutSec === undefined && e.timeout === undefined) fl.emit('HK-CP-TIMEOUT', { line, severity: 'note', strictSeverity: 'warning', message: `${event}: no timeoutSec (Copilot waits up to 30 s; set it explicitly)` });
-  if (e.timeoutSec !== undefined && e.timeout !== undefined) fl.emit('HK-CP-TIMEOUT', { line, message: `${event}: both timeoutSec and timeout (VS Code Local reads them in the opposite order)` });
-  const eff = typeof e.timeoutSec === 'number' ? e.timeoutSec : typeof e.timeout === 'number' ? e.timeout : null;
-  if (eff !== null && eff > 30) fl.emit('HK-CP-TIMEOUT', { line, message: `${event}: timeout ${eff} s is above 30 s` });
-  if (type === 'http') {
-    if (typeof e.url !== 'string') fl.emit('HK-CP-HTTP', { line, message: `${event}: http hooks need a url` });
-    else httpHookChecks(fl, 'HK-CP-HTTP', event, e.url, line, { strictEvents: ['preToolUse', 'PreToolUse', 'permissionRequest', 'PermissionRequest'] });
-    return;
-  }
-  const hasBash = typeof e.bash === 'string';
-  const hasPs = typeof e.powershell === 'string';
-  const hasCmd = typeof e.command === 'string';
-  const hasExec = e.exec !== undefined;
-  if (hasExec && (hasBash || hasPs || hasCmd)) fl.emit('HK-CP-EXEC-MIX', { line, message: `${event}: exec cannot be combined with bash, powershell or command` });
-  else if (hasExec) fl.emit('HK-CP-EXEC', { line, message: `${event}: exec/args entries run only in Copilot CLI` });
-  if (!hasBash && !hasPs && !hasCmd && !hasExec) fl.emit('HK-CP-COMMAND', { line, message: `${event}: a command hook needs bash and powershell, command, or exec` });
-  if (hasBash && !hasPs && !hasCmd) fl.emit('HK-CP-NO-WINDOWS', { line, message: `${event}: bash only; add a powershell entry for Windows` });
-  if (hasPs && !hasBash && !hasCmd) fl.emit('HK-CP-PS-ONLY', { line, message: `${event}: powershell only; the cloud agent (Linux) ignores it` });
-  if (hasCmd && !(hasBash && hasPs)) {
-    const problems = crossShellProblems(e.command);
-    if (problems.length) fl.emit('HK-XS-COMMAND', { line, message: `${event}: "command" is copied to both bash and PowerShell but uses ${problems.join('; ')}; write separate bash and powershell entries`, evidence: e.command });
-  }
-  if (hasPs && /&&|\|\|/.test(e.powershell)) fl.emit('HK-CP-PS-COMPAT', { line, message: `${event}: the powershell string uses && or ||, which Windows PowerShell 5.1 (the fallback launcher) rejects` });
-  const strings = [e.bash, e.powershell, e.command, e.exec, ...(Array.isArray(e.args) ? e.args : [])].filter((x) => typeof x === 'string');
-  const pluginRoot = fl.cls.plugin || null;
-  const scripts = referencedScripts(fl, strings, { baseDir: typeof e.cwd === 'string' && !e.cwd.includes('$') ? path.resolve(fl.run.root, e.cwd) : fl.run.root, pluginRoot });
-  if (strings.some((s) => ASK_RE.test(s)) || scripts.some((s) => ASK_RE.test(s.text))) {
-    fl.emit('HK-CP-ASK', { line, message: `${event}: the hook can answer permissionDecision "ask", which the cloud agent and autopilot treat as deny` });
-  }
-  if (pluginRoot && ['preToolUse', 'PreToolUse'].includes(event) && e.cwd !== '${PLUGIN_ROOT}') {
-    fl.emit('HK-CP-PLUGIN-CWD', { line, message: 'plugin preToolUse hook without "cwd": "${PLUGIN_ROOT}" may not fire (copilot-cli#2540)' });
-  }
-  if (pluginRoot) copilotPluginPaths(fl, event, e, strings, scripts, line);
-  for (const s of strings) {
-    const pkg = unpinnedPackage(s);
-    if (pkg) { fl.sec('SEC-UNPINNED', { line, message: `${event}: runs ${pkg} without a pinned version`, evidence: s }); break; }
-  }
-}
-
-const CP_ROOT_VAR = '(?:PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PLUGIN_ROOT)';
-const CP_SCRIPT = new RegExp(`(\\$\\{?${CP_ROOT_VAR}\\}?|\\$env:${CP_ROOT_VAR}|\\$\\{?PLUGIN_DATA\\}?)?([\\\\/]?[\\w.@~-][\\w.@~\\\\/-]*\\.(?:mjs|cjs|js|ts|py|sh|ps1|rb|pl))\\b`, 'g');
-const CP_WRITES_ROOT = new RegExp(`(?:>>?|\\bOut-File\\b[^\\n]*|\\bSet-Content\\b[^\\n]*|\\btee\\s+(?:-a\\s+)?)\\s*["']?(?:\\$\\{?|\\$env:)${CP_ROOT_VAR}|(?:writeFile|appendFile|createWriteStream|mkdir)\\w*\\([^\\n]*${CP_ROOT_VAR}`);
-
-/** Copilot plugin hooks: scripts relative to the project (copilot-cli#2540) and state under the plugin root. */
-function copilotPluginPaths(fl, event, e, strings, scripts, line) {
-  const rootCwd = typeof e.cwd === 'string' && new RegExp(`^(?:\\$\\{?${CP_ROOT_VAR}\\}?)`).test(e.cwd);
-  if (!rootCwd) {
-    for (const s of strings) {
-      for (const m of s.matchAll(CP_SCRIPT)) {
-        const p = m[2];
-        if (m[1] || p.startsWith('/') || p.startsWith('\\') || p.startsWith('~') || WIN_ABS_RE.test(p)) continue;
-        fl.emit('HK-CP-PLUGIN-PATHS', { line, message: `${event}: "${p}" resolves against the project directory, not the plugin; write "\${PLUGIN_ROOT}/${p.replace(/^\.[\\/]/, '')}" or set "cwd": "\${PLUGIN_ROOT}"`, evidence: s });
-        return;
-      }
-    }
-  }
-  if (strings.some((s) => CP_WRITES_ROOT.test(s)) || scripts.some((s) => CP_WRITES_ROOT.test(s.text))) {
-    fl.emit('HK-CP-PLUGIN-PATHS', { line, message: `${event}: writes under \${PLUGIN_ROOT}, which is replaced on every plugin update; keep state in \${PLUGIN_DATA}` });
-  }
-}
-
-function unquotedVars(cmd) {
-  const out = [];
-  let quote = null;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    if (quote) { if (ch === quote) quote = null; continue; }
-    if (ch === '"' || ch === "'") { quote = ch; continue; }
-    if (ch === '$') {
-      const m = /^\$\{?(CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA)\}?/.exec(cmd.slice(i));
-      if (m) out.push(m[0]);
-    }
-  }
-  return out;
-}
-
-function lintClaudeHooks(fl, hooks, text, { project = false, plugin = null } = {}) {
-  if (!isObj(hooks)) { fl.emit('HK-CL-SHAPE', { line: jsonKeyLine(text, 'hooks') || 1, message: '"hooks" must map event names to arrays of matcher groups' }); return; }
-  for (const [event, groups] of Object.entries(hooks)) {
-    const line = jsonKeyLine(text, event);
-    if (!CL_EVENTS.includes(event)) {
-      const guess = CL_EVENTS.find((e) => e.toLowerCase() === event.toLowerCase());
-      fl.emit('HK-CL-EVENT', { line, message: `"${event}" is not a Claude Code hook event; the entry is ignored${guess ? ` (did you mean ${guess}?)` : ''}` });
-    }
-    if (!Array.isArray(groups)) { fl.emit('HK-CL-SHAPE', { line, message: `"${event}" must be an array of matcher groups` }); continue; }
-    for (const g of groups) {
-      if (!isObj(g)) { fl.emit('HK-CL-SHAPE', { line, message: `${event}: every matcher group must be an object` }); continue; }
-      if (Array.isArray(g.matcher)) fl.emit('HK-CL-SHAPE', { line, message: `${event}: a matcher given as an array invalidates every hook in this file; use "A|B"` });
-      else if (g.matcher !== undefined && g.matcher !== '' && g.matcher !== '*') {
-        if (CL_NO_MATCHER.has(event)) fl.emit('HK-CL-MATCHER-IGNORED', { line, message: `${event} ignores matchers; "${g.matcher}" is dropped` });
-        else if (typeof g.matcher === 'string' && !/^[A-Za-z0-9_ ,|-]*$/.test(g.matcher)) {
-          try { new RegExp(g.matcher); } catch (err) { fl.emit('HK-CL-MATCHER', { line, message: `matcher "${g.matcher}" is not a valid regular expression` }); }
-        }
-      }
-      for (const k of Object.keys(g)) if (!['matcher', 'hooks'].includes(k)) fl.emit('HK-CL-FIELD', { line, field: k, message: `${event}: unknown matcher-group key "${k}"` });
-      if (!Array.isArray(g.hooks)) { fl.emit('HK-CL-SHAPE', { line, message: `${event}: every matcher group needs a "hooks" array` }); continue; }
-      for (const h of g.hooks) lintClaudeHandler(fl, event, h, line, { project, plugin });
-    }
-  }
-}
-
-function lintClaudeHandler(fl, event, h, line, { project, plugin }) {
-  if (!isObj(h)) { fl.emit('HK-CL-SHAPE', { line, message: `${event}: every hook handler must be an object` }); return; }
-  const type = h.type;
-  if (!['command', 'http', 'mcp_tool', 'prompt', 'agent'].includes(type)) { fl.emit('HK-CL-TYPE', { line, message: `${event}: handler type ${JSON.stringify(type)} is not command, http, mcp_tool, prompt or agent` }); return; }
-  if (CL_EVENTS.includes(event) && !claudeTypesFor(event).includes(type)) fl.emit('HK-CL-TYPE', { line, message: `${event} does not support ${type} hooks (only ${claudeTypesFor(event).join(', ')})` });
-  for (const k of Object.keys(h)) if (!CL_HANDLER_FIELDS.has(k)) fl.emit('HK-CL-FIELD', { line, field: k, message: `${event}: unknown handler field "${k}"` });
-  if (h.if !== undefined && !CL_IF_EVENTS.has(event)) fl.emit('HK-CL-IF', { line, message: `${event}: "if" is evaluated only on tool events; this hook never runs` });
-  if (h.once !== undefined) fl.emit('HK-CL-ONCE', { line, message: `${event}: "once" is ignored outside skill frontmatter` });
-  if (h.shell !== undefined && !['bash', 'powershell'].includes(h.shell)) fl.emit('HK-CL-SHELL', { line, message: `${event}: shell "${h.shell}" is not bash or powershell` });
-  if (h.onFailure !== undefined) {
-    if (!['continue', 'block'].includes(h.onFailure)) fl.emit('HK-CL-ONFAILURE', { line, message: `${event}: onFailure "${h.onFailure}" is not continue or block` });
-    else if (CL_ONFAILURE_NOEFFECT.has(event) || h.async) fl.emit('HK-CL-ONFAILURE', { line, severity: 'warning', message: `${event}: onFailure has no effect on ${h.async ? 'async hooks' : event}` });
-    else fl.emit('HK-CL-ONFAILURE', { line, severity: 'note', message: `${event}: onFailure requires Claude Code 2.1.295 or later` });
-  }
-  if (type === 'http') {
-    if (typeof h.url !== 'string') fl.emit('HK-CL-SHAPE', { line, message: `${event}: http hooks need a url` });
-    else {
-      let u = null;
-      try { u = new URL(h.url); } catch {}
-      if (u && !fl.run.allowHosts.has(u.hostname.toLowerCase())) fl.sec('SEC-HTTP-HOOK', { line, message: `HTTP hook sends payloads to ${u.hostname}, which is not on the allowlist (--allow-host)`, evidence: u.origin });
-    }
-    return;
-  }
+function claudeHandler(fl, event, h, line, { project, plugin }) {
+  const E = (id, msg, o) => fl.emit(id, line, `${event}: ${msg}`, o);
+  if (!isObj(h)) return E('HK-CL-SHAPE', 'every hook handler must be an object');
+  const [{ type, onFailure }, types] = [h, claudeTypes(event)];
+  if (!['command', 'http', 'mcp_tool', 'prompt', 'agent'].includes(type)) return E('HK-CL-TYPE', `handler type ${JSON.stringify(type)} does not exist`);
+  if (CL_EVENTS.includes(event) && !types.includes(type)) E('HK-CL-TYPE', `${type} hooks are not supported here (only ${types.join(', ')})`);
+  fl.unknown(h, CL_HANDLER_FIELDS, 'HK-CL-FIELD', () => line, 'handler field', { prefix: `${event}: ` });
+  if (h.if !== undefined && !CL_IF_EVENTS.has(event)) E('HK-CL-IF', '"if" is evaluated only on tool events; this hook never runs');
+  if (h.once !== undefined) E('HK-CL-ONCE', '"once" is ignored outside skill frontmatter');
+  if (h.shell !== undefined && !['bash', 'powershell'].includes(h.shell)) E('HK-CL-SHELL', `shell "${h.shell}" is not bash or powershell`);
+  if (onFailure !== undefined && !['continue', 'block'].includes(onFailure)) E('HK-CL-ONFAILURE', `onFailure "${onFailure}" is not continue or block`);
+  else if (onFailure !== undefined && (S('Stop SubagentStop TaskCompleted TeammateIdle').has(event) || h.async)) {
+    E('HK-CL-ONFAILURE', `onFailure has no effect on ${h.async ? 'async hooks' : event}`, { severity: 'warning' });
+  } else if (onFailure !== undefined) E('HK-CL-ONFAILURE', 'onFailure requires Claude Code 2.1.295 or later', { severity: 'note' });
+  if (type === 'http') return typeof h.url === 'string' ? httpSecurity(fl, line, h.url) : E('HK-CL-SHAPE', 'http hooks need a url');
   if (type !== 'command') return;
-  if (typeof h.command !== 'string' || !h.command.trim()) { fl.emit('HK-CL-SHAPE', { line, message: `${event}: a command hook needs a "command" string` }); return; }
+  if (typeof h.command !== 'string' || !h.command.trim()) return E('HK-CL-SHAPE', 'a command hook needs a "command" string');
   const exec = Array.isArray(h.args);
-  if (exec) {
-    const b = path.basename(h.command.replace(/\\/g, '/')).toLowerCase();
-    if (/\.(?:cmd|bat)$/.test(b) || NPM_SHIMS.has(b)) fl.emit('HK-CL-EXEC-SHIM', { line, message: `${event}: exec form cannot start "${h.command}" on Windows (a .cmd shim); use "command": "node" with the script in args` });
-    if (project) fl.emit('HK-CL-REPO-EXEC', { line, message: `${event}: Copilot CLI and VS Code also run this repository hook, and their handling of command+args is undocumented; use a single shell-string command` });
-  } else {
-    const uv = unquotedVars(h.command);
-    if (uv.length) fl.emit('HK-CL-UNQUOTED-VAR', { line, message: `${event}: ${uv[0]} is not double-quoted; a path with spaces splits the command`, evidence: h.command });
-    if (project) {
-      const problems = crossShellProblems(h.command);
-      if (problems.length) fl.emit('HK-XS-COMMAND', { only: ['copilot'], line, message: `${event}: Copilot also runs this repository hook in both bash and PowerShell, but it uses ${problems.join('; ')}`, evidence: h.command });
-    }
+  const shim = path.basename(h.command.replace(/\\/g, '/')).toLowerCase();
+  const [unquoted, xs] = exec ? [null, []] : [unquotedVar(h.command), project ? crossShellProblems(h.command) : []];
+  const list = strs(h.command, exec ? h.args : []);
+  if (exec && (/\.(?:cmd|bat)$/.test(shim) || NPM_SHIMS.has(shim))) E('HK-CL-EXEC-SHIM', `exec form cannot start "${h.command}" on Windows; run node + script`);
+  if (exec && project) E('HK-CL-REPO-EXEC', 'Copilot CLI and VS Code also run this repository hook (command+args undocumented there)');
+  if (unquoted) E('HK-CL-UNQUOTED-VAR', `${unquoted} is not double-quoted; a path with spaces splits the command`, { evidence: h.command });
+  if (xs.length) E('HK-XS-COMMAND', `Copilot runs this repository hook in bash and PowerShell, but it uses ${xs.join('; ')}`, { only: ['copilot'], evidence: h.command });
+  for (const s of plugin ? list : []) {
+    const tok = [...s.matchAll(SCRIPT)].map((m) => m[0]).find((t) => !isRooted(t) && !/^\$\{?CLAUDE_PROJECT_DIR/.test(t) && !/^(?:https?:|<)/.test(t));
+    if (tok) E('HK-CL-PLUGIN-ROOT', `"${tok}" resolves against the project; write "\${CLAUDE_PLUGIN_ROOT}/${tok.replace(/^\.\//, '')}"`);
   }
-  const strings = [h.command, ...(exec ? h.args : [])].filter((x) => typeof x === 'string');
-  if (plugin) {
-    for (const s of strings) {
-      for (const m of s.matchAll(SCRIPT_TOKEN)) {
-        const tok = m[0];
-        if (/^\$\{?(?:CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|CLAUDE_PROJECT_DIR)\}?/.test(tok) || /^(?:https?:|<)/.test(tok)) continue;
-        fl.emit('HK-CL-PLUGIN-ROOT', { line, message: `${event}: "${tok}" should be "\${CLAUDE_PLUGIN_ROOT}/${tok.replace(/^\.\//, '')}" (relative paths resolve against the project, not the plugin)` });
-        break;
-      }
-    }
-    const scripts = referencedScripts(fl, strings, { baseDir: plugin, pluginRoot: plugin });
-    const writesRoot = (t) => /(?:>>?|\btee\s+(?:-a\s+)?)\s*["']?\$\{?CLAUDE_PLUGIN_ROOT/.test(t) ||
-      /(?:writeFile|appendFile|createWriteStream|mkdir)\w*\([^\n]*CLAUDE_PLUGIN_ROOT/.test(t) || /open\([^\n]*CLAUDE_PLUGIN_ROOT[^\n]*["'][wa]/.test(t);
-    if (strings.some(writesRoot) || scripts.some((s) => writesRoot(s.text))) {
-      fl.emit('HK-CL-PLUGIN-DATA', { line, message: `${event}: writes under \${CLAUDE_PLUGIN_ROOT}, which is replaced on every plugin update; use \${CLAUDE_PLUGIN_DATA}` });
-    }
+  if (plugin && anyText(list, scriptsOf(fl, list, plugin, plugin), CL_WRITES_ROOT)) {
+    E('HK-CL-PLUGIN-DATA', 'writes under ${CLAUDE_PLUGIN_ROOT} (replaced on every update); use ${CLAUDE_PLUGIN_DATA}');
   }
-  for (const s of strings) {
-    const pkg = unpinnedPackage(s);
-    if (pkg) { fl.sec('SEC-UNPINNED', { line, message: `${event}: runs ${pkg} without a pinned version`, evidence: s }); break; }
-  }
+  fl.unpinned(list, line, `${event}: `);
 }
 
-/** Why a Codex `command` would fail under cmd.exe /C on Windows (when no commandWindows is given). */
-function cmdExeProblems(cmd) {
-  const out = [];
-  if (/(?:^|\s)\.{1,2}\/[^\s]*/.test(cmd) || /\.sh\b/.test(cmd)) out.push('a ./script or .sh path');
-  if (/\$\{?[A-Za-z_]/.test(cmd)) out.push('$VAR expansion (cmd.exe uses %VAR%)');
-  if (/'/.test(cmd)) out.push("single quotes (cmd.exe does not treat them as quotes)");
-  if (/(?:^|\s)~\//.test(cmd)) out.push('~/');
-  if (/\/dev\/null/.test(cmd)) out.push('/dev/null');
-  if (/\bcommand\s+-v\b|\bexport\s|;\s*then\b/.test(cmd)) out.push('POSIX shell syntax');
-  return out;
+/** Why a Codex `command` fails under cmd.exe /C on Windows (checked when no commandWindows is given). */
+const CMD_EXE = [[/(?:^|\s)\.{1,2}\/[^\s]*|\.sh\b/, 'a ./script or .sh path'], [/\$\{?[A-Za-z_]/, '$VAR (cmd.exe uses %VAR%)'],
+  [/'/, 'single quotes (not quotes in cmd.exe)'], [/(?:^|\s)~\//, '~/'], [/\/dev\/null/, '/dev/null'],
+  [/\bcommand\s+-v\b|\bexport\s|;\s*then\b/, 'POSIX shell syntax']];
+
+function codexHandler(fl, event, h, line) {
+  const E = (id, msg, o) => fl.emit(id, line, `${event}: ${msg}`, o);
+  if (!isObj(h)) return E('HK-CX-SHAPE', 'every handler must be an object');
+  if (!['command', 'mcp_tool', 'prompt', 'agent'].includes(h.type)) return E('HK-CX-TYPE', `handler type ${JSON.stringify(h.type)} is not command or mcp_tool`);
+  if (h.type === 'prompt' || h.type === 'agent') return E('HK-CX-TYPE', `${h.type} handlers are parsed but never run`, { severity: 'warning' });
+  for (const k of Object.keys(h).filter((x) => !CX_HANDLER_FIELDS[h.type].has(x))) {
+    E('HK-CX-FIELD', `"${k}" is not a Codex ${h.type} handler field${/^(?:args|cwd|env)$/.test(k) ? ' (Codex has no args, cwd or env)' : ''}`, { field: k });
+  }
+  if (h.type === 'command' && (typeof h.command !== 'string' || !h.command.trim())) return E('HK-CX-SHAPE', 'a command handler needs "command"');
+  if (h.type === 'command') {
+    const list = strs(h.command, h.commandWindows, h.command_windows);
+    const scripts = scriptsOf(fl, list, fl.run.root);
+    const win = h.commandWindows !== undefined || h.command_windows !== undefined ? []
+      : CMD_EXE.filter(([re]) => re.test(h.command)).map(([, w]) => w);
+    if (win.length) {
+      E('HK-CX-WINDOWS', `no commandWindows, and cmd.exe runs "command" on Windows, where it uses ${win.join(', ')}`);
+    }
+    if (anyText(list, scripts, EXIT2)) E('HK-CX-EXIT2', 'exits 2 to block, which PowerShell turns into 1 on Windows; print JSON on exit 0');
+    if (scripts.some((s) => /\b(?:modifiedArgs|modifiedResult|textResultForLlm)\b/.test(s.text) && !/hookSpecificOutput/.test(s.text))) {
+      E('HK-CX-OUTPUT', 'the handler prints Copilot-only fields (modifiedArgs/modifiedResult) that Codex rejects');
+    }
+    fl.unpinned(list, line, `${event}: `);
+  }
+  if (/^(?:SessionEnd|Interrupt)$/.test(event) && typeof h.timeout === 'number' && h.timeout > 3) E('HK-CX-SESSIONEND', `timeout ${h.timeout} s is capped at 3 s`);
+  if (event === 'SessionEnd' && h.async === true) E('HK-CX-SESSIONEND', 'async is ignored');
 }
 
-const EXIT2_RE = /process\.exit\(\s*2\s*\)|process\.exitCode\s*=\s*2\b|(?:^|[\s;&|])exit\s+2\b|sys\.exit\(\s*2\s*\)|\[Environment\]::Exit\(\s*2\s*\)/;
-const COPILOT_OUTPUT_RE = /\b(?:modifiedArgs|modifiedResult|textResultForLlm)\b/;
-
-function lintCodexHooks(fl, v, text, { fromToml = false } = {}) {
-  if (!isObj(v) || !isObj(v.hooks)) { fl.emit('HK-CX-SHAPE', { line: 1, message: 'expected {"hooks": {Event: [{"matcher"?, "hooks": [...]}]}}' }); return; }
-  if (!fromToml) for (const k of Object.keys(v)) if (!['description', 'hooks'].includes(k)) fl.emit('HK-CX-FIELD', { line: jsonKeyLine(text, k), field: k, message: `unknown top-level key "${k}"` });
-  const findLine = (needle) => { const i = text.indexOf(needle); return i < 0 ? null : lineOf(text, i); };
-  for (const [event, groups] of Object.entries(v.hooks)) {
-    if (fromToml && event === 'state') continue;
-    const line = fromToml ? findLine(`hooks.${event}`) : jsonKeyLine(text, event);
-    if (!CX_EVENTS.includes(event)) {
-      const guess = CX_EVENTS.find((e) => e.toLowerCase() === event.toLowerCase());
-      fl.emit('HK-CX-EVENT', { line, message: `"${event}" is not a Codex hook event${guess ? ` (Codex uses PascalCase: ${guess})` : ''}` });
-    }
-    if (!Array.isArray(groups)) { fl.emit('HK-CX-SHAPE', { line, message: `"${event}" must be an array of matcher groups` }); continue; }
-    for (const g of groups) {
-      if (!isObj(g) || !Array.isArray(g.hooks)) { fl.emit('HK-CX-SHAPE', { line, message: `${event}: every matcher group needs a "hooks" array` }); continue; }
-      for (const k of Object.keys(g)) if (!['matcher', 'hooks'].includes(k)) fl.emit('HK-CX-FIELD', { line, field: k, message: `${event}: unknown matcher-group key "${k}"` });
-      if (g.matcher !== undefined && g.matcher !== '' && g.matcher !== '*') {
-        if (CX_NO_MATCHER.has(event)) fl.emit('HK-CX-MATCHER-IGNORED', { line, message: `${event} ignores matchers` });
-        else if (typeof g.matcher === 'string' && !/^[A-Za-z0-9_|]+$/.test(g.matcher)) {
-          try { new RegExp(g.matcher); } catch { fl.emit('HK-CX-MATCHER', { line, message: `matcher "${g.matcher}" is not a valid regular expression` }); }
-        }
-      }
-      for (const h of g.hooks) {
-        if (!isObj(h)) { fl.emit('HK-CX-SHAPE', { line, message: `${event}: every handler must be an object` }); continue; }
-        if (!['command', 'mcp_tool', 'prompt', 'agent'].includes(h.type)) { fl.emit('HK-CX-TYPE', { line, message: `${event}: handler type ${JSON.stringify(h.type)} is not command or mcp_tool` }); continue; }
-        if (h.type === 'prompt' || h.type === 'agent') { fl.emit('HK-CX-TYPE', { line, severity: 'warning', message: `${event}: ${h.type} handlers are parsed but Codex does not run them` }); continue; }
-        for (const k of Object.keys(h)) {
-          if (!CX_HANDLER_FIELDS[h.type].has(k)) fl.emit('HK-CX-FIELD', { line, field: k, message: `${event}: "${k}" is not a Codex ${h.type} handler field${['args', 'cwd', 'env'].includes(k) ? ' (Codex has no args, cwd or env)' : ''}` });
-        }
-        if (h.type === 'command') {
-          if (typeof h.command !== 'string' || !h.command.trim()) { fl.emit('HK-CX-SHAPE', { line, message: `${event}: a command handler needs "command"` }); continue; }
-          if (h.commandWindows === undefined && h.command_windows === undefined) {
-            const p = cmdExeProblems(h.command);
-            if (p.length) fl.emit('HK-CX-WINDOWS', { line, message: `${event}: no commandWindows, and on Windows Codex runs "command" under cmd.exe, where it uses ${p.join(', ')}` });
-          }
-          const strings = [h.command, h.commandWindows, h.command_windows].filter((x) => typeof x === 'string');
-          const scripts = referencedScripts(fl, strings, { baseDir: fl.run.root });
-          if (strings.some((s) => EXIT2_RE.test(s)) || scripts.some((s) => EXIT2_RE.test(s.text))) {
-            fl.emit('HK-CX-EXIT2', { line, message: `${event}: the handler exits 2 to block; PowerShell collapses it to 1 on Windows, so print a JSON decision on exit 0` });
-          }
-          if (scripts.some((s) => COPILOT_OUTPUT_RE.test(s.text) && !/hookSpecificOutput/.test(s.text))) {
-            fl.emit('HK-CX-OUTPUT', { line, message: `${event}: the handler prints Copilot-only fields (modifiedArgs/modifiedResult); Codex rejects unknown output fields` });
-          }
-          for (const s of strings) {
-            const pkg = unpinnedPackage(s);
-            if (pkg) { fl.sec('SEC-UNPINNED', { line, message: `${event}: runs ${pkg} without a pinned version`, evidence: s }); break; }
-          }
-        }
-        if (['SessionEnd', 'Interrupt'].includes(event)) {
-          if (typeof h.timeout === 'number' && h.timeout > 3) fl.emit('HK-CX-SESSIONEND', { line, message: `${event}: timeout ${h.timeout} s is capped at 3 s` });
-          if (event === 'SessionEnd' && h.async === true) fl.emit('HK-CX-SESSIONEND', { line, message: 'SessionEnd ignores async' });
-        }
-      }
-    }
-  }
+function lintCodexHooks(fl, v, text, fromToml = false) {
+  if (!isObj(v?.hooks)) return fl.emit('HK-CX-SHAPE', 1, 'expected {"hooks": {Event: [{"matcher"?, "hooks": [...]}]}}');
+  if (!fromToml) fl.unknown(v, S('description hooks'), 'HK-CX-FIELD', (k) => keyLine(text, k), 'top-level key');
+  lintGroups(fl, v.hooks, text, 'CX', (event, h, line) => codexHandler(fl, event, h, line), fromToml);
   if (/(?:^|\/)\.codex\//.test(toPosix(fl.abs)) && fl.cls.scope === 'project') {
-    fl.emit('HK-CX-TRUST', { message: 'project hooks load only in a trusted project and after a one-time review in /hooks' });
+    fl.emit('HK-CX-TRUST', null, 'project hooks load only in a trusted project and after a one-time review in /hooks');
   }
 }
 
-async function lintHooksOrSettings(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const { kind, sub } = fl.cls;
-  const dialect = sub === 'copilot' ? 'CP' : sub === 'codex' ? 'CX' : 'CL';
+function lintHooksOrSettings(fl) {
+  const [{ kind, sub }, text] = [fl.cls, fl.text];
+  const dialect = { copilot: 'CP', codex: 'CX' }[sub] || 'CL';
   const parsed = parseJson(text, { jsonc: kind === 'settings' && sub === 'copilot' });
+  const v = parsed.value;
+  const claude = (hooks, opts) => (isObj(hooks) ? lintGroups(fl, hooks, text, 'CL', (event, h, line) => claudeHandler(fl, event, h, line, opts))
+    : fl.emit('HK-CL-SHAPE', keyLine(text, 'hooks') || 1, '"hooks" must map event names to arrays of matcher groups'));
   if (parsed.error) {
-    fl.emit(`HK-${dialect}-JSON`, { line: parsed.line, message: `invalid JSON: ${parsed.error}` });
-    if (kind === 'settings' && sub === 'claude' && fl.hosts.includes('copilot')) fl.emit('HK-CP-JSON', { line: parsed.line, message: `invalid JSON: ${parsed.error}` });
+    fl.emit(`HK-${dialect}-JSON`, parsed.line, `invalid JSON: ${parsed.error}`);
+    if (kind === 'settings' && sub === 'claude') fl.emit('HK-CP-JSON', parsed.line, `invalid JSON: ${parsed.error}`);
     return;
   }
-  const v = parsed.value;
-  if (kind === 'settings') {
-    if (!isObj(v)) { fl.emit(`HK-${dialect}-SHAPE`, { line: 1, message: 'a settings file must be a JSON object' }); return; }
-    if (own(v, 'hooks')) {
-      if (sub === 'claude') lintClaudeHooks(fl, v.hooks, text, { project: fl.cls.scope === 'project' });
-      else lintCopilotHooks(fl, { hooks: v.hooks }, text, { inline: true });
-    }
-    if (sub === 'copilot' && v.disableAllHooks === true) fl.emit('HK-CP-DISABLED', { line: jsonKeyLine(text, 'disableAllHooks'), message: '"disableAllHooks": true turns off every non-policy hook' });
-  } else if (sub === 'copilot') lintCopilotHooks(fl, v, text);
-  else if (sub === 'claude-plugin') {
-    if (!isObj(v) || !own(v, 'hooks')) fl.emit('HK-CL-SHAPE', { line: 1, message: 'plugin hooks files keep the {"hooks": {...}} wrapper; a file without it fails to load' });
-    else lintClaudeHooks(fl, v.hooks, text, { plugin: fl.cls.plugin || path.dirname(path.dirname(fl.abs)) });
-  } else if (sub === 'codex') {
-    lintCodexHooks(fl, v, text);
-    const toml = path.join(path.dirname(fl.abs), 'config.toml');
-    if (fs.existsSync(toml) && /^\s*\[\[?hooks[.\]]/m.test(readTextNormalized(toml) || '')) {
-      fl.emit('HK-CX-BOTH', { message: 'this layer defines hooks in both hooks.json and config.toml; Codex loads both and warns' });
-    }
+  if (kind === 'settings' && !isObj(v)) return fl.emit(`HK-${dialect}-SHAPE`, 1, 'a settings file must be a JSON object');
+  if (kind === 'settings' && Object.hasOwn(v, 'hooks')) {
+    if (sub === 'claude') claude(v.hooks, { project: fl.cls.scope === 'project' });
+    else lintCopilotHooks(fl, { hooks: v.hooks }, text, true);
   }
-  const scan = await getSecretScanner();
-  for (const s of scan(text)) fl.sec('SEC-SECRET', { line: s.line, message: `secret-shaped value (${s.id})`, evidence: s.redacted });
+  if (kind === 'settings' && sub === 'copilot' && v.disableAllHooks === true) {
+    fl.emit('HK-CP-DISABLED', keyLine(text, 'disableAllHooks'), '"disableAllHooks": true turns off every non-policy hook');
+  }
+  if (kind === 'hooks' && sub === 'copilot') lintCopilotHooks(fl, v, text);
+  if (kind === 'hooks' && sub === 'claude-plugin' && !(isObj(v) && Object.hasOwn(v, 'hooks'))) {
+    fl.emit('HK-CL-SHAPE', 1, 'plugin hooks files keep the {"hooks": {...}} wrapper; a file without it fails to load');
+  } else if (kind === 'hooks' && sub === 'claude-plugin') claude(v.hooks, { plugin: fl.cls.plugin || path.dirname(path.dirname(fl.abs)) });
+  if (kind === 'hooks' && sub === 'codex') lintCodexHooks(fl, v, text);
+  if (kind === 'hooks' && sub === 'codex' && /^\s*\[\[?hooks[.\]]/m.test(readNorm(path.join(path.dirname(fl.abs), 'config.toml')) || '')) {
+    fl.emit('HK-CX-BOTH', null, 'this layer defines hooks in both hooks.json and config.toml; Codex loads both and warns');
+  }
+  fl.secrets(text);
 }
 
 // ---------------------------------------------------------------------------
 // Plugins, marketplaces, MCP configs, Codex config.toml
 
-function pluginRootOf(fl) {
-  const d = path.dirname(fl.abs);
+function pluginRootOf(abs) {
+  const d = path.dirname(abs);
   const b = path.basename(d);
   if (['.claude-plugin', '.codex-plugin', '.plugin'].includes(b)) return path.dirname(d);
-  if (b === 'plugin' && path.basename(path.dirname(d)) === '.github') return path.dirname(path.dirname(d));
-  return d;
+  return b === 'plugin' && path.basename(path.dirname(d)) === '.github' ? path.dirname(path.dirname(d)) : d;
 }
 
 const AP_NAME = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
 const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-
-function projectSkillNames(root) {
-  const names = new Map();
-  for (const rel of ['.github/skills', '.agents/skills', '.claude/skills']) {
-    const d = path.join(root, rel);
-    let entries = [];
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) if (e.isDirectory() && fs.existsSync(path.join(d, e.name, 'SKILL.md'))) names.set(e.name, `${rel}/${e.name}`);
-  }
-  return names;
-}
+const hasSkill = (...p) => fs.existsSync(path.join(...p, 'SKILL.md'));
 
 function pluginSkillCollisions(fl, pluginRoot) {
-  const project = projectSkillNames(fl.run.root);
-  if (!project.size) return;
+  const project = new Map();
+  for (const rel of ['.github/skills', '.agents/skills', '.claude/skills']) {
+    for (const e of subdirs(path.join(fl.run.root, rel)).filter((x) => !project.has(x.name) && hasSkill(fl.run.root, rel, x.name))) {
+      project.set(e.name, `${rel}/${e.name}`);
+    }
+  }
   const skillsDir = path.join(pluginRoot, 'skills');
-  let entries = [];
-  try { entries = fs.readdirSync(skillsDir, { withFileTypes: true }); } catch { return; }
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const fm = parseFrontmatter(readTextNormalized(path.join(skillsDir, e.name, 'SKILL.md')) || '');
-    const name = typeof fm.data?.name === 'string' ? fm.data.name : e.name;
-    if (project.has(name) && path.resolve(path.join(fl.run.root, project.get(name))) !== path.resolve(path.join(skillsDir, e.name))) {
-      fl.emit('PL-SKILL-COLLISION', { message: `plugin skill "${name}" is shadowed by the project skill ${project.get(name)}` });
+  for (const e of project.size ? subdirs(skillsDir) : []) {
+    const fmName = parseFrontmatter(readNorm(path.join(skillsDir, e.name, 'SKILL.md')) || '').data?.name;
+    const n = typeof fmName === 'string' ? fmName : e.name;
+    if (project.has(n) && path.resolve(fl.run.root, project.get(n)) !== path.resolve(skillsDir, e.name)) {
+      fl.emit('PL-SKILL-COLLISION', null, `plugin skill "${n}" is shadowed by the project skill ${project.get(n)}`);
     }
   }
 }
 
-function checkComponentPath(fl, ruleId, field, value, root, { skills = false } = {}) {
-  const values = Array.isArray(value) ? value : [value];
-  for (const p of values) {
-    if (typeof p !== 'string') continue;
-    if (!(p.startsWith('./') || (skills && (p === '.' || p === './')))) { fl.emit(ruleId, { field, message: `"${field}" path "${p}" must start with ./` }); continue; }
-    if (p.includes('\\')) { fl.emit(ruleId, { field, message: `"${field}" path "${p}" uses backslashes` }); continue; }
-    const abs = path.resolve(root, p);
-    const rel = path.relative(root, abs);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) fl.emit(ruleId, { field, message: `"${field}" path "${p}" leaves the plugin root` });
-    else if (!fs.existsSync(abs)) fl.emit(ruleId, { field, message: `"${field}" path "${p}" does not exist` });
-  }
-}
-
-async function lintPlugin(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const parsed = parseJson(text);
-  if (parsed.error) { fl.emit('PL-JSON', { line: parsed.line, message: `invalid JSON: ${parsed.error}` }); return; }
-  const v = parsed.value;
-  const root = pluginRootOf(fl);
-  const L = (k) => jsonKeyLine(text, k);
-  if (!isObj(v)) { fl.emit('PL-JSON', { line: 1, message: 'the manifest must be a JSON object' }); return; }
-  const sub = fl.cls.sub;
+function lintPlugin(fl) {
+  const parsed = parseJson(fl.text);
+  const [v, root, { sub }] = [parsed.value, pluginRootOf(fl.abs), fl.cls];
+  const L = (k) => keyLine(fl.text, k);
+  const name = v?.name;
+  if (parsed.error) return fl.emit('PL-JSON', parsed.line, `invalid JSON: ${parsed.error}`);
+  if (!isObj(v)) return fl.emit('PL-JSON', 1, 'the manifest must be a JSON object');
+  const skillsDir = path.join(root, 'skills');
   if (sub === 'agent-plugins') {
-    if (!AP_SCHEMAS.includes(v.$schema)) fl.emit('PL-AP-SCHEMA', { line: L('$schema'), message: `$schema ${JSON.stringify(v.$schema)} is not a supported Agent Plugins version (1.0.0 or 1.1.0); Copilot rejects the plugin` });
-    for (const k of Object.keys(v)) if (!AP_FIELDS.has(k)) fl.emit('PL-AP-FIELD', { line: L(k), field: k, message: `"${k}" is outside the Agent Plugins field set (put client data under "extensions")` });
-    if (typeof v.name !== 'string' || !AP_NAME.test(v.name) || /--|\.\./.test(v.name)) fl.emit('PL-AP-NAME', { line: L('name'), message: `plugin name ${JSON.stringify(v.name)} is not 1-64 of a-z 0-9 - . with alphanumeric ends` });
-    if (fs.existsSync(path.join(root, 'SKILL.md')) && !fs.existsSync(path.join(root, 'skills'))) fl.emit('PL-AP-SKILLS', { message: 'a root SKILL.md is not loaded by Agent Plugins; move it to skills/<name>/SKILL.md' });
-    const skillsDir = path.join(root, 'skills');
-    for (const e of (statSafe(skillsDir)?.isDirectory() ? fs.readdirSync(skillsDir, { withFileTypes: true }) : [])) {
-      if (e.isDirectory() && !fs.existsSync(path.join(skillsDir, e.name, 'SKILL.md'))) {
-        const nested = fs.readdirSync(path.join(skillsDir, e.name), { withFileTypes: true }).some((x) => x.isDirectory() && fs.existsSync(path.join(skillsDir, e.name, x.name, 'SKILL.md')));
-        if (nested) fl.emit('PL-AP-SKILLS', { message: `skills/${e.name}/ nests skills one level too deep; only immediate subdirectories of skills/ load` });
+    if (!AP_SCHEMA('plugin').includes(v.$schema)) fl.emit('PL-AP-SCHEMA', L('$schema'), `$schema ${JSON.stringify(v.$schema)} is not 1.0.0 or 1.1.0`);
+    for (const k of Object.keys(v).filter((x) => !PLUGIN_FIELDS[sub].has(x))) {
+      fl.emit('PL-AP-FIELD', L(k), `"${k}" is outside the Agent Plugins field set (use "extensions")`, { field: k });
+    }
+    if (typeof name !== 'string' || !AP_NAME.test(name) || /--|\.\./.test(name)) {
+      fl.emit('PL-AP-NAME', L('name'), `plugin name ${JSON.stringify(name)} is not 1-64 of a-z 0-9 - . with alphanumeric ends`);
+    }
+    if (hasSkill(root) && !fs.existsSync(skillsDir)) fl.emit('PL-AP-SKILLS', null, 'a root SKILL.md is not loaded; move it to skills/<name>/');
+    for (const e of subdirs(skillsDir).filter((x) => !hasSkill(skillsDir, x.name))) {
+      if (subdirs(path.join(skillsDir, e.name)).some((y) => hasSkill(skillsDir, e.name, y.name))) {
+        fl.emit('PL-AP-SKILLS', null, `skills/${e.name}/ nests skills too deep; only immediate subdirectories of skills/ load`);
       }
     }
-    if (v.extensions !== undefined && !isObj(v.extensions)) fl.emit('PL-AP-FIELD', { line: L('extensions'), message: '"extensions" must be an object keyed by reverse-domain names' });
+    if (v.extensions !== undefined && !isObj(v.extensions)) fl.emit('PL-AP-FIELD', L('extensions'), '"extensions" must be an object');
   } else if (sub === 'copilot') {
-    if (typeof v.name !== 'string' || !KEBAB.test(v.name) || v.name.length > 64) fl.emit('PL-CP-MANIFEST', { line: L('name'), message: `plugin name ${JSON.stringify(v.name)} must be kebab-case, at most 64 characters` });
-    if (typeof v.description === 'string' && v.description.length > 1024) fl.emit('PL-CP-MANIFEST', { line: L('description'), message: `description has ${v.description.length} characters (max 1,024)` });
-    for (const k of Object.keys(v)) if (!CP_PLUGIN_FIELDS.has(k)) fl.emit('PL-CP-FIELD', { line: L(k), field: k, message: `unknown plugin field "${k}"` });
-    for (const f of ['agents', 'skills', 'commands', 'hooks', 'mcpServers', 'lspServers']) {
-      const val = v[f];
-      for (const p of (Array.isArray(val) ? val : [val])) {
-        if (typeof p === 'string' && !fs.existsSync(path.resolve(root, p))) fl.emit('PL-CP-MANIFEST', { line: L(f), field: f, message: `"${f}" path "${p}" does not exist` });
+    if (typeof name !== 'string' || !KEBAB.test(name) || name.length > 64) fl.emit('PL-CP-MANIFEST', L('name'), `name ${JSON.stringify(name)} is not kebab-case (max 64)`);
+    if (typeof v.description === 'string' && v.description.length > 1024) fl.emit('PL-CP-MANIFEST', L('description'), `description has ${v.description.length} characters (max 1,024)`);
+    fl.unknown(v, PLUGIN_FIELDS[sub], 'PL-CP-FIELD', L, 'plugin field');
+    for (const f of W('agents skills commands hooks mcpServers lspServers')) {
+      for (const p of strs(v[f]).filter((x) => !fs.existsSync(path.resolve(root, x)))) fl.emit('PL-CP-MANIFEST', L(f), `"${f}" path "${p}" does not exist`, { field: f });
+    }
+  } else if (sub === 'claude') claudePlugin(fl, v, root, L);
+  else if (sub === 'codex') {
+    for (const [obj, pre] of [[v, ''], [isObj(v.interface) ? v.interface : {}, 'interface.']]) {
+      for (const k of Object.keys(obj).filter((x) => CX_SNAKE[x])) {
+        fl.emit('PL-CX-FIELD', L(k), `"${pre}${k}" is snake_case; .codex-plugin/plugin.json uses "${CX_SNAKE[k]}"`, { field: `${pre}${k}`, severity: 'error' });
       }
     }
-  } else if (sub === 'claude') {
-    const name = v.name;
-    if (typeof name !== 'string' || !name) fl.emit('PL-CL-NAME', { line: L('name') || 1, message: '"name" is required' });
-    else {
-      if (!KEBAB.test(name)) fl.emit('PL-CL-NAME', { line: L('name'), message: `plugin name "${name}" is not kebab-case` });
-      if (CL_RESERVED_PLUGIN_NAMES.has(name) || CL_RESERVED_PLUGIN_PREFIXES.some((p) => name.startsWith(p))) fl.emit('PL-CL-NAME', { line: L('name'), message: `plugin name "${name}" is reserved` });
-      else if (/(?:^|-)(?:claude|anthropic)(?:-|$)/.test(name)) fl.emit('PL-CL-NAME-WORD', { line: L('name'), message: `plugin name "${name}" contains a reserved word` });
-    }
-    for (const k of Object.keys(v)) if (!CL_PLUGIN_FIELDS.has(k)) fl.emit('PL-CL-FIELD', { line: L(k), field: k, message: `unknown plugin field "${k}"` });
-    const missing = ['version', 'description', 'author'].filter((k) => v[k] === undefined);
-    if (missing.length) fl.emit('PL-CL-META', { message: `no ${missing.join(', ')} (claude plugin validate warns)` });
-    if (v.author !== undefined && !(isObj(v.author) && typeof v.author.name === 'string')) fl.emit('PL-CL-FIELD', { line: L('author'), field: 'author', message: '"author" needs a "name"' });
-    for (const f of CL_PLUGIN_PATH_FIELDS) {
-      if (v[f] === undefined || isObj(v[f])) continue;
-      if (Array.isArray(v[f])) checkComponentPath(fl, 'PL-CL-PATH', f, v[f].filter((x) => typeof x === 'string'), root, { skills: f === 'skills' });
-      else checkComponentPath(fl, 'PL-CL-PATH', f, v[f], root, { skills: f === 'skills' });
-    }
-    if (fs.existsSync(path.join(root, 'CLAUDE.md'))) fl.emit('PL-CL-CLAUDEMD', { message: 'CLAUDE.md at the plugin root is not loaded as context' });
-  } else if (sub === 'codex') {
-    for (const k of Object.keys(v)) {
-      if (CX_PLUGIN_SNAKE[k]) fl.emit('PL-CX-FIELD', { line: L(k), field: k, severity: 'error', message: `"${k}" is snake_case; .codex-plugin/plugin.json uses "${CX_PLUGIN_SNAKE[k]}"` });
-      else if (!CX_PLUGIN_FIELDS.has(k)) fl.emit('PL-CX-FIELD', { line: L(k), field: k, message: `unknown plugin field "${k}"` });
-    }
-    if (isObj(v.interface)) for (const k of Object.keys(v.interface)) if (CX_PLUGIN_SNAKE[k]) fl.emit('PL-CX-FIELD', { line: L(k), field: `interface.${k}`, severity: 'error', message: `"interface.${k}" is snake_case; use "${CX_PLUGIN_SNAKE[k]}"` });
+    fl.unknown(Object.fromEntries(Object.entries(v).filter(([k]) => !CX_SNAKE[k])), PLUGIN_FIELDS.codex, 'PL-CX-FIELD', L, 'plugin field');
   }
   pluginSkillCollisions(fl, root);
-  const scan = await getSecretScanner();
-  for (const s of scan(text)) fl.sec('SEC-SECRET', { line: s.line, message: `secret-shaped value (${s.id})`, evidence: s.redacted });
+  fl.secrets(fl.text);
+}
+
+function claudePlugin(fl, v, root, L) {
+  const name = v.name;
+  const reserved = typeof name === 'string' && (CL_RESERVED.has(name) || /^(?:claude|anthropics?|cc-plugin)-/.test(name));
+  const missing = ['version', 'description', 'author'].filter((k) => v[k] === undefined);
+  if (typeof name !== 'string' || !name) fl.emit('PL-CL-NAME', L('name') || 1, '"name" is required');
+  else if (!KEBAB.test(name)) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is not kebab-case`);
+  if (reserved) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is reserved`);
+  else if (/(?:^|-)(?:claude|anthropic)(?:-|$)/.test(name)) fl.emit('PL-CL-NAME-WORD', L('name'), `plugin name "${name}" contains a reserved word`);
+  fl.unknown(v, PLUGIN_FIELDS.claude, 'PL-CL-FIELD', L, 'plugin field');
+  if (missing.length) fl.emit('PL-CL-META', null, `no ${missing.join(', ')} (claude plugin validate warns)`);
+  if (v.author !== undefined && typeof v.author?.name !== 'string') fl.emit('PL-CL-FIELD', L('author'), '"author" needs a "name"', { field: 'author' });
+  for (const f of CL_PATH_FIELDS.filter((x) => v[x] !== undefined && !isObj(v[x]))) {
+    for (const p of strs(v[f])) {
+      const rel = path.relative(root, path.resolve(root, p));
+      const why = !(p.startsWith('./') || (f === 'skills' && (p === '.' || p === './'))) ? 'must start with ./'
+        : p.includes('\\') ? 'uses backslashes' : rel.startsWith('..') || path.isAbsolute(rel) ? 'leaves the plugin root'
+          : !fs.existsSync(path.resolve(root, p)) ? 'does not exist' : null;
+      if (why) fl.emit('PL-CL-PATH', null, `"${f}" path "${p}" ${why}`, { field: f });
+    }
+  }
+  if (fs.existsSync(path.join(root, 'CLAUDE.md'))) fl.emit('PL-CL-CLAUDEMD', null, 'CLAUDE.md at the plugin root is not loaded as context');
 }
 
 function sourcePinned(src) {
-  if (typeof src === 'string') return true;
   if (!isObj(src)) return true;
-  const kind = src.source;
-  if (['github', 'url', 'git-subdir', 'git'].includes(kind)) return typeof src.sha === 'string' && SHA40.test(src.sha);
-  if (kind === 'npm') return typeof src.version === 'string' && /\d/.test(src.version) && src.version !== 'latest';
-  if (kind === 'archive') return typeof src.sha256 === 'string' && /^[0-9a-f]{64}$/i.test(src.sha256);
-  return true;
+  if (['github', 'url', 'git-subdir', 'git'].includes(src.source)) return /^[0-9a-f]{40}$/i.test(String(src.sha ?? ''));
+  if (src.source === 'npm') return typeof src.version === 'string' && /\d/.test(src.version) && src.version !== 'latest';
+  return src.source !== 'archive' || /^[0-9a-f]{64}$/i.test(String(src.sha256 ?? ''));
 }
 
-async function lintMarketplace(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const parsed = parseJson(text);
-  if (parsed.error) { fl.emit('MK-JSON', { line: parsed.line, message: `invalid JSON: ${parsed.error}` }); return; }
-  const v = parsed.value;
-  const L = (k) => jsonKeyLine(text, k);
-  const sub = fl.cls.sub;
-  if (!isObj(v)) { fl.emit('MK-SHAPE', { line: 1, message: 'the marketplace must be a JSON object' }); return; }
-  if (typeof v.name !== 'string' || !v.name) fl.emit('MK-SHAPE', { line: L('name') || 1, message: '"name" is required' });
-  else if (sub === 'claude' && (CL_RESERVED_MARKETPLACES.has(v.name.toLowerCase()) || /^claudeai-/i.test(v.name))) fl.emit('MK-NAME-RESERVED', { line: L('name'), message: `marketplace name "${v.name}" is reserved` });
-  if (sub !== 'codex' && !(isObj(v.owner) && typeof v.owner.name === 'string')) fl.emit('MK-SHAPE', { line: L('owner') || 1, message: '"owner" with a "name" is required' });
-  if (!Array.isArray(v.plugins)) { fl.emit('MK-SHAPE', { line: L('plugins') || 1, message: '"plugins" must be an array' }); return; }
-  const known = sub === 'claude' ? CL_MKT_FIELDS : sub === 'codex' ? CX_MKT_FIELDS : CP_MKT_FIELDS;
-  if (sub !== 'codex') for (const k of Object.keys(v)) if (!known.has(k)) fl.emit('MK-FIELD', { only: [sub === 'claude' ? 'claude' : 'copilot'], line: L(k), field: k, message: `unknown top-level key "${k}"` });
+function lintMarketplace(fl) {
+  const parsed = parseJson(fl.text);
+  const [v, { sub }] = [parsed.value, fl.cls];
+  const L = (k) => keyLine(fl.text, k);
+  if (parsed.error) return fl.emit('MK-JSON', parsed.line, `invalid JSON: ${parsed.error}`);
+  if (!isObj(v)) return fl.emit('MK-SHAPE', 1, 'the marketplace must be a JSON object');
+  if (typeof v.name !== 'string' || !v.name) fl.emit('MK-SHAPE', L('name') || 1, '"name" is required');
+  else if (sub === 'claude' && (CL_RESERVED_MKT.has(v.name.toLowerCase()) || /^claudeai-/i.test(v.name))) {
+    fl.emit('MK-NAME-RESERVED', L('name'), `marketplace name "${v.name}" is reserved`);
+  }
+  if (sub !== 'codex' && typeof v.owner?.name !== 'string') fl.emit('MK-SHAPE', L('owner') || 1, '"owner" with a "name" is required');
+  if (!Array.isArray(v.plugins)) return fl.emit('MK-SHAPE', L('plugins') || 1, '"plugins" must be an array');
+  if (sub !== 'codex') fl.unknown(v, MKT_FIELDS[sub], 'MK-FIELD', L, 'top-level key', { only: [sub] });
   v.plugins.forEach((entry, i) => {
-    const line = isObj(entry) && entry.name ? jsonKeyLine(text, entry.name) || L('plugins') : L('plugins');
-    if (!isObj(entry) || typeof entry.name !== 'string' || entry.source === undefined) { fl.emit('MK-ENTRY', { line, message: `plugins[${i}] needs "name" and "source"` }); return; }
-    const src = entry.source;
-    if (typeof src === 'string') {
-      if (sub === 'claude' && !(src === '.' || src === './' || src.startsWith('./'))) fl.emit('MK-ENTRY', { only: ['claude'], line, message: `${entry.name}: relative source "${src}" must start with ./` });
-      if (src.split('/').includes('..')) fl.emit('MK-ENTRY', { line, message: `${entry.name}: source "${src}" must not use ..` });
-    } else if (isObj(src)) {
-      if (src.source === 'local' && typeof src.path === 'string' && src.path.split('/').includes('..')) fl.emit('MK-ENTRY', { line, message: `${entry.name}: source path must not use ..` });
-      if (!sourcePinned(src)) fl.emit('MK-UNPINNED', { line, message: `${entry.name}: ${src.source} source without a pinned ${src.source === 'npm' ? 'version' : src.source === 'archive' ? 'sha256' : '40-character sha'}` });
-    } else fl.emit('MK-ENTRY', { line, message: `${entry.name}: "source" must be a path string or an object` });
-    if (sub === 'claude' && entry.hooks !== undefined && !isObj(entry.hooks)) fl.emit('MK-HOOKS-PATH', { line, message: `${entry.name}: marketplace entries support hooks only as an inline object` });
+    const line = (isObj(entry) && entry.name && keyLine(fl.text, entry.name)) || L('plugins');
+    const src = entry?.source;
+    const E = (id, msg, o) => fl.emit(id, line, `${entry.name}: ${msg}`, o);
+    if (!isObj(entry) || typeof entry.name !== 'string' || src === undefined) return fl.emit('MK-ENTRY', line, `plugins[${i}] needs "name" and "source"`);
+    const pin = { npm: 'version', archive: 'sha256' }[src?.source] || '40-character sha';
+    if (typeof src === 'string' && sub === 'claude' && !(src === '.' || src.startsWith('./'))) {
+      E('MK-ENTRY', `relative source "${src}" must start with ./`, { only: ['claude'] });
+    }
+    if (typeof src === 'string' && src.split('/').includes('..')) E('MK-ENTRY', `source "${src}" must not use ..`);
+    if (src?.source === 'local' && String(src.path ?? '').split('/').includes('..')) E('MK-ENTRY', 'source path must not use ..');
+    if (!sourcePinned(src)) E('MK-UNPINNED', `${src.source} source without a pinned ${pin}`);
+    if (typeof src !== 'string' && !isObj(src)) E('MK-ENTRY', '"source" must be a path string or an object');
+    if (sub === 'claude' && entry.hooks !== undefined && !isObj(entry.hooks)) E('MK-HOOKS-PATH', 'hooks are supported only as an inline object');
   });
 }
 
 const SECRET_KEY = /(?:token|secret|password|passwd|api[_-]?key|apikey|auth|credential|bearer|cookie|private[_-]?key)/i;
+const literalCredential = (key, v) => typeof v === 'string' && v.length >= 8 && !/\$\{|\$[A-Z_]|\{\{|^\$|^<[^>]+>$|^[A-Z][A-Z0-9_]+$/.test(v)
+  && (/^(?:Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{12,}$/i.test(v)
+    || (SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(v) && /\d/.test(v) && /[A-Za-z]/.test(v)));
 
-function literalCredential(key, value) {
-  if (typeof value !== 'string' || value.length < 8) return false;
-  if (/\$\{|\$[A-Z_]|\{\{|^\$/.test(value) || /^<[^>]+>$/.test(value) || /^[A-Z][A-Z0-9_]+$/.test(value)) return false;
-  if (/^(?:Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{12,}$/i.test(value)) return true;
-  return SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(value) && /\d/.test(value) && /[A-Za-z]/.test(value);
-}
+const MCP_TYPES = { vscode: { copilot: W('stdio http sse') },
+  'agent-plugins': { copilot: W('stdio streamable-http sse'), codex: W('stdio streamable-http sse') },
+  other: { copilot: W('local stdio http sse'), claude: W('stdio http sse') } };
 
-async function mcpServerChecks(fl, name, s, text, { sub, hostTypes }) {
-  const line = jsonKeyLine(text, name);
-  if (!isObj(s)) { fl.emit('MC-SERVER', { line, message: `server "${name}" must be an object` }); return; }
-  const type = s.type;
-  for (const [host, types] of Object.entries(hostTypes)) {
-    if (type !== undefined && !types.includes(type)) fl.emit('MC-SERVER', { only: [host], line, severity: host === 'claude' && type === 'local' ? 'warning' : undefined, message: `server "${name}": type "${type}" is not one of ${types.join(', ')} for ${HOST_LABEL[host]}` });
+function mcpServer(fl, name, s, sub) {
+  const line = keyLine(fl.text, name);
+  const E = (id, msg, o) => fl.emit(id, line, `server "${name}": ${msg}`, o);
+  if (!isObj(s)) return E('MC-SERVER', 'must be an object');
+  for (const [host, types] of Object.entries(MCP_TYPES[sub] || MCP_TYPES.other)) {
+    if (s.type === undefined || types.includes(s.type)) continue;
+    E('MC-SERVER', `type "${s.type}" is not one of ${types.join(', ')} for ${LABEL[host]}`,
+      { only: [host], severity: host === 'claude' && s.type === 'local' ? 'warning' : null });
   }
-  if (typeof s.command !== 'string' && typeof s.url !== 'string') fl.emit('MC-SERVER', { line, message: `server "${name}" needs a "command" (local) or a "url" (remote)` });
-  if (typeof s.url === 'string') {
-    try {
-      const u = new URL(s.url);
-      if (u.protocol === 'http:' && !LOOPBACK.has(u.hostname)) fl.emit('MC-HTTP', { line, message: `server "${name}" uses plain http to ${u.hostname}` });
-    } catch { fl.emit('MC-SERVER', { line, message: `server "${name}": invalid url "${s.url}"` }); }
-  }
+  if (typeof s.command !== 'string' && typeof s.url !== 'string') E('MC-SERVER', 'needs a "command" (local) or a "url" (remote)');
+  let u = null;
+  try { u = typeof s.url === 'string' ? new URL(s.url) : null; } catch { E('MC-SERVER', `invalid url "${s.url}"`); }
+  if (u?.protocol === 'http:' && !LOOPBACK.has(u.hostname)) E('MC-HTTP', `uses plain http to ${u.hostname}`);
   if (JSON.stringify(s).includes('${input:')) {
-    fl.emit('MC-INPUT', { line, severity: sub === 'vscode' ? 'note' : undefined, message: sub === 'vscode' ? `server "${name}" uses \${input:...}; VS Code does not forward it to the Copilot harness` : `server "${name}" uses \${input:...}, which only VS Code resolves` });
+    E('MC-INPUT', sub === 'vscode' ? 'uses ${input:...}, which VS Code does not forward to the Copilot harness'
+      : 'uses ${input:...}, which only VS Code resolves', { severity: sub === 'vscode' ? 'note' : null });
   }
-  if (sub !== 'vscode' && sub !== 'agent-plugins') {
-    const missing = ['type', 'tools'].filter((k) => s[k] === undefined);
-    if (missing.length) fl.emit('MC-CLOUD', { line, message: `server "${name}" has no ${missing.map((k) => `"${k}"`).join(' or ')} (both are required when this JSON is pasted into the cloud agent's MCP settings)` });
-  }
-  for (const bag of ['env', 'headers']) {
-    if (!isObj(s[bag])) continue;
-    for (const [k, val] of Object.entries(s[bag])) {
-      if (literalCredential(k, val)) fl.sec('SEC-MCP-SECRET', { line: jsonKeyLine(text, k) || line, message: `server "${name}" ${bag}.${k} holds a literal credential; reference an environment variable (\${VAR})` });
+  const missing = /^(?:vscode|agent-plugins)$/.test(sub) ? [] : ['type', 'tools'].filter((k) => s[k] === undefined);
+  if (missing.length) E('MC-CLOUD', `no ${missing.map((k) => `"${k}"`).join(' or ')} (the cloud agent MCP settings need both)`);
+  for (const bag of ['env', 'headers'].filter((b) => isObj(s[b]))) {
+    for (const [k] of Object.entries(s[bag]).filter(([k, val]) => literalCredential(k, val))) {
+      fl.sec('SEC-MCP-SECRET', keyLine(fl.text, k) || line, `server "${name}" ${bag}.${k} holds a literal credential; use \${VAR}`);
     }
   }
-  const cmdLine = [s.command, ...(Array.isArray(s.args) ? s.args : [])].filter((x) => typeof x === 'string').join(' ');
-  const pkg = unpinnedPackage(cmdLine);
-  if (pkg) fl.sec('SEC-UNPINNED', { line, message: `server "${name}" runs ${pkg} without a pinned version`, evidence: cmdLine });
+  fl.unpinned([strs(s.command, Array.isArray(s.args) ? s.args : []).join(' ')], line, `server "${name}" `);
 }
 
-async function lintMcp(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const sub = fl.cls.sub;
-  const parsed = parseJson(text, { jsonc: sub === 'vscode' });
-  if (parsed.error) { fl.emit('MC-JSON', { line: parsed.line, message: `invalid JSON: ${parsed.error}` }); return; }
-  const v = parsed.value;
-  if (!isObj(v)) { fl.emit('MC-JSON', { line: 1, message: 'the MCP config must be a JSON object' }); return; }
-  let servers;
-  if (sub === 'vscode') {
-    fl.emit('MC-VSCODE-CLI', { message: 'Copilot CLI does not read .vscode/mcp.json; keep shared servers in .mcp.json' });
-    if (own(v, 'mcpServers') && !own(v, 'servers')) fl.emit('MC-TOPKEY', { line: jsonKeyLine(text, 'mcpServers'), message: 'VS Code reads "servers" in .vscode/mcp.json, not "mcpServers"' });
-    servers = v.servers ?? v.mcpServers;
-  } else if (sub === 'agent-plugins') {
-    if (!AP_MCP_SCHEMAS.includes(v.$schema)) fl.emit('PL-AP-MCP', { line: jsonKeyLine(text, '$schema') || 1, message: 'mcp.json must declare "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"' });
-    for (const k of Object.keys(v)) if (!['$schema', 'mcpServers'].includes(k)) fl.emit('PL-AP-MCP', { line: jsonKeyLine(text, k), message: `mcp.json may contain only $schema and mcpServers ("${k}")` });
-    servers = v.mcpServers;
-    for (const [name, s] of Object.entries(isObj(servers) ? servers : {})) {
-      if (!isObj(s)) continue;
-      const line = jsonKeyLine(text, name);
-      if (typeof s.command === 'string') {
-        if (/\s/.test(s.command.trim()) || path.isAbsolute(s.command) || WIN_ABS_RE.test(s.command)) fl.emit('PL-AP-MCP', { line, message: `server "${name}": command must be one token (a bare executable or ./relative path)` });
-        if (/\$\{PLUGIN_(?:ROOT|DATA)\}/.test(s.command)) fl.emit('PL-AP-MCP', { line, message: `server "${name}": \${PLUGIN_ROOT} expands only in args, env and cwd` });
-      }
-      if (s.cwd !== undefined && !/^(?:\.\/|\$\{PLUGIN_ROOT\}|\$\{PLUGIN_DATA\})/.test(String(s.cwd))) fl.emit('PL-AP-MCP', { line, message: `server "${name}": cwd must start with ./, \${PLUGIN_ROOT} or \${PLUGIN_DATA}` });
-      if (/\$\{PLUGIN_(?:ROOT|DATA)\}/.test(JSON.stringify([s.url ?? '', s.headers ?? {}]))) fl.emit('PL-AP-MCP', { line, message: `server "${name}": url and headers are not expanded` });
-    }
-  } else {
-    if (own(v, 'servers') && !own(v, 'mcpServers')) fl.emit('MC-TOPKEY', { line: jsonKeyLine(text, 'servers'), message: '"servers" is the VS Code format; Copilot CLI and Claude Code read "mcpServers"' });
-    servers = v.mcpServers;
-    if (servers === undefined && !own(v, 'servers') && Object.values(v).some((x) => isObj(x) && (x.command || x.url))) {
-      servers = v;
-      fl.emit('MC-TOPKEY', { only: ['claude'], line: 1, message: 'Claude Code expects servers under "mcpServers"' });
-    }
+function lintMcp(fl) {
+  const { sub } = fl.cls;
+  const parsed = parseJson(fl.text, { jsonc: sub === 'vscode' });
+  const [v, other] = [parsed.value, !/^(?:vscode|agent-plugins)$/.test(sub)];
+  const L = (k) => keyLine(fl.text, k);
+  if (parsed.error) return fl.emit('MC-JSON', parsed.line, `invalid JSON: ${parsed.error}`);
+  if (!isObj(v)) return fl.emit('MC-JSON', 1, 'the MCP config must be a JSON object');
+  const own = (k) => Object.hasOwn(v, k);
+  let servers = sub === 'vscode' ? v.servers ?? v.mcpServers : v.mcpServers;
+  if (sub === 'vscode') fl.emit('MC-VSCODE-CLI', null, 'Copilot CLI does not read .vscode/mcp.json; keep shared servers in .mcp.json');
+  if (sub === 'vscode' && own('mcpServers') && !own('servers')) fl.emit('MC-TOPKEY', L('mcpServers'), 'VS Code reads "servers" here, not "mcpServers"');
+  if (sub === 'agent-plugins') agentPluginsMcp(fl, v, L);
+  if (other && own('servers') && !own('mcpServers')) fl.emit('MC-TOPKEY', L('servers'), '"servers" is the VS Code format; use "mcpServers"');
+  if (other && servers === undefined && !own('servers') && Object.values(v).some((x) => isObj(x) && (x.command || x.url))) {
+    servers = v;
+    fl.emit('MC-TOPKEY', 1, 'Claude Code expects servers under "mcpServers"', { only: ['claude'] });
   }
-  if (servers !== undefined && !isObj(servers)) { fl.emit('MC-SERVER', { line: 1, message: 'the server map must be an object' }); return; }
-  const hostTypes = sub === 'vscode' ? { copilot: ['stdio', 'http', 'sse'] }
-    : sub === 'agent-plugins' ? { copilot: ['stdio', 'streamable-http', 'sse'], codex: ['stdio', 'streamable-http', 'sse'] }
-      : { copilot: ['local', 'stdio', 'http', 'sse'], claude: ['stdio', 'http', 'sse'] };
-  for (const [name, s] of Object.entries(servers || {})) await mcpServerChecks(fl, name, s, text, { sub, hostTypes });
-  const scan = await getSecretScanner();
-  for (const s of scan(text)) fl.sec('SEC-SECRET', { line: s.line, message: `secret-shaped value (${s.id})`, evidence: s.redacted });
+  if (servers !== undefined && !isObj(servers)) return fl.emit('MC-SERVER', 1, 'the server map must be an object');
+  for (const [name, s] of Object.entries(servers || {})) mcpServer(fl, name, s, sub);
+  fl.secrets(fl.text);
 }
 
-async function lintCodexConfig(fl) {
-  const text = readTextNormalized(fl.abs) || '';
-  const t = parseToml(text);
-  if (t.error) { fl.emit('CX-TOML', { line: t.error.line, message: `invalid TOML: ${t.error.message}` }); return; }
-  const v = t.value;
-  if (isObj(v.hooks)) {
-    lintCodexHooks(fl, { hooks: v.hooks }, text, { fromToml: true });
-    if (fs.existsSync(path.join(path.dirname(fl.abs), 'hooks.json'))) fl.emit('HK-CX-BOTH', { message: 'this layer defines hooks in both config.toml and hooks.json; Codex loads both and warns' });
+function agentPluginsMcp(fl, v, L) {
+  if (!AP_SCHEMA('mcp').includes(v.$schema)) fl.emit('PL-AP-MCP', L('$schema') || 1, `mcp.json must declare "$schema": "${AP_SCHEMA('mcp')[0]}"`);
+  for (const k of Object.keys(v).filter((x) => x !== '$schema' && x !== 'mcpServers')) {
+    fl.emit('PL-AP-MCP', L(k), `mcp.json may contain only $schema and mcpServers ("${k}")`);
   }
+  for (const [name, s] of Object.entries(isObj(v.mcpServers) ? v.mcpServers : {}).filter(([, x]) => isObj(x))) {
+    const E = (msg) => fl.emit('PL-AP-MCP', L(name), `server "${name}": ${msg}`);
+    const cmd = typeof s.command === 'string' ? s.command : null;
+    if (cmd && (/\s/.test(cmd.trim()) || path.isAbsolute(cmd) || WIN_ABS.test(cmd))) E('command must be one token (an executable or ./path)');
+    if (cmd && /\$\{PLUGIN_(?:ROOT|DATA)\}/.test(cmd)) E('${PLUGIN_ROOT} expands only in args, env and cwd');
+    if (s.cwd !== undefined && !/^(?:\.\/|\$\{PLUGIN_(?:ROOT|DATA)\})/.test(String(s.cwd))) E('cwd must start with ./, ${PLUGIN_ROOT} or ${PLUGIN_DATA}');
+    if (/\$\{PLUGIN_(?:ROOT|DATA)\}/.test(JSON.stringify([s.url ?? '', s.headers ?? {}]))) E('url and headers are not expanded');
+  }
+}
+
+function lintCodexConfig(fl) {
+  const t = parseToml(fl.text);
+  const [v, K] = [t.value, (k) => t.keyLines[k] || null];
+  if (t.error) return fl.emit('CX-TOML', t.error.line, `invalid TOML: ${t.error.message}`);
   const sc = isObj(v.skills) ? v.skills.config : undefined;
-  if (sc !== undefined) {
-    if (!Array.isArray(sc)) fl.emit('CX-SKILLS-CONFIG', { line: t.keyLines['skills.config'] || null, message: 'skills.config must be an array of tables ([[skills.config]])' });
-    else sc.forEach((e, i) => {
-      const sel = ['path', 'name'].filter((k) => isObj(e) && e[k] !== undefined);
-      if (sel.length !== 1 || typeof e.enabled !== 'boolean') fl.emit('CX-SKILLS-CONFIG', { line: t.keyLines['skills.config'] || null, message: `[[skills.config]] #${i + 1} needs exactly one of path or name, and enabled = true|false` });
-    });
+  if (isObj(v.hooks)) lintCodexHooks(fl, { hooks: v.hooks }, fl.text, true);
+  if (isObj(v.hooks) && fs.existsSync(path.join(path.dirname(fl.abs), 'hooks.json'))) {
+    fl.emit('HK-CX-BOTH', null, 'this layer defines hooks in both config.toml and hooks.json; Codex loads both and warns');
   }
-  if (own(v, 'mcpServers')) fl.emit('CX-MCP', { message: 'Codex reads [mcp_servers.<name>], not mcpServers' });
-  if (isObj(v.mcp_servers)) {
-    for (const [name, s] of Object.entries(v.mcp_servers)) {
-      if (!isObj(s) || (typeof s.command !== 'string' && typeof s.url !== 'string')) fl.emit('CX-MCP', { line: t.keyLines[`mcp_servers.${name}`] || null, message: `[mcp_servers.${name}] needs a command or a url` });
-      if (isObj(s?.env)) for (const [k, val] of Object.entries(s.env)) if (literalCredential(k, val)) fl.sec('SEC-MCP-SECRET', { line: t.keyLines[`mcp_servers.${name}.env.${k}`] || t.keyLines[`mcp_servers.${name}.env`] || null, message: `[mcp_servers.${name}] env.${k} holds a literal credential` });
-      const cmdLine = [s?.command, ...(Array.isArray(s?.args) ? s.args : [])].filter((x) => typeof x === 'string').join(' ');
-      const pkg = unpinnedPackage(cmdLine);
-      if (pkg) fl.sec('SEC-UNPINNED', { message: `[mcp_servers.${name}] runs ${pkg} without a pinned version`, evidence: cmdLine });
+  if (sc !== undefined && !Array.isArray(sc)) fl.emit('CX-SKILLS-CONFIG', K('skills.config'), 'skills.config must be an array of tables');
+  for (const [i, e] of (Array.isArray(sc) ? sc : []).entries()) {
+    if (['path', 'name'].filter((k) => isObj(e) && e[k] !== undefined).length === 1 && typeof e.enabled === 'boolean') continue;
+    fl.emit('CX-SKILLS-CONFIG', K('skills.config'), `[[skills.config]] #${i + 1} needs one of path or name, and enabled = true|false`);
+  }
+  if (Object.hasOwn(v, 'mcpServers')) fl.emit('CX-MCP', null, 'Codex reads [mcp_servers.<name>], not mcpServers');
+  for (const [name, s] of Object.entries(isObj(v.mcp_servers) ? v.mcp_servers : {})) {
+    const at = `[mcp_servers.${name}]`;
+    if (!isObj(s) || (typeof s.command !== 'string' && typeof s.url !== 'string')) fl.emit('CX-MCP', K(`mcp_servers.${name}`), `${at} needs a command or a url`);
+    for (const [k] of Object.entries(isObj(s?.env) ? s.env : {}).filter(([k, val]) => literalCredential(k, val))) {
+      fl.sec('SEC-MCP-SECRET', K(`mcp_servers.${name}.env.${k}`) || K(`mcp_servers.${name}.env`), `${at} env.${k} holds a literal credential`);
     }
+    fl.unpinned([strs(s?.command, Array.isArray(s?.args) ? s.args : []).join(' ')], null, `${at} `);
   }
-  const scan = await getSecretScanner();
-  for (const s of scan(text)) fl.sec('SEC-SECRET', { line: s.line, message: `secret-shaped value (${s.id})`, evidence: s.redacted });
+  fl.secrets(fl.text);
 }
 
 // ---------------------------------------------------------------------------
 // External validators (run when installed; results merged into the per-host findings)
 
-/** Spawn a validator CLI (Windows: .cmd shims through the shell); the default `exec` of runExternalValidators. */
-export function execTool(exe, args, { cwd, env, timeoutMs = 90_000 } = {}) {
-  let file = exe;
-  // npm puts an extensionless sh script next to the .cmd shim; Windows cannot spawn the former.
-  if (IS_WINDOWS && !path.extname(file)) file = ['.exe', '.cmd', '.bat'].map((e) => file + e).find((f) => fs.existsSync(f)) || file;
-  // npm-installed CLIs are .cmd shims on Windows, which only start through the shell.
-  if (IS_WINDOWS && /\.(?:cmd|bat)$/i.test(file)) return runShell([quoteArg(file), ...args.map(quoteArg)].join(' '), { cwd, env, timeoutMs });
-  return run(file, args, { cwd, env, timeoutMs });
-}
+/** Spawn a validator CLI (Windows `.cmd` shims go through the shell; 90 s default timeout); the default `exec`. */
+export const execTool = (exe, args, opts = {}) => runTool(exe, args, { timeoutMs: 90_000, ...opts });
 
-const firstLines = (text, n = 8) => String(text || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, n);
-
-function realOrResolved(p) {
-  let r = path.resolve(p);
-  try { r = fs.realpathSync.native(r); } catch {}
-  return IS_WINDOWS ? r.toLowerCase() : r;
-}
-const samePath = (a, b) => realOrResolved(a) === realOrResolved(b);
-
-/** Skill folders each host lists from `root` (only skills there can be checked with the host CLI). */
+/** Skill folders a host lists when started at `root` (only skills there can be checked with the host CLI). */
 function hostSkillRoots(host, root, env, home) {
-  const H = homeDirs(env, home);
-  if (host === 'copilot') {
-    const extra = String(env.COPILOT_SKILLS_DIRS || '').split(',').map((d) => d.trim()).filter(Boolean);
-    return [path.join(root, '.github', 'skills'), path.join(root, '.agents', 'skills'), path.join(root, '.claude', 'skills'),
-      `${H.copilot}/skills`, `${H.home}/.agents/skills`, ...extra];
-  }
+  const H = homes(env, home);
   // Codex reads .agents/skills from the project root down to the cwd (the root here) and ~/.agents/skills.
-  return [path.join(root, '.agents', 'skills'), `${H.home}/.agents/skills`];
+  if (host === 'codex') return [path.join(root, '.agents', 'skills'), `${H.home}/.agents/skills`];
+  return [...['.github', '.agents', '.claude'].map((d) => path.join(root, d, 'skills')), `${H.copilot}/skills`,
+    `${H.home}/.agents/skills`, ...String(env.COPILOT_SKILLS_DIRS || '').split(',').map((d) => d.trim()).filter(Boolean)];
 }
 const listedFrom = (s, roots) => roots.some((r) => samePath(path.dirname(s.dir), r));
-
 // gh skill publish discovers skills/<name>, skills/<scope>/<name>, <name> at the root and plugins/<scope>/skills/<name>.
-function ghDiscovers(s, root) {
-  const rel = toPosix(path.relative(root, s.dir));
-  return /^skills\/[^/]+$/.test(rel) || /^skills\/[^/]+\/[^/]+$/.test(rel) || /^[^/.][^/]*$/.test(rel) || /^plugins\/[^/]+\/skills\/[^/]+$/.test(rel);
-}
-
-/** Instruction files `copilot instruction list` reports for the repository root (nested AGENTS.md load per cwd). */
-function copilotListsInstruction(file, root) {
-  const rel = toPosix(path.relative(root, file));
-  return /^(?:AGENTS|CLAUDE|GEMINI)\.md$/.test(rel) || rel === '.github/copilot-instructions.md' ||
-    /^\.github\/instructions\/.+\.instructions\.md$/.test(rel) || /^\.claude\/rules\/.+\.md$/.test(rel);
-}
+const GH_DISCOVERS = /^(?:skills\/[^/]+(?:\/[^/]+)?|[^/.][^/]*|plugins\/[^/]+\/skills\/[^/]+)$/;
+// Instruction files `copilot instruction list` reports for the repository root (nested AGENTS.md files load per cwd).
+const CP_LISTED = /^(?:(?:AGENTS|CLAUDE|GEMINI)\.md|\.github\/copilot-instructions\.md|\.github\/instructions\/.+\.instructions\.md|\.claude\/rules\/.+\.md)$/;
 
 /** skills-ref prints "Validation failed for <dir>:" and one "- <problem>" item per problem (items may wrap). */
 function skillsRefProblems(text) {
+  const lines = String(text || '').split(/\r?\n/);
   const items = [];
-  for (const line of String(text || '').split(/\r?\n/)) {
-    const m = /^\s*- (.*)$/.exec(line);
-    if (m) items.push(m[1].trim());
-    else if (items.length && line.trim()) items[items.length - 1] += ` ${line.trim()}`;
+  for (const l of lines) {
+    if (/^\s*- /.test(l)) items.push(l.replace(/^\s*- /, '').trim());
+    else if (items.length && l.trim()) items[items.length - 1] += ` ${l.trim()}`;
   }
-  const out = items.length ? items : firstLines(text).filter((l) => !/^Validation failed for\b/.test(l));
-  return out.map((m) => truncate(m.replace(/\s+/g, ' '), 300));
+  return (items.length ? items : lines.map((l) => l.trim()).filter((l) => l && !/^Validation failed for\b/.test(l)).slice(0, 8))
+    .map((m) => truncate(m.replace(/\s+/g, ' '), 300));
 }
 
-/** Skills named in Codex's <skills_instructions> block: [{ name, file }] or null when the block is absent. */
+/** Skills named in Codex's <skills_instructions> block: [{ name, file }], or null when the block is absent. */
 export function codexListedSkills(stdout) {
   const texts = [];
-  const collect = (v) => {
-    if (typeof v === 'string') { if (v.includes('<skills_instructions>')) texts.push(v); }
-    else if (Array.isArray(v)) v.forEach(collect);
-    else if (isObj(v)) Object.values(v).forEach(collect);
-  };
+  const collect = (v) => (typeof v === 'string' ? v.includes('<skills_instructions>') && texts.push(v)
+    : v && typeof v === 'object' && Object.values(v).forEach(collect));
   try { collect(JSON.parse(stdout)); } catch {}
   if (!texts.length && String(stdout).includes('<skills_instructions>')) texts.push(String(stdout).replace(/\\n/g, '\n').replace(/\\"/g, '"'));
   if (!texts.length) return null;
-  const out = [];
-  for (const t of texts) {
-    const block = t.slice(t.indexOf('<skills_instructions>'), t.includes('</skills_instructions>') ? t.indexOf('</skills_instructions>') : undefined);
-    const roots = {};
-    for (const m of block.matchAll(/^- `(r\d+)` = `([^`]+)`\s*$/gm)) roots[m[1]] = m[2];
-    for (const line of block.split('\n')) {
-      const m = /^- ([^:`\n][^:\n]*): .*\(file: ([^)]+)\)\s*$/.exec(line);
-      if (!m) continue;
-      const f = m[2].trim();
-      const alias = /^(r\d+)\/(.*)$/.exec(f);
-      out.push({ name: m[1].trim(), file: alias && roots[alias[1]] ? path.join(roots[alias[1]], ...alias[2].split('/')) : f });
+  return texts.flatMap((t) => {
+    const end = t.indexOf('</skills_instructions>');
+    const block = t.slice(t.indexOf('<skills_instructions>'), end < 0 ? undefined : end);
+    const roots = Object.fromEntries([...block.matchAll(/^- `(r\d+)` = `([^`]+)`\s*$/gm)].map((m) => [m[1], m[2]]));
+    return [...block.matchAll(/^- ([^:`\n][^:\n]*): .*\(file: ([^)]+)\)\s*$/gm)].map(([, name, file]) => {
+      const alias = /^(r\d+)\/(.*)$/.exec(file.trim());
+      return { name: name.trim(), file: alias && roots[alias[1]] ? path.join(roots[alias[1]], ...alias[2].split('/')) : file.trim() };
+    });
+  });
+}
+
+/** `claude plugin validate --json` report → { status, summary, findings }, or null when nothing was validated. */
+function claudeReport(report, dir) {
+  const contents = Array.isArray(report.contents) ? report.contents : [];
+  const mErrors = Array.isArray(report.manifest?.errors) ? report.manifest.errors : [];
+  // Measured on 2.1.310: a bare skills directory yields success with manifest null and contents []: nothing validated.
+  if (!fs.existsSync(path.join(dir, '.claude-plugin')) && !contents.length && (!report.manifest || mErrors.every((e) => e.path === 'directory'))) {
+    return null;
+  }
+  const findings = [];
+  const F = (abs, severity, message) => findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity, message });
+  for (const entry of [report.manifest, ...contents].filter((e) => isObj(e) && e.file && !statOrNull(path.resolve(dir, e.file))?.isDirectory())) {
+    for (const [list, sev] of [[entry.errors, 'error'], [entry.warnings, 'warning']]) {
+      for (const e of list || []) F(path.resolve(dir, entry.file), sev, `claude plugin validate: ${e.path ? `${e.path}: ` : ''}${e.message}`);
     }
+  }
+  // Plugin-directory listing findings (README, LICENSE, icon) concern publishing, not loading.
+  const manifest = ['plugin.json', 'marketplace.json'].map((f) => path.join(dir, '.claude-plugin', f)).find((f) => fs.existsSync(f));
+  for (const d of manifest && Array.isArray(report.directory?.findings) ? report.directory.findings : []) {
+    F(manifest, 'note', `claude plugin validate (plugin directory listing): ${d.title || d.code}${d.message ? `: ${truncate(d.message, 160)}` : ''}`);
+  }
+  const dirErrors = statOrNull(path.resolve(dir, report.manifest?.file || '.'))?.isDirectory() ? mErrors : [];
+  const failed = report.success === false || findings.some((f) => f.severity === 'error');
+  const n = findings.filter((f) => f.severity !== 'note').length || dirErrors.length;
+  return { status: failed ? 'fail' : 'pass', findings,
+    summary: failed ? `${n} issue(s)${dirErrors.length ? `: ${dirErrors[0].message}` : ''}` : 'validation passed' };
+}
+
+/** Findings for skills a host CLI lists (`listed`: [{ name, path|file, enabled? }]). */
+function listingFindings(skills, listed, { host, rule, tool, here, other, missing }) {
+  return skills.flatMap((s) => {
+    const name = s.name || path.basename(s.dir);
+    const at = listed.find((x) => here(x, s));
+    const elsewhere = listed.find((x) => x.name === name);
+    const [severity, message] = at?.enabled === false ? ['warning', `${tool} shows "${name}" as disabled`] : at ? []
+      : elsewhere ? ['note', other(name, elsewhere)] : ['warning', `${tool} does not show "${name}"${missing}`];
+    return severity ? [{ abs: s.file, host, rule, severity, message }] : [];
+  });
+}
+
+/**
+ * Run the hosts' own validators that are installed. `targets`: { root, skills: [{dir, file, name}], plugins: [dir],
+ * instructions: [abs], codexConfigs: [abs], hosts, env, home }. Returns [{ tool, target, status: 'pass'|'fail'|'error'|
+ * 'skipped'|'not-applicable', exit, command, summary, findings: [{ abs, host, rule, severity, message }] }]; only `pass`
+ * is a pass. `exec`, `which` and `version` are injectable.
+ */
+export function runExternalValidators(targets, { exec = execTool, which: whichFn = which, version = toolVersion } = {}) {
+  const out = [];
+  const { root, skills = [], plugins = [], instructions = [], codexConfigs = [], hosts = HOSTS, env = process.env } = targets;
+  const home = targets.home || os.homedir();
+  const want = (h) => hosts.includes(h);
+  // Paths inside the root are shown relative to it, others (user-scope files) in full.
+  const rel = (p) => { const r = path.relative(root, String(p)); return !r ? '.' : r.startsWith('..') || path.isAbsolute(r) ? toPosix(p) : toPosix(r); };
+  const statusOf = (r) => (r.exit === 0 ? 'pass' : r.exit === null || r.error ? 'error' : 'fail');
+  const failOf = (findings) => (findings.some((f) => f.severity !== 'note') ? 'fail' : 'pass');
+  const push = (tool, target, status, command, summary, findings = [], exit = null) =>
+    out.push({ tool, target, status, exit, command, summary: redactSecrets(summary), findings });
+  const first = (r) => firstLine(r.stderr || r.stdout);
+  const ctx = { exec, whichFn, version, push, rel, first, root };
+
+  const refExe = want('spec') && skills.length ? whichFn('skills-ref') : null;
+  for (const s of want('spec') ? skills : []) {
+    const command = `skills-ref validate ${rel(s.dir)}`;
+    if (!refExe) {
+      push('skills-ref', rel(s.dir), 'skipped', command, 'skills-ref is not on PATH (uv tool install '
+        + '"git+https://github.com/agentskills/agentskills#subdirectory=skills-ref")');
+      continue;
+    }
+    const r = exec(refExe, ['validate', s.dir], { cwd: root });
+    const status = statusOf(r);
+    const problems = status !== 'fail' ? [] : skillsRefProblems(`${r.stdout}\n${r.stderr}`);
+    if (status === 'fail' && !problems.length) problems.push('validation failed');
+    push('skills-ref', rel(s.dir), status, command, status === 'fail' ? `${problems.length} problem(s): ${problems[0]}`
+      : firstLine(`${r.stdout}\n${r.stderr}`) || status,
+    problems.map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error', message: `skills-ref: ${m}` })), r.exit);
+  }
+
+  const claudeDirs = want('claude') ? [...new Set([...plugins, ...skills.map((s) => path.dirname(s.dir)).filter((d) => path.basename(d) === 'skills')])] : [];
+  const clExe = claudeDirs.length ? whichFn('claude') : null;
+  const clV = clExe ? version('claude') : null;
+  for (const dir of claudeDirs) {
+    const [tool, command] = ['claude plugin validate', `claude plugin validate ${rel(dir)} --strict --json`];
+    const skip = !clExe ? 'claude is not on PATH' : !clV?.version || !versionGte(clV.version, '2.1.259')
+      ? `Claude Code ${clV?.version || '?'} is older than 2.1.259 (no --json)` : null;
+    if (skip) { push(tool, rel(dir), 'skipped', command, skip); continue; }
+    const r = exec(clExe, ['plugin', 'validate', dir, '--strict', '--json'], { cwd: root });
+    let report = null;
+    try { report = JSON.parse(r.stdout); } catch {}
+    const res = isObj(report) && r.exit !== 2 && r.exit !== null ? claudeReport(report, dir) : undefined;
+    if (res === undefined) push(tool, rel(dir), 'error', command, first(r) || 'no JSON report', [], r.exit);
+    else if (res === null) push(tool, rel(dir), 'not-applicable', command, 'a bare skills directory is not validated (contents: [])', [], r.exit);
+    else push(tool, rel(dir), res.status, command, res.summary, res.findings, r.exit);
+  }
+
+  if (want('spec') && skills.length) ghSkillPublish(skills, ctx);
+  if (want('copilot') && (skills.length || instructions.length)) copilotLists(skills, instructions, { ...ctx, env, home, failOf });
+  if (want('codex') && skills.length) codexSkills(skills, { ...ctx, env, home, failOf });
+  if (want('codex') && codexConfigs.length) codexDoctor(codexConfigs, ctx);
+
+  const wazaExe = want('copilot') && skills.length ? whichFn('waza') : null;
+  for (const s of want('copilot') ? skills : []) {
+    const name = s.name || path.basename(s.dir);
+    const evalFile = [path.join(root, 'evals', name, 'eval.yaml'), path.join(s.dir, 'evals', 'eval.yaml')].find((f) => fs.existsSync(f));
+    const command = `waza spec verify ${rel(s.dir)} ${evalFile ? rel(evalFile) : `evals/${name}/eval.yaml`} --fail`;
+    if (!wazaExe || !evalFile) { push('waza', rel(s.dir), 'skipped', command, !wazaExe ? 'waza is not on PATH' : 'no eval.yaml for this skill'); continue; }
+    const r = exec(wazaExe, ['spec', 'verify', s.dir, evalFile, '--fail'], { cwd: root });
+    const [status, line] = [statusOf(r), firstLine(`${r.stdout}\n${r.stderr}`)];
+    push('waza', rel(s.dir), status, command, line || status, status !== 'fail' ? []
+      : [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning', message: `waza spec verify: ${line || 'failed'}` }], r.exit);
   }
   return out;
 }
 
-/**
- * Run the hosts' own validators that are installed. `targets`: { root, skills: [{dir, file, name}],
- * plugins: [dir], instructions: [abs], codexConfigs: [abs], hosts: [...], env, home }. Returns
- * [{ tool, target, status: 'pass'|'fail'|'error'|'skipped'|'not-applicable', exit, command, summary,
- * findings: [{ abs, host, rule, severity, message }] }]. `exec`, `which` and `version` are injectable.
- */
-export function runExternalValidators(targets, { exec = execTool, which: whichFn = which, version = toolVersion } = {}) {
-  const out = [];
-  const { root, skills = [], plugins = [], instructions = [], codexConfigs = [], hosts = HOSTS, env = process.env, home = os.homedir() } = targets;
-  const want = (h) => hosts.includes(h);
-  // Paths inside the root are shown relative to it, others (user-scope files) in full.
-  const shown = (p) => { const r = path.relative(root, String(p)); return r === '' ? '.' : !r.startsWith('..') && !path.isAbsolute(r) ? toPosix(r) : toPosix(p); };
-  const rel = shown;
-  const statusOf = (r) => (r.exit === 0 ? 'pass' : r.exit === null || r.error ? 'error' : 'fail');
-  const push = (tool, target, status, command, summary, findings = [], exit = null) => out.push({ tool, target, status, exit, command, summary, findings });
+function ghSkillPublish(skills, { exec, whichFn, version, push, rel, first, root }) {
+  const [tool, command] = ['gh skill publish', `gh skill publish --dry-run ${rel(root)}`];
+  const ghSkills = skills.filter((s) => GH_DISCOVERS.test(toPosix(path.relative(root, s.dir))));
+  const exe = ghSkills.length ? whichFn('gh') : null;
+  const v = exe ? version('gh') : null;
+  if (!ghSkills.length) return push(tool, '.', 'not-applicable', command, 'no linted skill is where gh skill publish looks');
+  if (!exe) return push(tool, '.', 'skipped', command, 'gh is not on PATH');
+  if (!v?.version || !versionGte(v.version, '2.90.0')) return push(tool, '.', 'skipped', command, `gh ${v?.version || '?'} has no "gh skill" (2.90.0+)`);
+  const r = exec(exe, ['skill', 'publish', '--dry-run', root], { cwd: root });
+  // Output lines are "<error|warning>\t<skill>\t<message>"; repository-level lines have no skill.
+  const lines = [...`${r.stdout}\n${r.stderr}`.matchAll(/^(error|warning)\t([^\t\n]*)\t(.+)$/gm)].map(([, sev, name, msg]) => ({ sev, name,
+    msg: msg.trim(), s: name ? ghSkills.find((x) => x.name === name || path.basename(x.dir) === name) : null }));
+  const findings = lines.filter((l) => l.s).map((l) => ({ abs: l.s.file, host: 'spec', rule: 'EXT-GH-SKILL',
+    severity: l.sev === 'error' ? 'error' : 'note', message: `gh skill publish --dry-run: ${l.msg}` }));
+  const errors = findings.filter((f) => f.severity === 'error').length;
+  const status = r.exit === 0 ? 'pass' : errors ? 'fail' : 'error';
+  const head = status === 'pass' ? 'dry run passed' : errors ? `${errors} validation error(s)` : first(r) || 'gh failed';
+  push(tool, '.', status, command, [head, ...lines.filter((l) => !l.name).map((l) => `${l.sev}: ${l.msg}`)].join('; '), findings, r.exit);
+}
 
-  if (want('spec') && skills.length) {
-    const exe = whichFn('skills-ref');
-    for (const s of skills) {
-      const command = `skills-ref validate ${rel(s.dir)}`;
-      if (!exe) { push('skills-ref', rel(s.dir), 'skipped', command, 'skills-ref is not on PATH (uv tool install "git+https://github.com/agentskills/agentskills#subdirectory=skills-ref")'); continue; }
-      const r = exec(exe, ['validate', s.dir], { cwd: root });
-      const status = statusOf(r);
-      const problems = status === 'fail' ? skillsRefProblems(`${r.stdout}\n${r.stderr}`) : [];
-      push('skills-ref', rel(s.dir), status, command, status === 'fail' ? `${problems.length} problem(s): ${problems[0] || 'validation failed'}` : firstLines(r.stdout + '\n' + r.stderr)[0] || status,
-        (problems.length ? problems : status === 'fail' ? ['validation failed'] : []).map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error', message: `skills-ref: ${m}` })), r.exit);
-    }
+function copilotLists(skills, instructions, { exec, whichFn, push, rel, root, env, home, failOf }) {
+  const cpSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('copilot', root, env, home)));
+  const cpInstructions = instructions.filter((f) => CP_LISTED.test(toPosix(path.relative(root, f))));
+  const exe = cpSkills.length || cpInstructions.length ? whichFn('copilot') : null;
+  const both = 'copilot skill list --json; copilot instruction list --json';
+  if (!cpSkills.length && !cpInstructions.length) return push('copilot', '.', 'not-applicable', both, 'no linted file is where Copilot CLI lists from the root');
+  if (!exe) return push('copilot', '.', 'skipped', both, 'copilot is not on PATH');
+  for (const [kind, list] of [['skill', cpSkills], ['instruction', cpInstructions]].filter(([, l]) => l.length)) {
+    const r = exec(exe, [kind, 'list', '--json'], { cwd: root, timeoutMs: 60_000 });
+    let rows = null;
+    try { const j = JSON.parse(r.stdout); rows = [j, j?.skills, j?.instructions].find(Array.isArray) || null; } catch {}
+    const listed = (rows || []).filter((x) => x.sourcePath).map((x) => path.resolve(root, String(x.sourcePath)));
+    const findings = !rows ? [] : kind === 'skill' ? listingFindings(list, rows, { host: 'copilot', rule: 'EXT-COPILOT-SKILL',
+      tool: 'copilot skill list', here: (x, s) => x.path && samePath(String(x.path), s.dir), missing: ' although it is in a Copilot skill folder',
+      other: (n, o) => `Copilot loads "${n}" from ${o.path ? rel(o.path) : o.source || '?'} (first found wins); this copy is not used by Copilot` })
+      : list.filter((f) => !listed.some((l) => samePath(l, f))).map((f) => ({ abs: f, host: 'copilot', rule: 'EXT-COPILOT-INSTRUCTION',
+        severity: 'warning', message: 'copilot instruction list does not show this file' }));
+    const summary = rows ? `${rows.length} ${kind === 'skill' ? 'skill(s)' : 'instruction source(s)'} listed` : firstLine(r.stderr) || 'no JSON output';
+    push(`copilot ${kind} list`, '.', rows ? failOf(findings) : 'error', `copilot ${kind} list --json`, summary, findings, r.exit);
   }
+}
 
-  const claudeDirs = [...new Set([...plugins, ...skills.map((s) => path.dirname(s.dir)).filter((d) => path.basename(d) === 'skills')])];
-  if (want('claude') && claudeDirs.length) {
-    const exe = whichFn('claude');
-    const v = exe ? version('claude') : null;
-    for (const dir of claudeDirs) {
-      const command = `claude plugin validate ${rel(dir)} --strict --json`;
-      if (!exe) { push('claude plugin validate', rel(dir), 'skipped', command, 'claude is not on PATH'); continue; }
-      if (!v || !v.version || !versionGte(v.version, '2.1.259')) { push('claude plugin validate', rel(dir), 'skipped', command, `Claude Code ${v?.version || '?'} is older than 2.1.259 (no --json)`); continue; }
-      const r = exec(exe, ['plugin', 'validate', dir, '--strict', '--json'], { cwd: root });
-      let report = null;
-      try { report = JSON.parse(r.stdout); } catch {}
-      if (!isObj(report) || r.exit === 2 || r.exit === null) {
-        push('claude plugin validate', rel(dir), 'error', command, firstLines(r.stderr || r.stdout)[0] || 'no JSON report', [], r.exit);
-        continue;
-      }
-      const contents = Array.isArray(report.contents) ? report.contents : [];
-      const manifestErrors = isObj(report.manifest) && Array.isArray(report.manifest.errors) ? report.manifest.errors : [];
-      const bareSkills = !fs.existsSync(path.join(dir, '.claude-plugin'));
-      // Measured on 2.1.310: a skills directory yields success with manifest null and contents [];
-      // that only means nothing was validated, never that the skills passed.
-      if (bareSkills && !contents.length && (!report.manifest || manifestErrors.every((e) => e.path === 'directory'))) {
-        push('claude plugin validate', rel(dir), 'not-applicable', command, 'claude plugin validate does not validate a bare skills directory (contents: []); the built-in rules apply instead', [], r.exit);
-        continue;
-      }
-      const findings = [];
-      const take = (entry) => {
-        if (!isObj(entry) || !entry.file) return;
-        const abs = path.resolve(dir, entry.file);
-        if (statSafe(abs)?.isDirectory()) return;
-        for (const e of entry.errors || []) findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'error', message: `claude plugin validate: ${e.path ? `${e.path}: ` : ''}${e.message}` });
-        for (const w of entry.warnings || []) findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'warning', message: `claude plugin validate: ${w.path ? `${w.path}: ` : ''}${w.message}` });
-      };
-      take(report.manifest);
-      for (const c of contents) take(c);
-      // Plugin-directory listing findings (README, LICENSE, icon) concern publishing, not loading.
-      const manifestFile = [path.join(dir, '.claude-plugin', 'plugin.json'), path.join(dir, '.claude-plugin', 'marketplace.json')].find((f) => fs.existsSync(f));
-      for (const d of (isObj(report.directory) && Array.isArray(report.directory.findings) ? report.directory.findings : [])) {
-        if (manifestFile) findings.push({ abs: manifestFile, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity: 'note', message: `claude plugin validate (plugin directory listing): ${d.title || d.code}${d.message ? `: ${truncate(d.message, 160)}` : ''}` });
-      }
-      const dirErrors = manifestErrors.filter(() => statSafe(path.resolve(dir, report.manifest.file || '.'))?.isDirectory());
-      const failed = report.success === false || findings.some((f) => f.severity === 'error');
-      push('claude plugin validate', rel(dir), failed ? 'fail' : 'pass', command,
-        failed ? `${findings.filter((f) => f.severity !== 'note').length || dirErrors.length} issue(s)${dirErrors.length ? `: ${dirErrors[0].message}` : ''}` : 'validation passed', findings, r.exit);
-    }
-  }
+function codexSkills(skills, { exec, whichFn, push, rel, first, root, env, home, failOf }) {
+  const command = 'codex debug prompt-input "x"';
+  const cxSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('codex', root, env, home)));
+  const exe = cxSkills.length ? whichFn('codex') : null;
+  if (!cxSkills.length) return push('codex', '.', 'not-applicable', command, 'no linted skill is in .agents/skills at the root or in ~/.agents/skills');
+  if (!exe) return push('codex', '.', 'skipped', command, 'codex is not on PATH');
+  // Renders the model input locally (no model call, no sign-in needed) and lists the discovered skills.
+  const r = exec(exe, ['debug', 'prompt-input', 'x'], { cwd: root, timeoutMs: 60_000 });
+  const listed = r.exit === 0 ? codexListedSkills(r.stdout) : null;
+  const findings = listed ? listingFindings(cxSkills, listed, { host: 'codex', rule: 'EXT-CODEX-SKILL', tool: 'codex debug prompt-input',
+    here: (x, s) => samePath(x.file, s.file), missing: ' (disabled in config.toml, invalid frontmatter, or not discovered)',
+    other: (n, o) => `Codex lists "${n}" from ${rel(o.file)}; this copy is not the one it uses` }) : [];
+  push('codex', '.', listed ? failOf(findings) : 'error', command, listed ? `${listed.length} skill(s) in <skills_instructions>`
+    : first(r) || 'no <skills_instructions> block in the output', findings, r.exit);
+}
 
-  if (want('spec') && skills.length) {
-    const command = `gh skill publish --dry-run ${rel(root)}`;
-    const ghSkills = skills.filter((s) => ghDiscovers(s, root));
-    const exe = ghSkills.length ? whichFn('gh') : null;
-    const v = exe ? version('gh') : null;
-    if (!ghSkills.length) push('gh skill publish', '.', 'not-applicable', command, 'no linted skill is where gh skill publish looks (skills/*/, skills/<scope>/*/, <dir>/ at the root, plugins/<scope>/skills/*/)');
-    else if (!exe) push('gh skill publish', '.', 'skipped', command, 'gh is not on PATH');
-    else if (!v?.version || !versionGte(v.version, '2.90.0')) push('gh skill publish', '.', 'skipped', command, `gh ${v?.version || '?'} has no "gh skill" (needs 2.90.0+)`);
-    else {
-      const r = exec(exe, ['skill', 'publish', '--dry-run', root], { cwd: root });
-      // Output lines are "<error|warning>\t<skill>\t<message>"; repository-level lines have no skill.
-      const findings = [];
-      const repoLines = [];
-      for (const line of `${r.stdout}\n${r.stderr}`.split(/\r?\n/)) {
-        const m = /^(error|warning)\t([^\t]*)\t(.+)$/.exec(line.trim() ? line : '');
-        if (!m) continue;
-        const s = m[2] ? ghSkills.find((x) => x.name === m[2] || path.basename(x.dir) === m[2]) : null;
-        if (s) findings.push({ abs: s.file, host: 'spec', rule: 'EXT-GH-SKILL', severity: m[1] === 'error' ? 'error' : 'note', message: `gh skill publish --dry-run: ${m[3].trim()}` });
-        else if (!m[2]) repoLines.push(`${m[1]}: ${m[3].trim()}`);
-      }
-      const errors = findings.filter((f) => f.severity === 'error').length;
-      const status = r.exit === 0 ? 'pass' : errors ? 'fail' : 'error';
-      push('gh skill publish', '.', status, command, [status === 'pass' ? 'dry run passed' : errors ? `${errors} validation error(s)` : firstLines(r.stderr || r.stdout)[0] || 'gh failed', ...repoLines].join('; '), findings, r.exit);
-    }
+/** `codex exec --strict-config` would bill a model turn; `codex doctor --json` lists ignored settings per layer for free. */
+function codexDoctor(configs, { exec, whichFn, push, rel, first, root }) {
+  const command = 'codex doctor --json';
+  const exe = whichFn('codex');
+  if (!exe) return configs.forEach((f) => push('codex doctor', rel(f), 'skipped', command, 'codex is not on PATH'));
+  const r = exec(exe, ['doctor', '--json'], { cwd: root, timeoutMs: 60_000 });
+  let report = null;
+  try { report = JSON.parse(r.stdout); } catch {}
+  const load = isObj(report?.checks?.['config.load']) ? report.checks['config.load'] : null;
+  const details = isObj(load?.details) ? load.details : {};
+  const ignored = [...String(details['startup warning'] || '').matchAll(/^[ \t]*(\S+) \((.+)\): `([^`]+)` is ignored/gm)]
+    .map(([, layer, file, key]) => ({ layer, file, key }));
+  const loaded = strs(details['config.toml'], ignored.map((x) => x.file));
+  for (const f of configs) {
+    const findings = ignored.filter((x) => samePath(x.file, f)).map((x) => ({ abs: f, host: 'codex', rule: 'EXT-CODEX-CONFIG',
+      severity: 'warning', message: `codex doctor: Codex ignores \`${x.key}\` (unrecognized ${x.layer} setting)` }));
+    if (!load) push('codex doctor', rel(f), 'error', command, first(r) || 'no config.load check in the report', [], r.exit);
+    else if (findings.length) push('codex doctor', rel(f), 'fail', command, `${findings.length} unrecognized setting(s)`, findings, r.exit);
+    else if (loaded.some((x) => samePath(x, f))) push('codex doctor', rel(f), 'pass', command, 'no unrecognized settings', [], r.exit);
+    else push('codex doctor', rel(f), 'not-applicable', command, 'Codex did not load this file (project config needs a trusted project)', [], r.exit);
   }
-
-  if (want('copilot') && (skills.length || instructions.length)) {
-    const cpSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('copilot', root, env, home)));
-    const cpInstructions = instructions.filter((f) => copilotListsInstruction(f, root));
-    const exe = cpSkills.length || cpInstructions.length ? whichFn('copilot') : null;
-    const listing = (args) => {
-      const r = exec(exe, args, { cwd: root, timeoutMs: 60_000 });
-      let rows = null;
-      try { const j = JSON.parse(r.stdout); rows = Array.isArray(j) ? j : Array.isArray(j?.skills) ? j.skills : Array.isArray(j?.instructions) ? j.instructions : null; } catch {}
-      return { r, rows };
-    };
-    if (!cpSkills.length && !cpInstructions.length) push('copilot', '.', 'not-applicable', 'copilot skill list --json; copilot instruction list --json', 'no linted skill or instruction file is in a location Copilot CLI lists from the repository root');
-    else if (!exe) push('copilot', '.', 'skipped', 'copilot skill list --json; copilot instruction list --json', 'copilot is not on PATH');
-    else {
-      if (cpSkills.length) {
-        const { r, rows } = listing(['skill', 'list', '--json']);
-        const findings = [];
-        for (const s of rows ? cpSkills : []) {
-          const name = s.name || path.basename(s.dir);
-          const here = rows.find((x) => x.path && samePath(String(x.path), s.dir));
-          const other = rows.find((x) => x.name === name);
-          if (here && here.enabled === false) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list shows "${name}" as disabled` });
-          else if (!here && other) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'note', message: `Copilot loads "${name}" from ${other.path ? shown(other.path) : other.source || '?'} (first found wins); this copy is not used by Copilot` });
-          else if (!here) findings.push({ abs: s.file, host: 'copilot', rule: 'EXT-COPILOT-SKILL', severity: 'warning', message: `copilot skill list does not show "${name}" although it is in a Copilot skill folder` });
-        }
-        push('copilot skill list', '.', rows ? (findings.some((f) => f.severity !== 'note') ? 'fail' : 'pass') : 'error', 'copilot skill list --json',
-          rows ? `${rows.length} skill(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings, r.exit);
-      }
-      if (cpInstructions.length) {
-        const { r, rows } = listing(['instruction', 'list', '--json']);
-        const findings = [];
-        if (rows) {
-          const listed = rows.map((x) => (x.sourcePath ? path.resolve(root, String(x.sourcePath)) : null)).filter(Boolean);
-          for (const f of cpInstructions) if (!listed.some((l) => samePath(l, f))) findings.push({ abs: f, host: 'copilot', rule: 'EXT-COPILOT-INSTRUCTION', severity: 'warning', message: 'copilot instruction list does not show this file' });
-        }
-        push('copilot instruction list', '.', rows ? (findings.length ? 'fail' : 'pass') : 'error', 'copilot instruction list --json',
-          rows ? `${rows.length} instruction source(s) listed` : firstLines(r.stderr)[0] || 'no JSON output', findings, r.exit);
-      }
-    }
-  }
-
-  if (want('codex') && skills.length) {
-    const command = 'codex debug prompt-input "x"';
-    const cxSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('codex', root, env, home)));
-    const exe = cxSkills.length ? whichFn('codex') : null;
-    if (!cxSkills.length) push('codex', '.', 'not-applicable', command, 'no linted skill is in .agents/skills at the repository root or in ~/.agents/skills');
-    else if (!exe) push('codex', '.', 'skipped', command, 'codex is not on PATH');
-    else {
-      // Renders the model input locally (no model call, no sign-in needed) and lists discovered skills.
-      const r = exec(exe, ['debug', 'prompt-input', 'x'], { cwd: root, timeoutMs: 60_000 });
-      const listed = r.exit === 0 ? codexListedSkills(r.stdout) : null;
-      const findings = [];
-      for (const s of listed ? cxSkills : []) {
-        const name = s.name || path.basename(s.dir);
-        const here = listed.find((x) => samePath(x.file, s.file));
-        const other = listed.find((x) => x.name === name);
-        if (!here && other) findings.push({ abs: s.file, host: 'codex', rule: 'EXT-CODEX-SKILL', severity: 'note', message: `Codex lists "${name}" from ${shown(other.file)}; this copy is not the one it uses` });
-        else if (!here) findings.push({ abs: s.file, host: 'codex', rule: 'EXT-CODEX-SKILL', severity: 'warning', message: `codex debug prompt-input does not list "${name}" (disabled in config.toml, invalid frontmatter, or not discovered)` });
-      }
-      push('codex', '.', listed ? (findings.some((f) => f.severity !== 'note') ? 'fail' : 'pass') : 'error', command,
-        listed ? `${listed.length} skill(s) in <skills_instructions>` : firstLines(r.stderr || r.stdout)[0] || 'no <skills_instructions> block in the output', findings, r.exit);
-    }
-  }
-  if (want('codex') && codexConfigs.length) {
-    // `codex exec --strict-config` would bill a model turn; `codex doctor --json` lists the
-    // ignored (unrecognized) settings per loaded config layer for free.
-    const command = 'codex doctor --json';
-    const exe = whichFn('codex');
-    if (!exe) for (const f of codexConfigs) push('codex doctor', rel(f), 'skipped', command, 'codex is not on PATH');
-    else {
-      const r = exec(exe, ['doctor', '--json'], { cwd: root, timeoutMs: 60_000 });
-      let report = null;
-      try { report = JSON.parse(r.stdout); } catch {}
-      const load = isObj(report?.checks?.['config.load']) ? report.checks['config.load'] : null;
-      const details = isObj(load?.details) ? load.details : {};
-      const ignored = [];
-      for (const line of String(details['startup warning'] || '').split('\n')) {
-        const m = /^\s*(\S+) \((.+)\): `([^`]+)` is ignored/.exec(line);
-        if (m) ignored.push({ layer: m[1], file: m[2], key: m[3] });
-      }
-      const loaded = [details['config.toml'], ...ignored.map((x) => x.file)].filter((x) => typeof x === 'string');
-      for (const f of codexConfigs) {
-        if (!load) { push('codex doctor', rel(f), 'error', command, firstLines(r.stderr || r.stdout)[0] || 'no config.load check in the report', [], r.exit); continue; }
-        const findings = ignored.filter((x) => samePath(x.file, f)).map((x) => ({ abs: f, host: 'codex', rule: 'EXT-CODEX-CONFIG', severity: 'warning', message: `codex doctor: Codex ignores \`${x.key}\` (unrecognized ${x.layer} setting)` }));
-        if (findings.length) push('codex doctor', rel(f), 'fail', command, `${findings.length} unrecognized setting(s)`, findings, r.exit);
-        else if (loaded.some((x) => samePath(x, f))) push('codex doctor', rel(f), 'pass', command, 'no unrecognized settings', [], r.exit);
-        else push('codex doctor', rel(f), 'not-applicable', command, 'Codex did not load this file from the repository root (project config needs a trusted project)', [], r.exit);
-      }
-    }
-  }
-
-  if (want('copilot') && skills.length) {
-    const exe = whichFn('waza');
-    for (const s of skills) {
-      const name = s.name || path.basename(s.dir);
-      const evalFile = [path.join(root, 'evals', name, 'eval.yaml'), path.join(s.dir, 'evals', 'eval.yaml')].find((f) => fs.existsSync(f));
-      const command = `waza spec verify ${rel(s.dir)} ${evalFile ? rel(evalFile) : `evals/${name}/eval.yaml`} --fail`;
-      if (!exe || !evalFile) { push('waza', rel(s.dir), 'skipped', command, !exe ? 'waza is not on PATH' : 'no eval.yaml for this skill'); continue; }
-      const r = exec(exe, ['spec', 'verify', s.dir, evalFile, '--fail'], { cwd: root });
-      const status = statusOf(r);
-      const first = firstLines(r.stdout + '\n' + r.stderr)[0];
-      push('waza', rel(s.dir), status, command, first || status,
-        status === 'fail' ? [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning', message: `waza spec verify: ${first || 'failed'}` }] : [], r.exit);
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 
-const LINTERS = {
-  'skill': lintSkillFile,
-  'codex-skill-meta': lintOpenaiYaml,
-  'instructions': lintInstructions,
-  'agent': lintAgent,
-  'command': lintCommandOrPrompt,
-  'prompt': lintCommandOrPrompt,
-  'hooks': lintHooksOrSettings,
-  'settings': lintHooksOrSettings,
-  'plugin': lintPlugin,
-  'marketplace': lintMarketplace,
-  'mcp': lintMcp,
-  'codex-config': lintCodexConfig,
-};
-
-function repoRootSafe(dir) {
-  try { return repoRoot(dir); } catch { return null; }
-}
+const LINTERS = { 'skill': lintSkill, 'codex-skill-meta': lintOpenaiYaml, 'instructions': lintInstructions,
+  'agent': lintAgent, 'command': lintCommandOrPrompt, 'prompt': lintCommandOrPrompt, 'hooks': lintHooksOrSettings,
+  'settings': lintHooksOrSettings, 'plugin': lintPlugin, 'marketplace': lintMarketplace, 'mcp': lintMcp,
+  'codex-config': lintCodexConfig };
 
 function summarize(run, files, external) {
-  const s = { files: files.length, errors: 0, warnings: 0, notes: 0, security: run.security.length,
-    security_errors: run.security.filter((x) => x.severity === 'error').length, hosts: run.selected, strict: run.strict, by_rule: {} };
-  for (const f of files) {
-    for (const r of f.host_results) {
-      s.errors += r.errors.length;
-      s.warnings += r.warnings.length;
-      s.notes += r.notes.length;
-      for (const x of [...r.errors, ...r.warnings, ...r.notes]) s.by_rule[x.rule] = (s.by_rule[x.rule] || 0) + 1;
-    }
-  }
-  for (const x of run.security) s.by_rule[x.rule] = (s.by_rule[x.rule] || 0) + 1;
+  const results = files.flatMap((f) => f.host_results);
+  const all = [...results.flatMap((r) => [...r.errors, ...r.warnings, ...r.notes]), ...run.security];
   const count = (st) => external.filter((e) => e.status === st).length;
-  s.external = { ran: count('pass') + count('fail') + count('error'), passed: count('pass'), failed: count('fail'), errors: count('error'),
-    skipped: count('skipped'), not_applicable: count('not-applicable') };
-  s.clean = s.errors === 0 && s.security_errors === 0 && (!run.strict || (s.warnings === 0 && s.security === 0));
-  return s;
+  const [errors, warnings, notes] = ['errors', 'warnings', 'notes'].map((k) => results.reduce((n, r) => n + r[k].length, 0));
+  const security = run.security.length;
+  const securityErrors = run.security.filter((x) => x.severity === 'error').length;
+  return { files: files.length, errors, warnings, notes, security, security_errors: securityErrors, hosts: run.selected,
+    strict: run.strict, by_rule: Object.fromEntries([...Map.groupBy(all, (x) => x.rule)].map(([k, v]) => [k, v.length])),
+    external: { ran: count('pass') + count('fail') + count('error'), passed: count('pass'), failed: count('fail'),
+      errors: count('error'), skipped: count('skipped'), not_applicable: count('not-applicable') },
+    clean: errors === 0 && securityErrors === 0 && (!run.strict || (warnings === 0 && security === 0)) };
 }
 
 /**
- * Lint tooling files and directories (async). Options: host ('all' | 'copilot' | 'claude' |
- * 'codex'), strict (spec-only frontmatter; warnings fail), root (repository root for relative
- * paths and project context), external (run installed validators), allowHosts (HTTP hook
- * allowlist). Returns { files[{path, kind, sub, scope, reads[], host_results[{host, errors[],
- * warnings[], notes[]}]}], security[], external[], summary }.
+ * Lint tooling files and directories (async). Options: host ('all' | 'spec' | 'copilot' | 'claude' | 'codex'), strict
+ * (spec-only frontmatter; warnings fail), root (the repository root for relative paths and project context), external
+ * (run the installed validators), allowHosts (HTTP hook allowlist), env, home. Returns { root, files[{path, kind, sub,
+ * scope, reads[], host_results[{host, errors[], warnings[], notes[]}]}], security[], external[], summary }.
  */
 export async function lintPaths(paths = [], opts = {}) {
   const { host = 'all', strict = false, env = process.env, home = os.homedir(), allowHosts = [], external = false } = opts;
   if (!['all', ...HOSTS].includes(host)) throw usageError(`--host must be all, copilot, claude or codex (got "${host}")`);
-  const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (!RULES.length) throw envError('LINT_CATALOG', 'references/tooling-lint.md has no rule table; reinstall the skill');
+  const list = [paths].flat().filter(Boolean);
   const first = list[0] ? path.resolve(list[0]) : process.cwd();
-  const root = path.resolve(opts.root || repoRootSafe(statSafe(first)?.isDirectory() ? first : path.dirname(first)) || process.cwd());
-  const run = new LintRun({ host, strict, root, env, home, allowHosts });
-  const targets = [];
-  const seen = new Set();
+  const root = path.resolve(opts.root || repoRoot(statOrNull(first)?.isDirectory() ? first : path.dirname(first)) || process.cwd());
+  const run = { selected: host === 'all' ? [...HOSTS] : strict && host !== 'spec' ? [host, 'spec'] : [host], strict: Boolean(strict),
+    root, home, allowHosts: new Set([...LOOPBACK, ...allowHosts.map((h) => String(h).toLowerCase())]), files: [], security: [],
+    secSeen: new Set(), directives: [], display: (abs) => {
+      const r = path.relative(root, abs);
+      return !r ? '.' : r.startsWith('..') || path.isAbsolute(r) ? toPosix(abs) : toPosix(r);
+    } };
+  const targets = new Map();
   for (const p of list.length ? list : [root]) {
     const abs = path.resolve(root, p);
-    const st = statSafe(abs);
+    const st = statOrNull(abs);
     if (!st) throw usageError(`path not found: ${toPosix(p)}`);
-    const found = st.isDirectory() ? discover(abs, { root, env, home })
-      : [{ abs, ...(classifyToolingPath(abs, { root, env, home, sniff: true }) || { kind: 'unknown', sub: null, scope: 'project', reads: [] }) }];
-    for (const f of found) {
-      const key = path.resolve(f.abs);
-      if (!seen.has(key)) { seen.add(key); targets.push(f); }
-    }
+    const found = st.isDirectory() ? discover(abs, { root, env, home }) : [{ abs, ...(classify(abs, { root, env, home, sniff: true })
+      || { kind: 'unknown', sub: null, scope: 'project', reads: [] }) }];
+    for (const f of found) if (!targets.has(path.resolve(f.abs))) targets.set(path.resolve(f.abs), f);
   }
   const internal = [];
-  for (const t of targets) {
+  for (const t of targets.values()) {
     const fl = new FileLint(run, t.abs, t);
     run.files.push(fl);
-    const linter = LINTERS[t.kind];
-    if (!linter) continue;
-    try { await linter(fl); } catch (err) { internal.push({ file: fl.path, message: String(err && err.message || err) }); }
+    try { LINTERS[t.kind]?.(fl); } catch (err) { internal.push({ file: fl.path, message: String(err?.message || err) }); }
   }
   crossInstructionChecks(run);
-  let ext = [];
-  if (external) {
-    const skills = run.files.filter((f) => f.cls.kind === 'skill').map((f) => ({ dir: path.dirname(f.abs), file: f.abs,
-      name: parseFrontmatter(readTextNormalized(f.abs) || '').data?.name }));
-    const plugins = [...new Set(run.files.filter((f) => (f.cls.kind === 'plugin' && f.cls.sub === 'claude') || (f.cls.kind === 'marketplace' && f.cls.sub === 'claude'))
-      .map((f) => pluginRootOf(f)))];
-    const instructions = run.files.filter((f) => f.cls.kind === 'instructions' && f.cls.reads.includes('copilot')).map((f) => f.abs);
-    const codexConfigs = run.files.filter((f) => f.cls.kind === 'codex-config').map((f) => f.abs);
-    ext = runExternalValidators({ root, skills, plugins, instructions, codexConfigs, hosts: run.selected, env, home }, opts);
-    const byAbs = new Map(run.files.map((f) => [path.resolve(f.abs), f]));
-    for (const e of ext) {
-      for (const f of e.findings) {
-        const fl = byAbs.get(path.resolve(f.abs));
-        if (fl) fl.emit(f.rule, { only: [f.host], severity: f.severity, message: f.message });
-      }
-      e.findings = e.findings.map((f) => ({ ...f, abs: undefined, file: run.display(f.abs) }));
-    }
-  }
+  const ext = external ? mergeExternal(run, opts) : [];
   const files = run.files.map((f) => f.toJSON());
-  const out = { root: toPosix(root), files, security: run.security, external: ext, summary: summarize(run, files, ext) };
-  if (internal.length) out.internal_errors = internal;
-  return out;
+  return { root: toPosix(root), files, security: run.security, external: ext, summary: summarize(run, files, ext),
+    ...(internal.length && { internal_errors: internal }) };
 }
 
-/**
- * Lint one skill directory (SKILL.md, agents/openai.yaml) against every host; async. Paths and
- * the external validators' discovery are relative to the enclosing Git repository when there is one.
- */
+function mergeExternal(run, opts) {
+  const of = (pred) => run.files.filter((f) => pred(f.cls));
+  const ext = runExternalValidators({ root: run.root, hosts: run.selected, env: opts.env || process.env, home: run.home,
+    skills: of((c) => c.kind === 'skill').map((f) => ({ dir: path.dirname(f.abs), file: f.abs, name: parseFrontmatter(f.text).data?.name })),
+    plugins: [...new Set(of((c) => /^(?:plugin|marketplace)$/.test(c.kind) && c.sub === 'claude').map((f) => pluginRootOf(f.abs)))],
+    instructions: of((c) => c.kind === 'instructions' && c.reads.includes('copilot')).map((f) => f.abs),
+    codexConfigs: of((c) => c.kind === 'codex-config').map((f) => f.abs) }, opts);
+  const byAbs = new Map(run.files.map((f) => [path.resolve(f.abs), f]));
+  for (const e of ext) {
+    for (const f of e.findings) byAbs.get(path.resolve(f.abs))?.emit(f.rule, null, f.message, { only: [f.host], severity: f.severity });
+    e.findings = e.findings.map(({ abs, ...f }) => ({ ...f, message: redactSecrets(f.message), file: run.display(abs) }));
+  }
+  return ext;
+}
+
+/** Lint one skill directory (SKILL.md, agents/openai.yaml) for every host; async. Paths are repository-relative. */
 export async function lintSkillDir(dir, { strict = false, host = 'all', external = false, ...rest } = {}) {
   const abs = path.resolve(dir);
-  const targets = [path.join(abs, 'SKILL.md')];
-  if (!fs.existsSync(targets[0])) {
-    const alt = fs.existsSync(abs) ? fs.readdirSync(abs).find((n) => n.toLowerCase() === 'skill.md') : null;
-    if (!alt) throw usageError(`no SKILL.md in ${toPosix(abs)}`);
-    targets[0] = path.join(abs, alt);
-  }
-  const meta = path.join(abs, 'agents', 'openai.yaml');
-  if (fs.existsSync(meta)) targets.push(meta);
-  return lintPaths(targets, { strict, host, external, root: repoRootSafe(abs) || abs, ...rest });
+  const name = fs.existsSync(path.join(abs, 'SKILL.md')) ? 'SKILL.md'
+    : statOrNull(abs)?.isDirectory() && fs.readdirSync(abs).find((n) => n.toLowerCase() === 'skill.md');
+  if (!name) throw usageError(`no SKILL.md in ${toPosix(abs)}`);
+  const targets = [path.join(abs, name), path.join(abs, 'agents', 'openai.yaml')].filter((f) => fs.existsSync(f));
+  return lintPaths(targets, { strict, host, external, root: repoRoot(abs) || abs, ...rest });
 }
 
-/** Exit code for a lint result: 1 on errors (or, with strict, any warning or security finding). */
-export function lintExit(result) {
-  return result.summary.clean ? EXIT.OK : EXIT.FINDINGS;
-}
+const summaryLine = (s) => `${s.files} file(s), ${s.errors} error(s), ${s.warnings} warning(s), ${s.notes} note(s), `
+  + `${s.security} security finding(s) for ${s.hosts.join(', ')}${s.strict ? ' (strict)' : ''}`;
 
 function renderHuman(res) {
-  const lines = [];
-  for (const f of res.files) {
-    const items = [];
-    for (const r of f.host_results) {
-      for (const [sev, list] of [['error', r.errors], ['warning', r.warnings], ['note', r.notes]]) {
-        for (const x of list) items.push(`  ${sev.padEnd(7)} ${r.host.padEnd(7)} ${x.rule}${x.line ? ` (line ${x.line})` : ''}: ${x.message}`);
-      }
-    }
-    if (items.length) lines.push(`${f.path} [${f.kind}]`, ...items);
-  }
-  if (res.security.length) {
-    lines.push('security:');
-    for (const s of res.security) lines.push(`  ${s.severity.padEnd(7)} ${s.rule} ${s.file}${s.line ? `:${s.line}` : ''}: ${s.message}`);
-  }
+  const lines = res.files.flatMap((f) => {
+    const items = f.host_results.flatMap((r) => [['error', r.errors], ['warning', r.warnings], ['note', r.notes]]
+      .flatMap(([sev, list]) => list.map((x) => `  ${sev.padEnd(7)} ${r.host.padEnd(7)} ${x.rule}${x.line ? ` (line ${x.line})` : ''}: ${x.message}`)));
+    return items.length ? [`${f.path} [${f.kind}]`, ...items] : [];
+  });
+  if (res.security.length) lines.push('security:');
+  for (const s of res.security) lines.push(`  ${s.severity.padEnd(7)} ${s.rule} ${s.file}${s.line ? `:${s.line}` : ''}: ${s.message}`);
   for (const e of res.external) lines.push(`external ${e.tool} ${e.target}: ${e.status}${e.summary ? ` - ${e.summary}` : ''}`);
-  const s = res.summary;
-  lines.push(`${s.files} file(s): ${s.errors} error(s), ${s.warnings} warning(s), ${s.notes} note(s), ${s.security} security finding(s); hosts ${s.hosts.join(', ')}${s.strict ? ' (strict)' : ''}`);
-  return lines.join('\n');
+  return [...lines, summaryLine(res.summary)].join('\n');
 }
 
 export const lintCommand = defineCommand({
   name: 'tooling lint',
-  usage: [
-    'usage: adc.mjs tooling lint [paths...] [--host all|copilot|claude|codex] [--strict] [--no-external] [--allow-host <host>]',
+  usage: ['usage: adc.mjs tooling lint [paths...] [--host all|copilot|claude|codex] [--strict] [--no-external] [--allow-host <h>]',
     '  Lints instructions, skills, agents, prompt files, hooks, plugins and MCP configs against each host\'s rules.',
     '  No paths: the whole repository. --strict: only the six spec fields and block-style YAML; warnings fail.',
     '  --no-external (or ADC_LINT_NO_EXTERNAL=1): skip skills-ref, claude plugin validate, gh skill publish,',
     '  copilot skill/instruction list, codex debug prompt-input and doctor, waza (none runs a model turn).',
     '  --allow-host <host> (repeatable): HTTP hooks to this host are not a security finding.',
-    '  Exit: 0 clean, 1 findings, 2 usage, 3 tracked .adc/.',
-  ].join('\n'),
-  options: {
-    host: { type: 'string' },
-    strict: { type: 'boolean' },
-    'no-external': { type: 'boolean' },
-    'allow-host': { type: 'string', multiple: true },
-  },
+    '  Exit: 0 clean, 1 findings, 2 usage, 3 tracked .adc/ or missing rule catalog.'].join('\n'),
+  options: { host: { type: 'string' }, strict: { type: 'boolean' }, 'no-external': { type: 'boolean' },
+    'allow-host': { type: 'string', multiple: true } },
   async run(ctx, values, positionals) {
     const host = values.host || 'all';
     if (!['all', 'copilot', 'claude', 'codex'].includes(host)) throw usageError(`--host must be all, copilot, claude or codex (got "${host}")`);
-    const gitRoot = repoRootSafe(ctx.cwd);
+    const gitRoot = repoRoot(ctx.cwd);
     if (gitRoot) assertStateUntracked(resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption }));
     const external = !values['no-external'] && !/^(?:1|true|yes)$/i.test(process.env.ADC_LINT_NO_EXTERNAL || '');
-    const res = await lintPaths(positionals.map((p) => path.resolve(ctx.cwd, p)), {
-      host, strict: Boolean(values.strict), root: gitRoot || ctx.cwd, external, allowHosts: values['allow-host'] || [],
-    });
-    const s = res.summary;
-    return {
-      result: res,
-      exit: lintExit(res),
-      human: renderHuman(res),
-      summary: `${s.files} file(s), ${s.errors} error(s), ${s.warnings} warning(s), ${s.security} security finding(s) for ${s.hosts.join(', ')}${s.strict ? ' (strict)' : ''}`,
-    };
+    const res = await lintPaths(positionals.map((p) => path.resolve(ctx.cwd, p)),
+      { host, strict: Boolean(values.strict), root: gitRoot || ctx.cwd, external, allowHosts: values['allow-host'] || [] });
+    return { result: res, exit: res.summary.clean ? EXIT.OK : EXIT.FINDINGS, human: renderHuman(res), summary: summaryLine(res.summary) };
   },
 });

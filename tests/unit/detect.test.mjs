@@ -8,9 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/formats.mjs';
 import {
-  detect, isTestFile, projectForFile, RUNNERS, DEFAULT_TEST_GLOBS, detectCommand, tokenizeShell, parseToml, parseYaml,
-  parseIni, parseMakeTargets, normalizeGlob, portableArg,
+  detect, isTestFile, projectForFile, RUNNERS, DEFAULT_TEST_GLOBS, detectCommand, parseMakeTargets, normalizeGlob, portableArg,
 } from '../../skills/agentic-developer-companion/scripts/lib/detect.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
@@ -135,7 +135,8 @@ test('RUNNERS catalog: every runner has a report, retries-off and globs; node-te
   assert.throws(() => { RUNNERS.jest.report.flag = 'x'; }, TypeError);
 });
 
-test('tokenizeShell: quotes, operators, redirections, continuations, CRLF', () => {
+test('splitShell (the tokenizer detect uses): quotes, operators, redirections, continuations, CRLF', () => {
+  const tokenizeShell = core.splitShell;
   const segs = tokenizeShell("FOO='a b' jest --ci && echo \"x \\\"y\\\"\" 2>&1 | tee log.txt; npm run test:unit > out.txt\r\nnode --test 'test/**'");
   assert.deepEqual(segs.map((s) => s.tokens), [['FOO=a b', 'jest', '--ci'], ['echo', 'x "y"'], ['tee', 'log.txt'], ['npm', 'run', 'test:unit'], ['node', '--test', 'test/**']]);
   assert.deepEqual(tokenizeShell('pytest \\\n  -q tests').map((s) => s.tokens), [['pytest', '-q', 'tests']]);
@@ -149,8 +150,8 @@ test('portableArg quotes for sh and cmd.exe alike', () => {
   assert.equal(portableArg('50%').portable, false);
 });
 
-test('parseToml: tables, arrays of tables, multi-line arrays, inline tables, strings, CRLF', () => {
-  const t = parseToml('a = 1\r\n[tool.pytest.ini_options]\r\ntestpaths = [\r\n  "tests", # c\r\n  \'it\',\r\n]\r\naddopts = """-q\r\n-x"""\r\n[[test]]\r\nname = "one"\r\n[[test]]\r\nname = "two"\r\n[deps]\r\nx = { version = "1", features = ["a"] }\r\n"quoted.key" = true\r\nbad line here\r\nafter = 2\r\n');
+test('lenient parseToml (detect reads manifests with it): tables, arrays of tables, inline tables, CRLF, bad lines', () => {
+  const { value: t } = parseToml('a = 1\r\n[tool.pytest.ini_options]\r\ntestpaths = [\r\n  "tests", # c\r\n  \'it\',\r\n]\r\naddopts = """-q\r\n-x"""\r\n[[test]]\r\nname = "one"\r\n[[test]]\r\nname = "two"\r\n[deps]\r\nx = { version = "1", features = ["a"] }\r\n"quoted.key" = true\r\nbad line here\r\nafter = 2\r\n', { lenient: true });
   assert.equal(t.a, 1);
   assert.deepEqual(t.tool.pytest.ini_options.testpaths, ['tests', 'it']);
   assert.equal(t.tool.pytest.ini_options.addopts, '-q\n-x');
@@ -160,50 +161,47 @@ test('parseToml: tables, arrays of tables, multi-line arrays, inline tables, str
   assert.equal(t.deps.after, 2);
 });
 
-test('parseIni: sections, continuation lines, comments', () => {
-  const i = parseIni('[tool:pytest]\r\ntestpaths =\r\n    tests\r\n    integration\r\n# comment\r\n[flake8]\r\nmax-line-length: 100\r\n');
-  assert.equal(i['tool:pytest'].testpaths, 'tests\nintegration');
-  assert.equal(i.flake8['max-line-length'], '100');
-});
-
-test('parseYaml: workflows with block scalars, sequences of mappings, flow, anchors, comments', () => {
-  const [doc] = parseYaml([
-    'name: ci # trailing comment',
-    'on: [push, pull_request]',
-    'defaults:',
-    '  run:',
-    '    working-directory: app',
-    'x-base: &base',
-    '  image: node',
-    'jobs:',
-    '  test:',
-    '    <<: *base',
-    '    steps:',
-    '      - uses: actions/checkout@v4',
-    '      - name: "Run: tests"',
-    '        run: |',
-    '          npm ci',
-    '          # not a yaml comment',
-    '          npm test',
-    '      - run: >-',
-    '          echo a',
-    '          b',
-    '    matrix: { node: [20, 22], os: "linux" }',
-    'list:',
-    '- a',
-    "- 'b c'",
-    '- - nested',
-  ].join('\r\n'));
-  assert.equal(doc.name, 'ci');
-  assert.deepEqual(doc.on, ['push', 'pull_request']);
-  assert.equal(doc.defaults.run['working-directory'], 'app');
-  assert.equal(doc.jobs.test.image, 'node');
-  assert.equal(doc.jobs.test.steps[1].name, 'Run: tests');
-  assert.equal(doc.jobs.test.steps[1].run, 'npm ci\n# not a yaml comment\nnpm test\n');
-  assert.equal(doc.jobs.test.steps[2].run, 'echo a b');
-  assert.deepEqual(doc.jobs.test.matrix, { node: ['20', '22'], os: 'linux' });
-  assert.deepEqual(doc.list, ['a', 'b c', ['nested']]);
-  assert.deepEqual(parseYaml('a: 1\n---\nb: 2\n'), [{ a: '1' }, { b: '2' }]);
+test('CI YAML: block and folded scalars, comments in scripts, flow maps, anchors and merge keys, CRLF', async () => {
+  const dir = writeFiles(tmpDir(), {
+    '.github/workflows/ci.yml': [
+      'name: ci # trailing comment',
+      'on: [push, pull_request]',
+      'x-web: &web',
+      '  working-directory: web',
+      'jobs:',
+      '  test:',
+      '    runs-on: ubuntu-latest',
+      '    strategy: { matrix: { node: [20, 22] } }',
+      '    defaults:',
+      '      run:',
+      '        working-directory: api',
+      '    steps:',
+      '      - uses: actions/checkout@v4',
+      '      - name: "Run: tests"',
+      '        run: |',
+      '          npm ci',
+      '          # not a yaml comment',
+      '          npm test',
+      '      - <<: *web',
+      '        run: >-',
+      '          npm test --',
+      '          --coverage',
+    ].join('\r\n'),
+    '.gitlab-ci.yml': '.base: &base\n  script:\n    - cd svc && pytest -q\nunit:\n  <<: *base\n  stage: test\n',
+    'api/package.json': { scripts: { test: 'jest' }, devDependencies: { jest: '29' } },
+    'web/package.json': { scripts: { test: 'vitest' }, devDependencies: { vitest: '2' } },
+    'svc/pyproject.toml': '[project]\nname = "svc"\n',
+  });
+  try {
+    const res = await detect({ root: dir, platform: 'linux', which: () => true, env: {} });
+    const steps = res.ci.steps.map((s) => `${s.file}|${s.cwd}|${s.cmd}`);
+    assert.deepEqual(steps, ['.github/workflows/ci.yml|api|npm test', '.github/workflows/ci.yml|web|npm test -- --coverage',
+      '.gitlab-ci.yml|svc|pytest -q'], JSON.stringify(res.ci.steps));
+    assert.equal(res.ci.steps[0].line, 18);
+    assert.deepEqual(res.ci.systems, ['github-actions', 'gitlab-ci']);
+    assert.equal(res.projects.find((p) => p.root === 'svc').runners[0].source, 'ci: .gitlab-ci.yml:3');
+    assert.deepEqual(res.projects.find((p) => p.root === 'web').ci_test_commands, ['npm test -- --coverage']);
+  } finally { cleanup(dir); }
 });
 
 test('parseMakeTargets: Makefile targets and justfile recipes named test*', () => {
@@ -302,6 +300,44 @@ test('secrets in CI commands and the live token never reach the result or detect
     } finally { cleanup(dir2); }
     assert.ok(res.ci.test_commands.some((c) => /pytest -q/.test(c) && /REDACTED/.test(c)));
     assert.match(res.cache_key, /^[0-9a-f]{64}$/, 'the digest is not mistaken for a secret');
+  } finally { cleanup(dir); }
+});
+
+test('CI directories that leave the checkout are never probed and never become projects', async () => {
+  const outside = tmpDir('adc-detect-outside-');
+  const dir = writeFiles(path.join(outside, 'repo'), {
+    '.github/workflows/ci.yml': 'on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: pytest\n'
+      + '        working-directory: ../sibling\n      - run: cd web/../.. && go test ./...\n      - run: cd web/../api && npm test\n',
+    'go.mod': 'module m\n', 'api/package.json': { scripts: { test: 'jest' }, devDependencies: { jest: '29' } },
+  });
+  writeFiles(outside, { 'sibling/pyproject.toml': '[tool.pytest.ini_options]\n' });
+  try {
+    const res = await detect({ root: dir, platform: 'linux', which: () => true, env: {} });
+    assert.deepEqual(res.ci.steps.map((s) => [s.cmd, s.cwd, s.project]), [['pytest', null, null], ['go test ./...', null, null],
+      ['npm test', 'api', 'api']]);
+    assert.deepEqual(Object.keys(res.probes), ['api'], 'nothing outside the checkout is probed');
+    assert.deepEqual(res.projects.map((p) => p.root), ['.', 'api']);
+  } finally { cleanup(outside); }
+});
+
+test('credentials after a space-separated option are redacted; a cache hit is redacted with the current token', async () => {
+  const pw = ['hunt', 'er2s', 'ecret'].join('');
+  const live = ['late', 'tok', '77abc'].join('');
+  const { dir } = makeRepo({
+    '.github/workflows/ci.yml': `on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: pytest --db-password ${pw} -q\n`
+      + `      - run: go test ./... -args -token "${live}"\n`,
+    'go.mod': 'module x\n', 'requirements.txt': 'pytest\n',
+  });
+  try {
+    const info = state.prepareStateDir({ cwd: dir }, { create: true });
+    const first = await detect({ root: dir, stateInfo: info, platform: 'linux', which: () => true, env: {} });
+    assert.ok(!JSON.stringify(first).includes(pw), JSON.stringify(first.ci.test_commands));
+    assert.ok(first.ci.test_commands.includes('pytest --db-password [REDACTED] -q'), JSON.stringify(first.ci.test_commands));
+    // The token was set only after detect.json was written: the hit must not hand it back.
+    const second = await detect({ root: dir, stateInfo: info, platform: 'linux', which: () => true, env: { ADC_LIVE_TOKEN: live } });
+    assert.equal(second.cache.hit, true);
+    assert.ok(!JSON.stringify(second).includes(live));
+    assert.match(second.cache_key, /^[0-9a-f]{64}$/);
   } finally { cleanup(dir); }
 });
 

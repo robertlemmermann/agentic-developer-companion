@@ -1826,6 +1826,98 @@
           "clean-run --runner"
         ]
       }
+    },
+    {
+      "name": "jvm-wrappers-match-the-platform-gradle-cache-always-bypassed",
+      "platform": "win32",
+      "files": {
+        "settings.gradle": "rootProject.name = 'w'\n",
+        "build.gradle": "dependencies { testImplementation 'junit:junit:4.13' }\n",
+        "gradlew": "#!/bin/sh\n",
+        "src/test/java/ATest.java": "class ATest {}\n"
+      },
+      "tools": {
+        "gradle": true
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "gradle",
+                "cmd": "gradle test --no-build-cache",
+                "available": true
+              }
+            ],
+            "typecheck": [
+              {
+                "name": "gradle-compile",
+                "cmd": "gradle testClasses"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "jvm-maven-cmd-wrapper-only-on-posix",
+      "files": {
+        "pom.xml": "<project><artifactId>a</artifactId></project>\n",
+        "mvnw.cmd": "@echo off\n",
+        "src/test/java/ATest.java": "class ATest {}\n"
+      },
+      "tools": {
+        "mvn": false
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "maven",
+                "cmd": "mvn -B test",
+                "available": false
+              }
+            ],
+            "warnings_re": [
+              "mvn is not on PATH and the project has no Maven wrapper"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-uv-toml-without-lockfile",
+      "files": {
+        "pyproject.toml": "[project]\nname = \"u\"\ndependencies = [\"pytest>=8\"]\n",
+        "uv.toml": "native-tls = true\n",
+        "tests/test_u.py": "def test_u():\n    assert True\n"
+      },
+      "expect": {
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "uv",
+                "lockfile": null,
+                "install": null,
+                "frozen": false,
+                "install_hint": "uv sync"
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "uv run pytest",
+                "source": "pytest dependency"
+              }
+            ],
+            "warnings_re": [
+              "pyproject.toml: no lockfile with hashes"
+            ]
+          }
+        ]
+      }
     }
   ]
 }
