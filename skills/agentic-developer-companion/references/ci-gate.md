@@ -2,7 +2,7 @@
 
 Generate a GitHub Actions gate that runs the full suite with retries off, enforces changed-line
 coverage, ratchets skip markers and suppressions against the base, scans for secrets and audits
-dependencies, all behind one required check. Notes for GitLab CI and Azure Pipelines are in §9.
+dependencies, all behind one required check.
 
 ## Contents
 
@@ -17,7 +17,6 @@ dependencies, all behind one required check. Notes for GitLab CI and Azure Pipel
 9. [GitLab CI and Azure Pipelines](#9-gitlab-ci-and-azure-pipelines)
 10. [Guidance-only mode (no Node)](#10-guidance-only-mode-no-node)
 
-Find `adc.mjs` as described in SKILL.md; commands below use `$ADC` and run from the repository root.
 Editing CI needs the user's consent: show the files first.
 
 ## 1. What the gate runs

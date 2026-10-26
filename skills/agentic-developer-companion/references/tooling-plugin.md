@@ -2,8 +2,7 @@
 
 `tooling plugin` builds, checks, tests and prepares releases of plugins that package the
 **user's own** skills, agents, hooks and MCP servers for GitHub Copilot (Agent Plugins 1.0),
-Claude Code and OpenAI Codex. Decision D10 keeps plugin packaging out of this companion's own
-repository: the command refuses to write into the companion skill.
+Claude Code and OpenAI Codex. It refuses to write into the companion skill itself.
 
 ## Contents
 
@@ -18,16 +17,14 @@ repository: the command refuses to write into the companion skill.
 
 ## 1. init
 
-1. Resolve `ADC` as described in [SKILL.md](../SKILL.md).
-2. Dry run, show the file list: `node "$ADC" tooling plugin init --for copilot|claude|codex|all --json
+1. Dry run, show the file list: `node "$ADC" tooling plugin init --for copilot|claude|codex|all --json
    [--name n] [--out dir] [--skills a,b] [--agents a,b] [--include-hooks] [--include-mcp]
    [--marketplace m] [--owner o] [--version 0.1.0] [--license l] [--description d]`
-3. After the user confirms, the same command with `--write` (`--force` merges an existing
+2. After the user confirms, the same command with `--write` (`--force` merges an existing
    marketplace file and overwrites other existing files, with backups in `.adc/tooling/backups/`).
 
-Defaults: name from `package.json` or the folder (kebab-case, 1-64 characters, not reserved
-by Claude Code: no `claude-`, `anthropic-`, `anthropics-`, `cc-plugin-` prefix, not `claude`,
-`anthropic`, `claude-code`, `claude-mods`), output `plugins/<name>/`, owner from
+Defaults: name from `package.json` or the folder (kebab-case, 1-64 characters, not reserved:
+`PL-CL-NAME` in [tooling lint](tooling-lint.md)), output `plugins/<name>/`, owner from
 `git config user.name`. What is packaged:
 
 - **Skills**: every project skill in `.agents/skills/`, `.github/skills/` and
@@ -76,22 +73,14 @@ folder. The marketplace entry is `{ "name", "source": "./plugins/<name>", "descr
 
 `node "$ADC" tooling plugin check [dir] --json` (default `.`). Exit `1` when there are errors.
 
-- **Manifests**: Agent Plugins `$schema` version, closed field set, `author` and `keywords`
-  shapes, name rules (Agent Plugins: `a-z 0-9 - .`, no `--` or `..`; Claude Code: kebab-case and
-  reserved names, `claude`/`anthropic` as whole words warn), Claude component paths start with
-  `./`, Codex fields are camelCase and the `hooks` file exists; all manifests agree on name and
-  version (`NAME_MISMATCH`, `VERSION_MISMATCH`).
-- **Components**: skills only as immediate `skills/<name>/` folders, frontmatter on line 1,
-  `name` equal to the folder and valid, a `description`; plugin agents need `name` and
-  `description` and lose `hooks`, `mcpServers`, `permissionMode`; plugin `mcp.json` variants
-  (`stdio` with a one-token `command`, `streamable-http`/`sse` with an https URL) and `cwd`
-  prefixes; hook files wrapped in `"hooks"`, scripts addressed through the plugin-root
-  variable, no writes under the plugin root (state goes to `${PLUGIN_DATA}` /
-  `${CLAUDE_PLUGIN_DATA}`), Copilot `bash` + `powershell` rather than `command`, `cwd` on
-  `preToolUse`; eval cases without `TODO`.
-- **Collisions**: a project skill with the same name as a plugin skill silently wins in
-  Copilot and Claude Code (`PL-SKILL-COLLISION` from the lint run below).
-- **[tooling lint](tooling-lint.md)** on the whole plugin folder.
+- **Cross-file checks**: a manifest exists (`NO_MANIFEST`); all manifests agree on name and
+  version (`NAME_MISMATCH`, `VERSION_MISMATCH`); Agent Plugins `author` and `keywords` shapes;
+  plugin `mcp.json` types (`stdio`, `streamable-http`, `sse`), their allowed keys, https URLs
+  (http only for loopback), no `PLUGIN_ROOT`/`PLUGIN_DATA` in `env`; the Codex `hooks` file
+  exists; eval cases without `TODO`.
+- **[tooling lint](tooling-lint.md)** on the whole plugin folder: manifests, marketplace,
+  skills, agents, hooks and MCP rules (`PL-*`, `MK-*`, `AG-*`, `HK-*`, ...), including
+  `PL-SKILL-COLLISION` (a same-named project or personal skill silently wins in Copilot and Claude Code).
 - **Host validators**, each free and without sign-in; statuses `pass`, `fail`, `error`,
   `unknown`, `skipped`, `not-applicable` (only `pass` is a pass):
 
@@ -156,8 +145,6 @@ on `PATH`. Hook loading cannot be observed without a session: check `/env` (Copi
 - Agent Plugins 1.0 defines no portable hooks, agents, commands or rules: they are
   client-specific (`com.github.copilot/` for Copilot).
 - VS Code currently drops the `hooks` field of plugin-provided agents.
-- Copilot `preToolUse` `ask` becomes deny in the cloud agent and autopilot.
-- A plugin cannot override a same-named project or personal skill.
 - Codex reading hooks from `extensions["com.openai"].hooks` in a root Agent Plugins manifest is
   unverified (it loads the skills; hooks need a session to observe).
 - Codex and Claude Code export the plugin root to hooks as environment variables; for Copilot

@@ -27,13 +27,11 @@ metadata:
 
 # agentic-developer-companion
 
-Two jobs: **QA of changes made by Copilot, Claude Code or Codex** (a claim-to-evidence ledger
-instead of trusting "all tests pass", plus reliable e2e, live, regression and flake-resistant
-test suites) and **agentic tooling development** (scaffold, lint, measure, evaluate, port and
-safely change instructions, skills, agents, prompt files, hooks, plugins and MCP configs).
-Invoked as `/agentic-developer-companion <mode>` (Copilot CLI, VS Code, Claude Code) or
-`$agentic-developer-companion <mode>` (Codex); the cloud agent and code review pick it up when
-the issue or PR names it.
+Two jobs: **QA of changes made by Copilot, Claude Code or Codex** (a claim-to-evidence ledger;
+e2e, live, regression and flake-resistant suites) and **agentic tooling development**. Invoked
+as `/agentic-developer-companion <mode>` (Copilot CLI, VS Code, Claude Code) or
+`$agentic-developer-companion <mode>` (Codex); the cloud agent uses it when the issue or PR
+names it, code review selects it by description.
 
 ## Operating principles (every mode)
 
@@ -88,8 +86,9 @@ Cross-cutting: [failure modes](references/failure-modes.md),
 
 `node "$ADC" <command> [options] --json`: one JSON document on stdout, a summary on stderr;
 exit `0` ok, `1` findings, `2` usage, `3` environment missing, `4` could not verify. Pass `--yes`
-when nobody can answer a prompt. **Locate `$ADC`**: if the host told you where this skill lives
-(a base directory or this file's path), use `<that dir>/scripts/adc.mjs`; otherwise run one of:
+when nobody can answer a prompt. Playbooks call this path `$ADC` and run every command from the
+repository root. **Locate `$ADC`**: if the host told you where this skill lives (a base
+directory or this file's path), use `<that dir>/scripts/adc.mjs`; otherwise run one of:
 
 ```bash
 R=$(git rev-parse --show-toplevel 2>/dev/null); for d in "$R/.github/skills" "$R/.agents/skills" "$R/.claude/skills" $(printf '%s' "${COPILOT_SKILLS_DIRS:-}" | tr ',' ' ') "${COPILOT_HOME:-$HOME/.copilot}/skills" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "$HOME/.agents/skills" "${CODEX_HOME:-$HOME/.codex}/skills"; do [ -f "$d/agentic-developer-companion/scripts/adc.mjs" ] && { ADC="$d/agentic-developer-companion/scripts/adc.mjs"; break; }; done; echo "$ADC"

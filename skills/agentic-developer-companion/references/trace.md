@@ -36,7 +36,7 @@ node "$ADC" trace --json --matrix $M
 
 `--spec` takes a file, `-` (stdin: paste issue or PR text) or a GitHub issue/PR URL (read
 through `gh` when it is installed and signed in; otherwise save the text to a file). `--base`
-picks the diff origin as in [verify](verify.md). Without `--json`, `--md` prints the Markdown matrix.
+picks the diff origin as in [verify](verify.md) §1. Without `--json`, `--md` prints the Markdown matrix.
 `trace --matrix` exits `0` for pass, `1` for missing or extra functionality, `4` when
 requirements are not judged.
 
@@ -81,11 +81,10 @@ requirements the extractor missed (any new `id`); they count as strong.
   "extras": [ { "key": "src/billing.ts:10-14", "requirement": null } ] }
 ```
 
-Record it: `node "$ADC" evidence add "<trace_matrix>" --ledger "<ledger>"` (or pipe it with `-`).
-Keep the file under `.adc/evidence/<ledger>/` or outside the repository; a file in the working
-tree changes the snapshot and makes the ledger stale. Fill `trace-matrix.json`, never `trace.json`:
-the script reads requirement strengths from `trace.json` and refuses an edited copy
-(`LEDGER_TAMPERED`).
+Record it: `node "$ADC" evidence add "<trace_matrix>" --ledger "<ledger>"` (or pipe it with `-`);
+keep the file in the ledger folder or outside the repository ([verify](verify.md) §1). Fill
+`trace-matrix.json`, never `trace.json`: the script reads requirement strengths from `trace.json`
+and refuses an edited copy (`LEDGER_TAMPERED`).
 
 ## 4. How CK-TRACE is derived
 
@@ -108,7 +107,7 @@ The script never trusts a status on its own word:
 
 Requirements without a cited test are reported as `info` findings. If the spec explicitly
 defers a requirement or allows a change, waive it with a quote:
-`evidence waive CK-TRACE --file R3 --reason "spec: '<exact quote>'"` (see [verify](verify.md)).
+`evidence waive CK-TRACE --file R3 --reason "spec: '<exact quote>'"` ([verify](verify.md) §4.4).
 
 ## 5. Output to produce
 
@@ -120,7 +119,7 @@ functionality" lists. State plainly which requirements you could not judge.
 ## 6. Manual fallback (no Node)
 
 1. List the requirements from the spec by the rules of §2, numbered `R1..Rn`.
-2. Get the hunks: `git diff -U0 $BASE $SNAP` (snapshot recipe in [verify](verify.md), §7.1);
+2. Get the hunks: `git diff -U0 $BASE $SNAP` (snapshot recipe: [verify](verify.md) §7.1);
    each `@@ -a,b +c,d @@` header is one hunk at lines `c..c+d-1` of the new file.
 3. Fill a table `Req | Text | Status | Implementation (path:line) | Tests (path:line)`, open
    each cited line to confirm it exists, then list unmapped hunks as extra functionality.

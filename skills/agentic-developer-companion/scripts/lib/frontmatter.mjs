@@ -5,7 +5,10 @@
 // line and link helpers the tooling modules share. It reads untrusted files (lint, detect), so
 // nesting deeper than the call stack and alias expansion ("billion laughs") are document errors.
 
-import { isObj } from './core.mjs';
+import { isObj, stripBom, lineLocator } from './core.mjs';
+
+// Moved to core.mjs; re-exported until tooling-lint imports it from there.
+export { lineLocator };
 
 export class YamlError extends Error {
   constructor(message, line = null, code = 'YAML_SYNTAX') {
@@ -303,21 +306,25 @@ class Parser {
     return this.parseInlineValue(j, col, parent, path);
   }
 
-  /** The value text after "key:" on line j (may continue on following lines). */
-  parseValueAfterKey(j, n, col, rest, path) {
+  /** Leading `&anchor` / `!tag` properties of `text` on line j: `{ anchor, tag, len }` (`len`: characters used). */
+  props(text, j, path) {
     let anchor = null;
     let tag = null;
-    let text = rest;
-    let c = col;
+    let len = 0;
     for (;;) {
-      const m = /^([&!])(\S*)(?:[ \t]+|$)/.exec(text);
-      if (!m) break;
+      const m = /^([&!])(\S*)(?:[ \t]+|$)/.exec(text.slice(len));
+      if (!m) return { anchor, tag, len };
       if (m[1] === '&') anchor = m[2];
       else tag = '!' + m[2];
       this.construct(m[1] === '&' ? 'anchor' : 'tag', j, path, m[0].trim());
-      c += m[0].length;
-      text = text.slice(m[0].length);
+      len += m[0].length;
     }
+  }
+
+  /** The value text after "key:" on line j (may continue on following lines). */
+  parseValueAfterKey(j, n, col, rest, path) {
+    const { anchor, tag, len } = this.props(rest, j, path);
+    const text = rest.slice(len);
     const bare = cutComment(text).text.trim();
     let r;
     if (bare === '') {
@@ -331,7 +338,7 @@ class Parser {
     } else {
       if (/^-(?:[ \t]|$)/.test(bare)) this.fail('a block sequence cannot start on the same line as its key', j,
         'BAD_SEQUENCE');
-      r = this.parseInlineValue(j, c, n, path, tag);
+      r = this.parseInlineValue(j, col + len, n, path, tag);
     }
     if (anchor) this.anchor(anchor, r.value);
     return r;
@@ -339,18 +346,13 @@ class Parser {
 
   /** Scalar, flow collection, alias or block scalar starting at (j, col). */
   parseInlineValue(j, col, parent, path, tag = null) {
-    let line = this.lines[j];
+    const line = this.lines[j];
     let c = col;
     let anchor = null;
     if (tag === null) {
-      for (;;) {
-        const m = /^([&!])(\S*)(?:[ \t]+|$)/.exec(line.slice(c));
-        if (!m) break;
-        if (m[1] === '&') anchor = m[2];
-        else tag = '!' + m[2];
-        this.construct(m[1] === '&' ? 'anchor' : 'tag', j, path, m[0].trim());
-        c += m[0].length;
-      }
+      const p = this.props(line.slice(c), j, path);
+      ({ anchor, tag } = p);
+      c += p.len;
       if (c >= line.length || isBlank(line.slice(c))) {
         // "- &a" or "- !!str" followed by a nested block.
         const r = this.parseNode(j + 1, parent, path);
@@ -776,8 +778,7 @@ class FlowParser {
  * constructs[{kind: 'flow'|'anchor'|'alias'|'tag', line, path, text}] }.
  */
 export function parseYamlDocument(text, { lineOffset = 0 } = {}) {
-  const src = String(text ?? '').replace(/^\ufeff/, '');
-  const p = new Parser(src, { lineOffset });
+  const p = new Parser(stripBom(String(text ?? '')), { lineOffset });
   let value = null;
   try {
     value = p.parseDocument();
@@ -809,7 +810,7 @@ const DOC_MARKER = /^(?:---|\.\.\.)[ \t]*(?:#.*)?$/;
  * null for a document that does not parse. Never throws.
  */
 export function parseYamlAll(text) {
-  const lines = String(text ?? '').replace(/^\ufeff/, '').split(/\r?\n/);
+  const lines = stripBom(String(text ?? '')).split(/\r?\n/);
   const docs = [];
   let start = 0;
   const flush = (end) => {
@@ -1054,22 +1055,7 @@ export function stringifyFrontmatter(data, body = null, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Text positions and Markdown bodies
-
-/** `(offset) => 1-based line` for `text`: the line breaks are indexed once, each lookup is a binary search. */
-export function lineLocator(text) {
-  const breaks = [];
-  for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) breaks.push(i);
-  return (offset) => {
-    let [lo, hi] = [0, breaks.length];
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (breaks[mid] < offset) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo + 1;
-  };
-}
+// Markdown bodies
 
 /**
  * Lines of a Markdown text with fenced-code state: `{ n, raw, code, fenceStart?, fenceEnd?, lang? }`

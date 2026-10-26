@@ -4,8 +4,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  EXIT, AdcError, envError, ensureDir, readJson, readText, writeFileAtomic, writeJsonAtomic, withLock,
-  relPosix, toPosix, nowIso, run, stamp, realPath, isDir, isObj, redactLiveToken, IS_WINDOWS, TEMPLATES_DIR,
+  EXIT, AdcError, ensureDir, readJson, readText, writeFileAtomic, writeJsonAtomic, withLock, relPosix, toPosix, nowIso,
+  run, stamp, runId, realPath, isDir, isObj, statOrNull, listDir, findUp, stripBom, cmp, usageError, redactLiveToken,
+  IS_WINDOWS, TEMPLATES_DIR,
 } from './core.mjs';
 import { repoRoot, lsFiles, checkIgnore, appendExclude, requireRepo, resolveBase, createSnapshot } from './git.mjs';
 
@@ -95,11 +96,12 @@ export function stateIgnored(info, sub = '.env.live') {
 }
 
 /**
- * Resolve, check and (optionally) create the state dir. Throws exit 3 when it is tracked.
+ * Resolve, check and (optionally) create the state dir. Throws exit 3 when it is tracked. Pass
+ * `root` when the repository root is already known (saves a `git rev-parse`).
  * Returns the info object extended with `paths` and `exclude`.
  */
-export function prepareStateDir(ctx = {}, { create = true } = {}) {
-  const info = resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption });
+export function prepareStateDir(ctx = {}, { create = true, root } = {}) {
+  const info = resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption, ...(root ? { root } : {}) });
   assertStateUntracked(info);
   let exclude = { ok: true, needed: info.insideRepo };
   if (create) {
@@ -201,7 +203,7 @@ export function materializeTemplates(info, { envLive = true } = {}) {
 /** Parse a dotenv-style file: BOM and \r stripped, optional `export `, optional quotes. */
 export function parseEnvFile(text) {
   const map = {};
-  for (const raw of String(text || '').replace(/^﻿/, '').split('\n')) {
+  for (const raw of stripBom(String(text || '')).split('\n')) {
     const line = raw.replace(/\r$/, '').trim();
     if (!line || line.startsWith('#')) continue;
     const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
@@ -230,6 +232,9 @@ export function sanitizeId(id) {
   return s || 'unknown';
 }
 
+/** A session id as `--session` accepts it (the hooks' ids are sanitized to this alphabet too). */
+export const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
+
 export const sessionFile = (stateDir, id) => path.join(statePaths(stateDir).sessions, `${sanitizeId(id)}.json`);
 
 export function readSession(stateDir, id) {
@@ -248,20 +253,46 @@ export async function updateSession(stateDir, id, mutate) {
   }, { waitMs: 800 });
 }
 
-/** Newest session file without a session-end record, or null. */
+/**
+ * Newest session file without a session-end record, or null: `{ id, mtime, session }`. Files are
+ * read newest first, so a long session history costs one read, not one per file.
+ */
 export function newestOpenSession(stateDir) {
   const dir = statePaths(stateDir).sessions;
-  let best = null;
-  let entries = [];
-  try { entries = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return null; }
-  for (const f of entries) {
+  const files = [];
+  for (const f of listDir(dir)) {
+    if (!f.endsWith('.json')) continue;
     const full = path.join(dir, f);
-    const s = readJson(full, null);
-    if (!s || s.ended) continue;
-    const mtime = fs.statSync(full).mtimeMs;
-    if (!best || mtime > best.mtime) best = { id: s.session_id || f.replace(/\.json$/, ''), mtime, session: s };
+    const st = statOrNull(full);
+    if (st) files.push({ f, full, mtime: st.mtimeMs });
   }
-  return best;
+  // Stable sort: among equal mtimes the first listed wins.
+  files.sort((a, b) => b.mtime - a.mtime);
+  for (const { f, full, mtime } of files) {
+    const s = readJson(full, null);
+    if (s && !s.ended) return { id: s.session_id || f.replace(/\.json$/, ''), mtime, session: s };
+  }
+  return null;
+}
+
+/**
+ * Session identity (§10.3.2): `explicit` (--session, validated) > the newest open hook session
+ * file > a generated run id. Returns `{ id, source: 'flag' | 'session-file' | 'generated', record? }`.
+ */
+export function resolveSession(stateDir, explicit) {
+  if (explicit) {
+    if (!SESSION_ID_RE.test(String(explicit))) throw usageError(`--session must match ${SESSION_ID_RE}`);
+    return { id: String(explicit), source: 'flag' };
+  }
+  const open = newestOpenSession(stateDir);
+  if (open?.id) return { id: String(open.id), source: 'session-file', record: open.session };
+  return { id: runId('run'), source: 'generated' };
+}
+
+/** `[{ name, file }]` for the `*.json` files in `<stateDir>/evidence` (or `evidenceDir`); [] when absent. */
+export function ledgerFiles(stateDir, { evidenceDir = null } = {}) {
+  const dir = evidenceDir || statePaths(stateDir).evidence;
+  return listDir(dir).filter((n) => n.endsWith('.json')).map((name) => ({ name, file: path.join(dir, name) }));
 }
 
 /**
@@ -271,14 +302,11 @@ export function newestOpenSession(stateDir) {
  * `evidenceDir` overrides `<stateDir>/evidence`. Returns `[{ file, name, created_at, finalized, verdict }]`.
  */
 export function listLedgers(stateDir, { max = Infinity, evidenceDir = null } = {}) {
-  const dir = evidenceDir || statePaths(stateDir).evidence;
-  let names;
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
-  let files = names.map((name) => ({ name, file: path.join(dir, name) }));
+  let files = ledgerFiles(stateDir, { evidenceDir });
   if (Number.isFinite(max)) {
-    for (const f of files) { try { f.mtimeMs = fs.statSync(f.file).mtimeMs; } catch { f.mtimeMs = -1; } }
+    for (const f of files) f.mtimeMs = statOrNull(f.file)?.mtimeMs ?? -1;
     files = files.filter((f) => f.mtimeMs >= 0)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? 1 : -1)).slice(0, max);
+      .sort((a, b) => b.mtimeMs - a.mtimeMs || cmp(b.name, a.name)).slice(0, max);
   }
   const rows = [];
   for (const f of files) {
@@ -290,7 +318,7 @@ export function listLedgers(stateDir, { max = Infinity, evidenceDir = null } = {
     rows.push({ file: f.file, name: f.name, created_at: ts, finalized: Boolean(led.finalized_at), verdict });
   }
   const t = (r) => Date.parse(r.created_at) || 0;
-  return rows.sort((a, b) => t(b) - t(a) || (a.name < b.name ? 1 : -1));
+  return rows.sort((a, b) => t(b) - t(a) || cmp(b.name, a.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -302,28 +330,19 @@ export function listLedgers(stateDir, { max = Infinity, evidenceDir = null } = {
  */
 export function locateRepo(start) {
   if (!start || typeof start !== 'string') return null;
-  let dir = path.resolve(start);
-  try { if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir); } catch { return null; }
-  for (let i = 0; i < 64; i++) {
-    const dotgit = path.join(dir, '.git');
-    let st = null;
-    try { st = fs.statSync(dotgit); } catch {}
-    if (st) {
-      let gitDir = dotgit;
-      if (st.isFile()) {
-        const m = /^gitdir:\s*(.+?)\s*$/m.exec(readText(dotgit, '') || '');
-        if (!m) return null;
-        gitDir = path.resolve(dir, m[1]);
-      }
-      const common = readText(path.join(gitDir, 'commondir'));
-      const commonDir = common && common.trim() ? path.resolve(gitDir, common.trim()) : gitDir;
-      return { root: realPath(dir), gitDir, commonDir };
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
+  const abs = path.resolve(start);
+  const st = statOrNull(abs);
+  const dir = st && findUp(st.isDirectory() ? abs : path.dirname(abs), '.git');
+  if (!dir) return null;
+  let gitDir = path.join(dir, '.git');
+  if (statOrNull(gitDir)?.isFile()) {
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readText(gitDir, '') || '');
+    if (!m) return null;
+    gitDir = path.resolve(dir, m[1]);
   }
-  return null;
+  const common = readText(path.join(gitDir, 'commondir'));
+  const commonDir = common && common.trim() ? path.resolve(gitDir, common.trim()) : gitDir;
+  return { root: realPath(dir), gitDir, commonDir };
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +440,7 @@ export function writeOutputs(outputs, {
 // ---------------------------------------------------------------------------
 // Append-only records
 
-export function appendJsonl(file, record) {
+function appendJsonl(file, record) {
   ensureDir(path.dirname(file));
   fs.appendFileSync(file, JSON.stringify(record) + '\n');
 }
@@ -456,7 +475,7 @@ export function hookLog(stateDir, entry) {
  */
 export async function prepareTarget(ctx, { base = null, snapshot = null, createState = true } = {}) {
   const root = requireRepo(ctx.cwd);
-  const state = prepareStateDir({ ...ctx, cwd: root }, { create: createState });
+  const state = prepareStateDir({ ...ctx, cwd: root }, { create: createState, root });
   const b = resolveBase(root, base);
   const snap = snapshot || createSnapshot(root, { exclude: snapshotExcludes(state) });
   return { root, state, base: b, snapshot: snap };

@@ -18,16 +18,13 @@ There is no separate script: the mode combines `tooling cost`, `tooling trigger-
 
 ## 1. Measure the baseline
 
-1. Resolve `ADC` as described in [SKILL.md](../SKILL.md).
-2. Context cost of everything (or the paths the user named):
+1. Context cost of everything (or the paths the user named):
    `node "$ADC" tooling cost [paths...] --json [--host all|copilot|claude|codex] [--context-tokens 200000]`
-3. For each artifact the user wants to optimize, record the baseline triple before touching it:
-   `node "$ADC" tooling modify baseline <path> --json` (lint, always-on tokens per host,
-   rendered context, hosts it loads in; for skills also the latest trigger score measured on the
-   same description). Skills without a trigger score: build the set first
-   ([tooling-eval](tooling-eval.md)); measuring it is paid and needs the user's consent.
-4. Outcome evals, when the repository has them (`claude plugin eval ... --json results.json`),
-   go into the baseline with `--outcome-results results.json`.
+2. For each artifact to optimize, record a baseline before touching it ([tooling-modify](tooling-modify.md) §1):
+   `node "$ADC" tooling modify baseline <path> --json`, with `--outcome-results results.json`
+   when the repository has outcome evals (`claude plugin eval ... --json results.json`). A skill
+   without a trigger score needs its set first ([tooling-eval](tooling-eval.md)); measuring it
+   is paid and needs the user's consent.
 
 ## 2. Read the cost report
 
@@ -101,9 +98,9 @@ Make one move per change, so each can be measured and reverted on its own.
 4. **Convert prompt files to skills** (`tooling modify <prompt> --migrate prompt-to-skill`):
    prompt files reach only the VS Code Local harness and Visual Studio.
 5. **One source for shared rules**: `AGENTS.md`, with `CLAUDE.md` = `@AGENTS.md` plus
-   Claude-only notes, and `.github/copilot-instructions.md` holding Copilot-only notes. A
-   generated copy is better than two hand-maintained ones, and a symlink breaks on Windows
-   checkouts.
+   Claude-only notes, and `.github/copilot-instructions.md` holding Copilot-only notes; no
+   `CLAUDE.local.md` (it stops Claude Code from reading `AGENTS.md`). A generated copy beats two
+   hand-maintained ones; a symlink breaks on Windows checkouts.
 6. **Description tuning** for skills: what + when + boundary, third person, the user's own
    words and keywords first, near-miss exclusions ("Not for ..."), at most 1,024 characters.
    Tune against the trigger set's train split only ([tooling-eval](tooling-eval.md)); a shorter
@@ -114,17 +111,10 @@ Make one move per change, so each can be measured and reverted on its own.
 
 ## 5. Accept only measured improvements
 
-After each move: `node "$ADC" tooling modify compare <path> --note "<why>" --json`.
-
-- The output is the before/after triple per artifact: always-on tokens per host, trigger score
-  (re-measure with `tooling trigger-set <skill> --host <h> --run` after a description change; it
-  is paid, ask first), outcome-eval score (`--outcome-results`).
-- `accept`: no new lint errors, trigger and outcome not below the baseline beyond the measured
-  spread, tokens not up without a `--note`, no host lost. `reject` lists the failing deltas;
-  `unverified` means a score measured in the baseline was not re-measured.
-- Record an accepted change with `--accept` (changelog entry, version bump, new baseline);
-  undo a rejected one with `--restore`. Details: [tooling-modify](tooling-modify.md).
-- Every compare and trigger run is appended to `.adc/metrics.jsonl`.
+After each move: `node "$ADC" tooling modify compare <path> --note "<why>" --json`. After a
+description change, re-measure the trigger score first (`tooling trigger-set <skill> --host <h>
+--run`, paid, ask first). Accept rules, `--accept` and `--restore`:
+[tooling-modify](tooling-modify.md) §3-§4.
 
 Never accept a token cut that lowers a measured trigger or outcome score, and never claim an
 improvement that was not measured: write `not measured` instead.
@@ -147,6 +137,4 @@ Without Node 24, measure by hand and write "guidance-only mode" in the report.
    (PowerShell: `Get-Content AGENTS.md, .github/copilot-instructions.md | Group-Object | Where-Object Count -gt 1`).
 4. Stale commands: compare each command in the files with `package.json` scripts, Makefile
    targets and the lockfile in the repository.
-5. Before editing, copy the file to `.adc/tooling/<name>/<date>/`; after editing,
-   `git diff --no-index .adc/tooling/<name>/<date>/<file> <file>`, recount, and re-run the same
-   handful of prompts in each host (see [tooling-eval](tooling-eval.md), manual fallback).
+5. Baseline, change and compare by hand as in [tooling-modify](tooling-modify.md#manual-fallback-guidance-only-mode).

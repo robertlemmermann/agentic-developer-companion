@@ -4,7 +4,7 @@
 // Imports only core.mjs: the post-shell hook loads parseSummaryText from here.
 
 import path from 'node:path';
-import { stripBom, toPosix, firstLine } from './core.mjs';
+import { stripBom, toPosix, firstLine, truncate, parseJsonl } from './core.mjs';
 
 const TEXT_CAP = 32 * 1024;
 const MESSAGE_CAP = 300;
@@ -81,10 +81,7 @@ const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
 /** Text without terminal color and title escape sequences. */
 export const stripAnsi = (s) => String(s ?? '').replace(ANSI_RE, '');
 
-const shortMessage = (s) => {
-  const line = firstLine(s);
-  return line.length > MESSAGE_CAP ? line.slice(0, MESSAGE_CAP - 3) + '...' : line;
-};
+const shortMessage = (s) => truncate(firstLine(s), MESSAGE_CAP);
 
 /** Root spellings to strip: as given, resolved, and the macOS /private alias (/var → /private/var). */
 export function rootVariants(root) {
@@ -365,10 +362,7 @@ function parseGoTestJson(text) {
   const builds = new Map();
   const seeds = [];
   const out = (o) => o.replace(/\r?\n$/, '');
-  for (const line of String(text).split(/\r?\n/)) {
-    if (!line.trim().startsWith('{')) continue;
-    let ev;
-    try { ev = JSON.parse(line); } catch { continue; }
+  for (const ev of parseJsonl(text)) {
     if (ev.Action === 'build-output' || ev.Action === 'build-fail') {
       const key = String(ev.ImportPath || '').replace(/ \[.*\]$/, '');
       const b = getOr(builds, key, () => ({ output: [], failed: false }));
@@ -739,7 +733,12 @@ function words(s, map) {
   return out;
 }
 
-const lastMatch = (text, re) => [...text.matchAll(re)].pop() || null;
+/** The last match of a global regex (only the last is kept: console output can be megabytes). */
+function lastMatch(text, re) {
+  let last = null;
+  for (const m of text.matchAll(re)) last = m;
+  return last;
+}
 const int = (m, i) => Number((m && m[i]) || 0);
 const sumAll = (text, re, keys) => {
   const all = [...text.matchAll(re)];

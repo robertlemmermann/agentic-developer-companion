@@ -1,8 +1,8 @@
 # Failure modes, checks and detection
 
-How the companion detects the ways an agent-made change can look done without being done.
-Use it to interpret `diff-scope` and `deps-check` results, to decide between "fix" and
-"waive", and to run the same checks by hand when Node is missing (guidance-only mode).
+How the companion detects an agent-made change that looks done without being done. Use it to
+interpret `diff-scope` and `deps-check` results, to choose between fix, allow and waive, and to
+run the checks by hand when Node is missing (guidance-only mode).
 
 ## Contents
 
@@ -101,53 +101,46 @@ Lint-side detectors give extra signals when the project has them: eslint-plugin-
 
 ## 4. Manual fallback (guidance-only mode)
 
-Without Node 24 run these by hand. The commands are identical in bash and PowerShell.
-Write "guidance-only mode" in the ledger you write yourself.
+Each command is identical in bash and PowerShell; record the results in the guidance-only
+ledger ([verify](verify.md) §7).
 
-1. **Base and range.** `git rev-parse --abbrev-ref origin/HEAD` (else `main`, then
-   `master`), then `git merge-base <base> HEAD`. Call the result `B`. `git diff B` covers
-   committed and uncommitted tracked changes; `git ls-files --others --exclude-standard`
-   lists untracked files, which are entirely new. Never include `.adc/`.
-2. **CK-TEST-DEL.** `git diff --name-status -M --diff-filter=DR B`; for every modified test
-   file compare the number of test declarations: `git show B:<file>` against the working copy.
-3. **CK-SKIP / CK-RETRY.** `git diff -U0 -G'\.(only|skip|todo|failing)\(|\b(fit|xit|fdescribe|xdescribe)\(|pytest\.mark\.(skip|skipif|xfail|flaky)|pytest\.skip\(|t\.Skip|#\[ignore|@Disabled|\[Ignore|Skip *=|retryTimes|retries:' B -- <test files>`;
+1. **Base and snapshot.** Create `$BASE` and `$SNAP` with [verify](verify.md) §7.1: a snapshot
+   commit of the working tree (untracked files included, `.adc/` excluded), so
+   `git diff $BASE $SNAP` covers every change.
+2. **CK-TEST-DEL.** `git diff --name-status -M --diff-filter=DR $BASE $SNAP`; for every modified
+   test file compare the number of test declarations in `git show $BASE:<file>` and `git show $SNAP:<file>`.
+3. **CK-SKIP / CK-RETRY.** `git diff -U0 -G'\.(only|skip|todo|failing)\(|\b(fit|xit|xtest|fdescribe|xdescribe)\(|pytest\.mark\.(skip|skipif|xfail|flaky)|pytest\.skip\(|t\.Skip|#\[ignore|@Disabled|\[Ignore|Skip *=|markTestSkipped|retryTimes|retries:' $BASE $SNAP -- <test files>`;
    only lines starting with `+` count, and only when the same line was not removed.
-4. **CK-ASSERT.** `git diff -U0 B -- <test files>`: count removed lines with `expect(`,
+4. **CK-ASSERT.** `git diff -U0 $BASE $SNAP -- <test files>`: count removed lines with `expect(`,
    `assert`, `Assert.`, `t.Error`, `assert_eq!` against added ones; look for `toBeTruthy()`
    replacing a value check, for `except AssertionError`, and for added `try:`/`try {`
    blocks around assertions whose handler only logs or passes.
-5. **CK-TEST-CFG.** `git diff B -- jest.config.* vitest.config.* playwright.config.* pytest.ini pyproject.toml setup.cfg tox.ini '*conftest.py' .mocharc* Cargo.toml '*.csproj' pom.xml 'build.gradle*' Makefile justfile package.json`
+5. **CK-TEST-CFG.** `git diff $BASE $SNAP -- jest.config.* vitest.config.* playwright.config.* pytest.ini pyproject.toml setup.cfg tox.ini '*conftest.py' .mocharc* Cargo.toml '*.csproj' pom.xml 'build.gradle*' Makefile justfile package.json`
    and read every change to discovery keys, retries, thresholds and test scripts; a new
    `conftest.py` or runner config with `collect_ignore`, `exclude` or `testIgnore` hides
    tests that already exist under it.
-6. **CK-SUPPRESS.** `git diff -U0 -G'eslint-disable|@ts-ignore|@ts-nocheck|type: ignore|noqa|nolint|#\[allow|pragma warning disable|SuppressWarnings|rubocop:disable' B`
-   and `git diff B -- .eslintrc* eslint.config.* tsconfig*.json ruff.toml mypy.ini .golangci.* .editorconfig`.
-7. **CK-CI.** `git diff B -- .github/workflows .gitlab-ci.yml azure-pipelines*.yml .circleci`
+6. **CK-SUPPRESS.** `git diff -U0 -G'eslint-disable|@ts-ignore|@ts-nocheck|type: ignore|noqa|nolint|#\[allow|pragma warning disable|SuppressWarnings|rubocop:disable' $BASE $SNAP`
+   and `git diff $BASE $SNAP -- .eslintrc* eslint.config.* tsconfig*.json ruff.toml mypy.ini .golangci.* .editorconfig`.
+7. **CK-CI.** `git diff $BASE $SNAP -- .github/workflows .gitlab-ci.yml azure-pipelines*.yml .circleci`
    and look for `continue-on-error`, `allow_failure`, `|| true`, `--passWithNoTests`,
    removed `run:` test steps and lowered numbers.
-8. **CK-SWALLOW.** `git diff -U0 -G'catch|except|rescue|err != nil|Err\(_\)|console\.(warn|error)|logger\.' B`
+8. **CK-SWALLOW.** `git diff -U0 -G'catch|except|rescue|err != nil|Err\(_\)|console\.(warn|error)|logger\.' $BASE $SNAP`
    in non-test files; an added empty handler, a broad handler that neither re-raises nor logs
    an error, or a `throw` turned into a log line is a finding.
-9. **CK-SECRETS.** `gitleaks git --log-opts="B..HEAD" --redact` plus `gitleaks dir <untracked files>`,
-   or `trufflehog filesystem <changed files> --no-verification`; otherwise read the added
+9. **CK-SECRETS.** `gitleaks git --log-opts="$BASE..$SNAP" --redact`, or
+   `trufflehog filesystem <changed files> --no-verification`; otherwise read the added
    lines for token prefixes (`AKIA`, `ghp_`, `github_pat_`, `glpat-`, `xox`, `sk_live_`,
    `AIza`, `-----BEGIN ... PRIVATE KEY-----`). Never paste a found value into the ledger.
-10. **CK-LOCK / CK-DEPS.** `git diff B -- '*package.json' '*lock*' go.mod go.sum Cargo.toml pyproject.toml 'requirements*.txt'`;
-    run the frozen check of section 3 in a temp worktree (`git worktree add --detach <tmp> HEAD`,
+10. **CK-LOCK / CK-DEPS.** `git diff $BASE $SNAP -- '*package.json' '*lock*' go.mod go.sum Cargo.toml pyproject.toml 'requirements*.txt'`;
+    run the frozen check of §3 in a temp worktree (`git worktree add --detach <tmp> $SNAP`,
     then `git worktree remove --force <tmp>`); look up every new name with the registry
-    command of section 3, even when the change added it to the lockfile, and compare it with
+    command of §3, even when the change added it to the lockfile, and compare it with
     the popular package it resembles; check that new `resolved` URLs point at your registry.
 
 ## 5. Evasion matrix
 
-One scenario per documented strategy, materialized committed and uncommitted by
-`tests/unit/diff-scope.test.mjs` in the companion's source repository (run it alone or with
-`node tests/selftest.mjs --only diffs`; the fixtures are in `tests/fixtures/diffs.json`). The diff-scope /
-deps-check column is asserted there; the other columns state the design, and the test keeps
-all three identical to the fixture. The same file runs every planted check of section 2
-committed and uncommitted, plus over 90 per-ecosystem scenarios and over 45 false-positive
-guards (ordinary changes that must stay quiet), rotating committed, uncommitted and staged-only
-changes.
+What each documented evasion strategy triggers. The diff-scope / deps-check column is asserted
+by the companion's test suite; the other columns state the design.
 
 | Strategy | diff-scope / deps-check | clean-run count delta | Caught only by |
 |---|---|---|---|
@@ -169,10 +162,8 @@ changes.
   make the CI step fail again, update the lockfile with the package manager.
 - **`--allow <glob>`** (diff-scope and verify) marks paths as in scope and drops `finding`
   and `info` results on them. It never drops `fail` results or CK-SECRETS.
-- **Waive** a `fail` only with quoted spec text:
-  `evidence waive CK-TEST-DEL --reason "spec §3: 'remove the legacy endpoint and its tests'"`.
-  A waiver caps the verdict at PASS-WITH-FINDINGS and is listed in the ledger. Never infer
-  a waiver from the implementer's summary.
+- **Waive** a `fail` only with quoted spec text, never on the implementer's word
+  ([verify](verify.md) §4.4).
 - Heuristic checks (CK-ASSERT downgrades, CK-SWALLOW, generic secrets, look-alikes,
   duplicated blocks) are `finding`, not `fail`, to keep the hard-check false-positive rate low.
   Settings that change how tests run rather than which run (timeouts, workers, coverage
@@ -182,8 +173,6 @@ changes.
 
 ## 7. Known limits
 
-- Operator overloading, special-casing of inputs and lookup tables pass every static check
-  and every clean run; only mutation testing and the adversarial review catch them.
 - CK-ASSERT and CK-MOCK are heuristics with a ratchet, not proofs; an assertion rewritten
   into a helper function is invisible to line counting, and a try block that swallows
   failures inside a helper is invisible to the try-wrap detector.
@@ -200,5 +189,3 @@ changes.
   when they are set in its environment (`ADC_LIVE_TOKEN`, `ADC_LIVE_*KEY`, `*SECRET`,
   `*PASSWORD`, `*TOKEN`). A token copied from the file into a source line that triggers another
   finding appears in that finding's evidence excerpt.
-- Coverage is a soft signal. The ledger is tamper-evident, not tamper-proof, against an
-  agent with shell access. Nothing here replaces human review of security-critical code.

@@ -2,7 +2,7 @@
 
 Give the repository a real end-to-end layer for its web UI, HTTP API or CLI, or harden the one it
 has. The scaffold renders known-good templates with detected values; you then adapt them to the
-repository's conventions. Nothing is written until the user has seen the file list.
+repository's conventions.
 
 ## Contents
 
@@ -15,8 +15,6 @@ repository's conventions. Nothing is written until the user has seen the file li
 7. [Desktop and mobile (notes only)](#7-desktop-and-mobile-notes-only)
 8. [Evidence and the summary to post](#8-evidence-and-the-summary-to-post)
 9. [Guidance-only mode (no Node)](#9-guidance-only-mode-no-node)
-
-Find `adc.mjs` as described in SKILL.md; commands below use `$ADC` and run from the repository root.
 
 ## 1. Pick the target and ask only what detection cannot know
 
@@ -58,7 +56,6 @@ user the list, then re-run with `--write`. An existing file is never replaced: i
 | `--out <dir>` | all | Output folder inside the repository (not `.git`, not the state dir) |
 | `--write`, `--force`, `--dry-run` | all | Write; replace existing files (with backup); force a dry run |
 
-Exit codes: `0` ok, `1` audit found P1/P2 items, `2` usage, `3` tracked `.adc/` or environment.
 The result carries `next_steps[]`; follow them in order.
 
 ## 3. Web UI (Playwright)
@@ -83,7 +80,7 @@ Then:
 3. Implement each journey and remove `test.fixme`; until then `verify` reports them under CK-SKIP.
 4. Deterministic data: `page.clock` for time, `page.route` / `page.routeFromHAR` for third parties,
    per-worker accounts for anything that writes. Waits are web-first assertions, never sleeps.
-5. Tag fast checks `@smoke` and run them with `--grep @smoke`; keep retries in CI only.
+5. Tag fast checks `@smoke` and run them with `--grep @smoke`.
 
 With `--for <host>` the next steps add the Playwright test agents (planner, generator, healer:
 `npx playwright init-agents --loop=copilot|claude|codex`; regenerate after every Playwright upgrade;

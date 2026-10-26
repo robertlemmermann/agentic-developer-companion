@@ -1,10 +1,7 @@
 # review: adversarial second pass in a fresh context
 
-A second reviewer that did not write the change and does not see the implementer's
-conversation checks the diff against the spec. It reports **only correctness and spec
-gaps** (a reviewer told to find problems always finds some), cites `file:line` for every
-answer, gives a reproduction step for every critical item, and may say "unknown". The
-script scores the answers; a critical item fails the verdict only when a command confirms it.
+A reviewer that did not write the change checks the diff against the spec and reports **only
+correctness and spec gaps** (a reviewer told to find problems always finds some).
 
 ## Contents
 
@@ -29,8 +26,7 @@ script scores the answers; a critical item fails the verdict only when a command
 
 ## 2. Prepare the review packet
 
-Write the packet into the ledger's folder (excluded from the snapshot, so the ledger stays
-fresh). `$ADC` is the located `adc.mjs`.
+Write the packet into the ledger's folder, which is outside the snapshot ([verify](verify.md) §1).
 
 ```bash
 L=$(node "$ADC" evidence status --json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).ledger))")
@@ -64,8 +60,7 @@ acceptance criteria there. The packet is: `review.stat`, `review.diff`, `spec.tx
 | Codex | `codex review --uncommitted - < "$D/review-prompt.md"` for the working tree, `--base <branch>` for a branch (PowerShell: `Get-Content -Raw "$D/review-prompt.md" \| codex review --uncommitted -`) |
 | Anything else | a new conversation with the §4 prompt and the packet files pasted |
 
-Save the §4 prompt as `$D/review-prompt.md` when a host reads instructions from a file. Use a
-different model than the implementer where the host allows it.
+Save the §4 prompt as `$D/review-prompt.md` when a host reads instructions from a file.
 
 ## 4. Reviewer prompt (paste as is)
 
@@ -113,7 +108,8 @@ node "$ADC" evidence score "$D/review-answers.json" --ledger "$L" --add --json
 ```
 
 - The script validates every citation against the ledger's snapshot; a `yes`/`no` without a
-  valid `file:line` is rejected (counts as unknown) and listed with its reason.
+  valid `file:line` is rejected (counts as unknown) and listed with its reason. Answers are
+  `yes`, `no` or `unknown`; a custom question needs `"pass_if": "yes"|"no"`.
 - A critical item without a valid citation **and** a reproduction step is downgraded to
   important. Remaining criticals mark CK-REVIEW `fail` and set `needs_human_triage`.
 - Failed answers, important items and rejections make CK-REVIEW a `finding`; a clean review
@@ -137,9 +133,6 @@ node "$ADC" evidence add --check CK-REVIEW --repro "npx vitest run tests/limiter
 - When the reproduction needs a new test file, write it, then re-run `verify`: the failing
   test becomes part of the snapshot and fails CK-CLEANRUN on its own.
 
-Unconfirmed criticals leave the verdict at most `PASS-WITH-FINDINGS` with
-`needs_human_triage: true`.
-
 ## 7. Output to produce
 
 1. The requirement table with citations (from the reviewer, unedited).
@@ -162,8 +155,6 @@ score; list the answers as given.
 
 ## 9. Judge mitigations and limits
 
-- Per-question yes/no/unknown answers instead of one overall grade; "unknown" is allowed.
-- No self-grading: the reviewer never sees the implementer's summary as evidence.
 - When comparing two alternatives, ask twice with the order swapped and keep only
   agreements.
 - A different model than the implementer where the host allows it; calibrate against a

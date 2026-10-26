@@ -54,7 +54,7 @@ export const generatedBy = () => `${SKILL_NAME} ${skillVersion()}`;
 // ---------------------------------------------------------------------------
 // Options, context, dispatch
 
-export const GLOBAL_OPTIONS = Object.freeze({
+const GLOBAL_OPTIONS = Object.freeze({
   json: { type: 'boolean' },
   cwd: { type: 'string' },
   'state-dir': { type: 'string' },
@@ -93,43 +93,27 @@ export function numberOption(values, name, def = null, { integer = false, allowZ
   return n;
 }
 
-/** Environment markers from plan §7.6 that make a command run non-interactively. */
-export function headlessMarkers(values = {}, env = process.env) {
-  const markers = [];
-  if (values.yes) markers.push('--yes');
-  for (const k of ['COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'CI', 'GITHUB_ACTIONS']) {
-    if (env[k] && env[k] !== 'false' && env[k] !== '0') markers.push(k);
-  }
-  if (!process.stdin.isTTY) markers.push('no-tty');
-  return markers;
-}
+// Cloud agent or CI (plan §7.6): no human can confirm anything, so writes that need consent refuse.
+const AUTOMATION_KEYS = ['COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'CI', 'GITHUB_ACTIONS'];
+// Agent sessions that run our scripts through their shell tool.
+const AGENT_KEYS = ['COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'COPILOT_CLI', 'CLAUDECODE',
+  'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'CODEX_THREAD_ID'];
+/** A flag variable that is set and not '0' or 'false'. */
+const envOn = (env, k) => env[k] != null && env[k] !== '' && env[k] !== '0' && env[k] !== 'false';
 
-/** Cloud agent or CI: no human can confirm anything, so writes that need consent refuse. */
-export function isAutomation(env = process.env) {
-  return ['COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'CI', 'GITHUB_ACTIONS']
-    .some((k) => env[k] && env[k] !== 'false' && env[k] !== '0');
-}
+export const isAutomation = (env = process.env) => AUTOMATION_KEYS.some((k) => envOn(env, k));
+export const agentMarkers = (env = process.env) => AGENT_KEYS.filter((k) => env[k]);
 
-/** Agent sessions that run our scripts through their shell tool. */
-export function agentMarkers(env = process.env) {
-  const keys = ['COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'COPILOT_CLI', 'CLAUDECODE',
-    'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'CODEX_THREAD_ID'];
-  return keys.filter((k) => env[k]);
+/**
+ * Run class for the live budget (§10.3.1): 'agent' with --yes or agent markers; 'interactive' on a
+ * real controlling terminal (both TTYs, no automation markers, §10.3.2); else 'ci' under CI.
+ */
+function classify(values, env, automation, agents) {
+  if (values.yes || agents.length) return 'agent';
+  if (process.stdin.isTTY && process.stdout.isTTY && !automation) return 'interactive';
+  return env.GITHUB_ACTIONS || env.CI ? 'ci' : 'agent';
 }
-
-/** A real controlling terminal: both TTYs, no --yes, no headless or agent markers (§10.3.2). */
-export function isInteractiveTty(values = {}, env = process.env) {
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY && !values.yes &&
-    !isAutomation(env) && agentMarkers(env).length === 0);
-}
-
-/** Run class for the live budget (§10.3.1): 'interactive' | 'ci' | 'agent'. */
-export function runClass(values = {}, env = process.env) {
-  if (values.yes || agentMarkers(env).length) return 'agent';
-  if (isInteractiveTty(values, env)) return 'interactive';
-  if (env.GITHUB_ACTIONS || env.CI) return 'ci';
-  return 'agent';
-}
+export const runClass = (values = {}, env = process.env) => classify(values, env, isAutomation(env), agentMarkers(env));
 
 const HOOKS_HOST = {
   'copilot-cloud': 'copilot-cloud', 'copilot-cli': 'copilot', vscode: 'copilot',
@@ -143,8 +127,7 @@ const HOOKS_HOST = {
  * 'copilot' | 'claude' | 'codex') or null; `candidates` lists every host with a marker.
  */
 export function hostFromEnv(env = process.env) {
-  const on = (k) => env[k] != null && env[k] !== '' && env[k] !== '0' && env[k] !== 'false';
-  const keys = Object.keys(env).filter(on);
+  const keys = Object.keys(env).filter((k) => envOn(env, k));
   const found = [];
   const add = (host, markers) => { if (markers.length) found.push({ host, markers }); };
   add('copilot-cloud', keys.filter((k) => k === 'COPILOT_AGENT_PROMPT' || k === 'GITHUB_COPILOT_API_TOKEN'));
@@ -177,7 +160,12 @@ export function makeContext(values = {}) {
   if (!fs.existsSync(given)) throw usageError(`--cwd does not exist: ${given}`);
   // Resolved, so it compares equal to the repository root git reports (macOS /var -> /private/var).
   const cwd = realPath(given);
-  const markers = headlessMarkers(values);
+  const env = process.env;
+  const automationKeys = AUTOMATION_KEYS.filter((k) => envOn(env, k));
+  const automation = automationKeys.length > 0;
+  // Markers that make the command non-interactive (plan §7.6).
+  const markers = [...(values.yes ? ['--yes'] : []), ...automationKeys, ...(process.stdin.isTTY ? [] : ['no-tty'])];
+  const cls = classify(values, env, automation, agentMarkers(env));
   return {
     cwd,
     json: Boolean(values.json) || !process.stdout.isTTY,
@@ -186,9 +174,9 @@ export function makeContext(values = {}) {
     stateDirOption: values['state-dir'] || null,
     headless: markers.length > 0,
     headlessMarkers: markers,
-    automation: isAutomation(),
-    interactiveTty: isInteractiveTty(values),
-    runClass: runClass(values),
+    automation,
+    interactiveTty: cls === 'interactive',
+    runClass: cls,
     values,
   };
 }
@@ -267,10 +255,19 @@ export function readText(file, fallback = null) {
   try { return stripBom(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
 }
 
-export function readJson(file, fallback = null) {
-  const text = readText(file);
+/** JSON.parse of `text` (BOM stripped), or `fallback` when it is null or not valid JSON. */
+export function tryJson(text, fallback = null) {
   if (text == null) return fallback;
-  try { return JSON.parse(text); } catch { return fallback; }
+  try { return JSON.parse(stripBom(String(text))); } catch { return fallback; }
+}
+
+export const readJson = (file, fallback = null) => tryJson(readText(file), fallback);
+
+/** A JSON file as `{ exists: false }`, `{ exists: true, value }` or `{ exists: true, error }` (the parse message). */
+export function readJsonFile(file) {
+  const text = readText(file);
+  if (text == null) return { exists: false };
+  try { return { exists: true, value: JSON.parse(text) }; } catch (err) { return { exists: true, error: err.message }; }
 }
 
 export function truncate(text, max) {
@@ -289,11 +286,43 @@ export const uniq = (list) => [...new Set(list.filter((x) => x != null && x !== 
 export const firstLine = (text) => String(text ?? '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) || '';
 /** Last non-empty line of a text, trimmed (tool errors end with the line that matters). */
 export const lastLine = (text) => String(text ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop() || '';
-/** 1-based line number of a character offset. */
-export const lineOf = (text, index) => (index <= 0 ? 1 : String(text).slice(0, index).split('\n').length);
+/** Runs of whitespace (newlines included) collapsed to one space, trimmed. */
+export const oneLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
+/** Whitespace-separated words, without empty ones. */
+export const words = (text) => String(text ?? '').split(/\s+/).filter(Boolean);
+/** Width of a line's leading whitespace. */
+export const indentOf = (line) => line.length - line.trimStart().length;
+/** `one` for 1, else `many` (default: `one` + 's'). */
+export const plural = (n, one, many = `${one}s`) => (n === 1 ? one : many);
+/** Ascending comparator by `<` (code-unit order, locale-independent); descending is `(a, b) => cmp(b, a)`. */
+export const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 /** A value for a Markdown table cell: one line, pipes escaped, truncated. */
 export const mdCell = (value, max = 160) =>
   truncate(String(value ?? '').replace(/\r?\n/g, ' ').replace(/\|/g, '\\|'), max);
+
+/** 1-based line number of a character offset (one lookup; use lineLocator for many). */
+export function lineOf(text, index) {
+  const s = String(text);
+  let line = 1;
+  for (let i = s.indexOf('\n'); i !== -1 && i < index; i = s.indexOf('\n', i + 1)) line++;
+  return line;
+}
+
+/** `(offset) => 1-based line` for `text`: the line breaks are indexed once, each lookup is a binary search. */
+export function lineLocator(text) {
+  const breaks = [];
+  for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) breaks.push(i);
+  return (offset) => {
+    let lo = 0;
+    let hi = breaks.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (breaks[mid] < offset) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo + 1;
+  };
+}
 
 /** Progress note on stderr (silenced by ADC_QUIET=1); stdout is reserved for the JSON result. */
 export function log(msg) {
@@ -347,18 +376,46 @@ export const nowIso = () => new Date().toISOString();
 /** Filesystem-safe UTC timestamp, e.g. 20261025T171243Z. */
 export const stamp = (d = new Date()) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 export const today = (d = new Date()) => d.toISOString().slice(0, 10);
+/** Sortable unique id `[<prefix>-]<stamp>-<6 hex>` (run ids, generated session ids, log names). */
+export const runId = (prefix = '') => `${prefix ? `${prefix}-` : ''}${stamp()}-${nonce().slice(0, 6)}`;
 
 // ---------------------------------------------------------------------------
 // Paths and files
 
 export const toPosix = (p) => String(p).replace(/\\/g, '/');
 
-/** Repo-relative POSIX path, or null when `file` is outside `root`. */
-export function relPosix(root, file) {
-  const rel = path.relative(root, path.resolve(root, file));
-  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return rel === '' ? '.' : null;
-  return toPosix(rel);
+/** The native relative path from `dir` to `p` ('' for `dir` itself), or null when `p` is outside `dir`. */
+function relInside(dir, p) {
+  const rel = path.relative(dir, p);
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel) ? null : rel;
 }
+
+/** Repo-relative POSIX path ('.' for the root), or null when `file` (absolute or root-relative) is outside `root`. */
+export function relPosix(root, file) {
+  const rel = relInside(root, path.resolve(root, file));
+  return rel == null ? null : toPosix(rel) || '.';
+}
+
+/** `p` is `dir` or inside it (`strict`: inside only). Paths resolve against the cwd. */
+export function isWithin(dir, p, { strict = false } = {}) {
+  const rel = relInside(path.resolve(String(dir)), path.resolve(String(p)));
+  return rel != null && (!strict || rel !== '');
+}
+
+/** A path for messages: repo-relative POSIX inside `root` ('.' for the root), else the full POSIX path. */
+export const displayPath = (root, p) => relPosix(root, p) ?? toPosix(p);
+
+// Repo-relative POSIX paths, where '.' (or '') is the whole repository.
+
+/** POSIX separators, no leading `./`, no trailing slash. */
+export const normRel = (p) => toPosix(String(p ?? '')).replace(/^(?:\.\/+)+/, '').replace(/\/+$/, '');
+const isTop = (dir) => !dir || dir === '.';
+/** `rel` is `dir` or below it. */
+export const isUnder = (rel, dir) => isTop(dir) || rel === dir || rel.startsWith(`${dir}/`);
+/** `rel` relative to `dir` (which contains it): '' for `dir` itself. */
+export const subPath = (rel, dir) => (isTop(dir) ? rel : rel === dir ? '' : rel.slice(dir.length + 1));
+/** `rel` (relative to `dir`) relative to the repository; an empty `rel` stays as it is. */
+export const joinRel = (dir, rel) => (isTop(dir) || !rel ? rel : `${dir}/${rel}`);
 
 /** Absolute on either platform: POSIX `/x`, a drive path `C:\x` or `C:/x` (also when parsed on Linux). */
 export const isAbsolutePath = (p) => path.isAbsolute(String(p)) || /^[A-Za-z]:[\\/]/.test(String(p));
@@ -390,12 +447,38 @@ export function statOrNull(p) {
 }
 export const isDir = (p) => Boolean(statOrNull(p)?.isDirectory());
 
+/** Entry names of a directory (`types`: Dirent objects), or [] when it cannot be read. */
+export function listDir(dir, { types = false } = {}) {
+  try { return fs.readdirSync(dir, types ? { withFileTypes: true } : undefined); } catch { return []; }
+}
+
+/**
+ * Up to `bytes` bytes from the start of a file (`fromEnd`: from its end) as UTF-8, with the file's
+ * size: `{ text, size }`, or null when it cannot be read. Large logs and transcripts are never read whole.
+ */
+export function readFilePart(file, bytes, { fromEnd = false } = {}) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.max(0, Math.min(size, bytes));
+    const buf = Buffer.alloc(len);
+    const n = fs.readSync(fd, buf, 0, len, fromEnd ? size - len : 0);
+    return { text: buf.toString('utf8', 0, n), size };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+}
+
 /** The nearest directory from `start` upwards that contains `rel`, or null (`stopAt` is the last one tried). */
 export function findUp(start, rel, { stopAt = null, maxDepth = 64 } = {}) {
   let d = path.resolve(start);
+  const last = stopAt && path.resolve(stopAt);
   for (let i = 0; i < maxDepth; i++) {
     if (fs.existsSync(path.join(d, rel))) return d;
-    if (stopAt && path.resolve(d) === path.resolve(stopAt)) return null;
+    if (d === last) return null;
     const parent = path.dirname(d);
     if (parent === d) return null;
     d = parent;
@@ -498,9 +581,7 @@ export function listFiles(root, {
   const out = [];
   const walk = (dir, depth) => {
     if (out.length >= maxFiles || depth > maxDepth) return;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const entries = listDir(dir, { types: true }).sort((a, b) => cmp(a.name, b.name));
     for (const e of entries) {
       if (ignore.has(e.name)) continue;
       const full = path.join(dir, e.name);
@@ -669,7 +750,7 @@ let trapped = false;
  * 0 kills at once) or its tree (Windows: taskkill /T /F). The group is signalled even when the
  * leader already exited, because grandchildren holding the pipes would keep the run open.
  */
-export function killTree(child, { graceMs = 2000 } = {}) {
+function killTree(child, { graceMs = 2000 } = {}) {
   if (!child || child.pid == null) return;
   if (IS_WINDOWS) {
     const opts = { windowsHide: true, stdio: 'ignore' };
@@ -913,6 +994,10 @@ export function tmpRoot(key) {
   return path.join(os.tmpdir(), `adc-${sha256(String(key)).slice(0, 8)}`);
 }
 
+/** A fresh (not yet created) `<label>-<rev, 12 chars>-<6 hex>` path under tmpRoot(key): worktrees, run outputs. */
+export const tmpPath = (key, label, rev) =>
+  path.join(tmpRoot(key), `${label}-${String(rev).slice(0, 12)}-${nonce().slice(0, 6)}`);
+
 // ---------------------------------------------------------------------------
 // Secrets: literal-value redaction (used for loaded credentials; shape regexes live in markers.mjs)
 
@@ -923,8 +1008,8 @@ export function redactLiterals(text, secrets = []) {
   for (const { name, value } of secrets) {
     if (!value || String(value).length < 4) continue;
     const v = String(value);
-    const forms = new Set([v, encodeURIComponent(v), Buffer.from(v).toString('base64'),
-      Buffer.from(v).toString('base64').replace(/=+$/, ''), Buffer.from(v).toString('base64url')]);
+    const b64 = Buffer.from(v).toString('base64');
+    const forms = new Set([v, encodeURIComponent(v), b64, b64.replace(/=+$/, ''), Buffer.from(v).toString('base64url')]);
     for (const form of forms) {
       if (form.length >= 4) out = out.split(form).join(`[REDACTED:${name}]`);
     }
@@ -936,13 +1021,13 @@ const LIVE_SECRET_NAME = /^ADC_LIVE_TOKEN$|^ADC_LIVE_\w*(?:TOKEN|SECRET|KEY|PASS
 // Built from parts so the skill tree carries no `NAME=value`-shaped token literal.
 const TOKEN_REDACTED = ['ADC_LIVE_TOKEN', '[REDACTED]'].join('=');
 
-/** Live-test credentials in `env` (ADC_LIVE_TOKEN, ADC_LIVE_*TOKEN|SECRET|KEY|PASSWORD) as redactLiterals input. */
 /** The environment without live-test credentials, for every project or tool process we start. */
 export function toolEnv(env = process.env) {
   const live = new Set(liveSecrets(env, { min: 1 }).map((s) => s.name));
   return live.size ? Object.fromEntries(Object.entries(env).filter(([k]) => !live.has(k))) : env;
 }
 
+/** Live-test credentials in `env` (ADC_LIVE_TOKEN, ADC_LIVE_*TOKEN|SECRET|KEY|PASSWORD) as redactLiterals input. */
 export function liveSecrets(env = process.env, { min = 4 } = {}) {
   return Object.entries(env || {})
     .filter(([k, v]) => LIVE_SECRET_NAME.test(k) && typeof v === 'string' && v.trim().length >= min)

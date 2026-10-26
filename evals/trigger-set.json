@@ -6,9 +6,8 @@
   "suite_threshold": 0.8,
   "guidance": [
     "The skill's own trigger set: 10 should-trigger queries across both jobs (QA of agent-made changes, agentic tooling) and 10 near misses that share keywords with them.",
-    "Each query runs 3 times; a query passes when more than half of its runs behave as labeled; the suite score is the share of passing queries (release gate: 0.8 in Claude Code and Copilot).",
-    "Free check from the repository root: node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json --json (validates the set, prints the paid commands). Paid run: add --host claude|copilot|codex --run.",
-    "Tune the description on the train split only; after 5 revisions add 5-10 fresh queries instead of editing these."
+    "Release gate: suite_threshold in Claude Code and Copilot. Scoring and tuning (train split only, at most 5 revisions, then 5-10 fresh queries instead of edits): skills/agentic-developer-companion/references/tooling-eval.md §2.",
+    "Free check from the repository root: node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json --json (validates the set, prints the paid commands). Paid run: add --host claude|copilot|codex --run."
   ],
   "queries": [
     { "id": "pos-01", "should_trigger": true, "query": "Copilot says it fixed the date parsing bug and that all tests pass. Can you check that this is actually true before I merge the branch?" },

@@ -7,14 +7,11 @@ fix it, and quarantine only as a dated, owned stopgap.
 ## Contents
 
 1. [Detect: repeat with seeds](#1-detect-repeat-with-seeds)
-2. [Classify](#2-classify)
-3. [Fix patterns](#3-fix-patterns)
-4. [Quarantine policy and registry](#4-quarantine-policy-and-registry)
-5. [Retries](#5-retries)
-6. [Evidence and the summary to post](#6-evidence-and-the-summary-to-post)
-7. [Guidance-only mode (no Node)](#7-guidance-only-mode-no-node)
-
-Find `adc.mjs` as described in SKILL.md; commands below use `$ADC` and run from the repository root.
+2. [Classify and fix](#2-classify-and-fix)
+3. [Quarantine policy and registry](#3-quarantine-policy-and-registry)
+4. [Retries](#4-retries)
+5. [Evidence and the summary to post](#5-evidence-and-the-summary-to-post)
+6. [Guidance-only mode (no Node)](#6-guidance-only-mode-no-node)
 
 ## 1. Detect: repeat with seeds
 
@@ -22,13 +19,12 @@ Find `adc.mjs` as described in SKILL.md; commands below use `$ADC` and run from 
 node "$ADC" flake-probe --tests "test/sum.test.mjs::handles floats" --times 20 --json
 ```
 
-`--tests` takes `file` or `file::test name` entries, comma-separated (default: the new and changed
+`--tests` takes comma-separated `file` or `file::test name` entries (default: the new and changed
 tests of the working tree); `--times` the repetitions (default 5). It shuffles and records seeds
-where the runner can: pytest-randomly + pytest-repeat, `go test -count=N -shuffle=on` (Go 1.17+),
-`jest --randomize` (jest-circus), `cargo nextest run --retries 0`, a `dotnet test` loop; otherwise
-it runs N times in order and records `shuffle: false`. Output: `{ runs, shuffle, seeds[],
-failures[], suspect_tests[] }` and a `CK-FLAKE` check. A test that fails in any run is a suspect;
-keep the failing seeds, they reproduce the order.
+where the runner can (Go 1.17+, jest-circus, pytest-randomly + pytest-repeat), else runs in order
+with `shuffle: false`. Output: `{ runs, shuffle, seeds[], failures[], suspect_tests[] }` and a
+`CK-FLAKE` check. A test that fails in any run is a suspect; keep the failing seeds, they
+reproduce the order.
 
 Manual fallback, one runner at a time (retries off, same seed recorded):
 
@@ -44,37 +40,23 @@ Manual fallback, one runner at a time (retries off, same seed recorded):
 
 PowerShell loop: `1..20 | ForEach-Object { node --test test/sum.test.mjs; if ($LASTEXITCODE) { "run $_ failed" } }`.
 
-## 2. Classify
+## 2. Classify and fix
 
 Assign exactly one class per incident, with the evidence that points to it:
 
-| Class | Signal |
-|---|---|
-| Order dependence | fails only with some seeds or orders; passes alone |
-| Time and timezone | fails near midnight, at DST changes, in another TZ, on slow machines |
-| Network | timeouts, DNS errors, third-party 5xx |
-| Concurrency | races between workers or async steps; shared ports, files, accounts |
-| Resource leaks | later tests fail; open handles; growing memory |
-| Test-data collisions | unique-constraint errors; shared fixtures mutated |
-| Environment | Windows paths, line endings, locale, CPU speed, missing tools |
-
-## 3. Fix patterns
-
-- Time: fake timers (`vi.useFakeTimers`, `jest.useFakeTimers`, Playwright `page.clock`, freezegun,
-  time-machine); pin `TZ`.
-- Network: mock at the boundary (MSW with unhandled requests as errors, nock `disableNetConnect`,
-  respx, VCR.py or pytest-recording `--block-network`, WireMock, Playwright `page.route`).
-- Isolation: state per test, reset globals, one resource (port, temp dir, account) per worker.
-- Determinism: fixed seeds for random data; stable sort before comparing.
-- Waiting: wait on conditions (web-first assertions, `expect.poll`, polling with a deadline), never
-  on sleeps.
-- Data: unique data per test (`<run id>-<counter>`), factories instead of shared fixtures, explicit
-  cleanup in `finally` or fixture teardown.
-- Environment: `path.join`, normalize EOL before comparing, no timing thresholds in assertions.
+| Class | Signal | Fix |
+|---|---|---|
+| Order dependence | fails only with some seeds or orders; passes alone | state per test, reset globals; fixed seeds for random data; stable sort before comparing |
+| Time and timezone | fails near midnight, at DST changes, in another TZ, on slow machines | fake timers (`vi.useFakeTimers`, `jest.useFakeTimers`, Playwright `page.clock`, freezegun, time-machine); pin `TZ` |
+| Network | timeouts, DNS errors, third-party 5xx | mock at the boundary (MSW with unhandled requests as errors, nock `disableNetConnect`, respx, VCR.py or pytest-recording `--block-network`, WireMock, Playwright `page.route`) |
+| Concurrency | races between workers or async steps; shared ports, files, accounts | wait on conditions (web-first assertions, `expect.poll`, polling with a deadline), never on sleeps; one port, temp dir and account per worker |
+| Resource leaks | later tests fail; open handles; growing memory | explicit cleanup in `finally` or fixture teardown |
+| Test-data collisions | unique-constraint errors; shared fixtures mutated | unique data per test (`<run id>-<counter>`), factories instead of shared fixtures |
+| Environment | Windows paths, line endings, locale, CPU speed, missing tools | `path.join`, normalize EOL before comparing, no timing thresholds in assertions |
 
 Verify the fix with the same probe and **zero failures** in the same number of runs.
 
-## 4. Quarantine policy and registry
+## 3. Quarantine policy and registry
 
 Quarantine only when the fix cannot land now. Scaffold the policy once per repository:
 
@@ -111,7 +93,7 @@ To quarantine a test:
 4. Weekly review: fix and remove the tag and the entry, extend once with a written reason, or
    delete the test with the reason in the PR.
 
-## 5. Retries
+## 4. Retries
 
 - Allowed only for e2e tests and only with a flaky report, so a retried pass is visible and fails
   the run: Playwright `failOnFlakyTests` / `--fail-on-flaky-tests`, Surefire `Flakes:` with
@@ -121,7 +103,7 @@ To quarantine a test:
 - CI fails when more than `--max-flaky` flaky tests are reported (`gate.mjs counts --max-flaky`).
 - `gh run rerun --failed` hides flakes: a green re-run is not evidence.
 
-## 6. Evidence and the summary to post
+## 5. Evidence and the summary to post
 
 1. With a ledger open (`node "$ADC" evidence init --json` or `verify`), add the probe before and
    after the fix: `node "$ADC" flake-probe --tests "<file::name>" --times 20 --json | node "$ADC" evidence add -`.
@@ -129,8 +111,8 @@ To quarantine a test:
 3. Post: the test, the evidence (runs, failures, seeds), the class, the fix, the verification
    (0 failures in N runs) or the quarantine entry (owner, issue, expiry), and the commands to reproduce.
 
-## 7. Guidance-only mode (no Node)
+## 6. Guidance-only mode (no Node)
 
 Run the manual repeat commands of §1, record runs, failures and seeds in the ledger you keep by
-hand (marked "guidance-only mode"), write the quarantine entry by hand with the fields of §4, and
+hand (marked "guidance-only mode"), write the quarantine entry by hand with the fields of §3, and
 keep the flake `UNVERIFIED` until a repeat run with zero failures has been seen.

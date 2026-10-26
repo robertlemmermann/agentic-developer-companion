@@ -20,19 +20,16 @@ prefer `unknown` to a guess.
 ## 1. Scope and inputs
 
 - **Paths given** (`audit-tests tests/limiter.test.ts`): audit those test files.
-- **No paths**: audit the test files the change adds or modifies against the base (default
-  chain `origin/HEAD` > `main` > `master` > `HEAD`); the working tree counts, uncommitted and
-  untracked files included.
+- **No paths**: audit the test files the change adds or modifies against the base (`--base`,
+  default chain in [verify](verify.md) §1), uncommitted and untracked files included.
 - **Regression tests** (the change fixes a bug): also prove red-green (§4). Ask for the bug
   or issue when the change does not name it; headless runs record `unknown` instead.
-- Locate `adc.mjs` as SKILL.md describes ("Locate the companion"); below it is `$ADC`.
 
 ## 2. Run it
 
 Reuse the ledger of a `verify` run on the same snapshot (`evidence status --json` shows it
 and whether it is `stale`); otherwise create one. Write every intermediate file into the
-ledger's folder (the ledger path without `.json`): `.adc/` is excluded from the snapshot,
-while a file anywhere else changes it and makes the ledger stale (`LEDGER_STALE`).
+ledger's folder, the ledger path without `.json` ([verify](verify.md) §1).
 
 ```bash
 L=$(node "$ADC" evidence init --json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).ledger))")
@@ -110,7 +107,7 @@ CK-REDGREEN is never waivable. A failing proof is a `fail` in the ledger.
 - **Coverage of behavior, not lines.** `coverage-delta` gives `pct` of changed executable
   lines, `uncovered[]` and `untested_branches[]` (`file`, `line`, `covered`/`total`
   branches). `precision: file` means the report could not be mapped to lines: say
-  "approximate". Coverage stays a soft signal; use it to find the branches to ask about.
+  "approximate". Use coverage to find the branches to ask about.
 - **Mutation** (`mutation-scope`): `score` and `survivors[]` on the changed files only. A
   surviving mutant in changed code is a concrete rewrite suggestion: name the mutant and the
   assertion that would kill it.
@@ -171,19 +168,17 @@ Without Node, take `BASE` and `SNAP` from [verify](verify.md) §7.1 and run:
 | Step | Commands |
 |---|---|
 | Changed test files | `git diff --name-status -M $BASE $SNAP` filtered by the test globs (`**/*.{test,spec}.*`, `test_*.py`, `*_test.go`, `src/test/**`, `spec/**`) |
-| Tampering | `git diff --name-status --diff-filter=DR $BASE $SNAP`; skip, assertion and retry patterns from [verify](verify.md) §7.2 and [failure modes](failure-modes.md) on `git diff -U0 $BASE $SNAP` |
-| Red-green | `WT="$(mktemp -d)/base"; git worktree add --detach "$WT" $BASE`; copy only the new test files in; run just them (`npx vitest run <file>`, `pytest <file>::<name>`, `go test -run <Name> ./pkg`); expect an assertion failure; run the same in a snapshot worktree; expect a pass; `git worktree remove --force "$WT"` |
+| Tampering | steps 2-4 of [failure modes](failure-modes.md) §4 |
+| Red-green | [regress](regress.md) §5 manual fallback: only the new test files in a base worktree must fail by assertion, then pass in the snapshot (`npx vitest run <file>`, `pytest <file>::<name>`, `go test -run <Name> ./pkg`) |
 | Coverage | the runner's coverage flag (`npx vitest run --coverage`, `pytest --cov --cov-report=xml`, `go test -coverprofile=c.out ./...`), then `diff-cover coverage.xml --compare-branch=$BASE` |
 | Mutation | `npx stryker run --mutate <files>`, `dotnet stryker --since:<base>`, `cargo mutants --in-diff <diff>`, `mutmut run` (POSIX only) |
-| Flakiness | `go test ./... -count=5 -shuffle=on`, `pytest -p randomly --count 5` (pytest-repeat), `npx jest --randomize`, `cargo nextest run --retries 0` in a loop |
+| Flakiness | repeat commands of [flake](flake.md) §1 |
 
-Write the answer table yourself in `.adc/evidence/<UTC stamp>-manual.md` with the line
-`mode: guidance-only`, and state that no score was computed by a script.
+Write the answer table into the guidance-only ledger ([verify](verify.md) §7) and state that no
+script computed a score.
 
 ## 9. Limits
 
-Mock-domination, mirrored assertions and weak assertions are heuristics a careful reader can
-argue either way: cite, explain, and let the ratchet and the reviewer decide. Coverage is
-soft; mutation testing is the stronger signal and needs a tool. A red-green proof shows the
-test detects *this* bug, not that the fix is complete. Nothing here replaces reading the
-test against the requirement.
+Mock-domination, mirrored and weak assertions can be argued either way: cite, explain, and let
+the ratchet and the reviewer decide. A red-green proof shows the test detects *this* bug, not
+that the fix is complete.

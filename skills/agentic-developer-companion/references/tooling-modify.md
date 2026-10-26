@@ -17,10 +17,9 @@ compare, accept or reject, record**. The built-in migrations run the same loop.
 
 ## 1. Baseline
 
-1. Resolve `ADC` as described in [SKILL.md](../SKILL.md).
-2. `node "$ADC" tooling modify baseline <path> --json [--external] [--strict] [--outcome-results <file>]`
+1. `node "$ADC" tooling modify baseline <path> --json [--external] [--strict] [--outcome-results <file>]`
    where `<path>` is a file or a skill folder inside the repository.
-3. It measures and stores under `.adc/tooling/<artifact>/baselines/<timestamp>/`:
+2. It measures and stores under `.adc/tooling/<artifact>/baselines/<timestamp>/`:
    - `lint`: errors and warnings per host from [tooling-lint](tooling-lint.md) (`--strict` for
      spec-only frontmatter);
    - `cost`: always-on and on-demand tokens per host ([tooling-optimize](tooling-optimize.md));
@@ -37,15 +36,13 @@ compare, accept or reject, record**. The built-in migrations run the same loop.
      replaced by `<repo>` and `~`; credential-shaped values in both snapshots are stored and
      printed as `[REDACTED:<id>]`;
    - `files/`: a copy of every file of the artifact (for restore).
-4. If a skill has no trigger score yet, say so: a change to its description cannot be
-   accepted later without one (see step 3).
+3. If a skill has no trigger score yet, say so: a change to its description cannot be
+   accepted later without one (§3).
 
 ## 2. Change
 
-Edit the artifact (or let the model edit it) with one intent per change, following the
-per-kind rules in [tooling-scaffold](tooling-scaffold.md) and the checklist in
-[tooling-practices](tooling-practices.md): no host-specific syntax in shared files, no
-secrets or hostnames, Windows-safe commands, and never rename a published skill or plugin.
+One intent per change, following the per-kind rules in [tooling-scaffold](tooling-scaffold.md)
+and the review checklist in [tooling-practices](tooling-practices.md) §5.
 
 ## 3. Compare
 
@@ -90,14 +87,15 @@ recorded, restored }`. Each compare is saved next to the baselines and appended 
 ## 5. Migrations
 
 `node "$ADC" tooling modify <path> --migrate <kind> [--to copilot|claude|codex] [--force] --json`
+(`--to` writes the result to another host's location).
 
-| `--migrate` | Source | Result | Equivalence proven by |
-|---|---|---|---|
-| `prompt-to-skill` | `.github/prompts/<n>.prompt.md` | `.github/skills/<n>/SKILL.md` with `disable-model-invocation: true`; `agent`, `model`, `tools` dropped | identical Markdown body |
-| `chatmode-to-agent` | `.github/chatmodes/<n>.chatmode.md` | `.github/agents/<n>.agent.md` | identical body |
-| `claude-commands-to-skills` | `.claude/commands/` (folder) or one command | `.claude/skills/<a>-<b>/SKILL.md` per command | identical body |
-| `vscode-mcp-to-mcp-json` | `.vscode/mcp.json` (`servers`, `${input:}`) | `.mcp.json` (`mcpServers`, `${VAR}`) | same servers: name, transport, command, args, URL, env and header names |
-| `copilot-hooks-to-camel` | a legacy or PascalCase `.github/hooks/*.json` | the same file as `version: 1` with camelCase events, `bash` + `powershell`, `timeoutSec` | same events, matchers, commands and timeouts after normalization |
+| `--migrate` | Source | Result | Read by (source → result) | Equivalence proven by |
+|---|---|---|---|---|
+| `prompt-to-skill` | `.github/prompts/<n>.prompt.md` | `.github/skills/<n>/SKILL.md` with `disable-model-invocation: true`; `agent`, `model`, `tools` dropped (as VS Code's own migration) | VS Code Local harness, Visual Studio → every host, as a skill in that host's folder (`--to`) | identical Markdown body |
+| `chatmode-to-agent` | `.github/chatmodes/<n>.chatmode.md` | `.github/agents/<n>.agent.md` | VS Code (legacy) → Copilot CLI, VS Code, cloud agent | identical body |
+| `claude-commands-to-skills` | `.claude/commands/` (folder) or one command | `.claude/skills/<a>-<b>/SKILL.md` per command | Claude Code (legacy), Copilot CLI → every host, as a skill in that host's folder (`--to`) | identical body |
+| `vscode-mcp-to-mcp-json` | `.vscode/mcp.json` (`servers`, `${input:}`) | `.mcp.json` (`mcpServers`, `${VAR}`) | VS Code → Copilot CLI (which stopped reading `.vscode/mcp.json` in 1.0.22), Claude Code, VS Code Copilot harness | same servers: name, transport, command, args, URL, env and header names |
+| `copilot-hooks-to-camel` | a legacy or PascalCase `.github/hooks/*.json` | the same file as `version: 1` with camelCase events, `bash` + `powershell`, `timeoutSec` | older Copilot CLI → Copilot CLI, VS Code, cloud agent (`bash` only) | same events, matchers, commands and timeouts after normalization |
 
 Each migration stores a baseline of every source first, migrates through `tooling port`, then
 measures every result: `accept` needs zero lint errors, the equivalence check, and trigger or

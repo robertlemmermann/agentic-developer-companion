@@ -16,9 +16,8 @@ MCP configs against each host's documented rules: `spec` (the Agent Skills speci
 
 ## Run it
 
-1. Resolve `ADC` (the path of `scripts/adc.mjs`) as described in [SKILL.md](../SKILL.md).
-2. Lint what the user named; with no path, the whole repository:
-   `node "$ADC" tooling lint [paths...] --json [--host all|copilot|claude|codex] [--strict]`
+Lint what the user named; with no path, the whole repository:
+`node "$ADC" tooling lint [paths...] --json [--host all|copilot|claude|codex] [--strict]`
 
 | Option | Effect |
 |---|---|
@@ -54,9 +53,8 @@ not portable; **note** = information, never fails. `security[]` holds the `SEC-*
 masked). External statuses: `pass`, `fail`, `error` (crashed or no parsable report), `skipped`
 (absent, too old), `not-applicable` (cannot validate this target); only `pass` is a pass.
 
-`gh skill install` rewrites SKILL.md frontmatter (sorted keys, single-quoted scalars) and adds
-`metadata.github-*` or `metadata.local-path`; lint ignores that provenance (`gh skill publish`
-strips it). Compare an installed copy with its source by parsed data, never byte for byte.
+Lint ignores the `metadata.github-*` and `metadata.local-path` provenance that `gh skill install`
+adds while rewriting the frontmatter ([host notes](host-notes.md) §8).
 
 ## Fix, re-run, report
 
@@ -89,8 +87,7 @@ Without Node 24, check by hand, write "guidance-only mode" in the report, and wa
    `for f in references/*; do grep -qF "$f" SKILL.md || echo "unlinked: $f"; done`
    (`Get-ChildItem references | Where-Object { -not (Select-String -Path SKILL.md -SimpleMatch "references/$($_.Name)" -Quiet) }`).
 3. JSON parses: `python3 -m json.tool <file> > /dev/null` (`Get-Content <file> -Raw | ConvertFrom-Json | Out-Null`).
-4. Run whichever validators exist, as in the table above (`skills-ref validate <skill-dir>`, `claude plugin
-   validate <plugin-dir> --strict --json`, `gh skill publish --dry-run`, `copilot skill list --json`, ...).
+4. Run whichever validators of the table above are installed.
 
 ## Rule catalog
 
@@ -289,7 +286,7 @@ Without Node 24, check by hand, write "guidance-only mode" in the report, and wa
 
 ## Sources
 
-Research digests checked 2026-10-24/25 (plan Appendix B); each key is cited in the catalog.
+Research digests checked 2026-10-24/25; each key is cited in the catalog.
 
 - Agent Skills: `spec` specification.mdx (agentskills.io/specification); `skills-ref` validator.py and parser.py; `measured` runs in the build container on 2026-10-25 (skills-ref @69ef37e, gh 2.99.0, Claude Code 2.1.310, Copilot CLI 1.0.103, Codex 0.164.0).
 - GitHub Copilot docs: `cp-skills` agent skills; `cp-cli` CLI command reference; `cp-listing` SDK skills (100-file listing, folders over 50 summarized); `cp-instr` custom instructions; `cp-cr` code review tutorial (about 1,000 lines); `cp-dist` CLI instructions and @imports; `cp-agents` custom agents; `cp-prompts` prompt files; `cp-hooks` hooks reference; `cp-hooks-howto` CLI hooks how-to; `cp-plugins` CLI plugin reference; `cp-mcp` MCP for the CLI and the cloud agent; `cp-2540` copilot-cli issue 2540 (plugin `preToolUse` `cwd`).

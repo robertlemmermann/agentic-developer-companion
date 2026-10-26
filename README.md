@@ -88,11 +88,8 @@ A plain-text version of both diagrams is in
 | OpenAI Codex | ✅ | `$agentic-developer-companion <mode>` |
 | Windows, macOS, Linux | ✅ one zero-dependency Node runtime, no shell scripts, no symlinks | — |
 
-Status of 0.1.0: the unit suites and the host CLIs (Copilot CLI 1.0.103, Claude Code 2.1.310,
-Codex 0.164.0, gh 2.99.0) were exercised in a Linux container; the Windows and macOS rows of the
-[manual matrix](tests/manual-matrix.md) are still open.
-Per-host details and known gaps:
-[host notes](skills/agentic-developer-companion/references/host-notes.md).
+0.1.0 is tested on Linux only; the Windows and macOS rows of the [manual matrix](tests/manual-matrix.md)
+are open. Per-host details and known gaps: [host notes](skills/agentic-developer-companion/references/host-notes.md).
 
 ## 🚀 Install
 
@@ -105,8 +102,8 @@ Everything else is optional and has a fallback:
 |---|---|---|---|---|---|
 | Version | 1.0.88 | 1.109 | 2.1.269 (`claude plugin eval`; 2.1.295 for hook `onFailure`) | 0.124.0 (stable hooks; 0.164.0 for `/presets`) | 2.90.0 |
 
-The `gh skill` commands below (GitHub CLI 2.90.0+, `gh skill` is in public preview) are
-identical in bash, PowerShell and cmd. Run project-scope commands in the repository root.
+The `gh skill` commands (public preview) are identical in bash, PowerShell and cmd; run
+project-scope commands in the repository root.
 
 **GitHub Copilot, a Copilot-only repository** (every surface, including code review):
 
@@ -154,13 +151,9 @@ Verify it loaded: the `/skills` picker shows it, or `$agentic-developer-companio
 without signing in, `codex debug prompt-input "hello"` lists it under `<skills_instructions>`.
 
 **Check the whole setup** with `doctor` (host, OS, Node, Git, every installed copy, hooks).
-Adjust the path to the copy you installed:
+Adjust the path to the copy you installed (bash and PowerShell, then cmd):
 
 ```bash
-node .agents/skills/agentic-developer-companion/scripts/adc.mjs doctor
-```
-
-```powershell
 node .agents/skills/agentic-developer-companion/scripts/adc.mjs doctor
 ```
 
@@ -239,12 +232,11 @@ Installed with `npx skills`? `npx skills remove agentic-developer-companion`. Co
 `$skill-installer` refuses to overwrite, so delete `~/.codex/skills/agentic-developer-companion`
 before reinstalling.
 
-**Windows notes.** Install PowerShell 7 (`winget install Microsoft.PowerShell`) for Copilot
-CLI and Codex hooks; Git for Windows for Claude Code's Bash tool. `node.exe` must be on the
-`PATH` the hook launcher sees (Node from nvm, fnm or Volta: `setup hooks --node-path`).
-Junctions and `--copy`, never symlinks, so Developer Mode is not needed. Deep temp
-worktrees may need `git config --global core.longpaths true`. Codex hooks on native Windows:
-confirm in `/hooks` that they fire. Long form: [install.md](skills/agentic-developer-companion/references/install.md).
+**Windows notes.** PowerShell 7 (`winget install Microsoft.PowerShell`) for Copilot CLI and
+Codex hooks; Git for Windows for Claude Code's Bash tool; `node.exe` on the hook launcher's
+`PATH` (Node from nvm, fnm or Volta: `setup hooks --node-path`); junctions and `--copy`, never
+symlinks, so no Developer Mode; `git config --global core.longpaths true` for deep temp
+worktrees; confirm in `/hooks` that Codex hooks fire on native Windows. Long form: [install.md](skills/agentic-developer-companion/references/install.md).
 
 ## 🎛️ Use
 
@@ -294,10 +286,9 @@ The full command table: [host notes](skills/agentic-developer-companion/referenc
 
 ## 🪝 Hooks (optional)
 
-Hooks add cheap real-time signals; the ledger stays the source of truth. They are opt-in,
-offline, read cached state only, and **fail open**: every handler prints one JSON object
-and exits 0, a missing or broken Node yields `{}`, and nothing blocks a session because a
-hook failed.
+Hooks are opt-in, offline real-time signals that read cached state only; the ledger stays the
+source of truth. They **fail open**: every handler prints one JSON object and exits 0, a
+missing or broken Node yields `{}`, and a failed hook never blocks a session.
 
 | Level | What it adds |
 |---|---|
@@ -339,11 +330,11 @@ All state lives in `<project-root>/.adc/`, created on first use (or with `doctor
   (owner-only permissions). Only `live run` reads it, and only to pass it to the probe
   process; `doctor` reports `set` or `unset`, never the value. A shell-capable agent can still
   read any file in your checkout, so use a least-privilege, short-lived token.
-- **Spend cap.** Live probes run under a budget of 2,500 credits per session and 2,500 per
-  calendar day. `--credits <n>` lowers the limit for a run; `--credits-override` raises it
-  only from an interactive terminal; CI may raise the session cap with `ADC_LIVE_BUDGET` (at
-  most 10,000); agent sandboxes keep the shipped cap. `budget show` prints what is left;
-  `LIVE_TESTS_ENABLED` set to anything but `true` stops live runs.
+- **Spend cap.** 2,500 credits per session and per UTC day. `--credits <n>` lowers it for a run;
+  `--credits-override` raises it only from a real terminal; CI may set the session cap with
+  `ADC_LIVE_BUDGET` (at most 10,000); agent sessions keep the shipped caps. `budget show`
+  prints what is left; `LIVE_TESTS_ENABLED` other than `true` stops live runs
+  ([budget ledger](skills/agentic-developer-companion/references/live.md#6-the-budget-ledger)).
 
 ## 📜 Evidence ledger
 
@@ -380,8 +371,7 @@ produced. Format and verdict rules: [verify](skills/agentic-developer-companion/
 
 ## 🧪 Testing the skill itself
 
-The tests, evals and release notes live at the repository root, not in the shipped skill
-folder, so an install carries only what the skill needs to run. From a clone:
+From a clone (tests and evals are never installed):
 
 ```bash
 node tests/selftest.mjs
@@ -389,10 +379,8 @@ node tests/selftest.mjs --only footprint,readme,release
 node --test "tests/unit/*.test.mjs"
 ```
 
-`tests/selftest.mjs` covers frontmatter, scripts, hook dialects and rendering, the planted-failure
-diff scenarios and the evasion matrix, detection, the file footprint (including that the
-skill folder carries no development files), `.adc/` handling, this README, prerequisites and
-release consistency, and prints the paid eval commands without running them. The OS × host
+`node tests/selftest.mjs --help` lists its 16 areas (including that the skill folder carries
+no development files); it prints the paid eval commands without running them. The OS × host
 checklist filled per tag is [tests/manual-matrix.md](tests/manual-matrix.md). The skill's own
 evals live in [`evals/`](evals/trigger-set.json): a 20-query trigger set
 (`node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json`
@@ -415,8 +403,8 @@ use a copy committed to the repository (its network is firewalled).
 | Claude Code | `strictPluginOnlyCustomization` blocks non-plugin skills | that setting, `allowManagedHooksOnly`, `disableAllHooks` |
 | Codex | no documented key blocks `.agents/skills` | `allow_managed_hooks_only` in `requirements.toml`; hooks need each user's `/hooks` approval |
 
-There is deliberately no plugin version of this skill, so where only plugins are allowed the
-options are an admin exception for the skill directories or guidance-only mode.
+There is no plugin version of this skill: where only plugins are allowed, ask for an admin
+exception for the skill directories or use guidance-only mode.
 
 **Vendored hooks and skills run on every colleague's machine** once a pull request changes
 them (Copilot gates repository hooks on folder trust only). Protect those paths:
@@ -467,7 +455,7 @@ for a fix and a coordinated disclosure.
 **Roadmap.** Phase 4, hardening and dogfooding: run `verify` on real agent pull requests and
 on read-only pilot repositories, turn false positives into baseline rules until hard checks
 stay below a 5% false-positive rate, fill the Windows and macOS rows of the manual matrix,
-reach a trigger suite score of at least 0.8 in Claude Code and Copilot, publish `SHA256SUMS`
+reach a trigger suite score of at least 0.8 in Copilot (Claude Code: 1.0), publish `SHA256SUMS`
 with every GitHub release, re-verify the host facts every quarter, then tag **v1.0.0**.
 
 **Changelog:** [CHANGELOG.md](CHANGELOG.md).

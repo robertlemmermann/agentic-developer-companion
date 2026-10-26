@@ -2,12 +2,11 @@
 // (strict for linting, lenient for manifests and lockfiles), INI and JSON with comments.
 // Zero dependencies; every reader handles a BOM and \r\n. YAML lives in frontmatter.mjs.
 
-import { stripBom } from './core.mjs';
+import { stripBom, isObj, lineOf, lineLocator } from './core.mjs';
 
 // ---------------------------------------------------------------------------
 // TOML
 
-const isTable = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const BARE_KEY = /[A-Za-z0-9_-]+/y;
 const DATE_RE = /\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?)?|\d{2}:\d{2}:\d{2}(?:\.\d+)?/y;
 const NUMBER_RE = /[+-]?(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|inf|nan|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?)(?![A-Za-z0-9_.:-])/y;
@@ -32,20 +31,11 @@ class TomlParser {
     this.prefix = '';
     this.keyLines = {};
     this.errors = [];
-    // Line starts for O(log n) line numbers (lockfiles have tens of thousands of keys).
-    this.starts = [0];
-    for (let i = 0; i < this.s.length; i++) if (this.s[i] === '\n') this.starts.push(i + 1);
+    // Indexed line numbers: lockfiles have tens of thousands of keys.
+    this.lineAt = lineLocator(this.s);
   }
 
-  line(pos = this.p) {
-    let lo = 0;
-    let hi = this.starts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (this.starts[mid] <= pos) lo = mid; else hi = mid - 1;
-    }
-    return lo + 1;
-  }
+  line(pos = this.p) { return this.lineAt(pos); }
 
   fail(msg) { throw new TomlError(msg, this.line()); }
   excerpt() { return this.s.slice(this.p, this.p + 20).split('\n')[0]; }
@@ -132,7 +122,7 @@ class TomlParser {
     for (const k of keys) {
       if (t[k] === undefined || (this.lenient && t[k] !== null && typeof t[k] !== 'object')) t[k] = {};
       t = Array.isArray(t[k]) ? t[k][t[k].length - 1] : t[k];
-      if (!isTable(t)) this.fail(`"${k}" is not a table`);
+      if (!isObj(t)) this.fail(`"${k}" is not a table`);
     }
     return t;
   }
@@ -326,8 +316,6 @@ export function stripJsonc(text) {
   return out.replace(/,(\s*[}\]])/g, '$1');
 }
 
-const lineAt = (text, index) => (index <= 0 ? 1 : text.slice(0, index).split('\n').length);
-
 /**
  * JSON.parse that reports where it failed. With `jsonc`, comments and trailing commas are
  * accepted (`jsonc: true` in the result); without it they are an error that still carries the
@@ -341,7 +329,7 @@ export function parseJson(text, { jsonc = false } = {}) {
   const loose = attempt(stripJsonc(src));
   const m = /line (\d+)/.exec(strict.error);
   const pos = /position (\d+)/.exec(strict.error);
-  const line = m ? Number(m[1]) : pos ? lineAt(src, Number(pos[1])) : 1;
+  const line = m ? Number(m[1]) : pos ? lineOf(src, Number(pos[1])) : 1;
   if (!loose.error) {
     if (jsonc) return { value: loose.value, jsonc: true };
     return { error: 'comments or trailing commas are not valid JSON here', line, looseValue: loose.value };

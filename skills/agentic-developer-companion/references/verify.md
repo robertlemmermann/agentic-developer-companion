@@ -2,8 +2,7 @@
 
 Verify the working tree an agent produced (uncommitted and untracked files included), record
 every check in the evidence ledger, and report one verdict: `PASS`, `PASS-WITH-FINDINGS`,
-`FAIL` or `UNVERIFIED`. A claim is unverified until a command, its exit code and its output
-are in the ledger.
+`FAIL` or `UNVERIFIED`.
 
 ## Contents
 
@@ -14,11 +13,8 @@ are in the ledger.
 5. [Finalize and post the summary](#5-finalize-and-post-the-summary)
 6. [Ledger format](#6-ledger-format)
 7. [Guidance-only mode (no Node)](#7-guidance-only-mode-no-node)
-8. [Limits](#8-limits)
 
 ## 1. Run it
-
-Find `adc.mjs` as described in SKILL.md ("Locate the companion"), then from the repository root:
 
 ```bash
 node "$ADC" verify --json --spec SPEC.md --claims - < implementer-summary.txt
@@ -42,13 +38,13 @@ Get-Content implementer-summary.txt | node "$ADC" verify --json --spec SPEC.md -
 | `--offline` | No registry lookups in deps-check (default inside the Codex sandbox or with `ADC_OFFLINE=1`) |
 | `--fail-under <pct>`, `--budget <min>`, `--times <n>` | Coverage gate, mutation budget, flake repetitions |
 | `--session <id>`, `--tool <host>` | Override the session (letters, digits, `._:-`) and host recorded in the ledger |
+| `--refresh` | Ignore the cached `detect` result (`.adc/detect.json`) |
 | `--dry-run` | List the steps and which modules are available; run and write nothing |
 
 Output: `{ ledger, markdown, verdict, finalized, needs_human_triage, tree_digest, base, tool, session_id,
 session_source, checks[], claims[], reasons[], next_steps[], trace_matrix, steps[], worktree_unchanged,
-duration_ms, finalize_error?, summary_markdown }`. Exit `0` for `PASS`
-and `PASS-WITH-FINDINGS`, `1` for `FAIL`, `4` for `UNVERIFIED`, `3` when Git or Node is missing or
-`.adc/` is tracked.
+duration_ms, finalize_error?, summary_markdown }`. Exit `0` for `PASS` and `PASS-WITH-FINDINGS`,
+`1` for `FAIL`, `4` for `UNVERIFIED`, `3` when Git or Node is missing or `.adc/` is tracked.
 
 Rules while a ledger is open:
 
@@ -58,30 +54,30 @@ Rules while a ledger is open:
 - Put scratch files (review answers, the trace matrix) under the ledger's folder
   `.adc/evidence/<ledger>/` or pipe them with `-`; a file inside the working tree changes the
   snapshot.
-- Follow `next_steps[]` in order. Never open `.adc/.env.live`.
-- Codex: the default `read-only` sandbox cannot create worktrees; use `workspace-write` or
-  approve the escalation. A step that cannot run is `UNVERIFIED`, never assumed to pass.
+- Follow `next_steps[]` in order. A step that cannot run is `UNVERIFIED`, never assumed to pass
+  (Codex: worktree steps need `workspace-write`, [host notes](host-notes.md) §1).
 
 ## 2. Steps and manual fallbacks
 
 One snapshot (`tree_digest`) is created and passed to every step. A step whose module is
 missing, or that throws, is recorded `unverified` (`MODULE_UNAVAILABLE`, `STEP_ERROR` or the
 error code) and the run continues. Each fallback below is what to run by hand in
-guidance-only mode (§7); `$BASE` and `$SNAP` come from §7.1.
+guidance-only mode (§7); `$BASE` and `$SNAP` come from §7.1; "FM N" is step N of
+[failure modes](failure-modes.md) §4.
 
 | # | Step (script) | Checks | Effect on the verdict | Manual fallback |
 |---|---|---|---|---|
 | 1 | `detect` | none | if it fails, each later step detects on its own (`unverified` when it cannot) | read `package.json` scripts, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.csproj`, CI files for the real test command |
 | 2 | `diff-scope` | CK-SCOPE | finding | `git diff --name-status -M $BASE $SNAP`; compare with the paths the spec names |
-| 3 | `diff-scope` | CK-TEST-DEL, CK-SKIP, CK-ASSERT | **FAIL** unless waived | `git diff --name-status --diff-filter=DR $BASE $SNAP`; skip markers in §7.2; removed `assert`/`expect(` lines in `git diff -U0` |
-| 4 | `diff-scope` | CK-TEST-CFG | **FAIL** unless waived | `git diff $BASE $SNAP -- package.json jest.config.* vitest.config.* pytest.ini pyproject.toml setup.cfg conftest.py .mocharc* Cargo.toml *.csproj Makefile justfile` |
-| 5 | `diff-scope` | CK-SUPPRESS | finding; **FAIL** for a rule turned off repo-wide | suppression pattern in §7.2 on added lines |
-| 6 | `diff-scope` | CK-CI | **FAIL** | `git diff $BASE $SNAP -- .github/workflows .gitlab-ci.yml azure-pipelines.yml`: `continue-on-error`, `\|\| true`, `--passWithNoTests`, removed steps |
-| 7 | `diff-scope` | CK-SWALLOW | finding | swallow pattern in §7.2 on added lines |
-| 8 | `diff-scope` | CK-SECRETS | **FAIL** | `gitleaks git --log-opts="$BASE..$SNAP" --redact`, else the built-in shapes of [failure modes](failure-modes.md) |
-| 9 | `deps-check` | CK-DEPS, CK-LOCK | **FAIL** for a nonexistent package or lock mismatch | `npm view <pkg> version`, `pip index versions <pkg>`, `cargo info <crate>`, `go list -m <mod>@latest`; `npm ci --dry-run`, `uv lock --check`, `go mod tidy -diff`, `cargo metadata --locked`, `dotnet restore --locked-mode` |
+| 3 | `diff-scope` | CK-TEST-DEL, CK-SKIP, CK-ASSERT | **FAIL** unless waived | FM 2-4 |
+| 4 | `diff-scope` | CK-TEST-CFG | **FAIL** unless waived | FM 5 |
+| 5 | `diff-scope` | CK-SUPPRESS | finding; **FAIL** for a rule turned off repo-wide | FM 6 |
+| 6 | `diff-scope` | CK-CI | **FAIL** | FM 7 |
+| 7 | `diff-scope` | CK-SWALLOW | finding | FM 8 |
+| 8 | `diff-scope` | CK-SECRETS | **FAIL** | FM 9 |
+| 9 | `deps-check` | CK-DEPS, CK-LOCK | **FAIL** for a nonexistent package or lock mismatch | FM 10 |
 | 10 | `typecheck` | CK-TYPES | **FAIL** on new errors; pre-existing ones are `pass-with-baseline` | run `npx tsc --noEmit`, `mypy .`, `go vet ./...`, `cargo check` or `dotnet build` in a base and a snapshot worktree; compare errors by file and message |
-| 11 | `clean-run` | CK-CLEANRUN | §2.1 | §7.3 |
+| 11 | `clean-run` | CK-CLEANRUN | §2.1 | §7.2 |
 | 12 | `coverage-delta` | CK-COVERAGE | soft | `diff-cover coverage.xml --compare-branch=$BASE` |
 | 13 | `mutation-scope` (`--deep`) | CK-MUTATION | soft | `npx stryker run --incremental --mutate <files>`, `dotnet stryker --since:<base>`, `cargo mutants --in-diff <diff>` |
 | 14 | `flake-probe` (`--deep`) | CK-FLAKE | finding | `go test ./... -count=5 -shuffle=on`, `pytest -p randomly --count 5`, `npx jest --randomize` |
@@ -126,51 +122,27 @@ Fill `trace_matrix` (a copy of the skeleton under the ledger folder), then
 
 ### 4.2 Adversarial review (CK-REVIEW)
 
-Use a **fresh context** that sees only the diff, the spec and the ledger; read-only; it reports
-correctness and spec gaps only (a reviewer told to find gaps always finds some). Protocol and
-template: [review](review.md).
+Run a read-only review in a **fresh context** that sees only the diff, the spec and the ledger.
+Packet, host table, reviewer prompt and scoring rules: [review](review.md) §2-§6. Record the
+answers, then confirm each critical item with a command the script runs:
 
-| Host | How to get the fresh context |
-|---|---|
-| Claude Code | a subagent with read-only tools (Read, Grep, Glob; `isolation: worktree` when available); `/code-review` only as a second opinion |
-| Copilot CLI | `/review` with the checklist, or a custom read-only agent; `/rubber-duck` for a second model |
-| VS Code | a new chat with a read-only custom agent and the template, ideally a different model |
-| Copilot cloud agent / code review | Copilot code review on the PR (`.github/skills/code-review` can carry the checklist) |
-| Codex | `codex review --uncommitted` (working tree) or `codex review --base <branch>` |
-| Any other | a new conversation with the [review](review.md) template pasted |
-
-Record the reviewer's answers; the script computes every aggregate:
-
-```json
-{ "kind": "review", "ready_to_merge": "With fixes", "declined_to_judge": ["performance"],
-  "answers": [ { "id": "RV-SPEC", "answer": "yes", "citation": "src/limiter.ts:42" },
-               { "id": "RV-BUG", "answer": "yes", "citation": "src/limiter.ts:57" } ],
-  "critical": [ { "title": "off-by-one at the limit", "citation": "src/limiter.ts:57",
-                  "repro": "npx vitest run tests/limiter.test.ts -t boundary" } ],
-  "important": [], "minor": [] }
+```bash
+node "$ADC" evidence score .adc/evidence/<ledger>/review-answers.json --ledger "<ledger>" --add
+node "$ADC" evidence add --check CK-REVIEW --repro "<command that fails because of the bug>" --ledger "<ledger>"
 ```
 
-`node "$ADC" evidence score .adc/evidence/<ledger>/review-answers.json --ledger "<ledger>" --add`
-
-- Questions: `RV-SPEC`, `RV-EDGE`, `RV-BUG`, `RV-HIDDEN`, `RV-ERRORS`, `RV-TESTS`, `RV-SCOPE`,
-  `RV-SECURITY` (custom questions need `"pass_if": "yes"|"no"`). Answers are `yes`, `no` or
-  `unknown`; a yes/no answer without a valid `file:line` citation is rejected.
-- A critical item needs a citation and a reproduction step, otherwise it is downgraded.
-- A critical item fails the verdict only when **confirmed** by a command the script runs:
-  `node "$ADC" evidence add --check CK-REVIEW --repro "<command that fails because of the bug>" --ledger "<ledger>"`.
-  Unconfirmed criticals give `PASS-WITH-FINDINGS` with `needs_human_triage: true`.
-- If the reproduction needs a new test file, write it, then re-run `verify` (the new failing
-  test becomes part of the snapshot and fails CK-CLEANRUN).
-- Recorded commands (`--run`, `--repro`) run without the `ADC_LIVE_*` variables and are stopped,
-  with their child processes, after `--timeout <s>` (default 600); a timeout is `unverified`.
+Only a reproduced critical item fails the verdict; unconfirmed criticals give
+`PASS-WITH-FINDINGS` with `needs_human_triage: true`. Recorded commands (`--run`, `--repro`) run
+without the `ADC_LIVE_*` variables and are stopped, with their child processes, after
+`--timeout <s>` (default 600); a timeout is `unverified`.
 
 ### 4.3 Claims
 
-`node "$ADC" evidence claims - --ledger "<ledger>"` with the implementer's summary on stdin, or
-JSON `[{ "text": "All tests pass", "evidence": ["CK-CLEANRUN"] }]` to map claims explicitly. A
-claim is `supported` only if every referenced check passed, `contradicted` if one failed,
-otherwise `unsupported`. Statuses in the input are ignored. Observed runs (hooks) never
-support a claim.
+`node "$ADC" evidence claims - --ledger "<ledger>"` with the implementer's summary on stdin
+(claims are mapped to checks by keywords), or JSON
+`[{ "text": "All tests pass", "evidence": ["CK-CLEANRUN"] }]` to name the evidence. A claim is
+`supported` only if every referenced check passed, `contradicted` if one failed, otherwise
+`unsupported`. Statuses in the input are ignored. Observed runs (hooks) never support a claim.
 
 ### 4.4 Waivers
 
@@ -195,7 +167,7 @@ node "$ADC" evidence waive CK-TEST-DEL --file tests/legacy.test.ts --reason "spe
    snapshot (`LEDGER_STALE`, exit 4), records CK-CLAIMS, derives the verdict and seals the
    ledger. Exit `1` on `FAIL`, `4` on `UNVERIFIED`.
 2. `node "$ADC" evidence render --short --ledger "<ledger>"` prints the summary to post;
-   `--out <file>` writes the full Markdown (decision D12: generated only; you or CI post it).
+   `--out <file>` writes the full Markdown. The script never posts; you or CI do.
 3. Post, in this order: the rendered summary unchanged; one line per `fail`, `unverified` or
    waiver in your own words; what the review concluded and whether `needs_human_triage` is set;
    the reproduce command. Never restate a verdict more favourably than the ledger.
@@ -257,23 +229,11 @@ $SNAP = git -c user.name=adc -c user.email=adc@localhost commit-tree (git write-
 Remove-Item $env:GIT_INDEX_FILE; Remove-Item Env:GIT_INDEX_FILE
 ```
 
+Without `origin/HEAD`, use `main`, else `master`, else `git config init.defaultBranch` (§1).
 The user's index, stash and working tree stay untouched; untracked files are included. The
 temporary index starts from `HEAD`, so every file is hashed and no same-second edit is missed.
 
-### 7.2 Diff patterns (added lines only: `git diff -U0 $BASE $SNAP`)
-
-- Skip/focus (test files): `\b(fit|xit|xtest|xdescribe|fdescribe)\s*\(`, `\.(only|skip|todo|failing)\s*\(`,
-  `@pytest\.mark\.(skip|skipif|xfail)`, `pytest\.skip\(`, `t\.(Skip|Skipf|SkipNow)\(`, `#\[ignore\]`,
-  `@Disabled`, `\[Ignore\(`, `\[Fact\(Skip`, `markTestSkipped`
-- Suppressions: `eslint-disable`, `@ts-ignore`, `@ts-nocheck`, `# type: ignore`, `# noqa`, `#\[allow\(`, `//nolint`
-- Swallowed errors: `catch\s*(\([^)]*\))?\s*\{\s*\}`, `except(\s+Exception)?\s*:\s*pass`
-- In-source retries: `jest\.retryTimes`, `@pytest\.mark\.flaky`, `retries:`
-
-bash: `git diff -U0 $BASE $SNAP | grep -nE '^\+.*(PATTERN)'`; PowerShell:
-`git diff -U0 $BASE $SNAP | Select-String -Pattern '^\+.*(PATTERN)'`. The full catalog and
-per-ecosystem commands are in [failure modes](failure-modes.md).
-
-### 7.3 Clean run
+### 7.2 Clean run
 
 ```bash
 WT="$(mktemp -d)/snap"; git -c core.hooksPath=/dev/null worktree add --detach "$WT" "$SNAP"
@@ -291,10 +251,3 @@ Use the project's frozen install and full-suite command with retries off (pytest
 `-p no:rerunfailures --junit-xml f`, `go test ./... -json -count=1`, `cargo nextest run --retries 0`,
 `dotnet test --logger "trx;LogFileName=f"`); run the same in a base worktree for the counts.
 
-## 8. Limits
-
-The ledger is tamper-evident, not tamper-proof: an agent with shell access can forge it, so
-re-run `verify` for a ledger you did not see produced. Special-cased inputs, lookup tables and
-operator overloading need the review and mutation testing; coverage is a soft signal; the
-claim-to-check mapping uses keywords unless claims name their evidence. Nothing here replaces
-human review of security-critical code.

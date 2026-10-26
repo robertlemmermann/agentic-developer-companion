@@ -17,16 +17,15 @@ always shows the command and the cost cap first and runs only after the user agr
 
 ## 1. Trigger sets
 
-1. Resolve `ADC` as described in [SKILL.md](../SKILL.md).
-2. Create the set next to the skill (free): `node "$ADC" tooling trigger-set <skill-dir> --init --json`
+1. Create the set next to the skill (free): `node "$ADC" tooling trigger-set <skill-dir> --init --json`
    writes `<skill-dir>/evals/trigger-set.json` from `assets/evals/trigger-set.template.json`
    (`--set <file>` for another location, `--force` to replace an existing one).
-3. Replace every `TODO` query; the runner refuses a set that still contains one. About 20
+2. Replace every `TODO` query; the runner refuses a set that still contains one. About 20
    queries: 8-10 `should_trigger: true` with varied phrasing (direct and indirect asks, the
    user's own words, realistic detail such as paths, tool names and error text) and 8-10
    **near misses** `should_trigger: false` (same keywords or files, another task or skill).
    One-step requests that need no skill make poor positives: agents rarely load a skill for them.
-4. Check it (free): `node "$ADC" tooling trigger-set <skill-dir> --json` prints the queries,
+3. Check it (free): `node "$ADC" tooling trigger-set <skill-dir> --json` prints the queries,
    their split, `ready`, `todo[]`, `warnings[]` and the exact paid commands per host.
 
 Format `adc-trigger-set/1`: `{ "schema", "skill", "runs": 3, "query_threshold": 0.5,
@@ -58,8 +57,9 @@ CLI is missing.
 [--runs 3] [--split all|train|validation] [--model <pinned>] [--max-cost-usd 10]
 [--timeout-s 180] [--concurrency 1] [--cli <path>]`
 
-With `--dry-run` nothing is run. Every run starts in a fresh temporary workspace that holds only a copy of the skill (its `evals/`
-excluded), so repository instructions, other skills and earlier sessions cannot leak in.
+With `--dry-run` nothing is run. Every run starts in a fresh temporary workspace that holds
+only a copy of the skill (its `evals/` excluded), so repository instructions, other skills and
+earlier sessions cannot leak in.
 
 | Host | Command per query | Counts as triggered | Confidence |
 |---|---|---|---|
@@ -123,18 +123,13 @@ Copilot has no built-in eval runner (`copilot -p` in CI, or waza); Codex uses `c
 
 ## 5. Regression suites for tooling changes
 
-- Every change to a measured artifact goes through `tooling modify baseline` / `compare`
-  ([tooling-modify](tooling-modify.md)): lint, tokens, trigger and outcome scores, hosts.
-- Rendered-context snapshots are the golden files: `--external` stores what the hosts
-  themselves render for free (`copilot instruction list --json`, `copilot skill list --json`,
-  the skills and `AGENTS.md` parts of `codex debug prompt-input`, `skills-ref to-prompt`) and
-  `compare --external` diffs them.
-- A/B two instruction variants on the same prompt set (two `claude plugin eval` arms, or the
-  same headless prompts against each version).
+- Every change to a measured artifact goes through the [tooling-modify](tooling-modify.md)
+  loop; its `--external` rendered-context snapshots are the golden files.
+- A/B two instruction variants on the same prompt set ([tooling-optimize](tooling-optimize.md) §4, move 1).
 - LLM-judge rubrics: per-dimension yes/no questions, "unknown" allowed, position-swapped
-  pairs, a judge model different from the one under test, and a periodic human check of a
-  sample of verdicts. Pin every model (`--model`, `--judge-model`) so a model rollout is not
-  mistaken for a tooling regression.
+  pairs, a judge model other than the one under test, a periodic human check of a sample.
+  Pin every model (`--model`, `--judge-model`) so a model rollout is not mistaken for a
+  tooling regression.
 
 ## 6. Report
 
@@ -145,7 +140,7 @@ that was not run.
 
 ## Manual fallback (guidance-only mode)
 
-Without Node 24, write "guidance-only mode" and run a small set by hand.
+Without Node 24, write "guidance-only mode" in the report and run a small set by hand.
 
 1. In a temporary folder, copy only the skill: `.claude/skills/<name>/` (Claude Code),
    `.github/skills/<name>/` (Copilot), `.agents/skills/<name>/` (Codex; `git init` first).

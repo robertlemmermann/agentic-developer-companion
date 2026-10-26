@@ -1,14 +1,12 @@
 # Third-party notices
 
-The `agentic-developer-companion` skill is licensed under the Apache License 2.0 (the
-`LICENSE` file at the repository root). This file lists third-party material included in the
-skill and the attribution it requires.
+The skill is licensed under Apache-2.0 ([`LICENSE`](LICENSE)). This file lists third-party
+material included in it and the attribution each requires.
 
 ## Included third-party code
 
-**None as of 0.1.0.** No file in this skill is ported, vendored or copied from another
-project, and the scripts have no runtime dependencies (Node.js built-ins only). Every check,
-parser, validator rule and template was written for this skill.
+**None as of 0.1.0.** No file is ported, vendored or copied from another project; the scripts
+use Node.js built-ins only.
 
 ## Rule for future ports
 
@@ -22,9 +20,9 @@ A file that ports or adapts code or text from another project:
    the license requires it to travel with the code;
 3. keeps the upstream copyright line.
 
-`node tests/selftest.mjs --only footprint` fails when a `Ported from` header has no entry
-here naming the same file and source. Only permissive licenses compatible with Apache-2.0 (MIT, BSD,
-Apache-2.0, ISC) are accepted.
+Only permissive licenses compatible with Apache-2.0 (MIT, BSD, Apache-2.0, ISC) are accepted.
+`node tests/selftest.mjs --only footprint` fails when a `Ported from` header has no entry here
+naming the same file and source.
 
 Entry template:
 
@@ -46,8 +44,6 @@ Entry template:
 | Test report and coverage formats (JUnit XML, TRX, Jest and RSpec JSON, `go test -json`, LCOV, Cobertura, Istanbul, Go cover profiles) | the respective projects | parsed by original code in `scripts/lib/reports.mjs` |
 
 ## Prior art credited (ideas, not code)
-
-The design builds on ideas from these projects; nothing from them is included:
 
 - [obra/superpowers](https://github.com/obra/superpowers) (MIT): the
   "verification before completion" discipline and per-host session-start output.

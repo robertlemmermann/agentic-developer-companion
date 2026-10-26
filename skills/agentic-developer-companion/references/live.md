@@ -16,9 +16,6 @@ from everything it keeps, and records each probe as a `CK-LIVE` check in the evi
 7. [Evidence and the summary to post](#7-evidence-and-the-summary-to-post)
 8. [CI, cloud agents and sandboxes](#8-ci-cloud-agents-and-sandboxes)
 9. [Guidance-only mode (no Node)](#9-guidance-only-mode-no-node)
-10. [Troubleshooting](#10-troubleshooting)
-
-Find `adc.mjs` as described in SKILL.md ("Locate the companion"); commands below use `$ADC`.
 
 ## 1. Safety checklist (before any write-capable probe)
 
@@ -38,10 +35,10 @@ runner skips synthetic probes while that file is missing or any line contains `T
 | Observability | Requests tagged `X-Test-Run: $ADC_TEST_RUN_ID`; JUnit kept; traces/HAR choice (below) |
 | Cadence | Schedule, alert threshold, owner; overlapping runs prevented (`concurrency`) |
 
-Traces, HAR files and failure reports record request headers. For authenticated probes keep
-Playwright `trace: 'off'` (or `retain-on-failure` with `outputDir` under `.adc/repro/`), never
-record HAR, and make sure `tests/live/test-results/`, `playwright-report/`, `blob-report/` and
-`*.har` are ignored: `git check-ignore -q tests/live/test-results/x` must exit 0.
+Traces, HAR files and reports record request headers: for authenticated probes keep Playwright
+`trace: 'off'` (or `retain-on-failure` with `outputDir` under `.adc/repro/`) and never record HAR.
+`tests/live/test-results/`, `playwright-report/`, `blob-report/` and `*.har` must be git-ignored
+(`git check-ignore -q tests/live/test-results/x` exits 0; `--write` checks this).
 
 ## 2. Scaffold the live project
 
@@ -56,11 +53,21 @@ It writes `tests/live/` (`probes/readonly/*`, gated `probes/synthetic/*`, `probe
 Show the user the file list and write only after they confirm. Without a scaffold, create
 `.adc/` with `node "$ADC" doctor --init --json`.
 
+| Option | Effect |
+|---|---|
+| `--lang ts\|js\|python` | Probe runner: Playwright, `node --test` or pytest (default: detected, else `ts`) |
+| `--checklist <file>` | The answered checklist; without `TODO` lines it enables the synthetic probe and job |
+| `--synthetic-cost <n>` | Credits per synthetic run; required once the checklist is complete, unless it has a line `Estimated credits per synthetic run: <n>` |
+| `--cost-header <h>`, `--cost-header-kind per_request\|cumulative` | Usage header written into every probe (§4) |
+| `--base-url <url>`, `--health-path <p>` | Defaults `https://staging.example.invalid` and `/health`; never put the token in the URL |
+| `--schedule "<cron>"` | 5-field UTC cron of the workflow (default `17 */6 * * *`) |
+| `--skill-path <dir>` | Vendored skill the workflow runs; default: found in `.github/skills`, `.agents/skills`, `.claude/skills`, else fetched at tag `v<version>` |
+| `--out <dir>`, `--write`, `--force` | Folder (default `tests/live`); write; replace existing files (backup kept) |
+
 ## 3. Credentials: `.adc/.env.live`
 
-- **Never open, print, copy or search `.adc/.env.live`, and never run `env`, `printenv` or
-  `Get-ChildItem Env:`.** Ask the user to paste the token into the file in their own editor:
-  `ADC_LIVE_TOKEN=<value>` (optional `ADC_LIVE_BASE_URL=`, `ADC_LIVE_TENANT=`).
+- **Never open, print, copy or search `.adc/.env.live`.** Ask the user to paste the token into
+  the file in their own editor: `ADC_LIVE_TOKEN=<value>` (optional `ADC_LIVE_BASE_URL=`, `ADC_LIVE_TENANT=`).
 - Check it without reading it: `node "$ADC" doctor --no-probes --json` shows
   `state.credential` as `set` or `unset` and its source, plus `state.env_live.perms`
   (owner-only: mode `0600`; Windows: an `icacls` ACL with only the user's SID).
@@ -206,9 +213,3 @@ the token or run the probes with it yourself. Instead:
 5. In the ledger you write by hand, record each probe as `CK-LIVE` with its cost and exit
    code, mark it "guidance-only mode", and keep it `unverified` unless the user ran it.
 
-## 10. Troubleshooting
-
-`node "$ADC" doctor --json` shows the credential source, `.env.live` permissions, the
-remaining session and daily budget, raised caps and recorded overrides (see
-[install](install.md)). Probe output is in `.adc/cache/live/<run_id>/<probe>.log`, already
-redacted. For the full verification flow around a change see [verify](verify.md).

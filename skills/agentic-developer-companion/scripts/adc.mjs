@@ -94,9 +94,11 @@ async function main() {
     return 2;
   }
   if (isHook) {
-    // The handler returns the decision object; this file prints it exactly once.
-    const mod = await import('./lib/' + entry[0]);
-    return mod[entry[1]](argv.slice(1));
+    // The handler returns the decision object (or its JSON text); this file prints it exactly once.
+    const [mod, core] = await Promise.all([import('./lib/' + entry[0]), import('./lib/core.mjs')]);
+    const out = await mod[entry[1]](argv.slice(1));
+    if (typeof out === 'string') return out.trim().startsWith('{') ? out.trim() : '{}';
+    return out && typeof out === 'object' ? core.asciiJson(out, 0) : '{}';
   }
   const core = await import('./lib/core.mjs');
   return core.dispatch(command, argv.slice(1), () => import('./lib/' + entry[0]), entry[1]);
@@ -113,22 +115,8 @@ if (isHook) {
   };
   const watchdog = setTimeout(() => { emit('{}'); process.exit(0); }, 2000);
   watchdog.unref();
-  main().then(
-    (out) => {
-      let text = '{}';
-      if (typeof out === 'string' && out.trim().startsWith('{')) text = out.trim();
-      else if (out && typeof out === 'object') {
-        try {
-          text = JSON.stringify(out).replace(/[\u007f-￿]/g,
-            (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-        } catch { text = '{}'; }
-      }
-      emit(text);
-      clearTimeout(watchdog);
-      process.exitCode = 0;
-    },
-    () => { emit('{}'); clearTimeout(watchdog); process.exitCode = 0; }
-  );
+  const done = (text) => { emit(text); clearTimeout(watchdog); process.exitCode = 0; };
+  main().then((text) => done(typeof text === 'string' ? text : '{}'), () => done('{}'));
 } else {
   main().then(
     (code) => { process.exitCode = typeof code === 'number' ? code : 0; },

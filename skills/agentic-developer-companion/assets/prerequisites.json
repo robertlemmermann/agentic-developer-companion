@@ -42,7 +42,7 @@
       "id": "qa-repo", "category": "required", "group": "Core", "name": "For QA modes: a Git repository with a resolvable base and enough history", "minimum": null,
       "tools": [],
       "needed_for": "`verify`, `audit-tests`, `trace`, `clean-run`",
-      "without": "base chain `--base` > `origin/HEAD` > `main`/`master` > `HEAD`; shallow clones get \"run `git fetch --unshallow`\" (exit 4)"
+      "without": "base chain `--base` > `origin/HEAD` > `main`/`master`/`init.defaultBranch` > `HEAD`; shallow clones get \"run `git fetch --unshallow`\" (exit 4)"
     },
 
     {

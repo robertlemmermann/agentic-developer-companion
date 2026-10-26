@@ -1,27 +1,10 @@
 # Prerequisites
 
-What `agentic-developer-companion` needs, what it can use when present, and what it does
-when something is missing. Written for someone who has never used the skill. The
-machine-readable twin is [`assets/prerequisites.json`](assets/prerequisites.json); `doctor`
-reads it and prints each item as present, missing or old together with the fallback in
-effect. The repository's own `node tests/selftest.mjs --only prereqs` fails when the two disagree.
-
-**In short:** Git, a supported host, and Node.js 24 for scripts and hooks. Everything else
-is optional and has a fallback. Run `node <skill-dir>/scripts/adc.mjs doctor` to check.
-
-## Contents
-
-1. [Required](#1-required)
-2. [Optional, with the fallback the skill applies](#2-optional-with-the-fallback-the-skill-applies)
-3. [Host minimums](#3-host-minimums)
-4. [Windows](#4-windows)
-5. [Your project's toolchain](#5-your-projects-toolchain-detected-never-installed-by-the-skill)
-6. [Explicit non-prerequisites](#6-explicit-non-prerequisites)
-7. [To confirm](#7-to-confirm)
+What the skill needs, what it uses when present, and the fallback when something is missing.
+`node <skill-dir>/scripts/adc.mjs doctor` prints every item as present, missing or old with
+the fallback in effect; its source is [`assets/prerequisites.json`](assets/prerequisites.json).
 
 ## 1. Required
-
-The skill cannot do its job without these; there is no fallback.
 
 | Prerequisite | Minimum | Needed for | Without it |
 |---|---|---|---|
@@ -31,10 +14,7 @@ The skill cannot do its job without these; there is no fallback.
 | Permission to run `node` and `git` through the host's shell tool | — | every script invocation (no `allowed-tools` is shipped) | a denied call leaves the step `UNVERIFIED`; headless runs need explicit grants |
 | A writable, git-excluded state directory (`.adc/`) | — | state, evidence, hook records, live credentials and the budget ledger | CLI commands exit 3 while `.adc/` is tracked by git; hooks keep emitting `{}`; relocate with `ADC_HOME` or `--state-dir` |
 | A writable OS temp directory | — | clean-run and typecheck worktrees | clean runs cannot start (`UNVERIFIED`) |
-| For QA modes: a Git repository with a resolvable base and enough history | — | `verify`, `audit-tests`, `trace`, `clean-run` | base chain `--base` > `origin/HEAD` > `main`/`master` > `HEAD`; shallow clones get "run `git fetch --unshallow`" (exit 4) |
-
-Node.js is listed as required because no machine-written evidence exists without it; the
-skill still works in **guidance-only mode** and says so in every ledger it writes by hand.
+| For QA modes: a Git repository with a resolvable base and enough history | — | `verify`, `audit-tests`, `trace`, `clean-run` | base chain `--base` > `origin/HEAD` > `main`/`master`/`init.defaultBranch` > `HEAD`; shallow clones get "run `git fetch --unshallow`" (exit 4) |
 
 ## 2. Optional, with the fallback the skill applies
 
@@ -110,19 +90,12 @@ skill still works in **guidance-only mode** and says so in every ledger it write
 | Claude Code | 2.1.269 | `claude plugin eval` (2.1.269+); hook `onFailure` (2.1.295+); direct `AGENTS.md` reading (2.1.277+) | older versions run the skill and hooks; evals are marked manual |
 | Codex | 0.124.0 | hooks (stable in 0.124.0), skills; `/presets` from 0.164.0 | older versions run the skill without hooks |
 
-Node.js 24 (Active LTS), Git 2.31+ and GitHub CLI 2.90.0+ are covered in sections 1 and 2.
-Trust and permission conditions per host:
-
-- **Copilot**: `copilot -p` loads project skills and repository hooks only in a trusted
-  folder (`--trust-folder`, `COPILOT_ALLOW_ALL=true`, `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS=true`);
-  interactive sessions gate repository hooks on folder trust.
-- **Claude Code**: settings-file hooks wait until workspace trust is accepted; `claude -p`
-  runs need `--allowedTools` for the scripts.
-- **Codex**: each hook needs a one-time approval in `/hooks`; `<repo>/.codex/hooks.json` needs
-  project trust; `verify` needs `workspace-write` (or an approved escalation).
-- **Enterprise plugin-only policies** (VS Code `ChatStrictPluginOnlyCustomization`, Claude
-  `strictPluginOnlyCustomization`) block standalone skills. No plugin wrapper is planned
-  (decision D10): ask for an admin exception or use guidance-only mode.
+- Trust and permission conditions per host: [host notes](references/host-notes.md) §1;
+  hook registration under folder or project trust: [install](references/install.md) §6.
+- Enterprise plugin-only policies (VS Code `ChatStrictPluginOnlyCustomization`, Claude
+  `strictPluginOnlyCustomization`) block standalone skills, and this skill ships no plugin
+  wrapper: ask for an admin exception or use guidance-only mode.
+- Open host questions: [host notes](references/host-notes.md) §9.
 
 ## 4. Windows
 
@@ -133,15 +106,14 @@ Trust and permission conditions per host:
 | `core.longpaths` for deep temp worktrees | — | clean-run worktrees with long paths | a clear `UNVERIFIED` reason instead of a path-length failure |
 | WSL2 | — | Claude shell-granting evals and mutmut | run those on macOS or Linux; everything else is native |
 
-- `node.exe` must be a real executable on PATH (fallback: `setup hooks --node-path`).
-- Junctions are used instead of symlinks, so **Developer Mode is not required**.
-- Codex hooks on native Windows are flagged "verify with `/hooks`" until confirmed.
-- `.adc/.env.live` is restricted with `icacls` to your own SID; `doctor` verifies it.
+`node.exe` must be on the launcher's PATH (else `setup hooks --node-path`); junctions replace
+symlinks (no Developer Mode); confirm Codex hooks on native Windows in `/hooks`; `doctor`
+checks the `icacls` ACL on `.adc/.env.live`. Details: [install](references/install.md) §9.
 
 ## 5. Your project's toolchain (detected, never installed by the skill)
 
-The runtime, package manager with a committed lockfile, test runner, type checker, coverage
-producer and linters that `detect` finds. The skill never installs them.
+`detect` finds the runtime, the package manager with its committed lockfile, the test runner,
+type checker, coverage producer and linters.
 
 - Missing test runner → the skill asks for the test command (headless: `UNVERIFIED`).
 - No detectable type checker → CK-TYPES is `skipped`; the verdict is unaffected.
@@ -153,11 +125,3 @@ producer and linters that `detect` finds. The skill never installs them.
 No npm or pip dependencies, no network calls from hooks, no telemetry or accounts, no
 Developer Mode, no `allowed-tools` grant, no `agents/openai.yaml`, no plugin manifests, no
 `jq`, no shellcheck or PSScriptAnalyzer at run time.
-
-## 7. To confirm
-
-Open items that are not yet verified empirically (tracked in [host notes](references/host-notes.md)):
-`gh skill` on GHEC/EMU hosts; Codex hooks on native Windows and their launcher; the Copilot
-Windows hook launcher flags and stdin pass-through; the CI token and `--allow-tool`
-sufficiency for unattended Copilot runs; `copilot skill add <dir>` semantics;
-`claude plugin eval` on a bare skills directory; `COPILOT_CLI=1` outside the CLI.

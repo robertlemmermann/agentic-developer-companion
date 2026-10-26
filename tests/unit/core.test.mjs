@@ -574,3 +574,150 @@ test('toolEnv drops live credentials only', () => {
   const env = core.toolEnv({ PATH: '/bin', ['ADC_LIVE_' + 'TOKEN']: ['abcd', 'efgh'].join(''), HOME: '/h' });
   assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH']);
 });
+
+test('text helpers: tryJson, readJson(File), oneLine, words, indentOf, plural, cmp; lineOf agrees with lineLocator', () => {
+  assert.deepEqual(core.tryJson('﻿{"a":1}'), { a: 1 });
+  assert.equal(core.tryJson('{bad', 'fb'), 'fb');
+  assert.equal(core.tryJson(null, 'fb'), 'fb');
+  const d = tmp('json');
+  fs.writeFileSync(path.join(d, 'ok.json'), '{"a":[1]}');
+  fs.writeFileSync(path.join(d, 'bad.json'), '{"a":');
+  assert.deepEqual(core.readJson(path.join(d, 'ok.json')), { a: [1] });
+  assert.equal(core.readJson(path.join(d, 'bad.json'), 0), 0);
+  assert.deepEqual(core.readJsonFile(path.join(d, 'ok.json')), { exists: true, value: { a: [1] } });
+  assert.deepEqual(core.readJsonFile(path.join(d, 'missing.json')), { exists: false });
+  const bad = core.readJsonFile(path.join(d, 'bad.json'));
+  assert.ok(bad.exists && typeof bad.error === 'string' && !('value' in bad));
+  assert.equal(core.oneLine('  a\n\t b  '), 'a b');
+  assert.deepEqual([core.words(' a  b\nc '), core.words('')], [['a', 'b', 'c'], []]);
+  assert.deepEqual([core.indentOf('  \tx'), core.indentOf('x')], [3, 0]);
+  assert.deepEqual([core.plural(1, 'case'), core.plural(2, 'case'), core.plural(0, 'entry', 'entries')], ['case', 'cases', 'entries']);
+  assert.deepEqual(['b', 'a', 'B'].sort(core.cmp), ['B', 'a', 'b']);
+  const text = 'one\ntwo\n\nfour';
+  const at = core.lineLocator(text);
+  for (let i = -1; i <= text.length + 1; i++) assert.equal(core.lineOf(text, i), at(Math.max(i, 0)), `offset ${i}`);
+  assert.equal(fm.lineLocator, core.lineLocator, 'frontmatter re-exports the core locator');
+});
+
+test('path helpers: isWithin, displayPath, normRel, isUnder, subPath, joinRel', () => {
+  const root = path.resolve('/repo');
+  assert.ok(core.isWithin(root, root) && !core.isWithin(root, root, { strict: true }));
+  assert.ok(core.isWithin(root, path.join(root, '..notes', 'a')), 'a child named ..notes is inside');
+  assert.ok(!core.isWithin(root, path.join(root, '..', 'x')) && !core.isWithin(root, path.resolve('/other')));
+  assert.equal(core.displayPath(root, path.join(root, 'a', 'b.md')), 'a/b.md');
+  assert.equal(core.displayPath(root, root), '.');
+  assert.equal(core.displayPath(root, path.resolve('/home/u/.claude/settings.json')), core.toPosix(path.resolve('/home/u/.claude/settings.json')));
+  assert.deepEqual(['././a/b/', './/a', '.\\a\\b', '.', null].map(core.normRel), ['a/b', 'a', 'a/b', '.', '']);
+  assert.ok(core.isUnder('a/b', '.') && core.isUnder('a/b', 'a') && core.isUnder('a', 'a') && !core.isUnder('ab/c', 'a'));
+  assert.deepEqual([core.subPath('a/b/c', 'a'), core.subPath('a', 'a'), core.subPath('x', '.')], ['b/c', '', 'x']);
+  assert.deepEqual([core.joinRel('.', 'x'), core.joinRel('a', 'x'), core.joinRel('a', '')], ['x', 'a/x', '']);
+});
+
+test('file helpers: listDir, readFilePart; runId and tmpPath', () => {
+  const d = tmp('part');
+  fs.writeFileSync(path.join(d, 'f.txt'), 'head-middle-tail');
+  fs.mkdirSync(path.join(d, 'sub'));
+  assert.deepEqual(core.listDir(d).sort(), ['f.txt', 'sub']);
+  assert.deepEqual(core.listDir(d, { types: true }).filter((e) => e.isDirectory()).map((e) => e.name), ['sub']);
+  assert.deepEqual(core.listDir(path.join(d, 'missing')), []);
+  assert.deepEqual(core.readFilePart(path.join(d, 'f.txt'), 4), { text: 'head', size: 16 });
+  assert.deepEqual(core.readFilePart(path.join(d, 'f.txt'), 4, { fromEnd: true }), { text: 'tail', size: 16 });
+  assert.deepEqual(core.readFilePart(path.join(d, 'f.txt'), 100), { text: 'head-middle-tail', size: 16 });
+  assert.equal(core.readFilePart(path.join(d, 'missing'), 4), null);
+  assert.match(core.runId('run'), /^run-\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+  assert.match(core.runId(), /^\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+  const p = core.tmpPath('/some/repo', 'out', 'abcdef0123456789');
+  assert.equal(path.dirname(p), core.tmpRoot('/some/repo'));
+  assert.match(path.basename(p), /^out-abcdef012345-[0-9a-f]{6}$/);
+});
+
+test('git: baseRef chain and resolveBase, ignoredPaths, lsFiles others, originUrl, workRoot, blobReader', () => {
+  const { dir, g } = makeRepo({ 'a.txt': 'a\n', '.gitignore': 'ignored/\n*.log\n' });
+  assert.deepEqual(git.baseRef(dir, null), { ref: 'main', tip: g('rev-parse', 'HEAD'), source: 'main' });
+  g('checkout', '-q', '-b', 'feature');
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'b\n');
+  g('add', '-A');
+  g('commit', '-q', '-m', 'b');
+  const base = git.resolveBase(dir, null);
+  assert.deepEqual([base.ref, base.source, base.sha], ['main', 'main', g('rev-parse', 'main')]);
+  assert.equal(git.resolveBase(dir, 'feature').source, 'flag');
+  assert.throws(() => git.baseRef(dir, 'no-such-ref'), (e) => e.exit === core.EXIT.USAGE);
+  const ignored = git.ignoredPaths(dir, ['ignored/x', 'a.txt', 'z.log', 'z.log']);
+  assert.deepEqual([...ignored].sort(), ['ignored/x', 'z.log']);
+  assert.deepEqual(git.ignoredPaths(dir, []), new Set());
+  fs.writeFileSync(path.join(dir, 'new.txt'), 'n\n');
+  fs.writeFileSync(path.join(dir, 'x.log'), 'l\n');
+  assert.deepEqual(git.lsFiles(dir).sort(), ['.gitignore', 'a.txt', 'b.txt']);
+  assert.deepEqual(git.lsFiles(dir, [], { others: true }).sort(), ['.gitignore', 'a.txt', 'b.txt', 'new.txt']);
+  assert.equal(git.originUrl(dir), null);
+  g('remote', 'add', 'origin', ['https://user', 'secret@example.com/o/r.git'].join(':'));
+  assert.equal(git.originUrl(dir), 'https://example.com/o/r.git');
+  assert.equal(git.workRoot(path.join(dir)), fs.realpathSync.native(dir));
+  const outside = tmp('noroot');
+  assert.equal(git.workRoot(outside), fs.realpathSync.native(outside));
+  fs.writeFileSync(path.join(dir, 'big.txt'), 'x'.repeat(100));
+  fs.writeFileSync(path.join(dir, 'bin.dat'), Buffer.from([1, 0, 2]));
+  g('add', '-A');
+  g('commit', '-q', '-m', 'blobs');
+  const pairs = [['HEAD', 'a.txt'], ['HEAD', 'big.txt'], ['HEAD', 'bin.dat'], ['HEAD', 'gone.txt'], ['main', 'a.txt']];
+  const batched = git.blobReader(dir, { maxBytes: 50 });
+  batched.prefetch(pairs);
+  const single = git.blobReader(dir, { maxBytes: 50 });
+  assert.deepEqual(pairs.map(([r, f]) => batched.read(r, f)), pairs.map(([r, f]) => single.read(r, f)));
+  assert.deepEqual(pairs.map(([r, f]) => batched.read(r, f)), ['a\n', null, null, null, 'a\n']);
+});
+
+test('snapshot excludes a relocated state dir and an ignored one in one pass', () => {
+  const { dir } = makeRepo({ 'a.txt': 'a\n', '.gitignore': 'st/\n' });
+  for (const d of ['.adc', 'st', 'other']) {
+    fs.mkdirSync(path.join(dir, d));
+    fs.writeFileSync(path.join(dir, d, 'f'), d);
+  }
+  const snap = git.createSnapshot(dir, { exclude: ['.adc', 'st/', '.adc'] });
+  const files = git.lsTree(dir, snap.commit);
+  assert.deepEqual(files.sort(), ['.gitignore', 'a.txt', 'other/f']);
+});
+
+test('state: resolveSession, newestOpenSession reads the newest open file, ledgerFiles', () => {
+  const sd = tmp('sess');
+  assert.deepEqual(state.resolveSession(sd, 'abc-1'), { id: 'abc-1', source: 'flag' });
+  assert.throws(() => state.resolveSession(sd, '-bad id'), (e) => e.exit === core.EXIT.USAGE);
+  assert.equal(state.resolveSession(sd, null).source, 'generated');
+  assert.match(state.resolveSession(sd, null).id, /^run-\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+  const write = (id, doc, ageS) => {
+    const f = state.sessionFile(sd, id);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, typeof doc === 'string' ? doc : JSON.stringify(doc));
+    const t = new Date(Date.now() - ageS * 1000);
+    fs.utimesSync(f, t, t);
+  };
+  write('old', { session_id: 'old' }, 100);
+  write('ended', { session_id: 'ended', ended: true }, 0);
+  write('broken', '{', 1);
+  write('mid', { session_id: 'mid' }, 50);
+  assert.equal(state.newestOpenSession(sd).id, 'mid');
+  const r = state.resolveSession(sd, null);
+  assert.deepEqual([r.id, r.source, r.record.session_id], ['mid', 'session-file', 'mid']);
+  assert.equal(state.newestOpenSession(tmp('nosess')), null);
+  assert.deepEqual(state.ledgerFiles(sd), []);
+  fs.mkdirSync(path.join(sd, 'evidence'));
+  fs.writeFileSync(path.join(sd, 'evidence', 'l.json'), '{}');
+  fs.writeFileSync(path.join(sd, 'evidence', 'notes.txt'), '');
+  assert.deepEqual(state.ledgerFiles(sd), [{ name: 'l.json', file: path.join(sd, 'evidence', 'l.json') }]);
+  assert.match(String(state.SESSION_ID_RE), /A-Za-z0-9/);
+});
+
+test('markers.classifyPath: every LOCKFILE_MANAGERS name is a lockfile (never generated); isTestFile matches classifyPath', () => {
+  for (const name of Object.keys(markers.LOCKFILE_MANAGERS)) {
+    const c = markers.classifyPath(`sub/${name}`);
+    assert.ok(c.lockfile && !c.generated, name);
+  }
+  assert.ok(!markers.classifyPath('package.json').lockfile);
+  const cases = { 'src/a.test.ts': true, 'tests/test_x.py': true, 'pkg/x_test.go': true, './spec/a_spec.rb': true,
+    'src/a.ts': false, 'tests/__snapshots__/a.test.ts.snap': false, 'tests/data.json': false };
+  for (const [f, isTest] of Object.entries(cases)) {
+    assert.equal(markers.classifyPath(f).test, isTest, f);
+    // The path heuristic alone, without the default globs (which also claim tests/** data files).
+    assert.equal(markers.isTestFile(f, { projects: [{ root: '.', test_globs: ['none/**'] }] }), isTest, f);
+  }
+});

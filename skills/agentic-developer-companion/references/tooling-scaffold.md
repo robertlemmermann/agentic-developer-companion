@@ -17,18 +17,16 @@ model `tooling port` uses, so a scaffold and a port always agree.
 
 ## Run it
 
-1. Resolve `ADC` (the path of `scripts/adc.mjs`) as described in [SKILL.md](../SKILL.md).
-2. Ask only what detection cannot know: the kind, the hosts the team uses (default `all`), a
+1. Ask only what detection cannot know: the kind, the hosts the team uses (default `all`), a
    name and a one-sentence description (what + when + boundary) for skills, agents and prompts.
-3. Dry run first and show the file list to the user:
-   `node "$ADC" tooling scaffold <kind> --for <hosts> [options] --json`
-4. After the user confirms, write: the same command with `--write`. Files that exist are never
-   changed (`skipped[]`); `--force` merges JSON and TOML configs (or overwrites Markdown) and
-   keeps a backup under `.adc/tooling/backups/<timestamp>/`.
-5. Follow `next_steps[]` and pass `manual_steps[]` on to the user verbatim.
+2. Dry run and show the file list: `node "$ADC" tooling scaffold <kind> --for <hosts> [options] --json`
+3. After the user confirms, the same command with `--write`. Existing files are never changed
+   (`skipped[]`); `--force` merges JSON and TOML configs (or overwrites Markdown) and keeps a
+   backup under `.adc/tooling/backups/<timestamp>/`.
+4. Follow `next_steps[]` and pass `manual_steps[]` on to the user verbatim.
 
-`--out <dir>` writes the tree somewhere else (to inspect it first). The companion refuses to
-scaffold into its own skill folder. `node "$ADC" scaffold <kind>` is the same command.
+`--out <dir>` writes the tree elsewhere (to inspect it first); scaffolding into the companion's
+own skill folder is refused. `node "$ADC" scaffold <kind>` is the same command.
 
 Output: `{ kind, hosts[], out, dry_run, written[{path, action, host, kind}], skipped[{path, reason}],
 backups[], next_steps[], manual_steps[] }`. Exit `0`, `2` usage (bad kind, host, name or
@@ -54,17 +52,13 @@ Codex dialects, including malformed and empty input and `stop_hook_active`).
 Every `skill` scaffold adds, in the Claude Code copy (or the only copy):
 `evals/trigger-set.json` (20 labeled TODO queries, [tooling-eval](tooling-eval.md)),
 `evals/<name>-basic/prompt.md` + `graders/skill-used.md` + `graders/outcome.md` (a
-`claude plugin eval` case) and `evals/evals.json` (skill-creator's format; the two formats are
-not interchangeable and each tool ignores the other's files).
+`claude plugin eval` case) and `evals/evals.json` (skill-creator's format; see
+[tooling-eval](tooling-eval.md) §4).
 
-Placement facts the table relies on (checked 2026-10-25 with Copilot CLI 1.0.103 and
-codex-cli 0.164.0, free commands, no sign-in): `copilot skill list --json` lists skills from
-`.agents/skills/` and `.claude/skills/`; `codex debug prompt-input "x"` lists skills from
-`.agents/skills/` and `.codex/skills/` and hides a skill whose `agents/openai.yaml` sets
-`allow_implicit_invocation: false`. A Codex agent therefore goes to `.codex/skills/`, because
-Copilot would show a copy in `.agents/skills/` next to the real Copilot agent. Claude Code reads
-only `.claude/skills/`, so `--for all` writes two copies of a skill; after editing one, sync with
-`node "$ADC" tooling port .agents/skills/<name> --to claude --force`.
+Placement follows [host notes](host-notes.md) §3. A Codex agent goes to `.codex/skills/`: Codex
+reads it there, Copilot does not, so it never shows next to the real Copilot agent. Claude Code
+reads only `.claude/skills/`, so `--for all` writes two copies of a skill; after editing one,
+sync with `node "$ADC" tooling port .agents/skills/<name> --to claude --force`.
 
 ## Options per kind
 
@@ -82,29 +76,22 @@ is a placeholder line to fill in or delete.
 
 ## Guidance baked into the templates
 
-- **Instructions**: `AGENTS.md` is the canonical source; host files hold host-only notes.
-  Short, self-contained, verifiable rules (one per line), commands over prose, no secrets,
-  tokens, internal hostnames or personal paths, commands valid in bash, PowerShell and cmd.
-  No `CLAUDE.local.md` in an `AGENTS.md` project: it stops Claude Code from reading
-  `AGENTS.md`. Budgets: Claude Code under 200 lines, Copilot about two pages per file, Codex
-  32 KiB of `AGENTS.md` from the root down to the working directory.
+Budgets, one source for shared rules, prompt files to skills: [tooling-optimize](tooling-optimize.md)
+§2 and §4; monorepo placement: [tooling-practices](tooling-practices.md) §7.
+
+- **Instructions**: `AGENTS.md` is the canonical source, host files hold host-only notes; one
+  verifiable rule per line, commands over prose, valid in bash, PowerShell and cmd.
 - **Skills**: the six spec fields only (`name`, `description`, `license`, `compatibility`,
   `metadata`, `allowed-tools`), `name` equal to the folder, `metadata.version`, body under 500
   lines with a `## Gotchas` section, details in `references/` (one level deep, linked from
   SKILL.md), deterministic steps in `scripts/`, forward slashes, evals before the body.
 - **Agents**: least-privilege tools, an explicit output contract (verdict, `file:line`
-  findings, commands and exit codes), "unknown" instead of guessing. Copilot agent bodies stay
-  under 30,000 characters.
-- **Prompt files** run only in the VS Code Local harness and Visual Studio; the skill is the
-  portable equivalent and the one to keep.
-- **Hooks**: read stdin, print exactly one ASCII-only JSON object, exit 0, fail open on any
-  error and after 5 seconds (the configs allow 10), never block a stop twice
-  (`stop_hook_active`), no network, no repository scans. Copilot `preToolUse` is fail-closed
-  when the command crashes, hence the guard that prints `{}` when Node is missing. Repository
-  `.claude/settings.json` hooks use repository-relative script paths: Copilot also runs them, in
-  bash and PowerShell, where `${CLAUDE_PROJECT_DIR}` does not expand. Start the hosts from the
-  repository root. Codex loads `.codex/hooks.json` only for trusted projects and asks for a
-  one-time review in `/hooks`.
+  findings, commands and exit codes), "unknown" instead of guessing.
+- **Hooks**: read stdin, print one ASCII-only JSON object, exit 0, fail open on any error and
+  after 5 seconds (the configs allow 10), never block a stop twice (`stop_hook_active`), no
+  network or repository scans. Copilot `preToolUse` is fail-closed when the command crashes,
+  hence the guard that prints `{}` when Node is missing. Script paths:
+  [tooling-port](tooling-port.md#hooks-in-detail); trust: [host notes](host-notes.md) §1.
 - **MCP**: one server definition rendered per host; secrets only as environment references;
   packages pinned to an exact version (`example-mcp-server@1.0.0`, never `@latest`).
 
@@ -124,8 +111,8 @@ Report the file list (created, skipped, merged), the manual steps and the measur
 
 ## Manual fallback (guidance-only mode)
 
-Without Node 24, create the files by hand at the locations in the table above, write
-"guidance-only mode" in the report, and check each against [tooling-lint](tooling-lint.md).
+Without Node 24, write "guidance-only mode" in the report, create the files at the locations
+in the table above, and check each against [tooling-lint](tooling-lint.md).
 
 Skill (`<dir>/<name>/SKILL.md`; `<dir>` is `.agents/skills`, `.github/skills` or `.claude/skills`):
 

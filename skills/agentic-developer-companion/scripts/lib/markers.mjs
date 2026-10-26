@@ -2,7 +2,9 @@
 // hook, path classification, test files and test cases, and secret scanning and redaction.
 // Imports only core.mjs: hooks load this module, so no git, no filesystem, no network.
 
-import { toPosix, matchAny, redactLiterals, liveSecrets, redactLiveToken } from './core.mjs';
+import {
+  toPosix, matchAny, redactLiterals, liveSecrets, redactLiveToken, words, indentOf, normRel, isUnder, subPath,
+} from './core.mjs';
 
 // Long patterns are written in pieces (each a valid literal; flags come from the first one):
 // `cat` concatenates, `alt` joins alternatives, `group` wraps them in (?:...), `capture` in (...),
@@ -13,7 +15,6 @@ const alt = (...res) => new RegExp(src(res, '|'), res[0].flags);
 const group = (...res) => new RegExp(`(?:${src(res, '|')})`, res[0].flags);
 const capture = (...res) => new RegExp(`(${src(res, '|')})`, res[0].flags);
 const names = (...res) => new RegExp(`^(?:${src(res, '|')})$`, res[0].flags);
-const words = (s) => s.trim().split(/\s+/);
 
 // ---------------------------------------------------------------------------
 // Languages and comment masking
@@ -91,7 +92,6 @@ const blankStrings = (line) => String(line ?? '').replace(STRING_LITERAL, blankL
 // Like blankStrings, but keeps a literal used as a property index (`describe['skip']`).
 const blankNonIndex = (line) => String(line ?? '')
   .replace(STRING_LITERAL, (s, _q, at, all) => (/\[\s*$/.test(all.slice(0, at)) ? s : blankLiteral(s)));
-const indentOf = (line) => line.length - line.trimStart().length;
 
 /** The `{ ... }` block opening at or after column `col` of line `i` (0-based): { start, end, endCol, body } or null. */
 function braceBlock(masked, i, col = 0) {
@@ -183,7 +183,7 @@ export const SKIP_MARKERS = catalog('skip', { code: true, kind: 'skip' }, [
 ]);
 
 /** Test-case declarations: `name` is the group holding the case name, `lookahead` finds it on the next lines. */
-export const TEST_CASE_LINE = catalog('case', { code: true }, [
+const TEST_CASE_LINE = catalog('case', { code: true }, [
   ['js', 'js', cat(/^\s*(?:it|test|specify|xit|xtest|fit|xspecify)(?:\.\w+(?:\((?:[^()]|\([^()]*\))*\)|`[^`]*`)?)*/,
     /\s*\(\s*(?:(['"`])((?:\\.|(?!\1).)*)\1)?/), { name: 2 }],
   ['py', 'py', /^\s*(?:async\s+)?def\s+(test\w*)\s*\(/, { name: 1 }],
@@ -451,7 +451,7 @@ export const IN_SOURCE_RETRIES = catalog('retry', { code: true }, [
 
 const NOT_A_VALUE = /(?![[<{$%]|process\.|os\.|env\.|getenv)/;
 
-export const SECRET_PATTERNS = catalog('secret', { severity: 'fail' }, [
+const SECRET_PATTERNS = catalog('secret', { severity: 'fail' }, [
   ['aws-access-key-id', '', /\b((?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z2-7]{16})\b/],
   ['aws-secret-key', '', cat(/aws_?secret_?(?:access_?)?key\w*["']?\s*[:=]\s*/i,
     /["']?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])/)],
@@ -791,9 +791,6 @@ const RUNNER_CONFIG_BASE = names(/jest\.config\.[cm]?[jt]s(?:on)?|vitest\.(?:con
   /directory\.build\.(?:props|targets)|.+\.(?:cs|fs|vb)proj|pom\.xml|build\.gradle(?:\.kts)?/,
   /settings\.gradle(?:\.kts)?|\.rspec|\.simplecov|rakefile|phpunit\.xml(?:\.dist)?|makefile|gnumakefile|.+\.mk/,
   /justfile|\.justfile|taskfile\.ya?ml|package\.json|codecov\.ya?ml|\.codecov\.ya?ml|deno\.jsonc?/);
-const LOCKFILE_BASE = names(/package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?/,
-  /poetry\.lock|uv\.lock|pipfile\.lock|pdm\.lock|go\.sum|cargo\.lock|packages\.lock\.json|gemfile\.lock|composer\.lock/,
-  /gradle\.lockfile|package\.resolved|pubspec\.lock|mix\.lock|flake\.lock|deno\.lock/);
 const MANIFEST_BASE = names(/package\.json|pyproject\.toml|setup\.py|setup\.cfg/,
   /requirements(?:[-_.][\w.-]+)?\.(?:txt|in)|constraints\.txt|pipfile|go\.mod|cargo\.toml|.+\.(?:cs|fs|vb)proj/,
   /directory\.packages\.props|packages\.config|pom\.xml|build\.gradle(?:\.kts)?|gemfile|.+\.gemspec|composer\.json/,
@@ -817,8 +814,8 @@ const GENERATED_BASE = cat(group(/\.min\.(?:js|css|mjs)|\.(?:js|css)\.map|\.pb\.
 
 const SNAPSHOT_BASE = /\.(?:snap|ambr|golden)$|\.(?:approved|verified|received)\.\w+$/;
 
-/** Path-only, heuristic: { test, runnerConfig, ci, lockfile, lintConfig, manifest, generated, testData, snapshot }. */
-export function classifyPath(file) {
+/** The path facts classifyPath and isTestFile share. */
+function pathFacts(file) {
   const p = toPosix(file).replace(/^\.\//, '');
   const segs = p.split('/');
   const lower = segs[segs.length - 1].toLowerCase();
@@ -828,14 +825,24 @@ export function classifyPath(file) {
     /src\/(?:test|androidtest)\//.test(p.toLowerCase());
   const snapshot = dirs.includes('__snapshots__') || SNAPSHOT_BASE.test(lower)
     || (dirs.includes('snapshots') && /\.snap(?:\.new)?$/.test(lower));
+  return { p, lower, dirs, code, inTestDir, snapshot };
+}
+
+/** A source file whose name or folder marks it as a test (snapshots excluded). */
+const testByPath = (f) => f.code && (testNaming(f.p) != null || f.inTestDir) && !f.snapshot;
+
+/** Path-only, heuristic: { test, runnerConfig, ci, lockfile, lintConfig, manifest, generated, testData, snapshot }. */
+export function classifyPath(file) {
+  const f = pathFacts(file);
+  const { lower, dirs } = f;
   const yml = /\.ya?ml$/.test(lower);
   const ci = CI_BASE.test(lower) || (dirs[0] === '.github' && (dirs[1] === 'workflows' ? yml : dirs[1] === 'actions' &&
     /^action\.ya?ml$/.test(lower))) || (dirs[0] === '.gitlab' && yml && dirs.includes('ci'))
     || (['.circleci', '.azure-pipelines', '.buildkite', '.woodpecker'].includes(dirs[0]) && yml);
-  const lockfile = LOCKFILE_BASE.test(lower);
+  const lockfile = Object.hasOwn(LOCKFILE_MANAGERS, lower);
   const parent = dirs[dirs.length - 1];
   return {
-    test: code && (testNaming(p) != null || inTestDir) && !snapshot,
+    test: testByPath(f),
     runnerConfig: RUNNER_CONFIG_BASE.test(lower) || (parent === '.config' && lower === 'nextest.toml') ||
       (parent === '.cargo' && lower === 'config.toml'),
     ci,
@@ -843,10 +850,18 @@ export function classifyPath(file) {
     lintConfig: LINT_CONFIG_BASE.test(lower),
     manifest: MANIFEST_BASE.test(lower),
     generated: !lockfile && (dirs.some((d) => GENERATED_DIRS.has(d)) || GENERATED_BASE.test(lower)),
-    testData: !code && inTestDir && (DATA_EXTS.has(extOf(lower)) || snapshot),
-    snapshot,
+    testData: !f.code && f.inTestDir && (DATA_EXTS.has(extOf(lower)) || f.snapshot),
+    snapshot: f.snapshot,
   };
 }
+/** Lockfile base name (lower case) → package manager. */
+export const LOCKFILE_MANAGERS = Object.freeze({
+  'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'pnpm-lock.yaml': 'pnpm', 'yarn.lock': 'yarn',
+  'bun.lock': 'bun', 'bun.lockb': 'bun', 'uv.lock': 'uv', 'poetry.lock': 'poetry', 'pdm.lock': 'pdm',
+  'pipfile.lock': 'pipenv', 'go.sum': 'go', 'cargo.lock': 'cargo', 'gemfile.lock': 'bundler',
+  'composer.lock': 'composer', 'packages.lock.json': 'nuget', 'gradle.lockfile': 'gradle',
+  'package.resolved': 'swiftpm', 'pubspec.lock': 'pub', 'mix.lock': 'mix', 'flake.lock': 'nix', 'deno.lock': 'deno',
+});
 
 /** Content header that marks a generated file. */
 export const GENERATED_HEADER = group(/Code generated\b.*\bDO NOT EDIT|@generated\b|<auto-generated/i,
@@ -864,8 +879,6 @@ export const DEFAULT_TEST_GLOBS = Object.freeze(['**/__tests__/**', '**/*.{test,
   '**/test_*.py', '**/conftest.py', '**/*_test.go', '**/*_spec.rb', 'test/**', 'tests/**', 'spec/**',
   '**/src/test/**', '**/*.cy.*', '**/*Tests/**', '**/*.Tests/**']);
 
-const relOf = (file) => toPosix(String(file || '')).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
-
 /** The project owning a repo-relative file (or an absolute one under `detectResult.repo_root`): longest root wins. */
 export function projectForFile(file, detectResult) {
   const projects = Array.isArray(detectResult?.projects) ? detectResult.projects : [];
@@ -874,13 +887,13 @@ export function projectForFile(file, detectResult) {
     const base = toPosix(detectResult.repo_root).replace(/\/+$/, '');
     if (rel.startsWith(`${base}/`)) rel = rel.slice(base.length + 1);
   }
-  rel = relOf(rel);
+  rel = normRel(rel);
   let best = null;
   for (const p of projects) {
-    const r = relOf(p?.root || '.') || '.';
-    const root = r === '.' ? '' : r;
-    if (root && rel !== root && !rel.startsWith(`${root}/`)) continue;
-    if (!best || root.length > best.len) best = { p, len: root.length };
+    const root = normRel(p?.root || '.') || '.';
+    if (!isUnder(rel, root)) continue;
+    const len = root === '.' ? 0 : root.length;
+    if (!best || len > best.len) best = { p, len };
   }
   return best ? best.p : null;
 }
@@ -892,26 +905,16 @@ export function projectForFile(file, detectResult) {
  * source files, so fixtures under tests/ stay data).
  */
 export function isTestFile(file, detectResult = null, { content = null, heuristic = true, codeOnly = false } = {}) {
-  const rel = relOf(file);
+  const rel = normRel(file || '');
   if (!rel) return false;
-  if (heuristic && classifyPath(rel).test) return true;
+  if (heuristic && testByPath(pathFacts(rel))) return true;
   if (content != null && /\.rs$/.test(rel) && /#\[(?:cfg\(test\)|test\])/.test(String(content))) return true;
   if (codeOnly && !isCodeFile(rel)) return false;
   const p = projectForFile(rel, detectResult);
-  const root = p ? relOf(p.root || '.') : '';
-  const sub = root && root !== '.' ? (rel === root ? '' : rel.slice(root.length + 1)) : rel;
+  const sub = p ? subPath(rel, normRel(p.root || '.')) : rel;
   const own = Array.isArray(p?.test_globs) ? p.test_globs.filter((g) => typeof g === 'string') : [];
   return matchAny(sub, own.length ? own : DEFAULT_TEST_GLOBS);
 }
-
-/** Lockfile base name (lower case) → package manager. */
-export const LOCKFILE_MANAGERS = Object.freeze({
-  'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'pnpm-lock.yaml': 'pnpm', 'yarn.lock': 'yarn',
-  'bun.lock': 'bun', 'bun.lockb': 'bun', 'uv.lock': 'uv', 'poetry.lock': 'poetry', 'pdm.lock': 'pdm',
-  'pipfile.lock': 'pipenv', 'go.sum': 'go', 'cargo.lock': 'cargo', 'gemfile.lock': 'bundler',
-  'composer.lock': 'composer', 'packages.lock.json': 'nuget', 'gradle.lockfile': 'gradle',
-  'package.resolved': 'swiftpm', 'pubspec.lock': 'pub', 'mix.lock': 'mix', 'flake.lock': 'nix', 'deno.lock': 'deno',
-});
 
 // ---------------------------------------------------------------------------
 // Redaction for output, logs and the ledger (finding excerpts use redactSecrets' masking instead)
@@ -945,7 +948,7 @@ export function makeRedactor({ literals = [], env = process.env, names: byName =
 }
 
 /** Keys whose string values are digests or object names, never secrets (redacting them breaks verification). */
-export const HASH_KEY = cat(group(/sha256|^tree_digest|^session_nonce|^snapshot_commit|^base|^head|^prev|^tip/,
+const HASH_KEY = cat(group(/sha256|^tree_digest|^session_nonce|^snapshot_commit|^base|^head|^prev|^tip/,
   /^sha|^tree|^commit|^cache_key/), /$/);
 
 /**

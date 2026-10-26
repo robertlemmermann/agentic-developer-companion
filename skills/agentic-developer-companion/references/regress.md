@@ -16,8 +16,6 @@ test that has never been red proves nothing.
 8. [Evidence and the summary to post](#8-evidence-and-the-summary-to-post)
 9. [Guidance-only mode (no Node)](#9-guidance-only-mode-no-node)
 
-Find `adc.mjs` as described in SKILL.md; commands below use `$ADC` and run from the repository root.
-
 ## 1. Reproduce first
 
 1. Read the issue: expected behavior, actual behavior, input, environment.
@@ -81,25 +79,23 @@ unedited skeleton can never pass.
 node "$ADC" clean-run --red-green test/regression/7-sum-of-an-empty-list-is-0.test.mjs --json
 ```
 
-It copies only the listed test files into a worktree of the base, runs them there (they must
-**fail by assertion**), runs the same test ids in the snapshot of the working tree (they must
-**pass**) and returns a `CK-REDGREEN` check (in `checks[]`) with both report paths. Several files: `--red-green a,b`;
-one test of a file: `--red-green file::name`. `pass` is the only acceptable result: `fail` (green on
-the base, or red after the fix) means the test does not pin the bug; `unverified` means it could not
-run (read `reason`). The working tree is left exactly as it was.
+The listed test files must **fail by assertion** in a base worktree and **pass** in the snapshot;
+the result is a `CK-REDGREEN` check with both report paths, and the working tree is left as it was.
+Several files: `--red-green a,b`; one test: `--red-green file::name`. Only `pass` is acceptable;
+`reason` values and what to do: [audit-tests](audit-tests.md) §4.
 
-Manual fallback (no scripts), bash:
+Manual fallback (no scripts; `$BASE` from [verify](verify.md) §7.1), bash:
 
 ```bash
-base=$(git merge-base HEAD origin/HEAD); tmp=$(mktemp -d)
-git worktree add --detach "$tmp/red" "$base"
+tmp=$(mktemp -d)
+git worktree add --detach "$tmp/red" "$BASE"
 mkdir -p "$tmp/red/test/regression" && cp test/regression/7-*.test.mjs "$tmp/red/test/regression/"
 (cd "$tmp/red" && npm ci && node --test test/regression/7-*.test.mjs); echo "base exit $?"   # must fail by assertion
 node --test test/regression/7-*.test.mjs; echo "fixed exit $?"                                 # must pass
 git worktree remove --force "$tmp/red"
 ```
 
-PowerShell: `$base = git merge-base HEAD origin/HEAD; $tmp = Join-Path $env:TEMP "adc-red"; git worktree add --detach $tmp $base`,
+PowerShell: `$tmp = Join-Path $env:TEMP "adc-red"; git worktree add --detach $tmp $BASE`,
 copy the test with `Copy-Item`, run the same commands with `Push-Location $tmp` / `Pop-Location`,
 check `$LASTEXITCODE`, then `git worktree remove --force $tmp`. Paste both outputs (trimmed) into
 `repro.md` section 3.

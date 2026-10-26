@@ -18,13 +18,12 @@ and everything a human must still do is in `manual_steps[]`; nothing is lost sil
 
 ## Run it
 
-1. Resolve `ADC` as described in [SKILL.md](../SKILL.md).
-2. Dry run and show the plan: `node "$ADC" tooling port <path> --to copilot|claude|codex|all --dry-run --json`
+1. Dry run and show the plan: `node "$ADC" tooling port <path> --to copilot|claude|codex|all --dry-run --json`
    (`<path>` is a file at its host location, or a skill folder; `--to` takes a comma list,
    default `all` = every host except the source's own).
-3. After the user confirms, run it without `--dry-run`. `--out <dir>` writes the targets under
+2. After the user confirms, run it without `--dry-run`. `--out <dir>` writes the targets under
    another folder (to review a round trip); `--from <host>` asserts the source host.
-4. Lint the results for the target hosts: `node "$ADC" tooling lint <written paths> --json`.
+3. Lint the results for the target hosts: `node "$ADC" tooling lint <written paths> --json`.
 
 Output: `{ source{path, kind, host}, targets[], out, dry_run, written[{path, action}], skipped[],
 backups[], dropped_fields[{file, field, value?, reason}], manual_steps[], notes[] }`. Actions:
@@ -128,9 +127,8 @@ then `manual_steps[]` as a checklist, then the lint result of the written files 
 
 ## Manual fallback (guidance-only mode)
 
-Without Node 24, translate by hand with the map above and write "guidance-only mode" in the
-report. For each source field: keep it if the target documents it, otherwise list it as
-dropped with the reason.
+Without Node 24, write "guidance-only mode" in the report and translate with the map above:
+keep each source field the target documents, list the rest as dropped with the reason.
 
 - Instructions: create `CLAUDE.md` with the single line `@AGENTS.md` (plus Claude-only
   notes); for Codex concatenate the imported files into `AGENTS.md`.
@@ -138,6 +136,6 @@ dropped with the reason.
   for Codex put the body under a heading in `<dir>/AGENTS.md`.
 - Agents: rewrite `tools` with the alias table; move the body unchanged.
 - Hooks: rename events with the table; split each command into `bash` and `powershell`
-  (Copilot) or `command` and `commandWindows` (Codex); check JSON with `python3 -m json.tool
-  <file>` (PowerShell `Get-Content <file> -Raw | ConvertFrom-Json`).
+  (Copilot) or `command` and `commandWindows` (Codex); check the JSON as in
+  [tooling-scaffold](tooling-scaffold.md#manual-fallback-guidance-only-mode).
 - Compare a round trip with `git diff --no-index <original> <round-tripped>`.
