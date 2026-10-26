@@ -105,7 +105,8 @@ const CATALOG = {
   ['**/*Tests*/**', 'tests/**', 'test/**']],
   maven: ['jvm', 'mvn -B test', junit(null, { dir: 'target/surefire-reports', glob: 'TEST-*.xml' }),
     '-Dsurefire.rerunFailingTestsCount=0', 'full', ['src/test/**']],
-  gradle: ['jvm', './gradlew test --no-build-cache', junit(null, { dir: 'build/test-results/test', glob: 'TEST-*.xml' }),
+  gradle: ['jvm', './gradlew test --no-build-cache', 
+    junit(null, { dir: 'build/test-results/test', glob: 'TEST-*.xml' }),
     'Gradle has no retry switch; framework-level retries are not visible', 'unknown', ['src/test/**']],
   rspec: ['ruby', 'bundle exec rspec', { flag: '--format json --out <f> --format progress', format: 'rspec-json' },
     'RSpec has no built-in retries', 'unknown', ['spec/**']],
@@ -129,7 +130,8 @@ function makeRunner(name, fields = {}) {
   return { ...def, source: null, ...fields };
 }
 const newUnit = (dir, ecosystem, ...manifests) => ({ dir, ecosystem, languages: [], manifests, managers: [],
-  runners: [], test_globs: [], typecheck: [], lint: [], coverage: [], test_script: null, workspace: null, warnings: [] });
+  runners: [], test_globs: [], typecheck: [], lint: [], coverage: [], test_script: null, workspace: null,
+  warnings: [] });
 const cfgTool = (name, cmd, file) => ({ name, cmd, config: file, source: file });
 const ciRef = (s) => `ci: ${s.file}${s.line ? `:${s.line}` : ''}`;
 
@@ -234,12 +236,10 @@ function relevantKind(rel) {
 }
 
 function readHead(file, bytes = 512) {
+  const buf = Buffer.alloc(bytes);
   let fd;
-  try {
-    fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(bytes);
-    return buf.subarray(0, fs.readSync(fd, buf, 0, bytes, 0)).toString('utf8');
-  } catch { return ''; } finally { if (fd !== undefined) fs.closeSync(fd); }
+  try { fd = fs.openSync(file, 'r'); return buf.toString('utf8', 0, fs.readSync(fd, buf, 0, bytes, 0)); }
+  catch { return ''; } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 /** File-list facts the detectors use: languages by extension, test files, test folders, Python packages. */
@@ -249,13 +249,11 @@ function fileTags(sub) {
   const segs = sub.split('/');
   const top = segs.length > 1 ? segs[0] : null;
   const tags = CODE_EXTS.has(ext) ? [`ext:${ext}`] : [];
-  if (ext === 'py' && /^test_.*\.py$|_test\.py$/.test(base)) tags.push('py-test', top ? `py-test-top:${top}` : 'py-test-root');
+  if (/^test_.*\.py$|_test\.py$/.test(base)) tags.push('py-test', top ? `py-test-top:${top}` : 'py-test-root');
   if (base === '__init__.py' && segs.length === 2) tags.push(`py-pkg:${top}`);
   if (ext === 'rb' && base.endsWith('_spec.rb')) tags.push('rb-spec');
   if (ext === 'rb' && /_test\.rb$|^test_.*\.rb$/.test(base)) tags.push('rb-test');
-  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(base) || (segs.includes('__tests__') && CODE_EXTS.has(ext))) {
-    tags.push('js-test');
-  }
+  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(base) || (segs.includes('__tests__') && tags.length)) tags.push('js-test');
   if (top === 'test') tags.push('dir:test');
   if (sub.startsWith('src/test/')) tags.push('dir:src/test');
   return tags;
@@ -367,7 +365,7 @@ const NODE_CONFIGS = {
   mocha: /^\.mocharc\.(?:js|cjs|mjs|json|jsonc|ya?ml)$/,
 };
 const NODE_VALUED = new Set(['-r', '--import', '--require', '--loader', '--experimental-loader', '--env-file',
-  '--conditions', '--test-concurrency', '--test-timeout', '--test-name-pattern', '--test-skip-pattern', '--test-shard']);
+  '--conditions', ...['concurrency', 'timeout', 'name-pattern', 'skip-pattern', 'shard'].map((o) => `--test-${o}`)]);
 // Mocha options that take a value (everything else that is not an option is a spec path).
 const MOCHA_VALUED = new Set(['-r', '--require', '-t', '--timeout', '-s', '--slow', '-u', '--ui', '-R', '--reporter',
   '-O', '--reporter-option', '--reporter-options', '-g', '--grep', '-f', '--fgrep', '--file', '--ignore', '--exclude',
@@ -384,6 +382,7 @@ const DROP_ARGS = {
 };
 const TYPECHECK_SCRIPTS = ['typecheck', 'type-check', 'check-types', 'types', 'tsc', 'check:types', 'types:check'];
 const LINT_SCRIPTS = ['lint', 'eslint', 'lint:js', 'lint:all'];
+const DEP_KEYS = ['dependencies', 'devDependencies', 'optionalDependencies'];
 const binName = (t) => baseOf(toPosix(String(t || ''))).replace(/\.(?:cmd|exe|bat|ps1|js|mjs|cjs)$/i, '');
 
 function nodeManager(ctx, dir, pkg) {
@@ -393,14 +392,14 @@ function nodeManager(ctx, dir, pkg) {
   const found = Object.entries(NODE_PMS).map(([n, d]) => [n, d[0].find(has)]).filter(([, f]) => f);
   const pick = found.find(([n]) => found.length > 1 && n === declared) || found[0];
   const [name, lockfile] = pick || [declared || 'npm', null];
-  const several = found.map((x) => x[1]).join(', ');
-  if (found.length > 1) ctx.warn(`${dir === '.' ? 'repository root' : dir}: several lockfiles (${several}); using ${lockfile}`);
+  const several = `${dir === '.' ? 'repository root' : dir}: several lockfiles (${found.map((x) => x[1]).join(', ')})`;
+  if (found.length > 1) ctx.warn(`${several}; using ${lockfile}`);
   const [, frozen, exec, run, test] = NODE_PMS[name];
   const berry = name === 'yarn' && (has('.yarnrc.yml') || /^yarn@(?:[2-9]|\d{2,})/.test(field)
     || /^__metadata:/m.test(ctx.read(J(dir, 'yarn.lock')) || ''));
   const install = !lockfile ? (name === 'npm' ? 'npm install --no-package-lock --no-audit --no-fund' : null)
     : berry ? 'yarn install --immutable' : frozen;
-  const entry = { name, lockfile, install, cwd: dir, frozen: Boolean(lockfile), ...(berry ? { variant: 'berry' } : {}) };
+  const entry = { name, lockfile, install, cwd: dir, frozen: Boolean(lockfile), ...(berry && { variant: 'berry' }) };
   const pnp = berry && (has('.pnp.cjs') || /nodeLinker:\s*["']?pnp/.test(ctx.read(J(dir, '.yarnrc.yml')) || ''));
   return { entry: { ...entry, ecosystem: 'node' }, exec, run, test, launcher: name, pnp };
 }
@@ -581,15 +580,16 @@ function nodeRunner(ctx, pm, occ, source, deps) {
   const specs = name === 'mocha' ? mochaSpecs(args) : [];
   if (specs.length) r.specs = specs;
   // node treats options after the first file pattern as test arguments: flags go before `paths`.
-  if (name === 'node-test') Object.assign(r, { base_cmd: `${envText}${h.text}`, paths: paths.map((p) => portableArg(p).text) });
+  if (name === 'node-test') r.base_cmd = `${envText}${h.text}`;
+  if (name === 'node-test') r.paths = paths.map((x) => portableArg(x).text);
   if (Object.keys(env).length) r.env = env;
   if (occ.coverage) r.coverage_wrapper = occ.coverage;
   if (!h.portable || !rest.portable) r.portable = false;
   return r;
 }
 
-function configGlobs(name, text, pkgSection) {
-  if (name === 'jest') return Array.isArray(pkgSection?.testMatch) ? pkgSection.testMatch : listOrOne(text, 'testMatch');
+function configGlobs(name, text, section) {
+  if (name === 'jest') return Array.isArray(section?.testMatch) ? section.testMatch : listOrOne(text, 'testMatch');
   if (name === 'cypress') return listOrOne(text, 'specPattern');
   if (name === 'vitest') {
     const at = (text || '').search(/\btest\s*:\s*\{/);
@@ -603,7 +603,7 @@ function configGlobs(name, text, pkgSection) {
     return base ? [`${base}/**`] : null;
   }
   if (name !== 'mocha') return null;
-  if (pkgSection?.spec) return [].concat(pkgSection.spec);
+  if (section?.spec) return [].concat(section.spec);
   const t = (text || '').trim();
   const doc = t.startsWith('{') ? parseJsonc(t) : parseYamlAll(t)[0];
   return isObj(doc) && doc.spec ? [].concat(doc.spec) : listOrOne(t, 'spec');
@@ -649,7 +649,7 @@ function nodeTools(ctx, u, { dir, pm, pkg, scripts, deps, tsconfig }) {
   if (ls) u.lint.push({ name: lsName, cmd: `${pm.run} ${ls}`, source: `package.json scripts.${ls}` });
   else if (eslint) u.lint.push(cfgTool('eslint', `${pm.exec} eslint .`, eslint));
   else if (isObj(pkg.eslintConfig)) {
-    u.lint.push({ ...cfgTool('eslint', `${pm.exec} eslint .`, J(dir, 'package.json')), source: 'package.json eslintConfig' });
+    u.lint.push({ ...cfgTool('eslint', `${pm.exec} eslint .`, u.manifests[0]), source: 'package.json eslintConfig' });
   } else if (biome) u.lint.push(cfgTool('biome', `${pm.exec} biome lint .`, biome));
 }
 
@@ -674,13 +674,15 @@ function detectNode(ctx) {
     const u = newUnit(dir, 'node', J(dir, 'package.json'));
     const tsconfig = ctx.exists(J(dir, 'tsconfig.json'));
     const facts = ctx.facts(dir);
-    u.languages.push(tsconfig || ['ts', 'tsx', 'mts', 'cts'].some((e) => facts.has(`ext:${e}`)) ? 'typescript' : 'javascript');
+    const ts = tsconfig || ['ts', 'tsx', 'mts', 'cts'].some((e) => facts.has(`ext:${e}`));
+    u.languages.push(ts ? 'typescript' : 'javascript');
     u.managers.push({ ...pm.entry, ...(wsRoot ? { workspace: true } : {}) });
-    if (!pm.entry.lockfile) u.warnings.push(`${J(dir, 'package.json')}: no lockfile committed; the install is not frozen`);
+    if (!pm.entry.lockfile) u.warnings.push(`${u.manifests[0]}: no lockfile committed; the install is not frozen`);
     const ws = wsRoots.get(dir) || wsRoots.get(wsRoot);
-    if (ws) u.workspace = wsRoots.has(dir) ? { kind: ws.kind, role: 'root', globs: ws.globs } : { kind: ws.kind, role: 'member', root: wsRoot };
+    const role = wsRoots.has(dir) ? { role: 'root', globs: ws?.globs } : { role: 'member', root: wsRoot };
+    if (ws) u.workspace = { kind: ws.kind, ...role };
     const scripts = isObj(pkg.scripts) ? pkg.scripts : {};
-    const own = new Set(['dependencies', 'devDependencies', 'optionalDependencies'].flatMap((k) => Object.keys(pkg[k] || {})));
+    const own = new Set(DEP_KEYS.flatMap((k) => Object.keys(pkg[k] || {})));
     const deps = new Set([...own, ...Object.keys((wsRoot && pkgs.get(wsRoot).devDependencies) || {})]);
     u.test_script = typeof scripts.test === 'string' && !NPM_PLACEHOLDER.test(scripts.test) ? scripts.test : null;
     const seen = new Set();
@@ -690,7 +692,7 @@ function detectNode(ctx) {
         const via = occ.via === 'test' ? '' : ` -> scripts.${occ.via}`;
         u.runners.push(nodeRunner(ctx, pm, occ, `package.json scripts.test${via}`, deps));
       }
-      if (a.delegates.length && !a.runners.length) Object.assign(u, { delegates: true, delegates_via: uniq(a.delegates) });
+      if (a.delegates.length && !a.runners.length) Object.assign(u, { delegates: true, delegates_via: a.delegates });
       else if (!a.runners.length && a.unknown.length) {
         const wraps = uniq(a.unknown).slice(0, 5);
         u.runners.push(makeRunner('npm-script', { cmd: pm.test, source: 'package.json scripts.test', wraps }));
@@ -701,7 +703,7 @@ function detectNode(ctx) {
       const cfg = nodeConfigFile(ctx, dir, name);
       const listed = own.has(jsDep(name));
       // A delegating workspace root only runs a suite its own config spreads over the members.
-      const spreads = cfg && /\b(?:projects|workspace)\s*:|vitest\.(?:workspace|projects)\./.test(`${cfg} ${ctx.read(cfg)}`);
+      const spreads = cfg && /\b(?:projects|workspace)\s*:|vitest\.(?:workspace|projects)\./.test(cfg + ctx.read(cfg));
       if (u.delegates ? !spreads : !cfg && !listed && !(name === 'jest' && isObj(pkg.jest))) continue;
       const occ = { runner: name, head: JS_SUB[name] ? [name, JS_SUB[name]] : [name], args: [] };
       u.runners.push(nodeRunner(ctx, pm, occ, cfg || `package.json ${listed ? 'devDependencies' : 'jest'}`, deps));
@@ -723,7 +725,8 @@ function detectNode(ctx) {
     }
     nodeTools(ctx, u, { dir, pm, pkg, scripts, deps, tsconfig });
     if (pm.pnp) u.warnings.push(`${J(lockDir, '.yarnrc.yml')}: Yarn Plug'n'Play; commands run through \`yarn\``);
-    if (!ctx.has(pm.launcher)) u.warnings.push(`${pm.launcher} is not on PATH (needed for ${pm.entry.install || pm.exec})`);
+    const needed = pm.entry.install || pm.exec;
+    if (!ctx.has(pm.launcher)) u.warnings.push(`${pm.launcher} is not on PATH (needed for ${needed})`);
     units.push(u);
   }
   return units;
@@ -759,7 +762,8 @@ function pyDeps(ctx, dir, pp) {
   const cfg = ctx.ini(J(dir, 'setup.cfg'));
   const pipfile = ctx.toml(J(dir, 'Pipfile'));
   const lines = (s) => String(s || '').split(/\r?\n/).filter((l) => !/^\s*(?:#|-)/.test(l));
-  for (const v of [pp?.project?.dependencies, tool.uv?.['dev-dependencies'], ...vals(pp?.project?.['optional-dependencies']),
+  const project = pp?.project || {};
+  for (const v of [project.dependencies, tool.uv?.['dev-dependencies'], ...vals(project['optional-dependencies']),
     ...vals(pp?.['dependency-groups']), ...vals(tool.pdm?.['dev-dependencies'])]) add(v);
   for (const t of [poetry.dependencies, poetry['dev-dependencies'], pipfile?.packages, pipfile?.['dev-packages'],
     ...vals(poetry.group).map((g) => g?.dependencies)]) keys(t);
@@ -822,7 +826,8 @@ function detectPython(ctx) {
   const uvWs = new Map();
   for (const d of dirs) {
     const ws = ctx.toml(J(d, 'pyproject.toml'))?.tool?.uv?.workspace;
-    if (Array.isArray(ws?.members)) uvWs.set(d, { members: ws.members.map(String), exclude: [].concat(ws.exclude || []).map(String) });
+    const exclude = [].concat(ws?.exclude || []).map(String);
+    if (Array.isArray(ws?.members)) uvWs.set(d, { members: ws.members.map(String), exclude });
   }
   const py = ctx.win || ctx.has('python') || !ctx.has('python3') ? 'python' : 'python3';
   const units = [];
@@ -851,13 +856,14 @@ function detectPython(ctx) {
     const conftest = ctx.inputs('conftest.py').some((r) => under(r, dir));
     const ciStep = ctx.ci.steps.find((st) => st.cwd === dir && /\bpytest\b/.test(st.cmd));
     if (cfg || conftest || deps.has('pytest') || ciStep) {
-      const source = cfg ? cfg.file : conftest ? 'conftest.py' : deps.has('pytest') ? 'pytest dependency' : ciRef(ciStep);
+      const source = cfg?.file || (conftest ? 'conftest.py' : deps.has('pytest') ? 'pytest dependency' : ciRef(ciStep));
       const r = makeRunner('pytest', { cmd: run('pytest'), source, available: ctx.has(launcher) });
       // A declared pytest-rerunfailures stays loaded (blocking it breaks its markers under --strict-markers);
       // --reruns=0 turns the CLI reruns off, but @pytest.mark.flaky(reruns=...) in test code still reruns.
       const rerun = deps.has('pytest-rerunfailures');
       const flaky = deps.has('flaky') ? ' -p no:flaky' : '';
-      r.retries_off = { mechanism: `${rerun ? '--reruns=0' : '-p no:rerunfailures'}${flaky}`, coverage: rerun ? 'partial' : 'full' };
+      const mechanism = `${rerun ? '--reruns=0' : '-p no:rerunfailures'}${flaky}`;
+      r.retries_off = { mechanism, coverage: rerun ? 'partial' : 'full' };
       if (rerun) r.retries_note = '@pytest.mark.flaky(reruns=...) in test code overrides --reruns';
       if (cfg?.addopts) r.addopts = cfg.addopts;
       u.runners.push(r);
@@ -877,7 +883,7 @@ function detectPython(ctx) {
       u.test_globs.push(...RUNNERS.unittest.test_globs, ...(start ? [`${start}/**`] : []));
     }
     const covTool = ['pytest-cov', 'coverage'].find((d) => deps.has(d));
-    if (u.runners.length && covTool) u.coverage.push({ name: covTool, format: 'cobertura', source: 'python dependency' });
+    if (u.runners.length && covTool) u.coverage.push({ name: covTool, format: 'cobertura', source: 'python deps' });
     // Type checkers and linters, by their config files.
     const first = (...c) => c.find(Boolean) || null;
     const setupCfg = ctx.ini(J(dir, 'setup.cfg')) || {};
@@ -891,7 +897,8 @@ function detectPython(ctx) {
     const tox = ctx.ini(J(dir, 'tox.ini')) || {};
     const flake8 = first(file('.flake8'), setupCfg.flake8 && J(dir, 'setup.cfg'), tox.flake8 && J(dir, 'tox.ini'));
     if (flake8) u.lint.push(cfgTool('flake8', run('flake8'), flake8));
-    if (prefix && !ctx.has(launcher)) u.warnings.push(`${launcher} is not on PATH (needed for ${mgr?.install || prefix})`);
+    const needed = mgr?.install || prefix;
+    if (prefix && !ctx.has(launcher)) u.warnings.push(`${launcher} is not on PATH (needed for ${needed})`);
     units.push(u);
   }
   return units;
@@ -941,10 +948,12 @@ function detectRust(ctx) {
     u.languages.push('rust');
     if (ws) u.workspace = { kind: 'cargo workspace', role: 'root', globs: [].concat(ws.members || []).map(String) };
     const locked = ctx.exists(J(dir, 'Cargo.lock'));
-    u.managers.push({ name: 'cargo', lockfile: locked ? 'Cargo.lock' : null, install: `cargo fetch${locked ? ' --locked' : ''}`,
-      cwd: dir, frozen: locked, ecosystem: 'rust' });
+    const install = `cargo fetch${locked ? ' --locked' : ''}`;
+    u.managers.push({ name: 'cargo', lockfile: locked ? 'Cargo.lock' : null, install, cwd: dir, frozen: locked,
+      ecosystem: 'rust' });
     if (!locked) u.warnings.push(`${manifest}: no Cargo.lock committed; the fetch is not frozen`);
-    const cargo = makeRunner('cargo', { cmd: `cargo test${flag} --no-fail-fast`, source: manifest, available: ctx.has('cargo') });
+    const cargo = makeRunner('cargo', { cmd: `cargo test${flag} --no-fail-fast`, source: manifest });
+    cargo.available = ctx.has('cargo');
     const cfgFile = J(dir, '.config/nextest.toml');
     const configured = ctx.exists(cfgFile);
     const installed = ctx.has('cargo-nextest');
@@ -962,7 +971,8 @@ function detectRust(ctx) {
     } else u.runners.push(cargo);
     u.test_globs.push('tests/**', ...(ws ? ['**/tests/**'] : []));
     u.typecheck.push({ name: 'cargo-check', cmd: `cargo check --all-targets${flag}`, source: manifest });
-    if (ctx.has('cargo-llvm-cov')) u.coverage.push({ name: 'cargo-llvm-cov', format: 'lcov', source: 'cargo-llvm-cov on PATH' });
+    const llvmCov = { name: 'cargo-llvm-cov', format: 'lcov', source: 'cargo-llvm-cov on PATH' };
+    if (ctx.has('cargo-llvm-cov')) u.coverage.push(llvmCov);
     const clippy = ['clippy.toml', '.clippy.toml'].map((f) => J(dir, f)).find(ctx.exists);
     if (clippy) u.lint.push(cfgTool('clippy', `cargo clippy --all-targets${flag}`, clippy));
     units.push(u);
@@ -974,7 +984,8 @@ function detectRust(ctx) {
 // .NET, JVM, Ruby
 
 const TEST_SDK = new RegExp(`^(?:${['Microsoft\\.NET\\.Test\\.Sdk', 'xunit(?:\\.v3)?', 'xunit\\.runner\\.visualstudio',
-  'nunit', 'NUnit3TestAdapter', 'MSTest(?:\\.TestFramework|\\.TestAdapter)?', 'TUnit(?:\\.Engine)?', 'Expecto'].join('|')})$`, 'i');
+  'nunit', 'NUnit3TestAdapter', 'MSTest(?:\\.TestFramework|\\.TestAdapter)?', 'TUnit(?:\\.Engine)?', 'Expecto']
+  .join('|')})$`, 'i');
 const COVERLET = /^(?:coverlet\.(?:collector|msbuild)|Microsoft\.Testing\.Extensions\.CodeCoverage)$/i;
 
 function csprojInfo(text, file) {
@@ -991,7 +1002,8 @@ function detectDotnet(ctx) {
   const slns = ctx.inputs(SLN);
   const projs = ctx.inputs(DOTNET_PROJ).map((f) => csprojInfo(ctx.read(f), f));
   const slnDirs = uniq(slns.map(dirOf)).sort((a, b) => b.length - a.length);
-  const groups = new Map(slnDirs.map((d) => [d, { dir: d, target: slns.filter((s) => dirOf(s) === d).sort()[0], projs: [] }]));
+  const slnIn = (d) => slns.filter((s) => dirOf(s) === d).sort()[0];
+  const groups = new Map(slnDirs.map((d) => [d, { dir: d, target: slnIn(d), projs: [] }]));
   // Projects belong to the nearest solution; a test project without one is a group of its own.
   for (const p of projs) {
     const d = slnDirs.find((s) => under(p.file, s)) ?? (p.isTest ? dirOf(p.file) : null);
@@ -1000,7 +1012,9 @@ function detectDotnet(ctx) {
     if (!groups.has(d)) groups.set(d, { dir: d, target: several ? p.file : null, projs: [] });
     groups.get(d).projs.push(p);
   }
-  const globalJson = (dir) => { for (let d = dir; ; d = dirOf(d)) { const j = ctx.json(J(d, 'global.json')); if (j || d === '.') return j; } };
+  const globalJson = (dir) => {
+    for (let d = dir; ; d = dirOf(d)) { const j = ctx.json(J(d, 'global.json')); if (j || d === '.') return j; }
+  };
   return [...groups.values()].sort((a, b) => cmp(a.dir, b.dir)).map((grp) => {
     const tests = grp.projs.filter((p) => p.isTest);
     const u = newUnit(grp.dir, 'dotnet', ...(grp.target ? [grp.target] : []), ...grp.projs.map((p) => p.file));
@@ -1012,11 +1026,12 @@ function detectDotnet(ctx) {
       install: `dotnet restore${tArg}${locked ? ' --locked-mode' : ''}`, ecosystem: 'dotnet' });
     if (tests.length) {
       const mtp = /Microsoft\.Testing\.Platform/i.test(String(globalJson(grp.dir)?.test?.runner || ''));
-      const r = makeRunner('dotnet', { cmd: `dotnet test${tArg}`, platform: mtp ? 'mtp' : 'vstest', source: grp.target || tests[0].file,
-        available: ctx.has('dotnet') });
+      const r = makeRunner('dotnet', { cmd: `dotnet test${tArg}`, platform: mtp ? 'mtp' : 'vstest',
+        source: grp.target || tests[0].file, available: ctx.has('dotnet') });
       if (mtp) {
         r.cmd = `dotnet test${target ? ` ${SLN.test(grp.target) ? '--solution' : '--project'} ${target}` : ''}`;
-        r.report = tests.every((p) => p.trx) ? { ...r.report, flag: '--report-trx --results-directory <d>' } : structuredClone(SUMMARY);
+        const trx = { ...r.report, flag: '--report-trx --results-directory <d>' };
+        r.report = tests.every((p) => p.trx) ? trx : structuredClone(SUMMARY);
         const mechanism = 'Microsoft.Testing.Platform retries only with --retry-failed-tests, which is never passed';
         r.retries_off = { mechanism, coverage: 'full' };
       }
@@ -1033,75 +1048,69 @@ function detectDotnet(ctx) {
   });
 }
 
+const MAVEN_TEST_DEP = /<artifactId>\s*(?:junit|junit-jupiter[\w-]*|testng)\s*</;
+const GRADLE_TEST_DEP = /\btest(?:Implementation|RuntimeOnly)\b|useJUnitPlatform|junit/;
+
 function jvmLanguages(ctx, dir, texts) {
   const f = ctx.facts(dir);
   const other = ['kt', 'kts', 'scala', 'groovy'].some((e) => f.has(`ext:${e}`));
-  return [(f.has('ext:java') || !other) && 'java', (f.has('ext:kt') || /org\.jetbrains\.kotlin|kotlin\(/.test(texts)) && 'kotlin',
-    f.has('ext:scala') && 'scala', f.has('ext:groovy') && 'groovy'].filter(Boolean);
+  const kotlin = f.has('ext:kt') || /org\.jetbrains\.kotlin|kotlin\(/.test(texts);
+  return [(f.has('ext:java') || !other) && 'java', kotlin && 'kotlin', f.has('ext:scala') && 'scala',
+    f.has('ext:groovy') && 'groovy'].filter(Boolean);
+}
+
+/** One Maven or Gradle build (`b`: tool, wrapper names, test and compile arguments, subprojects, signals). */
+function jvmUnit(ctx, dir, files, text, b) {
+  const u = newUnit(dir, 'jvm', ...files);
+  u.languages.push(...jvmLanguages(ctx, dir, text));
+  // The project's wrapper script (`./mvnw`; `mvnw.cmd` on Windows) wins over the tool on PATH.
+  const wrapped = ctx.exists(J(dir, ctx.win ? b.win : b.nix));
+  const bin = !wrapped ? b.tool : ctx.win ? b.win : `./${b.nix}`;
+  u.managers.push({ name: b.manager, lockfile: b.lockfile ?? null, install: null, offline_flag: b.offline, cwd: dir,
+    frozen: false, ecosystem: 'jvm' });
+  if (ctx.facts(dir).has('dir:src/test') || b.subs.length || b.tested) {
+    const r = makeRunner(b.manager, { cmd: `${bin} ${b.test}`, source: files[0] });
+    r.available = wrapped || ctx.has(b.tool);
+    if (b.subs.length) r.report.dirs = b.subs.map((s) => `${s}/${r.report.dir}`);
+    if (b.retry) r.retries_off = { mechanism: 'the org.gradle.test-retry plugin is configured', coverage: 'partial' };
+    u.runners.push(r);
+    u.test_globs.push('src/test/**', ...(b.subs.length ? ['**/src/test/**'] : []));
+  }
+  u.typecheck.push({ name: `${b.manager}-compile`, cmd: `${bin} ${b.compile}`, source: files[0] });
+  if (b.jacoco) u.coverage.push({ name: 'jacoco', format: 'jacoco', source: files[0] });
+  if (!wrapped && !ctx.has(b.tool)) u.warnings.push(`${b.tool} is not on PATH (and no wrapper)`);
+  return u;
 }
 
 function detectJvm(ctx) {
-  const units = [];
-  // The project's wrapper script (`./mvnw`; `mvnw.cmd` on Windows) wins over the tool on PATH.
-  const wrapper = (dir, nix, win, tool) => {
-    if (ctx.win) return ctx.exists(J(dir, win)) ? win : tool;
-    return ctx.exists(J(dir, nix)) ? `./${nix}` : tool;
-  };
   const poms = ctx.inputs('pom.xml').map(dirOf).sort((a, b) => a.length - b.length);
   const modulesOf = (dir) => [...(/<modules>([\s\S]*?)<\/modules>/.exec(ctx.read(J(dir, 'pom.xml')) || '')?.[1] || '')
     .matchAll(/<module>\s*([^<]+?)\s*<\/module>/g)].map((m) => normRel(m[1]));
   // Maven: a pom listed as a module of an ancestor pom belongs to that reactor.
   const aggregated = new Set(poms.flatMap((d) => modulesOf(d).map((m) => J(d, m))));
-  for (const dir of poms.filter((d) => !aggregated.has(d))) {
-    const pom = J(dir, 'pom.xml');
-    const text = ctx.read(pom) || '';
-    const u = newUnit(dir, 'jvm', pom);
-    u.languages.push(...jvmLanguages(ctx, dir, text));
-    const mvn = wrapper(dir, 'mvnw', 'mvnw.cmd', 'mvn');
-    u.managers.push({ name: 'maven', lockfile: null, install: null, offline_flag: '-o', cwd: dir, frozen: false, ecosystem: 'jvm' });
-    const modules = modulesOf(dir);
-    if (ctx.facts(dir).has('dir:src/test') || modules.length || /<artifactId>\s*(?:junit|junit-jupiter[\w-]*|testng)\s*</.test(text)) {
-      const r = makeRunner('maven', { cmd: `${mvn} -B test`, source: pom, available: mvn !== 'mvn' || ctx.has('mvn') });
-      if (modules.length) r.report.dirs = modules.map((m) => `${m}/target/surefire-reports`);
-      u.runners.push(r);
-      u.test_globs.push('src/test/**', ...(modules.length ? ['**/src/test/**'] : []));
-    }
-    u.typecheck.push({ name: 'maven-compile', cmd: `${mvn} -B -q test-compile`, source: pom });
-    if (/jacoco-maven-plugin/.test(text)) u.coverage.push({ name: 'jacoco', format: 'jacoco', source: pom });
-    if (mvn === 'mvn' && !ctx.has('mvn')) u.warnings.push('mvn is not on PATH and the project has no Maven wrapper');
-    units.push(u);
-  }
+  const units = poms.filter((d) => !aggregated.has(d)).map((dir) => {
+    const text = ctx.read(J(dir, 'pom.xml')) || '';
+    return jvmUnit(ctx, dir, [J(dir, 'pom.xml')], text, { tool: 'mvn', nix: 'mvnw', win: 'mvnw.cmd', manager: 'maven',
+      offline: '-o', test: '-B test', compile: '-B -q test-compile', subs: modulesOf(dir),
+      tested: MAVEN_TEST_DEP.test(text), jacoco: /jacoco-maven-plugin/.test(text) });
+  });
   // Gradle: a settings file roots a (multi-)project build; build files below it are subprojects.
   const settings = ctx.inputs(/^settings\.gradle(?:\.kts)?$/).map(dirOf);
   const builds = ctx.inputs(/^build\.gradle(?:\.kts)?$/);
-  for (const dir of uniq([...settings, ...builds.map(dirOf).filter((b) => !settings.some((s) => under(b, s)))]).sort()) {
-    const files = ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts'].map((f) => J(dir, f)).filter(ctx.exists);
-    const buildText = builds.filter((r) => under(r, dir)).map((r) => ctx.read(r) || '').join('\n');
+  const roots = uniq([...settings, ...builds.map(dirOf).filter((b) => !settings.some((s) => under(b, s)))]);
+  for (const dir of roots.sort()) {
+    const files = ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts'].map((f) => J(dir, f))
+      .filter(ctx.exists);
+    const text = builds.filter((r) => under(r, dir)).map((r) => ctx.read(r) || '').join('\n');
     const settingsText = files.filter((f) => /settings\.gradle/.test(f)).map((f) => ctx.read(f) || '').join('\n');
-    const u = newUnit(dir, 'jvm', ...files);
-    u.languages.push(...jvmLanguages(ctx, dir, buildText));
-    const gradle = wrapper(dir, 'gradlew', 'gradlew.bat', 'gradle');
-    u.managers.push({ name: 'gradle', lockfile: ctx.exists(J(dir, 'gradle.lockfile')) ? 'gradle.lockfile' : null, install: null,
-      offline_flag: '--offline', cwd: dir, frozen: false, ecosystem: 'jvm' });
-    const subprojects = uniq([...settingsText.matchAll(/\binclude\s*\(?([^)\n]+)\)?/g)]
+    const subs = uniq([...settingsText.matchAll(/\binclude\s*\(?([^)\n]+)\)?/g)]
       .flatMap((m) => [...m[1].matchAll(/['"]:?([^'"]+)['"]/g)].map((x) => x[1].replace(/:/g, '/'))));
-    const tested = /\btest(?:Implementation|RuntimeOnly)\b|useJUnitPlatform|junit/.test(buildText);
-    if (ctx.facts(dir).has('dir:src/test') || subprojects.length || tested) {
-      // A test task restored from a build cache (enabled by the project, the user's gradle.properties or
-      // an init script) reports results without running, so the cache is always bypassed.
-      const r = makeRunner('gradle', { cmd: `${gradle} test --no-build-cache`, source: files[0],
-        available: gradle !== 'gradle' || ctx.has('gradle') });
-      if (subprojects.length) r.report.dirs = subprojects.map((s) => `${s}/build/test-results/test`);
-      if (/test-retry/.test(buildText)) {
-        r.retries_off = { mechanism: 'the org.gradle.test-retry plugin is configured in the build script', coverage: 'partial' };
-      }
-      u.runners.push(r);
-      u.test_globs.push('src/test/**', ...(subprojects.length ? ['**/src/test/**'] : []));
-    }
-    u.typecheck.push({ name: 'gradle-compile', cmd: `${gradle} testClasses`, source: files[0] });
-    if (/\bjacoco\b/.test(buildText)) u.coverage.push({ name: 'jacoco', format: 'jacoco', source: files[0] });
-    if (gradle === 'gradle' && !ctx.has('gradle')) u.warnings.push('gradle is not on PATH and the project has no Gradle wrapper');
-    units.push(u);
+    // A test task restored from a build cache (enabled by the project, the user's gradle.properties or
+    // an init script) reports results without running, so the cache is always bypassed.
+    units.push(jvmUnit(ctx, dir, files, text, { tool: 'gradle', nix: 'gradlew', win: 'gradlew.bat', manager: 'gradle',
+      offline: '--offline', lockfile: ctx.exists(J(dir, 'gradle.lockfile')) ? 'gradle.lockfile' : null,
+      test: 'test --no-build-cache', compile: 'testClasses', subs, retry: /test-retry/.test(text),
+      tested: GRADLE_TEST_DEP.test(text), jacoco: /\bjacoco\b/.test(text) }));
   }
   return units;
 }
@@ -1110,13 +1119,15 @@ function detectRuby(ctx) {
   return ctx.inputs('Gemfile').map(dirOf).sort().map((dir) => {
     const gemfile = J(dir, 'Gemfile');
     const file = (f) => (ctx.exists(J(dir, f)) ? J(dir, f) : null);
-    const gems = new Set([...(ctx.read(gemfile) || '').matchAll(/^\s*gem\s+['"]([^'"]+)['"]/gm)].map((m) => m[1].toLowerCase()));
+    const gemList = [...(ctx.read(gemfile) || '').matchAll(/^\s*gem\s+['"]([^'"]+)['"]/gm)];
+    const gems = new Set(gemList.map((m) => m[1].toLowerCase()));
     const locked = Boolean(file('Gemfile.lock'));
     const u = newUnit(dir, 'ruby', gemfile);
     u.languages.push('ruby');
     // Bundler 4 removed `install --frozen`; the local config setting is the supported switch.
     const install = locked ? 'bundle config set --local frozen true && bundle install' : 'bundle install';
-    u.managers.push({ name: 'bundler', lockfile: locked ? 'Gemfile.lock' : null, install, cwd: dir, frozen: locked, ecosystem: 'ruby' });
+    u.managers.push({ name: 'bundler', lockfile: locked ? 'Gemfile.lock' : null, install, cwd: dir, frozen: locked,
+      ecosystem: 'ruby' });
     const facts = ctx.facts(dir);
     const rails = gems.has('rails') || Boolean(file('bin/rails'));
     const retry = (r, gem) => {
@@ -1124,13 +1135,15 @@ function detectRuby(ctx) {
       return r;
     };
     if (file('.rspec') || ['rspec', 'rspec-rails', 'rspec-core'].some((g) => gems.has(g)) || facts.has('rb-spec')) {
-      u.runners.push(retry(makeRunner('rspec', { source: file('.rspec') || gemfile, available: ctx.has('bundle') }), 'rspec-retry'));
+      const r = makeRunner('rspec', { source: file('.rspec') || gemfile, available: ctx.has('bundle') });
+      u.runners.push(retry(r, 'rspec-retry'));
       u.test_globs.push('spec/**');
     }
     if (gems.has('minitest') || facts.has('rb-test') || (rails && facts.has('dir:test'))) {
       const cmd = rails ? 'bundle exec rails test' : file('Rakefile') ? 'bundle exec rake test' : null;
       const source = rails ? 'rails' : J(dir, 'Rakefile');
-      if (cmd) u.runners.push(retry(makeRunner('minitest', { cmd, source, available: ctx.has('bundle') }), 'minitest-retry'));
+      const r = cmd && makeRunner('minitest', { cmd, source, available: ctx.has('bundle') });
+      if (cmd) u.runners.push(retry(r, 'minitest-retry'));
       if (cmd) u.test_globs.push('test/**');
       else u.warnings.push(`${gemfile}: Minitest files but no Rakefile test task; give the test command`);
     }
@@ -1159,8 +1172,9 @@ function detectMake(ctx) {
       const main = TARGET_PRIORITY.map((n) => targets.find((t) => t.name === n)).find(Boolean) || targets[0];
       const wraps = uniq(splitShell(main.recipe.join('\n')).map((s) => recognizeCommand(s.tokens)?.runner));
       const u = newUnit(dir, tool, file);
-      u.runners.push(makeRunner(tool, { cmd: `${tool} ${main.name}`, target: main.name, targets: targets.map((t) => t.name),
-        source: `${file} target ${main.name}`, ...(wraps.length ? { wraps } : {}), available: ctx.has(tool) }));
+      u.runners.push(makeRunner(tool, { cmd: `${tool} ${main.name}`, target: main.name,
+        targets: targets.map((t) => t.name), source: `${file} target ${main.name}`, ...(wraps.length && { wraps }),
+        available: ctx.has(tool) }));
       units.push(u);
     }
   }
@@ -1171,15 +1185,15 @@ function detectMake(ctx) {
 // CI: system, files, the test commands it runs (and the directory it runs them in)
 
 const RUN_KEYS = new Set(['run', 'script', 'before_script', 'bash', 'pwsh', 'powershell', 'command', 'sh']);
-const CI_WORKSPACE = new RegExp(`^(?:\\$\\{\\{\\s*github\\.workspace\\s*\\}\\}|\\$\\(\\s*(?:System\\.DefaultWorkingDirectory`
-  + `|Build\\.SourcesDirectory|Pipeline\\.Workspace)\\s*\\)|\\$(?:CI_PROJECT_DIR|GITHUB_WORKSPACE))/?`);
+const CI_WORKSPACE = new RegExp('^(?:\\$\\{\\{\\s*github\\.workspace\\s*\\}\\}|\\$(?:CI_PROJECT_DIR|GITHUB_WORKSPACE)'
+  + '|\\$\\(\\s*(?:System\\.DefaultWorkingDirectory|Build\\.SourcesDirectory|Pipeline\\.Workspace)\\s*\\))/?');
 // Setup lines that mention a test tool without running tests (`pip install pytest`).
 const INSTALL_LINE = new RegExp(`^\\s*(?:sudo\\s+)?(?:${[
   'pip3?\\s+install', 'python[\\d.]*\\s+-m\\s+pip\\b', 'uv\\s+(?:pip|tool|add|sync)\\b', 'poetry\\s+(?:add|install)',
   'pipx\\b', 'npm\\s+(?:i|install|ci|config)\\b', 'yarn\\s+(?:add|install)\\b', 'pnpm\\s+(?:add|install|i)\\b',
   'bun\\s+(?:add|install)\\b', 'gem\\s+install', 'bundle\\s+install', 'apt(?:-get)?\\b', 'brew\\b', 'choco\\b',
   'go\\s+(?:install|get|mod)\\b', 'cargo\\s+(?:install|fetch|binstall)\\b', 'dotnet\\s+(?:tool|restore|new)\\b',
-  'echo\\b', 'printf\\b', 'export\\b', 'cd\\s+\\S+\\s*$', 'curl\\b', 'wget\\b'].join('|')})`);
+  'echo\\b', 'printf\\b', 'export\\b', 'curl\\b', 'wget\\b'].join('|')})`);
 const TEST_LINE_RES = [
   /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:-\S+|--\S+)\s+)*(?:run\s+|run-script\s+)?(?:test|t|tst)(?::[\w:.-]+)?\b/,
   /\b(?:npx|bunx|pnpm\s+exec|yarn)\s+(?:--?\S+\s+)*(?:jest|vitest|mocha|playwright\s+test|cypress\s+run)\b/,
@@ -1189,7 +1203,8 @@ const TEST_LINE_RES = [
   /\b(?:\.\/)?mvnw?(?:\.cmd)?\b.*\s(?:test|verify|integration-test)\b/,
   /\b(?:\.\/)?gradlew?(?:\.bat)?\b.*\s(?:test|check|\S+:test)\b/,
   /\b(?:bundle\s+exec\s+)?(?:rspec|rake\s+(?:test|spec))\b/, /\brails\s+test\b/,
-  /\b(?:make|just)\s+(?:-\S+\s+)*test[\w:.-]*/, /(?:^|[\s/])(?:run[-_]?)?tests?(?:[-_][\w-]+)?\.(?:sh|ps1|py|bat|cmd)\b/,
+  /\b(?:make|just)\s+(?:-\S+\s+)*test[\w:.-]*/,
+  /(?:^|[\s/])(?:run[-_]?)?tests?(?:[-_][\w-]+)?\.(?:sh|ps1|py|bat|cmd)\b/,
 ];
 // Report or narrowing flags a learned CI command must not keep (the companion adds its own).
 const CI_DROP = {
@@ -1197,7 +1212,7 @@ const CI_DROP = {
   pytest: /^--(?:junit-?xml|junitxml|junit-prefix)(?:=|$)|^--cov(?:-report)?(?:=|$)|^-n$|^--numprocesses(?:=|$)/,
   go: /^-json$/, dotnet: /^--logger(?:=|$)|^-l$|^--results-directory(?:=|$)/, rspec: /^--(?:format|out)(?:=|$)|^-[fo]$/,
 };
-const CI_VALUED = /^-(?:n|l|f|o)$|^--(?:logger|numprocesses|format|out|results-directory|junitxml|junit-xml|cov|cov-report)$/;
+const CI_VALUED = /^-[nlfo]$|^--(?:logger|numprocesses|format|out|results-directory|junit-?xml|cov|cov-report)$/;
 
 const firstString = (...vals) => vals.find((v) => typeof v === 'string' && v.trim())?.trim() ?? null;
 
@@ -1206,7 +1221,8 @@ const firstString = (...vals) => vals.find((v) => typeof v === 'string' && v.tri
  * home paths name the checkout itself (CircleCI `~/project`); a path that leaves it is null.
  */
 function ciDir(d, base = '.') {
-  let s = toPosix(String(d)).trim().replace(CI_WORKSPACE, '');
+  let s = toPosix(String(d)).trim();
+  if (CI_WORKSPACE.test(s)) [s, base] = [s.replace(CI_WORKSPACE, ''), '.'];
   if (/^(?:\/|~|[A-Za-z]:\/)/.test(s)) return '.';
   s = normRel(s);
   if (base == null || !s || /[$]/.test(s)) return base;
@@ -1216,7 +1232,7 @@ function ciDir(d, base = '.') {
 
 function ciScripts(tree) {
   const out = [];
-  const emit = (script, wd, hint = null) => { if (typeof script === 'string' && script.trim()) out.push({ script, wd, hint }); };
+  const emit = (script, wd, hint) => { if (script?.trim?.()) out.push({ script, wd, hint }); };
   const visit = (node, wd) => {
     if (Array.isArray(node)) { for (const x of node) visit(x, wd); return; }
     if (!isObj(node)) return;
@@ -1228,9 +1244,10 @@ function ciScripts(tree) {
     const inner = def == null ? here : ciDir(def);
     const inp = isObj(node.inputs) ? node.inputs : {};
     const task = typeof node.task === 'string' ? node.task : '';
-    if (/^DotNetCoreCLI@/i.test(task) && String(inp.command) === 'test') emit(`dotnet test ${inp.projects || ''}`.trim(), here, task);
-    if (/^Maven@/i.test(task) && /\b(?:test|verify)\b/.test(String(inp.goals || ''))) emit(`mvn ${inp.goals}`, here, task);
-    if (/^Gradle@/i.test(task) && /\b(?:test|check)\b/.test(String(inp.tasks || ''))) emit(`./gradlew ${inp.tasks}`, here, task);
+    // Azure Pipelines tasks that run tests without a script.
+    if (/^DotNetCoreCLI@/i.test(task) && inp.command === 'test') emit(`dotnet test ${inp.projects ?? ''}`, here, task);
+    if (/^Maven@/i.test(task) && /\b(?:test|verify)\b/.test(inp.goals)) emit(`mvn ${inp.goals}`, here, task);
+    if (/^Gradle@/i.test(task) && /\b(?:test|check)\b/.test(inp.tasks)) emit(`./gradlew ${inp.tasks}`, here, task);
     for (const [k, v] of Object.entries(node)) {
       const list = Array.isArray(v) ? v.flat(4) : null;
       if (RUN_KEYS.has(k) && typeof v === 'string') emit(v, here);
@@ -1272,11 +1289,16 @@ function detectCi(ctx) {
         .map((m) => ({ script: m[1].replace(/^['"]|['"]$/g, ''), wd: '.' }));
     }
     for (const { script, wd, hint } of scripts) {
-      for (const line of ciCommandLines(script).filter(isTestCommand)) {
-        const cd = /^cd\s+("[^"]+"|'[^']+'|\S+)\s*(?:&&|;)\s*/.exec(line);
-        const cwd = cd ? ciDir(cd[1].replace(/^['"]|['"]$/g, ''), wd) : wd;
-        const cmd = truncate(cd ? line.slice(cd[0].length) : line, 400);
-        steps.push({ file: rel, line: lineNo(text, line) ?? (hint ? lineNo(text, hint) : null), cmd, cwd });
+      let cwd = wd;
+      for (const line of ciCommandLines(script)) {
+        // A leading `cd` (or PowerShell `Set-Location`) moves this line and the rest of the script.
+        const cd = /^(?:cd|pushd|set-location|sl)\s+(?:-path\s+)?("[^"]+"|'[^']+'|[^\s;&|]+)\s*(?:$|&&|;)\s*/i
+          .exec(line);
+        if (cd) cwd = ciDir(cd[1].replace(/^['"]|['"]$/g, ''), cwd);
+        const cmd = cd ? line.slice(cd[0].length) : line;
+        if (!cmd || !isTestCommand(cmd)) continue;
+        const at = lineNo(text, line) ?? (hint ? lineNo(text, hint) : null);
+        steps.push({ file: rel, line: at, cmd: truncate(cmd, 400), cwd });
       }
     }
   }
@@ -1297,19 +1319,17 @@ function recognizeCommand(tokens) {
   const pyRun = ['uv', 'poetry', 'pdm', 'pipenv', 'hatch'].includes(b) && w[0] === 'run';
   const bundled = b === 'bundle' && w[0] === 'exec';
   const hit = (runner) => ({ runner, env });
-  if (b === 'pytest' || b === 'py.test' || (py && a[0] === '-m' && a[1] === 'pytest') || (pyRun && w.includes('pytest'))) {
-    return hit('pytest');
-  }
-  if ((py && a[0] === '-m' && a[1] === 'unittest') || (pyRun && /unittest/.test(a.join(' ')))) return hit('unittest');
+  const pyMod = (m) => (py && a[0] === '-m' && a[1] === m) || (pyRun && w.includes(m));
+  if (b === 'pytest' || b === 'py.test' || pyMod('pytest')) return hit('pytest');
+  if (pyMod('unittest')) return hit('unittest');
   if (b === 'go' && w[0] === 'test') return hit('go');
   if (b === 'cargo' && (w[0] === 'nextest' || w[0] === 'test')) return hit(w[0] === 'test' ? 'cargo' : 'nextest');
   if (b === 'dotnet' && w[0] === 'test') return hit('dotnet');
   if (/^mvnw?$/.test(b) && w.some((x) => /^(?:test|verify|integration-test)$/.test(x))) return hit('maven');
   if (/^gradlew?$/.test(b) && w.some((x) => /(?:^|:)(?:test|check)$/.test(x))) return hit('gradle');
   if (b === 'rspec' || (bundled && w[1] === 'rspec')) return hit('rspec');
-  if ((/^(?:rake|rails)$/.test(b) && w[0] === 'test') || (bundled && /^(?:rake|rails)$/.test(w[1]) && w[2] === 'test')) {
-    return hit('minitest');
-  }
+  const rake = (x, y) => /^(?:rake|rails)$/.test(x) && y === 'test';
+  if (rake(b, w[0]) || (bundled && rake(w[1], w[2]))) return hit('minitest');
   if ((b === 'make' || b === 'just') && w.some((x) => /^test/.test(x))) return hit(b);
   const js = classifySegment(tokens, null);
   return js.kind === 'runner' ? { runner: js.runner, env, occ: js } : null;
@@ -1317,12 +1337,9 @@ function recognizeCommand(tokens) {
 
 /** Is the program a command line starts with on PATH (or a repository script)? */
 function launcherAvailable(ctx, cmd) {
-  for (const seg of splitShell(cmd || '')) {
-    const { rest } = stripEnv(seg.tokens);
-    if (!rest.length || ['set', 'cd', 'export'].includes(rest[0])) continue;
-    return /^\.{1,2}\//.test(rest[0]) || ctx.has(binName(rest[0]));
-  }
-  return false;
+  const firsts = splitShell(cmd).map((seg) => stripEnv(seg.tokens).rest[0]);
+  const bin = firsts.find((t) => t && !['set', 'cd', 'export'].includes(t));
+  return Boolean(bin) && (/^\.{1,2}\//.test(bin) || ctx.has(binName(bin)));
 }
 
 function learnedRunner(ctx, step) {
@@ -1357,9 +1374,9 @@ function mergeUnits(units) {
     const all = (k) => list.flatMap((u) => u[k]);
     const first = (k) => list.find((u) => u[k])?.[k] ?? null;
     const p = { root: dir, ecosystems: uniq(list.map((u) => u.ecosystem)), languages: uniq(all('languages')),
-      manifests: uniq(all('manifests')), managers: all('managers'), runners: all('runners'), test_globs: uniq(all('test_globs')),
-      typecheck: all('typecheck'), lint: all('lint'), coverage: all('coverage'), test_script: first('test_script'),
-      workspace: first('workspace'), warnings: uniq(all('warnings')) };
+      manifests: uniq(all('manifests')), managers: all('managers'), runners: all('runners'),
+      test_globs: uniq(all('test_globs')), typecheck: all('typecheck'), lint: all('lint'), coverage: all('coverage'),
+      test_script: first('test_script'), workspace: first('workspace'), warnings: uniq(all('warnings')) };
     const del = list.filter((u) => u.delegates);
     if (del.length) p.delegates_to = uniq(del.flatMap((u) => u.delegates_via));
     if (first('module')) p.module = first('module');
@@ -1376,8 +1393,9 @@ function summarize(projects) {
       const g = groups.get(eco) || { count: 0, names: [] };
       groups.set(eco, g);
       g.count++;
+      const runners = p.runners.filter((r) => r.ecosystem === eco);
       g.names.push(...p.managers.filter((m) => m.ecosystem === eco).map((m) => m.name),
-        ...p.runners.filter((r) => r.ecosystem === eco).map((r) => (r.name === 'make' || r.name === 'just' ? r.target : r.name)));
+        ...runners.map((r) => (r.name === 'make' || r.name === 'just' ? r.target : r.name)));
     }
   }
   const parts = [...groups].sort(([a], [b]) => ECO_ORDER.indexOf(a) - ECO_ORDER.indexOf(b))
@@ -1400,7 +1418,8 @@ function gitInfo(root) {
     if (sym && revParse(root, sym)) {
       return { default_branch: sym.replace(/^refs\/remotes\/origin\//, ''), base_source: 'origin/HEAD', base_error };
     }
-    const name = ['main', 'master'].find((n) => revParse(root, `refs/heads/${n}`) || revParse(root, `refs/remotes/origin/${n}`));
+    const name = ['main', 'master'].find((n) => revParse(root, `refs/heads/${n}`)
+      || revParse(root, `refs/remotes/origin/${n}`));
     return { default_branch: name || current(), base_source: name || null, base_error };
   }
 }
@@ -1445,7 +1464,8 @@ function derive(g, { platform, tools }) {
   for (const p of projects) delete p._delegating;
   const oversize = g.oversize.map((f) => `${f}: larger than 2 MB; only its presence was used`);
   return {
-    summary: summarize(projects), projects, ci, lint: tagged('lint'), typecheck: tagged('typecheck'), other_packages: other,
+    summary: summarize(projects), projects, ci, lint: tagged('lint'), typecheck: tagged('typecheck'),
+    other_packages: other,
     warnings: uniq([...ctx.warnings, ...projects.flatMap((p) => p.warnings), ...oversize]),
     next_steps: projects.some((p) => p.runners.length) ? [] : ['No test runner was detected: ask the user for the test '
       + 'command and pass it as `clean-run --runner "<command>"` (headless runs record CK-CLEANRUN as UNVERIFIED).'],
@@ -1458,11 +1478,13 @@ function derive(g, { platform, tools }) {
 // Identifiers and paths the companion computed itself (a digest would look like a key).
 const KEEP_KEYS = /^(?:cache_key|repo_root|generated_at|generated_by|schema|platform|file_listing|path)$|sha256$/;
 // A credential-named option whose value follows a space (`--password x`); `NAME=x` is the redactor's.
-const SECRET_FLAG = /(--?[\w-]*(?:token|secret|passw(?:or)?d|api-?key|access-?key|private-?key|credentials?)[\w-]*\s+)(?!\$|\[REDACTED|-)(["']?)[^\s"']{4,}\2/gi;
+const SECRET_FLAG = new RegExp('(--?[\\w-]*(?:token|secret|passw(?:or)?d|api-?key|access-?key|private-?key|credential)'
+  + '[\\w-]*\\s+)(?!\\$|\\[REDACTED|-)(["\']?)[^\\s"\']{4,}\\2', 'gi');
 
 function redactResult(value, env) {
   const base = M.makeRedactor({ env, names: true });
-  return M.redactDeep(value, (s) => base(s).replace(SECRET_FLAG, '$1[REDACTED]'), { keep: KEEP_KEYS, secretKeys: true });
+  const redact = (s) => base(s).replace(SECRET_FLAG, '$1[REDACTED]');
+  return M.redactDeep(value, redact, { keep: KEEP_KEYS, secretKeys: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,9 +1519,9 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
   }
   const sorted = (o) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => cmp(a, b)));
   const derived = derive(g, { platform, tools });
-  const result = redactResult({ schema: DETECT_SCHEMA, cache_key: key, generated_at: nowIso(), generated_by: generatedBy(),
-    detect_source: 'detect', platform, file_listing: g.listing, files_scanned: g.fileCount, inputs: g.relevant.size,
-    ...derived, ...live, tools: sorted(seen), probes: sorted(g.probes) }, env);
+  const result = redactResult({ schema: DETECT_SCHEMA, cache_key: key, generated_at: nowIso(),
+    generated_by: generatedBy(), detect_source: 'detect', platform, file_listing: g.listing, files_scanned: g.fileCount,
+    inputs: g.relevant.size, ...derived, ...live, tools: sorted(seen), probes: sorted(g.probes) }, env);
   let written = false;
   let error = null;
   if (cacheFile && write && isDir(path.dirname(cacheFile))) {
@@ -1511,12 +1533,14 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
 export { DEFAULT_TEST_GLOBS, projectForFile } from './markers.mjs';
 
 /** Is `file` a test file by its project's test globs (DEFAULT_TEST_GLOBS without one)? `content`: Rust inline tests. */
-export const isTestFile = (file, detectResult, opts = {}) => M.isTestFile(file, detectResult, { ...opts, heuristic: false });
+export const isTestFile = (file, detectResult, opts = {}) => M.isTestFile(file, detectResult,
+  { ...opts, heuristic: false });
 
 // ---------------------------------------------------------------------------
 // Command
 
-const USAGE = `usage: node <skill>/scripts/adc.mjs detect [--refresh] [--json] [--cwd <dir>] [--state-dir <dir>] [--dry-run]
+const USAGE = `usage: node <skill>/scripts/adc.mjs detect [--refresh] [--json] [--cwd <dir>] [--state-dir <dir>]
+                                          [--dry-run]
 
 Detects projects (monorepo-aware), package managers with their frozen install, test runners
 with report and retries-off flags, test-file globs, type checkers, linters, the CI system and
@@ -1526,25 +1550,11 @@ The result is cached in .adc/detect.json (keyed by a digest of every detection i
   --refresh    ignore the cache and detect again
   --dry-run    read the cache but write nothing (no .adc/ is created)`;
 
-function human(res) {
-  const lines = [`detect: ${res.summary}`];
-  for (const p of res.projects) {
-    const install = p.managers.map((m) => m.install || `${m.name} (no frozen install)`).join('; ');
-    lines.push(`  ${p.root}  [${(p.languages.length ? p.languages : p.ecosystems).join(', ')}]${install ? `  install: ${install}` : ''}`);
-    for (const r of p.runners) {
-      const notes = `${r.kind === 'e2e' ? ' (e2e)' : ''}: ${r.cmd}   retries off: ${r.retries_off.coverage}`;
-      lines.push(`    ${r.name}${notes}${r.available === false ? '   (not on PATH)' : ''}`);
-    }
-    for (const t of p.typecheck) lines.push(`    typecheck ${t.name}: ${t.cmd}`);
-  }
-  const tests = res.ci.test_commands.length ? `; test: ${res.ci.test_commands.slice(0, 4).join(' | ')}` : '';
-  if (res.ci.system) lines.push(`ci: ${(res.ci.systems || [res.ci.system]).join(', ')} (${res.ci.files.join(', ')})${tests}`);
-  lines.push(`default branch: ${res.default_branch || 'unknown'} (${res.base_source || 'no git'})`);
-  lines.push(...res.warnings.map((w) => `warning: ${w}`), ...res.next_steps.map((s) => `next: ${s}`));
-  const state = res.cache.hit ? 'hit' : res.cache.written ? 'written' : 'not written';
-  lines.push(`cache: ${state}${res.cache.path ? ` (${res.cache.path})` : ''}`);
-  return lines.join('\n');
-}
+// The terminal view (`--json` or a pipe prints the full result).
+const human = (res) => [`detect: ${res.summary}`, ...res.projects.flatMap((p) => [
+  `  ${p.root}: ${p.managers.map((m) => m.install || `${m.name} (no frozen install)`).join('; ')}`,
+  ...p.runners.map((r) => `    ${r.name}: ${r.cmd}`)]), ...res.warnings.map((w) => `warning: ${w}`),
+...res.next_steps.map((s) => `next: ${s}`)].join('\n');
 
 export const detectCommand = defineCommand({
   name: 'detect',
@@ -1554,7 +1564,8 @@ export const detectCommand = defineCommand({
   async run(ctx, values) {
     const top = repoRoot(ctx.cwd);
     const root = top || ctx.cwd;
-    const stateInfo = top || ctx.stateDirOption ? prepareStateDir({ ...ctx, cwd: root }, { create: !ctx.dryRun }) : null;
+    const wanted = top || ctx.stateDirOption;
+    const stateInfo = wanted ? prepareStateDir({ ...ctx, cwd: root }, { create: !ctx.dryRun }) : null;
     const res = await detect({ root, stateInfo, refresh: Boolean(values.refresh), write: !ctx.dryRun });
     return { result: res, exit: EXIT.OK, summary: res.summary, human: human(res) };
   },

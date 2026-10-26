@@ -171,8 +171,8 @@ export const SKIP_MARKERS = catalog('skip', { code: true, kind: 'skip' }, [
   ['go-build-tag', 'go', /^\s*\/\/\s*(?:go:build|\+build)\s+(?!ignore\b)\S/, { code: false, kind: 'constraint' }],
   ['rs-ignore', 'rs', /#\[ignore(?:\s*=\s*"[^"]*")?\s*\]/],
   ['jvm', 'jvm', /@(?:Disabled\w*|Ignore)\b|@Test\s*\([^)]*\benabled\s*=\s*false/],
-  ['cs', 'cs', alt(/\[\s*(?:\w+\s*,\s*)*Ignore\b/, /\[\s*(?:Fact|Theory|SkippableFact|SkippableTheory)\s*\([^)]*\bSkip\s*=/,
-    /\bAssert\.(?:Ignore|Inconclusive)\s*\(/)],
+  ['cs', 'cs', alt(/\[\s*(?:\w+\s*,\s*)*Ignore\b/,
+    /\[\s*(?:Fact|Theory|SkippableFact|SkippableTheory)\s*\([^)]*\bSkip\s*=|\bAssert\.(?:Ignore|Inconclusive)\s*\(/)],
   ['rb', 'rb', alt(/^\s*(?:xit|xdescribe|xcontext|xspecify|xexample|xscenario)\b/, /^\s*(?:skip|pending)\b(?!\s*[=:])/,
     /(?:,\s*|\b)(?:skip|pending):\s*(?:true|['"])/, /,\s*:(?:skip|pending)\b/)],
   ['rb-focus', 'rb', alt(/^\s*(?:fit|fdescribe|fcontext|fspecify|fexample|fscenario)\b/, /(?:,\s*|\b)focus:\s*true/,
@@ -195,8 +195,10 @@ export const TEST_CASE_LINE = catalog('case', { code: true }, [
     /RetryingTest|RepeatedIfExceptionsTest|CartesianTest/), /\b/),
   { lookahead: /\b(?:void|fun|def)\s+`?([^`(\s]+(?: [^`(]+)*)`?\s*\(/ }],
   ['cs', 'cs', cat(/\[\s*(?:\w+\s*,\s*)*/, group(/Fact|Theory|Test|TestMethod|TestCase|DataTestMethod/,
-    /SkippableFact|SkippableTheory|RetryFact|RetryTheory/), /\b/), { lookahead: /\b(?:void|Task|ValueTask)\s+(\w+)\s*\(/ }],
-  ['rb', 'rb', /^\s*(?:[xf]?(?:it|specify|example|scenario)|test)\b\s*\(?\s*(?:(['"])((?:\\.|(?!\1).)*)\1)?/, { name: 2 }],
+    /SkippableFact|SkippableTheory|RetryFact|RetryTheory/), /\b/),
+  { lookahead: /\b(?:void|Task|ValueTask)\s+(\w+)\s*\(/ }],
+  ['rb', 'rb', cat(/^\s*(?:[xf]?(?:it|specify|example|scenario)|test)\b\s*\(?\s*/, /(?:(['"])((?:\\.|(?!\1).)*)\1)?/),
+    { name: 2 }],
   ['rb-minitest', 'rb', /^\s*def\s+(test_\w+)/, { name: 1 }],
   ['php', 'php', /\bfunction\s+(test\w+)\s*\(/, { name: 1 }],
   ['php-pest', 'php', /^\s*(?:it|test)\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1/, { name: 2 }],
@@ -227,8 +229,9 @@ export const ASSERTION_LINE = catalog('assert', { code: true }, [
 
 /** Assertions that only check truthiness or existence (a "downgrade" when they replace stronger ones). */
 export const WEAK_ASSERTIONS = catalog('weak', { code: true }, [
-  ['js', 'js', alt(/\.(?:toBeTruthy|toBeDefined|toBeFalsy)\s*\(\s*\)|\.not\.(?:toBeNull|toBeUndefined|toThrow)\s*\(\s*\)/,
-    /\bexpect\.anything\s*\(|\.toHaveBeenCalled\s*\(\s*\)|\bassert(?:\.ok)?\s*\(\s*[\w$.]+\s*\)\s*;?\s*$/)],
+  ['js', 'js', alt(/\.(?:toBeTruthy|toBeDefined|toBeFalsy)\s*\(\s*\)/,
+    /\.not\.(?:toBeNull|toBeUndefined|toThrow)\s*\(\s*\)|\bexpect\.anything\s*\(|\.toHaveBeenCalled\s*\(\s*\)/,
+    /\bassert(?:\.ok)?\s*\(\s*[\w$.]+\s*\)\s*;?\s*$/)],
   ['py', 'py', alt(/^\s*assert\s+(?:not\s+)?[\w.]+(?:\(\))?\s*$|^\s*assert\s+[\w.]+\s+is\s+not\s+None\s*$/,
     /\bself\.assert(?:True|IsNotNone|False|IsNone)\s*\(\s*[\w.]+\s*\)/)],
   ['jvm', 'jvm', /\bassert(?:NotNull|True|False)\s*\(\s*[\w.]+\s*\)/],
@@ -298,6 +301,9 @@ export const SUPPRESSIONS = catalog('suppress', {}, [
   ['secret-allow', '', SECRET_ALLOW],
 ]);
 
+// Numeric settings (`maxWarnings: 0`) are not rules turned off.
+const NUMERIC = /max|min|warnings|width|version|depth|size|limit|timeout|ecma|indent|tab|level|line/;
+const NOT_NUMERIC_KEY = new RegExp(String.raw`(?![\w@/-]*(?:${NUMERIC.source})[\w-]*["']?\s*[:=])`);
 const TS_STRICT = /strict\w*|noImplicit\w+|noUnused\w+|noFallthroughCasesInSwitch|exactOptionalPropertyTypes|checkJs/;
 
 /**
@@ -305,8 +311,7 @@ const TS_STRICT = /strict\w*|noImplicit\w+|noUnused\w+|noFallthroughCasesInSwitc
  * lint sections of pyproject.toml, setup.cfg, package.json, Cargo.toml, MSBuild props).
  */
 export const LINT_CONFIG_WEAKENING = catalog('lintcfg', {}, [
-  ['rule-off', '', cat(/^\s*["']?/,
-    /(?![\w@/-]*(?:max|min|warnings|width|version|depth|size|limit|timeout|ecma|indent|tab|level|line)[\w-]*["']?\s*[:=])/,
+  ['rule-off', '', cat(/^\s*["']?/, NOT_NUMERIC_KEY,
     /(?:@?[\w-]+\/)*[\w-]+["']?\s*[:=]\s*(?:["']off["']|0(?![\d.])|\[\s*(?:["']off["']|0(?![\d.])))/)],
   ['rule-allow', '', /^\s*["']?[\w:-]+["']?\s*=\s*(?:["']allow["']|\{\s*level\s*=\s*["']allow["'])/],
   ['ts-strict-off', '', cat(/["']/, group(TS_STRICT, /alwaysStrict|useUnknownInCatchVariables/),
@@ -342,7 +347,8 @@ export const STRICTNESS_ON = catalog('strict', {}, [
     /warn_redundant_casts|strict_optional|no_implicit_optional|strict_equality/), /\s*=\s*(?:true|True)\b/)],
   ['pyright', '', /["']?typeCheckingMode["']?\s*[:=]\s*["']strict["']/],
   ['msbuild', '', alt(
-    /<(?:TreatWarningsAsErrors|EnforceCodeStyleInBuild|RunAnalyzers|RunAnalyzersDuringBuild|EnableNETAnalyzers)>\s*true\s*</i,
+    cat(/<(?:TreatWarningsAsErrors|EnforceCodeStyleInBuild|RunAnalyzers|RunAnalyzersDuringBuild|EnableNETAnalyzers)>/i,
+      /\s*true\s*</),
     /<Nullable>\s*enable\s*<|<WarningsAsErrors>[^<]+</)],
   ['all', '', /^\s*["']?(?:enable-all|enable_all)["']?\s*[:=]\s*true\b/],
 ]);
@@ -351,9 +357,9 @@ export const STRICTNESS_ON = catalog('strict', {}, [
 export const LINT_ENABLE_KEYS = /^(?:select|extend-select|extend_select|enable|enabled|presets|extends)$/i;
 
 /** Keys whose list items are exclusions (an added item under them turns a check off or narrows it). */
-export const LINT_EXCLUSION_KEYS = names(/ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|exclude|extend-exclude/i,
-  /extend_exclude|per-file-ignores|per_file_ignores|disable|disabled|skip-dirs|skip-files|skip_dirs|skip_files/,
-  /exclude-dirs|exclude-files|exclude_dirs|exclude_files|exclude_rules|unfixable|globalIgnores/);
+export const LINT_EXCLUSION_KEYS = names(/ignore|ignores|ignorePatterns|extend-ignore|extend_ignore|exclude/i,
+  /extend-exclude|extend_exclude|per-file-ignores|per_file_ignores|disable|disabled|skip-dirs|skip-files|skip_dirs/,
+  /skip_files|exclude-dirs|exclude-files|exclude_dirs|exclude_files|exclude_rules|unfixable|globalIgnores/);
 
 // A handler body that re-raises, fails, exits or reports at error level is not a swallow.
 const HANDLED = alt(/\b(?:raise|throw|rethrow|panic|abort|exit|fail|Fail)\b/, cat(/\b/,
@@ -382,34 +388,38 @@ export const SWALLOW_PATTERNS = catalog('swallow', { code: true }, [
   // Broad handlers whose body neither re-raises nor reports at error level (plan Appendix A FM-07).
   ['py-broad-except', 'py', /^\s*except\s*\(?\s*(?:Exception|BaseException)\s*\)?(?:\s+as\s+\w+)?\s*:/,
     { bodyNot: HANDLED }],
-  ['broad-catch', 'jvm',
-    /\bcatch\s*\(\s*(?:final\s+)?(?:java\.lang\.)?(?:Exception|Throwable|RuntimeException)\s+\w+\s*\)\s*\{/, { bodyNot: HANDLED }],
+  ['broad-catch', 'jvm', cat(/\bcatch\s*\(\s*(?:final\s+)?(?:java\.lang\.)?(?:Exception|Throwable|RuntimeException)/,
+    /\s+\w+\s*\)\s*\{/), { bodyNot: HANDLED }],
   ['broad-catch', 'cs', /\bcatch\s*(?:\(\s*(?:System\.)?Exception(?:\s+\w+)?\s*\))?\s*\{/, { bodyNot: HANDLED }],
 ]);
 
 /** Logging calls with their level (used to detect error -> warning downgrades). */
-export const LOG_CALL = alt(cat(
-  /\b(?:console|logger|log|logging|LOG|Log|slog|zap|logrus|Logger|_logger|_log|this\.(?:logger|log)|self\.(?:logger|log))/,
-  /\s*\.\s*/, capture(/error|err|fatal|critical|exception|warn|warning|info|debug|trace|Error|Errorf|Fatal|Fatalf|Warn|Warnf/,
-    /Warning|Info|Infof|Debug|Debugf|LogError|LogCritical|LogWarning|LogInformation|LogDebug/), /\s*\(/),
+export const LOG_CALL = alt(cat(/\b/,
+  group(/console|logger|log|logging|LOG|Log|slog|zap|logrus|Logger|_logger|_log/,
+    /this\.(?:logger|log)|self\.(?:logger|log)/),
+  /\s*\.\s*/, capture(/error|err|fatal|critical|exception|warn|warning|info|debug|trace|Error|Errorf|Fatal|Fatalf|Warn/,
+    /Warnf|Warning|Info|Infof|Debug|Debugf|LogError|LogCritical|LogWarning|LogInformation|LogDebug/), /\s*\(/),
 /\b(error|warn|info|debug|trace)!\s*\(/);
-export const THROW_LINE = /\bthrow\b|^\s*raise\b|\bpanic!?\s*\(|\breturn\s+(?:nil\s*,\s*)?(?:err\b|fmt\.Errorf\b|errors\.)|\bErr\s*\(/;
+export const THROW_LINE = alt(/\bthrow\b|^\s*raise\b|\bpanic!?\s*\(/,
+  /\breturn\s+(?:nil\s*,\s*)?(?:err\b|fmt\.Errorf\b|errors\.)|\bErr\s*\(/);
 export const LOG_LEVEL_RANK = Object.freeze({
-  fatal: 3, critical: 3, error: 3, err: 3, exception: 3, warn: 2, warning: 2, info: 1, information: 1, debug: 0, trace: 0,
+  fatal: 3, critical: 3, error: 3, err: 3, exception: 3, warn: 2, warning: 2, info: 1, information: 1, debug: 0,
+  trace: 0,
 });
 
 /** CI edits that turn a failing step green (FM-06); applied to added lines of CI files. */
 export const CI_WEAKENING = catalog('ci', {}, [
   ['continue-on-error', '', /\bcontinue-on-error\s*:\s*(?:true\b|["']?\$\{\{)/],
-  ['allow-failure', '', /\ballow_failure\s*:\s*(?:true\b|\{)|\bcontinueOnError\s*:\s*true\b|\bignore_failure\s*:\s*true\b/],
+  ['allow-failure', '', alt(/\ballow_failure\s*:\s*(?:true\b|\{)/,
+    /\bcontinueOnError\s*:\s*true\b|\bignore_failure\s*:\s*true\b/)],
   ['or-true', '', /\|\|\s*(?:true\b|:\s*(?:$|[;)&|])|exit\s+0\b|echo\b)|;\s*(?:true|exit\s+0)\s*["']?\s*$/],
   ['pass-with-no-tests', '', /--pass(?:WithNoTests|-with-no-tests)\b|--allow-no-tests\b|--no-tests[= ](?:pass|warn)\b/],
   ['set-plus-e', '', /^\s*(?:-\s*)?set\s+\+e\b|\$ErrorActionPreference\s*=\s*['"]?(?:SilentlyContinue|Continue)\b/],
   ['if-false', '', /^\s*(?:-\s*)?if\s*:\s*(?:false|["']?\$\{\{\s*false\s*\}\}["']?|0)\s*$/],
   ['skip-tests', '', alt(/-DskipTests\b|-Dmaven\.test\.skip=true\b|--skip-tests?\b|(?:^|\s)-x\s+(?::?\w+:)?test\b/,
     /--exclude-task\s+test\b|\bSKIP_TESTS\s*[:=]\s*['"]?(?:1|true)\b/)],
-  ['ignore-test-failures', '', alt(/-Dmaven\.test\.failure\.ignore=true\b|\btestFailureIgnore\b|\bignoreFailures\s*=\s*true\b/,
-    /--exit-zero\b|--no-fail(?:-on-\w+)?\b|--fail-on-flaky-tests\s*=\s*false/)],
+  ['ignore-test-failures', '', alt(/-Dmaven\.test\.failure\.ignore=true\b|\btestFailureIgnore\b/,
+    /\bignoreFailures\s*=\s*true\b|--exit-zero\b|--no-fail(?:-on-\w+)?\b|--fail-on-flaky-tests\s*=\s*false/)],
   ['fail-off', '', alt(/\bfail_ci_if_error\s*:\s*false\b|\bfail-on-error\s*:\s*false\b|\bfail_on_failure\s*:\s*false\b/,
     /\bfail-on-severity\s*:\s*(?:none|never)\b|\bfailOnStderr\s*:\s*false\b/)],
   ['paths-ignore', '', /^\s*paths-ignore\s*:/, { severity: 'finding' }],
@@ -426,8 +436,8 @@ export const IN_SOURCE_RETRIES = catalog('retry', { code: true }, [
   ['jest', 'js', /\bjest\.retryTimes\s*\(/, B],
   ['mocha', 'js', /\bthis\.retries\s*\(\s*[1-9]/, B],
   ['playwright', 'js', /\.describe\.configure\s*\(\s*\{[^}]*\bretries\s*:\s*[1-9]/, B],
-  ['js-options', 'js', cat(/\b(?:it|test|describe)(?:\.(?:only|skip|concurrent|sequential))*\s*\(\s*(['"`])(?:(?!\1).)*\1/,
-    /\s*,\s*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/), B],
+  ['js-options', 'js', cat(/\b(?:it|test|describe)(?:\.(?:only|skip|concurrent|sequential))*/,
+    /\s*\(\s*(['"`])(?:(?!\1).)*\1\s*,\s*\{[^}]*\bretr(?:y|ies)\s*:\s*(?:\{|[1-9])/), B],
   ['py', 'py', /@pytest\.mark\.flaky\b|@flaky\b|\bpytest\.mark\.flaky\b|@(?:pytest\.mark\.)?retry\b/],
   ['jvm', 'jvm', /@(?:RetryingTest|Retry|RepeatedIfExceptionsTest|Flaky)\b|\bretryAnalyzer\s*=/],
   ['cs', 'cs', /\[\s*(?:\w+\s*,\s*)*(?:Retry|RetryFact|RetryTheory)\b/],
@@ -443,7 +453,8 @@ const NOT_A_VALUE = /(?![[<{$%]|process\.|os\.|env\.|getenv)/;
 
 export const SECRET_PATTERNS = catalog('secret', { severity: 'fail' }, [
   ['aws-access-key-id', '', /\b((?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z2-7]{16})\b/],
-  ['aws-secret-key', '', cat(/aws_?secret_?(?:access_?)?key\w*["']?\s*[:=]\s*/i, /["']?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])/)],
+  ['aws-secret-key', '', cat(/aws_?secret_?(?:access_?)?key\w*["']?\s*[:=]\s*/i,
+    /["']?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])/)],
   ['github-token', '', /\b(gh[pousr]_[A-Za-z0-9]{36,255})\b/],
   ['github-fine-grained', '', /\b(github_pat_[A-Za-z0-9_]{60,255})\b/],
   ['gitlab-token', '', /\b(gl(?:pat|dt|rt|ptt|cbt)-[A-Za-z0-9_-]{20,})\b/],
@@ -468,16 +479,20 @@ export const SECRET_PATTERNS = catalog('secret', { severity: 'fail' }, [
   // `process.env.X` are not values.
   ['adc-live-token', '', cat(/\bADC_LIVE_TOKEN\s*[:=]\s*/, group(cat(/["']/, NOT_A_VALUE, /([^\s"'`;,()]{6,})["']/),
     cat(/(?![[<{$%"']|process\.|os\.|env\.|getenv)/, /([^\s"'`;,()]{6,})(?=\s*(?:#.*)?$)/)))],
-  ['generic-assignment', '', cat(/\b/i, group(/api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token/,
-    /auth[_-]?token|private[_-]?key|passw(?:or)?d|pwd/), /\b["']?\s*[:=]\s*["']([^"'\s]{12,200})["']/),
+  ['generic-assignment', '', cat(/\b/i, group(/api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret/,
+    /access[_-]?token|auth[_-]?token|private[_-]?key|passw(?:or)?d|pwd/), /\b["']?\s*[:=]\s*["']([^"'\s]{12,200})["']/),
   { severity: 'finding', generic: true }],
 ]);
 
 const SECRET_GLOBAL = SECRET_PATTERNS.map((p) => ({ ...p, g: new RegExp(p.re.source, `${p.re.flags}g`) }));
-const PLACEHOLDER = names(/x+|\*+|\.+|<[^>]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|%\(?\w+\)?s?|changeme|change_me|replace_?me|your[_-]?\w*/i,
-  /example\w*|dummy\w*|fake\w*|test\w*|sample\w*|placeholder\w*|redacted\w*|none|null|undefined|todo\w*|secret|password\w*/);
-const ENV_REFERENCE = /process\.env|os\.environ|getenv|System\.getenv|Environment\.GetEnvironmentVariable|ENV\[|\$\{\{\s*secrets\./;
+const PLACEHOLDER = names(/x+|\*+|\.+|<[^>]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|%\(?\w+\)?s?|changeme|change_me|replace_?me/i,
+  /your[_-]?\w*|example\w*|dummy\w*|fake\w*|test\w*|sample\w*|placeholder\w*|redacted\w*|none|null|undefined|todo\w*/,
+  /secret|password\w*/);
+const ENV_REFERENCE = alt(/process\.env|os\.environ|getenv|System\.getenv|Environment\.GetEnvironmentVariable/,
+  /ENV\[|\$\{\{\s*secrets\./);
 const RESERVED_HOST = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|db|postgres|mysql|redis|mongo)$/i;
+// RFC 2606 / 6761 names never resolve to a real service: documentation and test fixtures.
+const RESERVED_DOMAIN = /(?:^|\.)(?:example\.(?:com|net|org)|example|test|invalid|localhost)$/i;
 
 function entropy(s) {
   const counts = new Map();
@@ -498,8 +513,7 @@ function plausibleUrlCredential(userPass, host) {
   const [user, pass] = String(userPass).split(':');
   if (!pass || PLACEHOLDER.test(pass) || PLACEHOLDER.test(user) || /^\$|^%|^\{/.test(pass)) return false;
   const h = String(host).split('/')[0].replace(/:\d+$/, '');
-  // RFC 2606 / 6761 names never resolve to a real service: documentation and test fixtures.
-  if (RESERVED_HOST.test(h) || /(?:^|\.)(?:example\.(?:com|net|org)|example|test|invalid|localhost)$/i.test(h)) return false;
+  if (RESERVED_HOST.test(h) || RESERVED_DOMAIN.test(h)) return false;
   return pass !== user;
 }
 
@@ -510,14 +524,14 @@ function secretHits(line) {
   for (const p of SECRET_GLOBAL) {
     for (const m of line.matchAll(p.g)) {
       const value = m[1] || m[2] || m[0];
-      if (p.generic ? !plausibleGeneric(value, line) : p.id === 'secret.url-credentials' && !plausibleUrlCredential(m[1], m[2])) {
-        continue;
-      }
-      hits.push({ id: p.id, severity: p.severity, value });
+      const plausible = p.generic ? plausibleGeneric(value, line)
+        : p.id !== 'secret.url-credentials' || plausibleUrlCredential(m[1], m[2]);
+      if (plausible) hits.push({ id: p.id, severity: p.severity, value });
     }
   }
   const specific = hits.filter((h) => !h.id.startsWith('secret.generic')).map((h) => h.value);
-  return hits.filter((h) => !h.id.startsWith('secret.generic') || !specific.some((v) => v.includes(h.value) || h.value.includes(v)));
+  return hits.filter((h) => !h.id.startsWith('secret.generic')
+    || !specific.some((v) => v.includes(h.value) || h.value.includes(v)));
 }
 
 /** A secret masked for messages: a short prefix (long values only) for recognizability, never the value. */
@@ -564,6 +578,8 @@ export function credentialFileName(file) {
 // Scanning
 
 const masksCache = new WeakMap();
+// Empty and `pass`-only handler bodies belong to the empty-handler entries, not to the `bodyNot` ones.
+const EMPTY_BODY = /^(?:\s|pass\b|\.\.\.|continue\b|;)*$/;
 
 /**
  * Scan `text` (a string or an array of lines) with one catalog or an array of catalogs. Options:
@@ -601,13 +617,13 @@ export function scanText(text, catalogs, opts = {}) {
       }
       if (e.bodyNot) {
         const block = handlerBody(getMasked(), i, lang);
-        // Empty and `pass`-only bodies belong to the empty-handler entries, not to this one.
-        if (!block || /^(?:\s|pass\b|\.\.\.|continue\b|;)*$/.test(block.body) || e.bodyNot.test(blankStrings(block.body))) continue;
+        if (!block || EMPTY_BODY.test(block.body) || e.bodyNot.test(blankStrings(block.body))) continue;
       }
       seen.add(e.id);
       out.push({
         id: e.id, line: i + 1, text: raw[i].trim().slice(0, 240), match: code.slice(m.index, m.index + m[0].length),
-        ...(e.kind ? { kind: e.kind } : {}), ...(e.severity ? { severity: e.severity } : {}), ...(e.scope ? { scope: e.scope } : {}),
+        ...(e.kind ? { kind: e.kind } : {}), ...(e.severity ? { severity: e.severity } : {}),
+        ...(e.scope ? { scope: e.scope } : {}),
       });
     }
   }
@@ -615,7 +631,8 @@ export function scanText(text, catalogs, opts = {}) {
 }
 
 const linesOf = (lines) => (Array.isArray(lines) ? lines : String(lines ?? '').split(/\r?\n/));
-const FAILS_TEST = /\b(?:raise|throw|rethrow|fail|Fail|assert\w*|Assert|expect|done)\b|\$this->fail|\bpytest\.fail\b|\bself\.fail\b/;
+const FAILS_TEST = alt(/\b(?:raise|throw|rethrow|fail|Fail|assert\w*|Assert|expect|done)\b/,
+  /\$this->fail|\bpytest\.fail\b|\bself\.fail\b/);
 const CS_ASSERT_CATCH = alt(/^(?:System\.)?Exception\b/,
   cat(/\b/, group(/AssertionException|XunitException|AssertFailedException|AssertActualExpectedException/), /\b/));
 // Handler types that catch assertion failures, per language (JUnit/Kotest assertions throw Errors).
@@ -623,7 +640,8 @@ const CATCHES_ASSERTIONS = {
   py: (t) => !t || /\b(?:Exception|BaseException|AssertionError)\b/.test(t),
   js: () => true,
   dart: () => true,
-  jvm: (t) => /\b(?:Throwable|Error|AssertionError|AssertionFailedError|ComparisonFailure|MultipleFailuresError)\b/.test(t),
+  jvm: (t) => /\b(?:Throwable|Error|AssertionError|AssertionFailedError|ComparisonFailure|MultipleFailuresError)\b/
+    .test(t),
   cs: (t) => !t || CS_ASSERT_CATCH.test(t.trim()),
   php: (t) => /\b(?:Exception|Throwable|AssertionFailedError|ExpectationFailedException)\b/.test(t),
 };
@@ -673,7 +691,8 @@ export function tryWrappedAssertions(lines, file) {
     const m = /^\s*catch\s*(?:\(([^)]*)\))?\s*\{/.exec(rest);
     if (!m) continue;
     const handler = braceBlock(masked, j, blankStrings(masked[j]).indexOf('catch'));
-    if (handler && catches(String(m[1] || '').replace(/\s+\$?\w+\s*$/, '').trim()) && !FAILS_TEST.test(handler.body)) hit(j);
+    const type = String(m[1] || '').replace(/\s+\$?\w+\s*$/, '').trim();
+    if (handler && catches(type) && !FAILS_TEST.test(handler.body)) hit(j);
   }
   return out;
 }
@@ -724,8 +743,8 @@ export function testCases(lines, file) {
 // ---------------------------------------------------------------------------
 // Path classification (heuristic; detect.mjs refines `test` with the runner's real globs)
 
-const TEST_DIRS = new Set(words(`test tests __tests__ spec specs e2e integration-tests integration_tests functional-tests
-  acceptance-tests __mocks__ cypress testing`));
+const TEST_DIRS = new Set(words(`test tests __tests__ spec specs e2e integration-tests integration_tests
+  functional-tests acceptance-tests __mocks__ cypress testing`));
 const DATA_EXTS = new Set(words('json yaml yml txt csv xml html md snap golden toml ini cfg sql log png jpg gif svg')
   .map((e) => `.${e}`));
 
@@ -733,13 +752,13 @@ const DATA_EXTS = new Set(words('json yaml yml txt csv xml html md snap golden t
 export function testNaming(file) {
   const base = baseOf(toPosix(file));
   const lower = base.toLowerCase();
-  if (/\.(?:test|spec|e2e|e2e-spec|cy|it|bench)\.[cm]?[jt]sx?$/.test(lower) || /\.(?:test|spec)\.(?:vue|svelte)$/.test(lower)) return 'js';
+  if (/\.(?:test|spec|e2e|e2e-spec|cy|it|bench)\.[cm]?[jt]sx?$|\.(?:test|spec)\.(?:vue|svelte)$/.test(lower)) {
+    return 'js';
+  }
   if (/^test_.*\.py$|_test\.py$|^tests\.py$|^conftest\.py$/.test(lower)) return 'pytest';
   if (/_test\.go$/.test(lower)) return 'go';
   if (/_spec\.rb$|_test\.rb$|^test_.*\.rb$/.test(lower)) return 'ruby';
-  if (/^Test[A-Z_]\w*\.(?:java|kt|groovy|scala)$|^\w+(?:Test|Tests|TestCase|IT|Spec|Suite)\.(?:java|kt|groovy|scala)$/.test(base)) {
-    return 'jvm';
-  }
+  if (/^(?:Test[A-Z_]\w*|\w+(?:Test|Tests|TestCase|IT|Spec|Suite))\.(?:java|kt|groovy|scala)$/.test(base)) return 'jvm';
   if (/^\w+(?:Tests?|Specs?|Fixture)\.(?:cs|fs|vb)$/.test(base)) return 'dotnet';
   if (/^\w+Test\.php$/.test(base)) return 'phpunit';
   if (/^\w+Tests?\.swift$/.test(base)) return 'xctest';
@@ -751,33 +770,38 @@ export function testNaming(file) {
 const RUNNER_CONFIG_BASE = names(/jest\.config\.[cm]?[jt]s(?:on)?|vitest\.(?:config|workspace|projects)\.[cm]?[jt]s/,
   /vite\.config\.[cm]?[jt]s|playwright(?:-ct)?\.config\.[cm]?[jt]s|cypress\.config\.[cm]?[jt]s|cypress\.json/,
   /\.mocharc(?:\.[cm]?js|\.json|\.jsonc|\.ya?ml)?|karma\.conf\.[cm]?[jt]s|ava\.config\.[cm]?js|wdio\.conf\.[cm]?[jt]s/,
-  /\.c8rc(?:\.json)?|\.nycrc(?:\.json|\.ya?ml)?|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|conftest\.py|noxfile\.py/,
-  /\.coveragerc|nextest\.toml|cargo\.toml|.+\.runsettings|.+\.testsettings|directory\.build\.(?:props|targets)/,
-  /.+\.(?:cs|fs|vb)proj|pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|\.rspec|\.simplecov|rakefile/,
-  /phpunit\.xml(?:\.dist)?|makefile|gnumakefile|.+\.mk|justfile|\.justfile|taskfile\.ya?ml|package\.json/,
-  /codecov\.ya?ml|\.codecov\.ya?ml|deno\.jsonc?/);
-const LOCKFILE_BASE = names(/package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|poetry\.lock/,
-  /uv\.lock|pipfile\.lock|pdm\.lock|go\.sum|cargo\.lock|packages\.lock\.json|gemfile\.lock|composer\.lock/,
+  /\.c8rc(?:\.json)?|\.nycrc(?:\.json|\.ya?ml)?|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|conftest\.py/,
+  /noxfile\.py|\.coveragerc|nextest\.toml|cargo\.toml|.+\.runsettings|.+\.testsettings/,
+  /directory\.build\.(?:props|targets)|.+\.(?:cs|fs|vb)proj|pom\.xml|build\.gradle(?:\.kts)?/,
+  /settings\.gradle(?:\.kts)?|\.rspec|\.simplecov|rakefile|phpunit\.xml(?:\.dist)?|makefile|gnumakefile|.+\.mk/,
+  /justfile|\.justfile|taskfile\.ya?ml|package\.json|codecov\.ya?ml|\.codecov\.ya?ml|deno\.jsonc?/);
+const LOCKFILE_BASE = names(/package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?/,
+  /poetry\.lock|uv\.lock|pipfile\.lock|pdm\.lock|go\.sum|cargo\.lock|packages\.lock\.json|gemfile\.lock|composer\.lock/,
   /gradle\.lockfile|package\.resolved|pubspec\.lock|mix\.lock|flake\.lock|deno\.lock/);
-const MANIFEST_BASE = names(/package\.json|pyproject\.toml|setup\.py|setup\.cfg|requirements(?:[-_.][\w.-]+)?\.(?:txt|in)/,
-  /constraints\.txt|pipfile|go\.mod|cargo\.toml|.+\.(?:cs|fs|vb)proj|directory\.packages\.props|packages\.config/,
-  /pom\.xml|build\.gradle(?:\.kts)?|gemfile|.+\.gemspec|composer\.json|deno\.jsonc?|package\.swift|pubspec\.yaml|mix\.exs/);
+const MANIFEST_BASE = names(/package\.json|pyproject\.toml|setup\.py|setup\.cfg/,
+  /requirements(?:[-_.][\w.-]+)?\.(?:txt|in)|constraints\.txt|pipfile|go\.mod|cargo\.toml|.+\.(?:cs|fs|vb)proj/,
+  /directory\.packages\.props|packages\.config|pom\.xml|build\.gradle(?:\.kts)?|gemfile|.+\.gemspec|composer\.json/,
+  /deno\.jsonc?|package\.swift|pubspec\.yaml|mix\.exs/);
 const LINT_CONFIG_BASE = names(/\.eslintrc(?:\.[cm]?js|\.json|\.ya?ml)?|eslint\.config\.[cm]?[jt]s/,
   /\.(?:eslint|stylelint|markdownlint|semgrep|gitleaks)ignore|\.gitleaks\.toml|biome\.jsonc?|\.oxlintrc\.json/,
-  /tsconfig(?:\.[\w-]+)?\.json|jsconfig\.json|\.flake8|ruff\.toml|\.ruff\.toml|mypy\.ini|\.mypy\.ini|pyrightconfig\.json/,
-  /\.pylintrc|pylintrc|\.golangci\.(?:ya?ml|toml|json)|clippy\.toml|\.clippy\.toml|\.stylelintrc(?:\.\w+)?/,
+  /tsconfig(?:\.[\w-]+)?\.json|jsconfig\.json|\.flake8|ruff\.toml|\.ruff\.toml|mypy\.ini|\.mypy\.ini/,
+  /pyrightconfig\.json|\.pylintrc|pylintrc|\.golangci\.(?:ya?ml|toml|json)|clippy\.toml|\.clippy\.toml/,
+  /\.stylelintrc(?:\.\w+)?/,
   /\.markdownlint(?:\.\w+)?|\.yamllint(?:\.ya?ml)?|\.rubocop(?:_todo)?\.ya?ml|\.standard\.yml|phpstan\.neon(?:\.dist)?/,
   /psalm\.xml|\.?phpcs\.xml(?:\.dist)?|\.swiftlint\.ya?ml|detekt\.ya?ml|checkstyle[\w-]*\.xml|pmd[\w-]*\.xml/,
-  /spotbugs[\w-]*\.xml|\.clang-tidy|\.editorconfig|\.globalconfig|.+\.ruleset|stylecop\.json|\.pre-commit-config\.ya?ml/,
-  /\.deepsource\.toml|sonar-project\.properties/);
+  /spotbugs[\w-]*\.xml|\.clang-tidy|\.editorconfig|\.globalconfig|.+\.ruleset|stylecop\.json/,
+  /\.pre-commit-config\.ya?ml|\.deepsource\.toml|sonar-project\.properties/);
 const CI_BASE = names(/\.gitlab-ci\.ya?ml|azure-pipelines(?:[\w.-]*)\.ya?ml|\.travis\.ya?ml|bitbucket-pipelines\.ya?ml/,
-  /\.drone\.ya?ml|appveyor\.ya?ml|\.appveyor\.ya?ml|jenkinsfile|cloudbuild\.ya?ml|buildspec\.ya?ml|\.woodpecker\.ya?ml/);
-const GENERATED_DIRS = new Set(words(`dist target node_modules vendor __generated__ generated .next .nuxt .svelte-kit coverage
-  htmlcov __pycache__ site-packages .gradle obj .turbo .parcel-cache`));
+  /\.drone\.ya?ml|appveyor\.ya?ml|\.appveyor\.ya?ml|jenkinsfile|cloudbuild\.ya?ml|buildspec\.ya?ml/,
+  /\.woodpecker\.ya?ml/);
+const GENERATED_DIRS = new Set(words(`dist target node_modules vendor __generated__ generated .next .nuxt .svelte-kit
+  coverage htmlcov __pycache__ site-packages .gradle obj .turbo .parcel-cache`));
 const GENERATED_BASE = cat(group(/\.min\.(?:js|css|mjs)|\.(?:js|css)\.map|\.pb\.go|_pb2(?:_grpc)?\.pyi?|\.pb\.(?:cc|h)/,
   /\.g\.(?:dart|cs)|\.designer\.cs|\.generated\.\w+|_generated\.go|^zz_generated[\w.]*\.go|\.pyc/), /$/);
 
-/** Heuristic, path-only classification: { test, runnerConfig, ci, lockfile, lintConfig, manifest, generated, testData, snapshot }. */
+const SNAPSHOT_BASE = /\.(?:snap|ambr|golden)$|\.(?:approved|verified|received)\.\w+$/;
+
+/** Path-only, heuristic: { test, runnerConfig, ci, lockfile, lintConfig, manifest, generated, testData, snapshot }. */
 export function classifyPath(file) {
   const p = toPosix(file).replace(/^\.\//, '');
   const segs = p.split('/');
@@ -786,12 +810,12 @@ export function classifyPath(file) {
   const code = isCodeFile(p);
   const inTestDir = dirs.some((d) => TEST_DIRS.has(d) || /\.(?:unit|integration|functional)?tests?$/.test(d)) ||
     /src\/(?:test|androidtest)\//.test(p.toLowerCase());
-  const snapshot = dirs.includes('__snapshots__') || /\.(?:snap|ambr|golden)$/.test(lower) ||
-    /\.(?:approved|verified|received)\.\w+$/.test(lower) || (dirs.includes('snapshots') && /\.snap(?:\.new)?$/.test(lower));
+  const snapshot = dirs.includes('__snapshots__') || SNAPSHOT_BASE.test(lower)
+    || (dirs.includes('snapshots') && /\.snap(?:\.new)?$/.test(lower));
   const yml = /\.ya?ml$/.test(lower);
-  const ci = (dirs[0] === '.github' && dirs[1] === 'workflows' && yml) || (dirs[0] === '.github' && dirs[1] === 'actions' &&
-    /^action\.ya?ml$/.test(lower)) || CI_BASE.test(lower) || (dirs[0] === '.circleci' && yml) ||
-    (dirs[0] === '.gitlab' && yml && dirs.includes('ci')) || (['.azure-pipelines', '.buildkite', '.woodpecker'].includes(dirs[0]) && yml);
+  const ci = CI_BASE.test(lower) || (dirs[0] === '.github' && (dirs[1] === 'workflows' ? yml : dirs[1] === 'actions' &&
+    /^action\.ya?ml$/.test(lower))) || (dirs[0] === '.gitlab' && yml && dirs.includes('ci'))
+    || (['.circleci', '.azure-pipelines', '.buildkite', '.woodpecker'].includes(dirs[0]) && yml);
   const lockfile = LOCKFILE_BASE.test(lower);
   const parent = dirs[dirs.length - 1];
   return {
@@ -810,7 +834,8 @@ export function classifyPath(file) {
 
 /** Content header that marks a generated file. */
 export const GENERATED_HEADER = group(/Code generated\b.*\bDO NOT EDIT|@generated\b|<auto-generated/i,
-  /This file (?:is|was|has been) (?:automatically |auto-)?generated|\bAUTO-?GENERATED FILE\b|\bDO NOT EDIT\b.*\bgenerated\b/);
+  /This file (?:is|was|has been) (?:automatically |auto-)?generated/,
+  /\bAUTO-?GENERATED FILE\b|\bDO NOT EDIT\b.*\bgenerated\b/);
 
 /** The header ci-gate writes into the workflows it generates (plan §10.5). */
 export const CI_GATE_HEADER = /^#\s*generated by agentic-developer-companion ci-gate\b/m;
@@ -904,7 +929,8 @@ export function makeRedactor({ literals = [], env = process.env, names: byName =
 }
 
 /** Keys whose string values are digests or object names, never secrets (redacting them breaks verification). */
-export const HASH_KEY = /(?:sha256|^tree_digest|^session_nonce|^snapshot_commit|^base|^head|^prev|^tip|^sha|^tree|^commit|^cache_key)$/;
+export const HASH_KEY = cat(group(/sha256|^tree_digest|^session_nonce|^snapshot_commit|^base|^head|^prev|^tip/,
+  /^sha|^tree|^commit|^cache_key/), /$/);
 
 /**
  * `redact` applied to every string inside a JSON-like value. Strings under `keep` keys stay as

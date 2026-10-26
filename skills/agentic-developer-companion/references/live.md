@@ -61,7 +61,7 @@ Show the user the file list and write only after they confirm. Without a scaffol
 - **Never open, print, copy or search `.adc/.env.live`, and never run `env`, `printenv` or
   `Get-ChildItem Env:`.** Ask the user to paste the token into the file in their own editor:
   `ADC_LIVE_TOKEN=<value>` (optional `ADC_LIVE_BASE_URL=`, `ADC_LIVE_TENANT=`).
-- Check it without reading it: `node "$ADC" doctor --no-discovery --json` shows
+- Check it without reading it: `node "$ADC" doctor --no-probes --json` shows
   `state.credential` as `set` or `unset` and its source, plus `state.env_live.perms`
   (owner-only: mode `0600`; Windows: an `icacls` ACL with only the user's SID).
 - Precedence: the environment variable wins over the file. On developer machines prefer the
@@ -69,6 +69,8 @@ Show the user the file list and write only after they confirm. Without a scaffol
   CI and cloud-agent runs read the environment only, never the file.
 - The runner refuses a base URL with credentials in it (`https://user:pass@host`, exit 2),
   refuses to read a `.env.live` that git would not ignore, and never runs unauthenticated.
+  It replaces every token value it loaded (raw, trimmed, URL-encoded and base64) in the probe
+  output, logs, `budget.json`, `metrics.jsonl` and the ledger with `[REDACTED:ADC_LIVE_TOKEN]`.
 
 ## 4. The probe manifest and the probe contract
 
@@ -95,9 +97,9 @@ The runner starts `cmd` with piped stdio and these variables: `ADC_LIVE_TOKEN` (
 `ADC_LIVE_BASE_URL`, `ADC_LIVE_TENANT` when set), `ADC_TEST_RUN_ID`, `ADC_PROBE_ID`,
 `ADC_SESSION_ID` and `ADC_PROBE_RESULT`. A probe may write JSON to the `ADC_PROBE_RESULT` file:
 `{"headers": {...}}` (response headers, for `cost_header`), `{"cost": n}` (a reported cost) and
-`{"status": 401}` (the HTTP status, recorded in the ledger). Header values are only used for
-cost; nothing else from that file is stored. The project itself holds no credential or budget
-logic.
+`{"status": 401}` or `{"http_status": 401}` (the HTTP status, recorded in the ledger). Header
+values are only used for cost; nothing else from that file is stored. The project itself holds
+no credential or budget logic.
 
 ## 5. Run the probes
 
@@ -115,10 +117,15 @@ node "$ADC" live run --json
 | `--credits-override <n>` | Raise this session's cap; accepted **only from a real terminal** (else exit 2 "run this from a terminal"). Never pass it yourself; tell the user to run it |
 | `--ledger <file>` / `--no-ledger` | Append to that evidence ledger / record nothing (default: the newest unfinalized ledger for the same snapshot, else a new one) |
 
-Output: `{ session_id, identity_source, run_id, run_class, probes[{id, status, reason, cost,
-cost_source, duration_ms, log, tail}], spent, run_spent, spent_today, remaining,
-stopped_reason, budget, checks[], warnings[], ledger }`. Probe logs (redacted) are in
-`.adc/cache/live/<run_id>/`. Exit `0` all ran and passed, `1` a probe failed, `4` not verified.
+Output: `{ session_id, identity_source, run_id, run_class, dry_run, credential, checklist,
+probes[{id, kind, status, reason, cost, cost_source, estimate, duration_ms, exit_code,
+http_status, log, tail}], spent, run_spent, spent_today, remaining, stopped_reason,
+stopped_detail, budget, checks[], warnings[], ledger }`. Probe status is `pass`, `fail`,
+`unverified`, `skipped` (gated), `not-run` (stopped) or `would-run` (dry run). Probe logs
+(redacted) are in `.adc/cache/live/<run_id>/`; the newest 20 runs are kept. Progress notices
+(`warn_at` crossed, a recreated `budget.json`, caps ignored for agents) go to stderr and
+`warnings[]`. Exit `0` all ran and passed (or nothing ran by policy), `1` a probe failed,
+`4` not verified.
 
 | Status / reason | Meaning | What to do |
 |---|---|---|
@@ -129,6 +136,7 @@ stopped_reason, budget, checks[], warnings[], ledger }`. Probe logs (redacted) a
 | `SYNTHETIC_GATED` | Checklist missing or has `TODO` lines | Finish section 1 with the user |
 | `TIMEOUT`, `PROBE_FAILED`, `AUTH_REJECTED` | The probe failed (401/403: token expired or rejected) | Read `tail`/`log`; fix the service or the probe, never the check |
 | `RUNNER_MISSING` | The probe command was not found (exit 127/9009) | Install the project's runner (`npm ci` in `tests/live`) |
+| `SPAWN_FAILED` | The shell could not start (for example the probe's `cwd` is missing) | Fix `cwd` in `probes.json`; see the log |
 
 ## 6. The budget ledger
 
@@ -146,9 +154,14 @@ file keeps the newest 50 sessions; every probe and run is also appended to `.adc
   `ADC_LIVE_BUDGET` (ceiling 10,000); `agent` (any host session, `--yes`, cloud agent) keeps the
   shipped caps hard, ignores overrides and `ADC_LIVE_BUDGET`, and ignores a `budget.json`
   edited above the defaults.
-- Inspect: `node "$ADC" budget show --json` (`--session <id>` for one session's probes).
-  Maintain: `node "$ADC" budget prune --json`. `budget reset --session <id>` zeroes a
-  session's spend (the daily total stays) and works only from a terminal.
+- Inspect: `node "$ADC" budget show --json` (`--session <id>` for one session's probes). It
+  prints the file's caps and, under `effective`, the caps your run class gets; `today.remaining`
+  uses the effective daily cap.
+- Maintain: `node "$ADC" budget prune [--dry-run] --json` keeps the newest 50 sessions (plus the
+  open hook session) and 90 days of totals. `budget reset --session <id>` zeroes a session's
+  spend (the daily total stays) and works only from a terminal. Both write under the lock.
+- By hand (no Node): read `.adc/budget.json`; the spend of today is `days.<YYYY-MM-DD>.spent`,
+  a session's is `sessions.<id>.spent`; never lower either.
 
 ## 7. Evidence and the summary to post
 

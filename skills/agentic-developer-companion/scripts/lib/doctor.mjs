@@ -1,7 +1,6 @@
 // Environment and installation diagnostics (§6.6, §6.7, §8.6): host guess, OS, Node and Git,
 // host CLIs against their floors, every prerequisite with the fallback in effect, every installed
-// copy (with discovery confirmed by `copilot skill list --json` and `codex debug prompt-input`),
-// registered hooks, launcher probes, the state dir, and `--verify-vendored` drift checks.
+// copy, registered hooks, launcher probes, the state dir, and `--verify-vendored` drift checks.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,12 +9,10 @@ import {
   EXIT, AdcError, usageError, unverifiable, defineCommand, readText, readJson, toPosix, relPosix, truncate, isObj,
   uniq, firstLine, lastLine, which, toolVersion, parseVersion, versionGte, nonce, quoteFor, spawnCapture, hostFromEnv,
   hostHomes, samePath, realPath, listFiles, makeTempDir, isAutomation, agentMarkers, runClass as runClassOf, isDir,
-  isAbsolutePath,
-  IS_WINDOWS, SKILL_DIR, SKILL_NAME, ADC_SCRIPT, ASSETS_DIR, skillVersion,
+  isAbsolutePath, IS_WINDOWS, SKILL_DIR, SKILL_NAME, ADC_SCRIPT, ASSETS_DIR, skillVersion,
 } from './core.mjs';
-import {
-  gitTry, gitRaw, gitVersion, repoRoot, resolveBase, lsFiles, lsTree, readBlobs, gitPath, MIN_GIT,
-} from './git.mjs';
+import { gitTry, gitRaw, gitVersion, repoRoot, resolveBase, lsFiles, lsTree, readBlobs, gitPath, MIN_GIT } from
+  './git.mjs';
 import {
   resolveStateDir, statePaths, trackedStateFiles, stateIgnored, credentialStatus, checkOwnerOnly, prepareStateDir,
   materializeTemplates, newestOpenSession, parseEnvFile, DEFAULT_BUDGET,
@@ -47,9 +44,8 @@ const skillData = (text) => { const d = parseFrontmatter(text || '').data; retur
 
 /** Host guess from environment markers (§8.4): `{ host, hooks_host, markers[], candidates[] }`. */
 export function guessHostEnv(env = process.env) {
-  const g = hostFromEnv(env);
-  const host = g.tool === 'unknown' ? null : g.tool;
-  return { host, hooks_host: g.hooks, markers: g.markers, candidates: g.candidates };
+  const { tool, hooks, markers, candidates } = hostFromEnv(env);
+  return { host: tool === 'unknown' ? null : tool, hooks_host: hooks, markers, candidates };
 }
 
 /** `{ major, lts, eol, warning }` for a Node version string. */
@@ -97,14 +93,14 @@ export function discoveryDirs({ root = null, cwd = process.cwd(), env = process.
   add(path.join(h.home, '.agents', 'skills'), 'user', '~/.agents/skills', ['copilot-cli', 'vscode', 'codex']);
   add(path.join(h.claude, 'skills'), 'user', '~/.claude/skills', ['claude-code', 'vscode']);
   add(path.join(h.codex, 'skills'), 'user', '~/.codex/skills', ['codex']);
-  for (const d of String(env.COPILOT_SKILLS_DIRS || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+  for (const d of uniq(String(env.COPILOT_SKILLS_DIRS || '').split(',').map((x) => x.trim()))) {
     add(d, 'env', 'COPILOT_SKILLS_DIRS', ['copilot-cli']);
   }
   for (const name of ['settings.json', 'config.json']) {
     const dirs = readJson(path.join(h.copilot, name), null)?.skillDirectories;
-    for (const d of Array.isArray(dirs) ? dirs.filter((x) => typeof x === 'string' && x) : []) {
-      const abs = path.resolve(h.home, d.replace(/^~(?=[/\\]|$)/, h.home));
-      add(abs, 'registered', `skillDirectories (${name})`, ['copilot-cli']);
+    for (const d of (Array.isArray(dirs) ? dirs : []).filter((x) => typeof x === 'string' && x)) {
+      add(path.resolve(h.home, d.replace(/^~(?=[/\\]|$)/, h.home)), 'registered', `${name} skillDirectories`,
+        ['copilot-cli']);
     }
   }
   if (!IS_WINDOWS) add('/etc/codex/skills', 'admin', '/etc/codex/skills', ['codex']);
@@ -120,7 +116,7 @@ function describeCopy(dir, { scope, location, hosts, root }) {
     path: toPosix(dir), scope, location, hosts, version: data.metadata?.version?.toString() ?? null,
     name_ok: data.name === SKILL_NAME, has_script: fs.existsSync(path.join(dir, 'scripts', 'adc.mjs')),
     this_copy: samePath(dir, SKILL_DIR), ...(symlink ? { symlink, target: toPosix(realPath(dir)) } : {}),
-    provenance: provenanceOf(data), discovered_by: [],
+    provenance: provenanceOf(data),
     ...(rel !== undefined ? { rel, tracked: Boolean(rel) && lsFiles(root, [`${rel}/SKILL.md`]).length > 0 } : {}),
   };
 }
@@ -138,66 +134,10 @@ export function findInstalledCopies({ root = null, cwd = process.cwd(), env = pr
       else copies.push(describeCopy(c, { ...d, root }));
     }
   }
-  if (!copies.some((c) => c.this_copy)) {
-    // Not in a scanned directory (even inside the repository): no host loads it unless registered.
-    const location = 'running copy (not in a scanned directory)';
-    const c = describeCopy(SKILL_DIR, { scope: 'other', location, hosts: [], root });
-    copies.push(root && relPosix(root, SKILL_DIR) ? { ...c, in_repo: true } : c);
-  }
+  // A running copy outside the scanned directories (even inside the repository) loads only when registered.
+  const location = 'running copy (not in a scanned directory)';
+  if (!copies.some((c) => c.this_copy)) copies.push(describeCopy(SKILL_DIR, { scope: 'other', location, hosts: [] }));
   return copies;
-}
-
-// ---------------------------------------------------------------------------
-// Host discovery: ask the host CLIs which skills they actually load
-
-/** Parse `copilot skill list --json` → `[{ name, path, source, enabled }]` (warning lines may precede it). */
-export function parseCopilotSkillList(text) {
-  const s = String(text || '');
-  for (const m of s.matchAll(/^\[/gm)) {
-    let arr = null;
-    try { arr = JSON.parse(s.slice(m.index, s.lastIndexOf(']') + 1)); } catch {}
-    if (!Array.isArray(arr)) continue;
-    return arr.filter(isObj).map((e) => ({
-      name: String(e.name || ''), path: e.path ? toPosix(String(e.path)) : null, source: e.source?.toString() || null,
-      enabled: e.enabled === undefined ? null : Boolean(e.enabled),
-    }));
-  }
-  return null;
-}
-
-const strings = (v) => (typeof v === 'string' ? [v] : Object.values(Object(v) === v ? v : {}).flatMap(strings));
-
-/** Parse `codex debug prompt-input` (JSON or text) → `[{ name, path }]` from its skills catalog. */
-export function parseCodexPromptInput(text) {
-  const s = String(text || '');
-  let list;
-  try { list = strings(JSON.parse(s)).filter((x) => x.includes('(file: ')); } catch { list = [s]; }
-  return list.flatMap((str) => {
-    const roots = Object.fromEntries([...str.matchAll(/^- `(\w+)` = `([^`\r\n]+)`\s*$/gm)].map((m) => [m[1], m[2]]));
-    return [...str.matchAll(/^- ([^:\r\n]+?): .*\(file: ([^)\r\n]+)\)\s*$/gm)].map((m) => {
-      const alias = /^(\w+)[/\\](.*)$/.exec(m[2].trim());
-      const file = alias && roots[alias[1]] ? `${roots[alias[1]].replace(/[/\\]+$/, '')}/${alias[2]}` : m[2].trim();
-      return { name: m[1].trim(), path: toPosix(file).replace(/\/SKILL\.md$/i, '') };
-    });
-  });
-}
-
-const DISCOVERY = [
-  { host: 'copilot', id: 'copilot-cli', args: ['skill', 'list', '--json'], parse: parseCopilotSkillList, inRoot: true },
-  { host: 'codex', id: 'codex', args: ['debug', 'prompt-input', 'x'], parse: parseCodexPromptInput },
-];
-
-async function hostDiscovery({ root, cwd, env }) {
-  return Object.fromEntries(await Promise.all(DISCOVERY.filter((d) => which(d.host, env)).map(async (d) => {
-    const cmdCwd = d.inRoot ? root || cwd : cwd;
-    const r = await spawnCapture(which(d.host, env), d.args, { cwd: cmdCwd, env, timeoutMs: 30_000, input: '' });
-    const skills = r.exit === 0 ? d.parse(r.stdout) : null;
-    const row = { command: `${d.host} ${d.args.join(' ')}`, ran: true, ok: Boolean(skills), exit: r.exit, ms: r.ms,
-      ...(r.timedOut ? { timed_out: true } : {}) };
-    const error = truncate(firstLine(r.error || r.stderr || r.stdout) || 'unparsable', 200);
-    const mine = skills?.filter((x) => x.name.replace(/^.*:/, '') === SKILL_NAME);
-    return [d.host, skills ? { ...row, listed: skills.length, skill: mine } : { ...row, error }];
-  })));
 }
 
 // ---------------------------------------------------------------------------
@@ -269,18 +209,14 @@ export async function launcherProbes(hosts, { env = process.env, cwd = process.c
   }));
 }
 
-// ---------------------------------------------------------------------------
-// Prerequisites (assets/prerequisites.json)
-
+/** Prerequisite status for a tool entry of assets/prerequisites.json. */
 function probeTool(item, env) {
   const c = item.check;
   const tools = item.tools || [];
-  if (!c?.cmd) {
-    const found = tools.filter((t) => which(t, env));
-    if (!tools.length) return st('unknown');
-    return found.length ? { status: 'present', tool: found.join(', '), path: toPosix(which(found[0], env)) }
-      : { status: 'missing', tool: tools.join(' | ') };
-  }
+  const found = tools.filter((t) => which(t, env));
+  if (!c?.cmd && !tools.length) return st('unknown');
+  if (!c?.cmd) return found.length ? { status: 'present', tool: found.join(', '), path: toPosix(which(found[0], env)) }
+    : { status: 'missing', tool: tools.join(' | ') };
   if (!which(c.cmd, env)) return { status: 'missing', tool: c.cmd };
   const v = toolVersion(c.cmd, c.args || ['--version']);
   const version = v?.version || null;
@@ -315,30 +251,20 @@ const COMPUTED = {
   'temp-dir': ({ tempWritable: w }) => st(w ? 'present' : 'missing', toPosix(os.tmpdir()) + (w ? '' : ' not writable')),
   'qa-repo': ({ repo: r }) => (!r.root ? st('missing', 'not inside a Git work tree')
     : r.base_error ? st('missing', r.base_error) : st('present', `base ${r.base_ref || 'none'} (${r.base_source})`)),
-  'node-launcher': ({ probes }) => {
-    const ran = probes.filter((p) => p.ok !== null);
-    const bad = ran.filter((p) => !p.ok).map((p) => `${p.launcher}: ${p.detail || 'failed'}`);
-    return !ran.length ? st('unknown', 'launcher probes not run')
-      : bad.length ? st('missing', bad.join('; ')) : st('present', ran.map((p) => p.launcher).join(', '));
+  'node-launcher': ({ probes: ps }) => {
+    const [ok, bad] = [ps.filter((p) => p.ok), ps.filter((p) => p.ok === false)];
+    return bad.length ? st('missing', bad.map((p) => `${p.launcher}: ${p.detail}`).join('; '))
+      : ok.length ? st('present', ok.map((p) => p.launcher).join(', ')) : st('unknown', 'launcher probes not run');
   },
   'hooks-registered': ({ hooks }) => st(hooks.length ? 'present' : 'missing', hooks.map((h) => h.host).join()),
   'live-token': ({ state: { credential: c } }) => (c.set ? st('present', `set (source: ${c.source})`)
     : st('missing', 'unset')),
-  'budget-ledger': ({ state: { budget: b } }) => (b.valid ? st('present')
-    : st('missing', b.exists ? b.error : 'created on the first live run')),
+  'budget-ledger': ({ state: { budget: b } }) => st(b.valid ? 'present' : 'missing', b.valid ? '' : b.error),
   'adc-debug': ({ env }) => st(env.ADC_DEBUG === '1' ? 'present' : 'missing'),
-  'skill-installer': ({ env, tools }) => {
-    const file = path.join(hostHomes({ env }).codex, 'skills', '.system', 'skill-installer', 'SKILL.md');
-    return st(fs.existsSync(file) ? 'present' : tools.codex?.status === 'present' ? 'missing' : 'unknown');
-  },
-  'copilot-skill-add': ({ tools: { copilot: c } }) => (['present', 'old'].includes(c?.status)
-    ? { status: c.status, version: c.version } : st('missing')),
-  'host-diagnostics': ({ tools: t }) => st([t.copilot?.status, t.claude?.status].includes('present')
-    ? 'present' : 'missing'),
+  'copilot-skill-add': ({ tools: { copilot: c } }) => (c?.status === 'missing' ? st('missing') : c),
   'copilot-setup-steps': inRepo('.github/workflows/copilot-setup-steps.yml'),
   codeowners: inRepo('CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS'),
   longpaths: winOnly((f) => st(f.longpaths ? 'present' : 'missing')),
-  wsl2: winOnly((f) => st(which('wsl', f.env) ? 'present' : 'missing')),
 };
 
 function prereqRows(items, facts) {
@@ -370,13 +296,8 @@ export function gitSkillTree(gitDir, commitish, { skillPath = null } = {}) {
   if (!commit) throw usageError(`"${commitish}" does not name a commit in ${toPosix(gitDir)}`);
   const want = skillPath ? toPosix(skillPath).replace(/\/?SKILL\.md$/i, '').replace(/^\/+|\/+$/g, '') : null;
   const has = (p) => gitRaw(gitDir, ['cat-file', '-e', `${commit}:${p ? `${p}/` : ''}SKILL.md`]).exit === 0;
-  let sp = [want, `skills/${SKILL_NAME}`, ''].filter((p) => p !== null).find(has);
-  if (sp === undefined) {
-    const hit = lsTree(gitDir, commit, { entries: true }).map((e) => e.path)
-      .filter((p) => p.endsWith(`${SKILL_NAME}/SKILL.md`)).sort((a, b) => a.length - b.length)[0];
-    if (!hit) throw unverifiable('NO_SKILL_IN_REF', `no ${SKILL_NAME}/SKILL.md in ${commitish}`);
-    sp = hit.replace(/\/SKILL\.md$/, '');
-  }
+  const sp = [want, `skills/${SKILL_NAME}`, ''].filter((p) => p !== null).find(has);
+  if (sp === undefined) throw unverifiable('NO_SKILL_IN_REF', `no SKILL.md in ${commitish} (root, skills/<name>)`);
   const entries = lsTree(gitDir, commit, { entries: true, paths: sp ? [sp] : [] }).filter((e) => e.type === 'blob')
     .map((e) => ({ rel: sp ? e.path.slice(sp.length + 1) : e.path, sha: e.sha }))
     .filter((e) => !JUNK.includes(path.posix.basename(e.rel)));
@@ -481,8 +402,8 @@ export function verifyVendored(copies, { against = null, ref = null, cwd = proce
   const vendored = copies.filter((c) => c.scope === 'project');
   if (!vendored.length) return { status: 'none', detail: 'no copy of the skill in a project skill folder', copies: [] };
   const rows = vendored.map((copy) => {
-    const row = { path: copy.path, rel: copy.rel || null, tracked: copy.tracked ?? null, version: copy.version,
-      provenance: copy.provenance };
+    const { path: p, rel, tracked, version, provenance } = copy;
+    const row = { path: p, rel, tracked, version, provenance };
     try {
       const t = referenceFor(copy, { against, ref, cwd });
       row.reference = { kind: t.kind, source: t.source, ref: t.ref, ...(t.commit ? { commit: t.commit } : {}),
@@ -502,14 +423,12 @@ export function verifyVendored(copies, { against = null, ref = null, cwd = proce
 function stateReport(info, { env, sessionId }) {
   const p = statePaths(info.dir);
   let exclude = null;
-  if (info.insideRepo) {
+  try {
+    const file = info.insideRepo && gitPath(info.root, 'info/exclude');
+    const lines = file && readText(file, '').split(/\r?\n/).map((l) => l.trim());
     const entries = [`/${info.rel}/`, `/${info.rel}`, `${info.rel}/`];
-    try {
-      const file = gitPath(info.root, 'info/exclude');
-      const lines = (readText(file, '') || '').split(/\r?\n/).map((l) => l.trim());
-      exclude = { file: toPosix(file), entry_present: entries.some((e) => lines.includes(e)) };
-    } catch { exclude = { file: null, entry_present: false }; }
-  }
+    if (file) exclude = { file: toPosix(file), entry_present: entries.some((e) => lines.includes(e)) };
+  } catch { exclude = { file: null, entry_present: false }; }
   const envLive = { exists: fs.existsSync(p.envLive), ignored: stateIgnored(info, '.env.live') };
   if (envLive.exists) envLive.perms = checkOwnerOnly(p.envLive);
   const { budget: b, ...loaded } = loadBudget(info);
@@ -517,8 +436,7 @@ function stateReport(info, { env, sessionId }) {
   const hook = !sessionId && newestOpenSession(info.dir);
   const open = sessionId ? { id: sessionId, source: 'flag' } : hook && { id: String(hook.id), source: 'session-file' };
   const caps = effectiveCaps(b, { runClass: cls, session: open ? b.sessions[open.id] : null, env });
-  const view = { sessionId: open?.id || '(next run)', identitySource: open?.source || 'generated', caps,
-    runClass: cls };
+  const view = { sessionId: open?.id || '(next)', identitySource: open?.source || 'generated', caps, runClass: cls };
   return {
     dir: toPosix(info.dir), rel: info.rel, source: info.source, inside_repo: info.insideRepo, exists: isDir(info.dir),
     tracked: trackedStateFiles(info).slice(0, 20), exclude, ignored: stateIgnored(info, 'probe'), env_live: envLive,
@@ -527,19 +445,17 @@ function stateReport(info, { env, sessionId }) {
       path: loaded.path, exists: loaded.exists, valid: loaded.valid, ...(loaded.valid ? {} : { error: loaded.error }),
       unit: b.unit, max_per_session: b.max_per_session, max_per_day: b.max_per_day, warn_at: b.warn_at,
       defaults_exceeded: loaded.defaults_exceeded, run_class: cls, effective: { session: caps.session, day: caps.day },
-      today: budgetView(b, view),
-      overrides: Object.entries(b.sessions)
-        .filter(([, x]) => isObj(x.override)).map(([id, x]) => ({ session: id, ...x.override })),
+      today: budgetView(b, view), overrides: Object.entries(b.sessions).filter(([, x]) => isObj(x.override))
+        .map(([id, x]) => ({ session: id, ...x.override })),
     },
   };
 }
 
 /** Warnings about the state dir, the credential and the budget. */
-function stateWarnings(s, { env, info }) {
+function stateWarnings(s, { env, info, wsl }) {
   const rel = s.rel || '.adc';
   const { perms } = s.env_live;
-  const b = s.budget;
-  const def = DEFAULT_BUDGET.max_per_session;
+  const [b, def] = [s.budget, DEFAULT_BUDGET.max_per_session];
   return [
     s.tracked.length && `${rel}/ is tracked by git: every CLI command exits 3; run \`git rm -r --cached ${rel}\``,
     s.exists && s.inside_repo && !s.ignored && `${rel}/ is not git-ignored: run \`doctor --init\` (check for !.adc/**)`,
@@ -554,40 +470,29 @@ function stateWarnings(s, { env, info }) {
       + `session, ${b.max_per_day} per day (agent runs keep ${def})`,
     b.exists && !b.valid && `budget.json is ${b.error}: headless runs refuse (BUDGET_UNVERIFIED) with spend today`,
     ...b.overrides.map((o) => `session ${o.session} carries a terminal override of the session cap: ${o.max}`),
-    process.platform === 'linux' && /^\/mnt\/[a-z]\//i.test(toPosix(info.dir))
-      && 'the state dir is on a Windows drive under WSL (DrvFs), which may not hold owner-only modes; use ADC_HOME',
+    wsl && /^\/mnt\/[a-z]\//i.test(toPosix(info.dir)) && 'the state dir is on a Windows drive under WSL (DrvFs), '
+      + 'which may not hold owner-only modes; use ADC_HOME',
   ].filter(Boolean);
 }
 
-/** Warnings about installed copies, host discovery and registered hooks. */
-function installWarnings(copies, disc, hooks, root) {
+/** Warnings about installed copies and registered hooks. */
+function installWarnings(copies, hooks, root) {
   const out = [];
-  for (const [host, d] of Object.entries(disc || {})) {
-    const id = DISCOVERY.find((x) => x.host === host).id;
-    const scanned = copies.find((c) => c.hosts.includes(id));
-    if (!d.ok) out.push(`${d.command} did not return a skill list (${d.error || `exit ${d.exit}`})`);
-    else if (scanned && !copies.some((c) => c.discovered_by.includes(host))) {
-      out.push(`${host} does not list ${SKILL_NAME} although ${scanned.path} is in a directory it scans (disabled `
-        + 'skill, folder trust, or a name/frontmatter problem)');
-    }
-  }
   const versions = uniq(copies.map((c) => c.version));
   if (versions.length > 1) out.push(`installed copies have different versions (${versions.join(', ')})`);
-  const project = copies.filter((c) => c.scope === 'project');
-  if (project.length && !project.some((c) => c.location === '.github/skills')) {
-    out.push('the repository has no copy in .github/skills: Copilot code review reads only .github/skills');
-  }
+  const project = copies.filter((c) => c.scope === 'project').map((c) => c.location);
+  const review = 'no copy in .github/skills, the only folder Copilot code review reads';
+  if (project.length && !project.includes('.github/skills')) out.push(review);
   for (const c of copies) if (!c.name_ok) out.push(`${c.path}/SKILL.md does not declare name: ${SKILL_NAME}`);
-  const self = copies.find((c) => c.this_copy);
-  if (self && !self.hosts.length) {
-    out.push(`this copy (${self.path}) is in no directory a host scans; hosts load it only when registered or copied`);
-  }
+  const self = copies.find((c) => c.this_copy && !c.hosts.length);
+  if (self) out.push(`this copy (${self.path}) is in no directory a host scans; it loads only if registered or copied`);
   for (const h of hooks) {
     if (h.present === false) out.push(`hooks recorded in .adc/hooks-installed.json are missing from ${h.file}`);
     else if (h.matches_current === false) out.push(`${h.host} hooks in ${h.file} differ from the template`);
     for (const sp of h.skill_paths || []) {
       const abs = isAbsolutePath(sp) || !root ? sp : path.join(root, sp);
-      if (!isDir(path.join(abs, 'scripts'))) out.push(`${h.host} hooks in ${h.file}: no adc.mjs in ${sp}`);
+      const dead = !fs.existsSync(path.join(abs, 'scripts', 'adc.mjs'));
+      if (dead) out.push(`${h.host} hooks in ${h.file} point at ${sp}, which has no scripts/adc.mjs (dead hook)`);
     }
   }
   return out;
@@ -613,10 +518,9 @@ function runtime(env) {
   return { node, git, nodeOnPath, warnings: warnings.filter(Boolean) };
 }
 
-/** Build the doctor report. `opts`: `{ cwd, env, stateDirOption, discovery, probes, vendored, session }`. */
+/** Build the doctor report. `opts`: `{ cwd, env, stateDirOption, probes, vendored, session }`. */
 export async function doctorReport({
-  cwd = process.cwd(), env = process.env, stateDirOption = null, discovery = true, probes = true, vendored = null,
-  session = null,
+  cwd = process.cwd(), env = process.env, stateDirOption = null, probes = true, vendored = null, session = null,
 } = {}) {
   const root = repoRoot(cwd);
   const info = resolveStateDir({ cwd, stateDirOption, env });
@@ -628,8 +532,7 @@ export async function doctorReport({
   const warnings = [];
   let hooks = [];
   try { hooks = listRegisteredHooks({ root, env }); } catch (err) { warnings.push(`hooks not listed: ${err.message}`); }
-  // Slow, independent work starts first (host CLIs listing skills can take 15+ s); awaited below.
-  const discoveryP = discovery ? hostDiscovery({ root, cwd, env }) : null;
+  // The launcher probes run while the rest is collected; awaited below.
   const probeHosts = uniq([guess.host, ...hooks.map((h) => HOOK_HOSTS[h.host])]);
   const probesP = probes ? launcherProbes(probeHosts, { env, cwd, redact }) : [];
   const rt = runtime(env);
@@ -641,9 +544,9 @@ export async function doctorReport({
   for (const id of PROBED_TOOLS.filter((t) => t !== 'node' && (t !== 'git-bash' || IS_WINDOWS))) {
     const item = prereqs.find((i) => i.id === id);
     const bash = id === 'git-bash' && gitBashPath(env);
+    const gitBash = bash ? { status: 'present', tool: 'bash', path: toPosix(bash) } : st('missing', 'no Git Bash');
     if (!item) warnings.push(`assets/prerequisites.json has no entry for "${id}"`);
-    else if (id !== 'git-bash') tools[id] = probeTool(item, env);
-    else tools[id] = bash ? { status: 'present', tool: 'bash', path: toPosix(bash) } : st('missing', 'no Git Bash');
+    else tools[id] = id === 'git-bash' ? gitBash : probeTool(item, env);
   }
   const hosts = prereqs.filter((i) => i.category === 'host').map((i) => {
     const t = tools[i.id] || { status: 'missing' };
@@ -652,29 +555,18 @@ export async function doctorReport({
     const present = ['present', 'old', 'unknown'].includes(t.status);
     return { id: i.id, name: i.name, present, version: t.version || null, minimum: i.minimum, ok, path: t.path };
   });
-  const repo = { root: root ? toPosix(root) : null };
-  try {
-    const b = root && resolveBase(root, null);
-    if (b) Object.assign(repo, { base_ref: b.ref, base_source: b.source });
-  } catch (err) { repo.base_error = err.message; }
+  const repo = { root: root && toPosix(root) };
+  try { if (root) ({ ref: repo.base_ref, source: repo.base_source } = resolveBase(root, null)); }
+  catch (err) { repo.base_error = err.message; }
   let tempWritable = false;
   try { fs.rmSync(makeTempDir('doctor'), { recursive: true, force: true }); tempWritable = true; } catch {}
   const state = stateReport(info, { env, sessionId: session });
-  warnings.push(...stateWarnings(state, { env, info }));
+  const procVersion = process.platform === 'linux' ? readText('/proc/version', '') : '';
+  const wsl = Boolean(procVersion && (env.WSL_DISTRO_NAME || /microsoft/i.test(procVersion)));
+  warnings.push(...stateWarnings(state, { env, info, wsl }));
 
   const copies = findInstalledCopies({ root, cwd, env });
-  const disc = await discoveryP;
-  for (const [host, d] of Object.entries(disc || {})) {
-    const hostIds = [DISCOVERY.find((x) => x.host === host).id];
-    const where = { scope: 'discovered', location: `listed by ${host}`, hosts: hostIds, root };
-    for (const s of d.skill || []) {
-      let c = s.path && copies.find((x) => samePath(x.path, s.path));
-      if (!c && s.path) copies.push(c = describeCopy(s.path, where));
-      if (c && !c.discovered_by.includes(host)) c.discovered_by.push(host);
-      if (c && s.enabled === false) c.disabled_in = [...(c.disabled_in || []), host];
-    }
-  }
-  warnings.push(...installWarnings(copies, disc, hooks, root));
+  warnings.push(...installWarnings(copies, hooks, root));
   const probeRows = await probesP;
   for (const p of probeRows.filter((x) => x.ok === false)) {
     warnings.push(`launcher probe ${p.launcher} failed: ${p.detail || 'unexpected output'} (such hooks are dead)`);
@@ -692,9 +584,8 @@ export async function doctorReport({
     host_guess: guess.host, hooks_host: guess.hooks_host, host_markers: guess.markers,
     host_candidates: guess.candidates,
     os: { platform: process.platform, release: os.release(), arch: process.arch, shell: shell && path.basename(shell),
-      wsl: process.platform === 'linux'
-        && (Boolean(env.WSL_DISTRO_NAME) || /microsoft/i.test(readText('/proc/version', ''))) },
-    node: rt.node, git: rt.git, hosts, repo, install_paths: copies, discovery: disc, hooks, probes: probeRows, state,
+      wsl },
+    node: rt.node, git: rt.git, hosts, repo, install_paths: copies, hooks, probes: probeRows, state,
     prerequisites: prereqRows(prereqs, facts), warnings,
   };
   if (vendored) {
@@ -708,46 +599,37 @@ export async function doctorReport({
 
 function humanReport(r) {
   const s = r.state;
-  const counts = {};
-  for (const p of r.prerequisites) counts[p.status] = (counts[p.status] || 0) + 1;
   const list = (label, xs) => (xs?.length ? `; ${label} ${xs.slice(0, 5).join(', ')}` : '');
   const flags = (c) => [c.scope, c.this_copy && 'this copy', c.tracked && 'tracked'].filter(Boolean).join(', ');
-  const copy = (c) => `  ${c.path} [${flags(c)}] v${c.version || '?'}${list('read by', c.hosts)}`
-    + list('listed by', c.discovered_by);
-  const ref = ({ reference: x }) => (x ? ` vs ${x.kind} ${x.source}${x.ref ? `@${x.ref}` : ''}` : '');
-  const vend = (c) => `  ${c.path}: ${c.status}${ref(c)}${typeof c.detail === 'string' ? ` - ${c.detail}` : ''}`
-    + `${list('changed', c.changed)}${list('missing', c.missing)}${list('extra', c.extra)}`;
-  const host = (h) => `${h.id} ${h.present ? `${h.version || '?'}${h.ok === false ? ' (old)' : ''}` : 'missing'}`;
-  const ignored = s.tracked.length ? ' TRACKED' : s.ignored ? ' (ignored)' : ' (NOT ignored)';
+  const counts = Object.entries(Object.groupBy(r.prerequisites, (p) => p.status)).map(([k, v]) => `${v.length} ${k}`);
   const token = s.credential.set ? `set (source: ${s.credential.source})` : 'unset';
-  const t = s.budget.today;
   return [
-    `${r.skill.name} ${r.skill.version} doctor`, `script:  ${r.skill.script}`,
-    `host:    ${r.host_guess || 'unknown'}${r.host_markers.length ? ` (${r.host_markers.join(', ')})` : ''}`,
-    `os:      ${r.os.platform} ${r.os.release} ${r.os.arch}${r.os.wsl ? ' (WSL)' : ''}`,
-    `node:    ${r.node.version} ${r.node.ok ? 'ok' : 'TOO OLD'}${r.node.eol ? ` (EOL ${r.node.eol})` : ''}`,
-    `git:     ${r.git.version ? `${r.git.version} ${r.git.ok ? 'ok' : 'TOO OLD'}` : 'missing'}`,
-    `hosts:   ${r.hosts.map(host).join(' | ')}`, 'copies:', ...r.install_paths.map(copy),
-    `hooks:   ${r.hooks.map((h) => `${h.host}/${h.scope} ${h.level || ''} (${h.file})`).join('; ') || 'none'}`,
-    `probes:  ${r.probes.map((p) => `${p.launcher} ${p.ok === null ? 'n/a' : p.ok ? 'ok' : 'FAIL'}`).join(', ')}`,
-    `state:   ${s.dir}${s.exists ? '' : ' (not created)'}${ignored}; ADC_LIVE_TOKEN ${token}`,
-    `budget:  remaining ${t.remaining} ${t.unit} (today ${t.spent_today}/${t.max_per_day})`,
-    `prereqs: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')}`,
+    `${r.skill.name} ${r.skill.version} doctor (${r.skill.script})`,
+    `host ${r.host_guess || 'unknown'}; ${r.os.platform} ${r.os.release}${r.os.wsl ? ' (WSL)' : ''}`,
+    `node ${r.node.version}${r.node.ok ? '' : ' (too old)'}`,
+    `git ${r.git.version || 'missing'}${r.git.version && !r.git.ok ? ' (too old)' : ''}`,
+    `hosts: ${r.hosts.map((h) => `${h.id} ${h.present ? h.version || '?' : 'missing'}`).join(', ')}`,
+    ...r.install_paths.map((c) => `copy: ${c.path} v${c.version || '?'} [${flags(c)}]`),
+    `hooks: ${r.hooks.map((h) => `${h.host}/${h.scope}`).join(', ') || 'none'}`,
+    `probes: ${r.probes.map((p) => `${p.launcher} ${p.ok === null ? 'n/a' : p.ok ? 'ok' : 'FAIL'}`).join(', ')}`,
+    `state: ${s.dir}${s.tracked.length ? ' TRACKED' : !s.exists ? ' (none yet)' : s.ignored ? '' : ' (not ignored)'}`,
+    `ADC_LIVE_TOKEN ${token}`,
+    `budget: remaining ${s.budget.today.remaining} ${s.budget.unit}`,
+    `prerequisites: ${counts.join(', ')}`,
     ...r.prerequisites.filter((p) => ['missing', 'old'].includes(p.status) && p.category !== 'host')
-      .map((p) => `  ${p.status.padEnd(7)} ${p.name}${p.in_effect ? ` -> ${p.in_effect}` : ''}`),
-    ...(r.vendored ? [`vendored: ${r.vendored.status}`, ...r.vendored.copies.map(vend)] : []),
-    ...(r.init ? [`init:    ${r.init.refused || `${r.init.dry_run ? 'would create' : 'ready'} ${r.init.dir}`}`] : []),
-    ...(r.warnings.length ? ['warnings:', ...r.warnings.map((w) => `  - ${w}`)] : []),
+      .map((p) => `  ${p.status} ${p.name}${p.in_effect ? ` -> ${p.in_effect}` : ''}`),
+    ...(r.vendored ? [`vendored: ${r.vendored.status}`, ...r.vendored.copies.map((c) => `  ${c.path}: ${c.status}`
+      + `${list('changed', c.changed)}${list('missing', c.missing)}${list('extra', c.extra)}`)] : []),
+    ...(r.init ? [`init: ${r.init.refused || `${r.init.dry_run ? 'would create' : 'ready'} ${r.init.dir}`}`] : []),
+    ...r.warnings.map((w) => `warning: ${w}`),
   ].join('\n');
 }
 
 const USAGE = [
-  'doctor [--init] [--verify-vendored [--against <dir|clone|url>] [--ref <tag|sha>]] [--no-discovery] [--no-probes]',
-  '       [--session <id>] [--json]',
-  'Host, OS, Node, Git, host CLIs vs their floors, every prerequisite with the fallback in effect, installed',
-  'copies (and which host CLIs list them), registered hooks, launcher probes, the state dir and the budget.',
-  '--init creates .adc/, writes the exclude entry and materializes the templates. --verify-vendored compares',
-  'each copy under the repository with its release (SKILL.md semantically, other files byte for byte).',
+  'doctor [--init] [--verify-vendored [--against <dir|clone|url>] [--ref <tag|sha>]] [--no-probes] [--session <id>]',
+  'Host, OS, Node, Git, host CLIs vs their floors, every prerequisite with the fallback in effect, installed copies,',
+  'registered hooks, launcher probes, the state dir and the budget. --init creates .adc/, its exclude entry and the',
+  'templates. --verify-vendored compares each copy under the repository with its release (SKILL.md semantically).',
   'Exit: 3 when .adc/ is tracked (the report is still printed), 1 on vendored drift, 4 when it cannot be compared.',
 ].join('\n');
 
@@ -756,10 +638,9 @@ function initState(ctx) {
   const dir = toPosix(info.dir);
   const refused = `${info.rel}/ is tracked by git; run \`git rm -r --cached ${info.rel}\` first`;
   if (trackedStateFiles(info).length) return { dir, refused };
-  if (ctx.dryRun) {
-    const exclude = info.insideRepo ? [`add /${info.rel}/ to the exclude file`] : [];
-    return { dir, dry_run: true, would: ['create the state dir (0700)', ...exclude, 'write budget.json, .env.live'] };
-  }
+  const would = ['create the state dir (0700)', info.insideRepo && `add /${info.rel}/ to the exclude file`,
+    'write budget.json and .env.live from the templates'];
+  if (ctx.dryRun) return { dir, dry_run: true, would: would.filter(Boolean) };
   const prepared = prepareStateDir(ctx, { create: true });
   const t = materializeTemplates(prepared);
   return { dir, exclude: prepared.exclude, budget: t.budget, env_live: t.envLive };
@@ -770,9 +651,10 @@ export const doctorCommand = defineCommand({
   usage: USAGE,
   positionals: false,
   options: {
-    init: { type: 'boolean' }, 'verify-vendored': { type: 'boolean' }, 'no-discovery': { type: 'boolean' },
-    'no-probes': { type: 'boolean' }, against: { type: 'string' }, ref: { type: 'string' }, session: { type: 'string' },
-    probe: { type: 'string' },
+    init: { type: 'boolean' }, 'verify-vendored': { type: 'boolean' }, 'no-probes': { type: 'boolean' },
+    against: { type: 'string' }, ref: { type: 'string' }, session: { type: 'string' }, probe: { type: 'string' },
+    // Accepted for older invocations: doctor no longer asks host CLIs which skills they list.
+    'no-discovery': { type: 'boolean' },
   },
   run: async (ctx, values) => {
     if (values.probe != null) {
@@ -788,7 +670,7 @@ export const doctorCommand = defineCommand({
     const init = values.init ? initState(ctx) : null;
     const vendored = vv ? { against: values.against, ref: values.ref, cwd: ctx.cwd } : null;
     const report = await doctorReport({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption, session: values.session,
-      discovery: !values['no-discovery'], probes: !values['no-probes'], vendored });
+      probes: !values['no-probes'], vendored });
     if (init) {
       report.init = init;
       const e = init.env_live;
@@ -800,9 +682,8 @@ export const doctorCommand = defineCommand({
       : ['unverified', 'none'].includes(v) ? EXIT.UNVERIFIABLE : EXIT.OK;
     const failing = report.prerequisites.filter((p) => p.category === 'required' && p.status === 'missing').length;
     const n = report.install_paths.length;
-    const summary = [report.host_guess || 'unknown host', `node ${report.node.version}`,
-      `git ${report.git.version || 'none'}`, `${n} cop${n === 1 ? 'y' : 'ies'}`,
-      `${report.hooks.length} hook registration(s)`, `${report.warnings.length} warning(s)`,
+    const summary = [report.host_guess || 'no host', `node ${report.node.version}`, `git ${report.git.version || '-'}`,
+      `${n} cop${n === 1 ? 'y' : 'ies'}`, `${report.hooks.length} hook(s)`, `${report.warnings.length} warning(s)`,
       failing && `${failing} required item(s) missing`, exit === EXIT.ENV && 'state dir tracked (exit 3)'];
     return { result: report, exit, human: humanReport(report), summary: summary.filter(Boolean).join('; ') };
   },

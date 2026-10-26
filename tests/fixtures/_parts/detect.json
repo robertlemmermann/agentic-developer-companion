@@ -1880,7 +1880,7 @@
               }
             ],
             "warnings_re": [
-              "mvn is not on PATH and the project has no Maven wrapper"
+              "mvn is not on PATH \\(and no wrapper\\)"
             ]
           }
         ]

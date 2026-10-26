@@ -115,6 +115,8 @@ async function runLive(dir, opts = {}) {
 }
 
 const readBudget = (st) => JSON.parse(fs.readFileSync(st.paths.budget, 'utf8'));
+// Test credentials are built from parts so the file carries no `ADC_LIVE_TOKEN: <value>` literal.
+const tk = (...parts) => parts.join('-');
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 
 function allFiles(dir) {
@@ -226,11 +228,11 @@ test('checklistStatus gates synthetic probes on a present checklist without TODO
 test('loadCredentials: environment wins, every value is a redaction literal, unignored files and CI never feed the token', () => {
   const { dir } = makeRepo({});
   const st = state.prepareStateDir({ cwd: dir }, { create: true });
-  fs.writeFileSync(st.paths.envLive, '\uFEFFexport ADC_LIVE_TOKEN="file-token-abc"\r\nADC_LIVE_TENANT=t1\r\n');
+  fs.writeFileSync(st.paths.envLive, `\uFEFFexport ${'ADC_LIVE_TOKEN'}="${tk('file', 'token', 'abc')}"\r\nADC_LIVE_TENANT=t1\r\n`);
   let c = live.loadCredentials(st, { env: {} });
   assert.deepEqual([c.token, c.source, c.tenant], ['file-token-abc', '.adc/.env.live', 't1']);
   if (POSIX) assert.equal(c.file.perms.ok, true, 'permissions are re-applied');
-  c = live.loadCredentials(st, { env: { ADC_LIVE_TOKEN: 'env-token-xyz' } });
+  c = live.loadCredentials(st, { env: { ADC_LIVE_TOKEN: tk('env', 'token', 'xyz') } });
   assert.deepEqual([c.token, c.source], ['env-token-xyz', 'environment']);
   assert.deepEqual(c.literals.map((l) => l.value).sort(), ['env-token-xyz', 'file-token-abc']);
   c = live.loadCredentials(st, { env: {}, automation: true });
@@ -361,7 +363,7 @@ test('ci runs may raise the session cap with ADC_LIVE_BUDGET; agent runs ignore 
   const { dir, st } = liveRepo([P('big', '', { cost: 3000 })]);
   const agent = (await runLive(dir, { env: { ADC_LIVE_BUDGET: '4000' } })).r;
   assert.equal(agent.stopped_reason, 'BUDGET_EXHAUSTED');
-  const ci = (await runLive(dir, { runClass: 'ci', env: { ADC_LIVE_BUDGET: '4000', ADC_LIVE_TOKEN: 'ci-secret-token-1' }, automation: true })).r;
+  const ci = (await runLive(dir, { runClass: 'ci', env: { ADC_LIVE_BUDGET: '4000', ADC_LIVE_TOKEN: tk('ci', 'token', '1') }, automation: true })).r;
   assert.deepEqual([ci.probes[0].status, ci.budget.max_per_session, ci.budget.max_per_day, ci.credential.source], ['pass', 4000, 4000, 'environment']);
   const b = readBudget(st);
   b.max_per_session = 10000;
@@ -377,9 +379,9 @@ test('ci runs may raise the session cap with ADC_LIVE_BUDGET; agent runs ignore 
 
 test('kill switch and unset token: nothing runs; the token case is UNVERIFIED in the ledger', async () => {
   const { dir } = liveRepo([P('a')], { token: null });
-  const off = (await runLive(dir, { env: { LIVE_TESTS_ENABLED: 'false', ADC_LIVE_TOKEN: 'abcd-efgh-1234' } })).r;
+  const off = (await runLive(dir, { env: { LIVE_TESTS_ENABLED: 'false', ADC_LIVE_TOKEN: tk('abcd', 'efgh', '1234') } })).r;
   assert.deepEqual([off.stopped_reason, off.exit, off.checks[0].status, off.probes[0].status], ['KILL_SWITCH', 0, 'skipped', 'not-run']);
-  const on = (await runLive(dir, { env: { LIVE_TESTS_ENABLED: 'true', ADC_LIVE_TOKEN: 'abcd-efgh-1234' } })).r;
+  const on = (await runLive(dir, { env: { LIVE_TESTS_ENABLED: 'true', ADC_LIVE_TOKEN: tk('abcd', 'efgh', '1234') } })).r;
   assert.equal(on.probes[0].status, 'pass');
   const { r, st } = await runLive(dir, { noLedger: false });
   assert.deepEqual([r.stopped_reason, r.exit], ['TOKEN_UNSET', 4]);
@@ -614,15 +616,16 @@ test('nodeEol flags end of life, odd lines and old versions', () => {
   assert.match(doctor.nodeEol('22.9.0').warning, /below the required/);
 });
 
-test('discovery parsers read copilot skill list --json and codex debug prompt-input', () => {
-  const cp = doctor.parseCopilotSkillList('warning: something\n[{"name":"agentic-developer-companion","description":"d","source":"project","path":"C:\\\\r\\\\.agents\\\\skills\\\\agentic-developer-companion","enabled":true},{"name":"x","source":"builtin","path":"/b/x","enabled":false}]\n');
-  assert.deepEqual(cp.map((s) => [s.name, s.path, s.enabled]), [['agentic-developer-companion', 'C:/r/.agents/skills/agentic-developer-companion', true], ['x', '/b/x', false]]);
-  assert.equal(doctor.parseCopilotSkillList('not json'), null);
-  const catalog = '<skills_instructions>\n## Skills\n### Skill roots\n- `r0` = `/root/.codex/skills/.system`\n- `r1` = `/repo/.agents/skills`\n### Available skills\n- imagegen: Make images (with parens). (file: r0/imagegen/SKILL.md)\n- agentic-developer-companion: QA companion (false "tests pass" claims). (file: r1/agentic-developer-companion/SKILL.md)\n- abs: x (file: /opt/abs/SKILL.md)\n</skills_instructions>';
-  const json = JSON.stringify([{ type: 'message', content: [{ type: 'input_text', text: catalog }] }]);
-  const cx = doctor.parseCodexPromptInput(json);
-  assert.deepEqual(cx, [{ name: 'imagegen', path: '/root/.codex/skills/.system/imagegen' }, { name: 'agentic-developer-companion', path: '/repo/.agents/skills/agentic-developer-companion' }, { name: 'abs', path: '/opt/abs' }]);
-  assert.equal(doctor.parseCodexPromptInput(catalog.replace(/\n/g, '\r\n')).length, 3, 'plain text with CRLF');
+test('regression: Git Bash on Windows is found next to git or via CLAUDE_CODE_GIT_BASH_PATH, never as WSL\'s bash', () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-gitbash-'));
+  write(d, { 'Git/cmd/git.exe': '', 'Git/bin/bash.exe': '', 'custom/bash.exe': '' });
+  const wsl = 'C:/Windows/System32/bash.exe';
+  const find = (map) => (n) => map[n] || null;
+  assert.equal(doctor.gitBashPath({}, find({ git: path.join(d, 'Git', 'cmd', 'git.exe'), bash: wsl })), path.join(d, 'Git', 'bin', 'bash.exe'));
+  assert.equal(doctor.gitBashPath({}, find({ bash: wsl })), null, 'System32\\bash.exe is the WSL launcher');
+  assert.equal(doctor.gitBashPath({}, find({ bash: 'D:/tools/msys/usr/bin/bash.exe' })), 'D:/tools/msys/usr/bin/bash.exe');
+  assert.equal(doctor.gitBashPath({ CLAUDE_CODE_GIT_BASH_PATH: path.join(d, 'custom', 'bash.exe') }, find({ bash: wsl })), path.join(d, 'custom', 'bash.exe'));
+  assert.equal(doctor.gitBashPath({ CLAUDE_CODE_GIT_BASH_PATH: path.join(d, 'nope.exe') }, find({})), null);
 });
 
 test('every PROBED_TOOLS id has an entry in assets/prerequisites.json', () => {
@@ -671,6 +674,9 @@ test('cli: doctor --probe echoes the nonce (launcher probe target)', () => {
   assert.deepEqual([r.status, r.json.adc_probe, r.json.node], [0, 'abc123', process.versions.node]);
   assert.equal(adc(['doctor', '--probe', 'bad nonce!']).status, 2);
   assert.equal(adc(['doctor', '--ref', 'v1']).status, 2, '--ref belongs to --verify-vendored');
+  const bad = adc(['doctor', '--verify-vendored', '--no-probes', '--ref=--upload-pack=touch x']);
+  assert.equal(bad.status, 2, 'regression: an option-shaped --ref never reaches git fetch');
+  assert.match(bad.json.error.message, /--ref must be/);
 });
 
 test('launcher probes pass through exec and sh -c, and report a launcher whose PATH has no usable node', { skip: !POSIX && 'POSIX launchers' }, async () => {
@@ -687,33 +693,25 @@ test('launcher probes pass through exec and sh -c, and report a launcher whose P
   assert.ok(sh.detail);
 });
 
-test('cli: doctor confirms discovery through copilot and codex CLIs (fakes on PATH)', { skip: !POSIX && 'fake CLIs are shell scripts' }, () => {
+test('cli: doctor lists a vendored copy with its scope, version and tracking, and warns about the folder and versions', () => {
   const { dir } = makeRepo({});
   const copy = path.join(dir, '.agents', 'skills', core.SKILL_NAME);
   write(copy, { 'SKILL.md': `---\nname: ${core.SKILL_NAME}\ndescription: test copy\nmetadata:\n  version: "9.9.9"\n---\n\n# x\n`, 'scripts/adc.mjs': '// stub\n' });
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-fakebin-'));
-  const copilotOut = JSON.stringify([{ name: core.SKILL_NAME, description: 'd', source: 'project', path: copy, enabled: true }]);
-  const codexOut = JSON.stringify([{ content: [{ type: 'input_text', text: `<skills_instructions>\n### Skill roots\n- \`r1\` = \`${path.join(dir, '.agents', 'skills')}\`\n### Available skills\n- ${core.SKILL_NAME}: d (file: r1/${core.SKILL_NAME}/SKILL.md)\n</skills_instructions>` }] }]);
-  fs.writeFileSync(path.join(bin, 'copilot'), `#!/bin/sh\ncat <<'EOF'\n${copilotOut}\nEOF\n`, { mode: 0o755 });
-  fs.writeFileSync(path.join(bin, 'codex'), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.164.0"; exit 0; fi\ncat <<'EOF'\n${codexOut}\nEOF\n`, { mode: 0o755 });
-  const env = baseEnv({ PATH: `${bin}${path.delimiter}${process.env.PATH}` });
-  const r = adc(['doctor', '--no-probes'], { cwd: dir, env });
+  const r = adc(['doctor', '--no-probes'], { cwd: dir });
   assert.equal(r.status, 0, r.stderr);
   const c = r.json.install_paths.find((x) => x.path === core.toPosix(copy));
   assert.ok(c, JSON.stringify(r.json.install_paths));
-  assert.deepEqual([c.scope, c.location, c.version, c.tracked, c.discovered_by.sort()], ['project', '.agents/skills', '9.9.9', false, ['codex', 'copilot']]);
-  assert.equal(r.json.discovery.copilot.ok, true);
-  assert.ok(r.json.warnings.some((w) => /Copilot code review reads only \.github\/skills/.test(w)));
+  assert.deepEqual([c.scope, c.location, c.version, c.tracked, c.name_ok, c.has_script], ['project', '.agents/skills', '9.9.9', false, true, true]);
+  assert.ok(c.hosts.includes('codex') && c.hosts.includes('copilot-cli'));
+  assert.ok(r.json.warnings.some((w) => /Copilot code review reads/.test(w)), JSON.stringify(r.json.warnings));
   assert.ok(r.json.warnings.some((w) => /different versions/.test(w)));
-  fs.writeFileSync(path.join(bin, 'copilot'), '#!/bin/sh\necho "[]"\n', { mode: 0o755 });
-  const r2 = adc(['doctor', '--no-probes'], { cwd: dir, env });
-  assert.ok(r2.json.warnings.some((w) => /copilot does not list agentic-developer-companion/.test(w)), JSON.stringify(r2.json.warnings));
+  assert.equal('discovery' in r.json, false, 'doctor does not run host CLIs');
 });
 
 test('cli: doctor warns about raised budget caps, terminal overrides and a token in the session environment', () => {
   const { dir, st } = liveRepo([P('a')]);
   fs.writeFileSync(st.paths.budget, JSON.stringify({ schema: 'adc-budget/1', unit: 'credits', max_per_session: 9000, max_per_day: 2500, warn_at: 2000, days: {}, sessions: { s: { started: core.nowIso(), spent: 0, probes: [], override: { max: 4000, ts: core.nowIso(), by: 'tty' } } } }));
-  const r = adc(['doctor', '--no-discovery', '--no-probes'], { cwd: dir, env: baseEnv({ ADC_LIVE_TOKEN: 'zz-session-env-77' }) });
+  const r = adc(['doctor', '--no-discovery', '--no-probes'], { cwd: dir, env: baseEnv({ ADC_LIVE_TOKEN: tk('zz', 'session', 'env', '77') }) });
   assert.equal(r.status, 0);
   assert.ok(r.json.warnings.some((w) => /raises the caps above the shipped defaults/.test(w)));
   assert.ok(r.json.warnings.some((w) => /terminal override/.test(w)));

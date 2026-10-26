@@ -23,6 +23,7 @@ const asBool = (v) => (v === true || /^(true|yes|on|1)$/i.test(String(v ?? '')) 
   : v === false || /^(false|no|off|0)$/i.test(String(v ?? '')) ? false : null);
 const uniq = (list) => [...new Set(list)];
 const json = (v) => JSON.stringify(v, null, 2) + '\n';
+const some = (o) => Object.keys(o || {}).length > 0;
 /** A row of `dropped_fields[]`. */
 const dropRow = (file, field, reason, value) => ({ file, field, ...(value !== undefined ? { value } : {}), reason });
 
@@ -42,13 +43,15 @@ export function skillNameProblems(name) {
 }
 
 /** Best-effort conversion of any label into a valid skill name. */
-export const toSkillName = (label) => String(label ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-  .slice(0, 64).replace(/-$/, '') || 'skill';
+export const toSkillName = (label) => String(label ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-|-$/g, '').slice(0, 64).replace(/-$/, '') || 'skill';
 
 /** Copilot agent file names allow `. - _ a-z A-Z 0-9`. */
 const agentFileName = (name) => String(name).replace(/[^.\-_a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
 
-export const SKILL_DIRS = Object.freeze({ copilot: '.github/skills', claude: '.claude/skills', codex: '.agents/skills' });
+export const SKILL_DIRS = Object.freeze({
+  copilot: '.github/skills', claude: '.claude/skills', codex: '.agents/skills',
+});
 /**
  * Codex-only skills (agents translated to skills): Copilot also loads `.agents/skills`, where such
  * a skill would duplicate the Copilot agent. Codex reads `.codex/skills` in a repository (checked
@@ -73,7 +76,8 @@ const LOCATIONS = [
   [/(^|\/)\.github\/chatmodes\/.+\.chatmode\.md$/, 'chatmode', 'copilot', CP],
   [/(^|\/)\.claude\/commands\/.+\.md$/, 'command', 'claude', CL],
   [/(^|\/)\.(github|copilot)\/hooks\/[^/]+\.json$/, 'hooks', 'copilot', CP],
-  [/(^|\/)(\.github\/copilot\/settings(\.local)?|\.copilot\/settings)\.json$/, 'hooks', 'copilot', CP, { settings: true }],
+  [/(^|\/)(\.github\/copilot\/settings(\.local)?|\.copilot\/settings)\.json$/, 'hooks', 'copilot', CP,
+    { settings: true }],
   [/(^|\/)\.claude\/settings(\.local)?\.json$/, 'hooks', 'claude', CL, { settings: true }],
   [/(^|\/)\.codex\/hooks\.json$/, 'hooks', 'codex', CX],
   [/(^|\/)\.vscode\/mcp\.json$/, 'mcp', 'vscode', CP, { dialect: 'vscode' }],
@@ -103,17 +107,18 @@ export function classifyArtifact(relPath) {
     const kind = m[4] === 'SKILL.md' ? 'skill' : /\.md$/i.test(m[4]) ? 'skill-file' : null;
     return kind && { kind, host, hosts: [...hosts], name: m[3], dir: [m[1], m[2], m[3]].filter(Boolean).join('/') };
   }
-  for (const [re, kind, host, hosts, extra] of LOCATIONS) if (re.test(p)) return { kind, host, hosts: [...hosts], ...extra };
-  const scoped = dir === '.' ? {} : { scopeDir: dir };
-  if (base === 'AGENTS.override.md') return { kind: dir === '.' ? 'instructions' : 'scoped', host: 'codex', hosts: [...CX] };
-  if (base === 'AGENTS.md') {
-    return { kind: dir === '.' ? 'instructions' : 'scoped', host: dir === '.' ? 'portable' : 'codex',
-      hosts: ['copilot', 'codex', 'claude'], ...scoped };
-  }
+  const hit = LOCATIONS.find(([re]) => re.test(p));
+  if (hit) return { kind: hit[1], host: hit[2], hosts: [...hit[3]], ...hit[4] };
+  const top = dir === '.';
+  const scoped = top ? {} : { scopeDir: dir };
+  const kind = top ? 'instructions' : 'scoped';
+  if (base === 'AGENTS.override.md') return { kind, host: 'codex', hosts: [...CX] };
+  const everywhere = ['copilot', 'codex', 'claude'];
+  if (base === 'AGENTS.md') return { kind, host: top ? 'portable' : 'codex', hosts: everywhere, ...scoped };
   if (base !== 'CLAUDE.md' && base !== 'CLAUDE.local.md') return null;
-  const top = dir === '.' || dir === '.claude';
-  return { kind: top ? 'instructions' : 'scoped', host: 'claude', hosts: base === 'CLAUDE.md' ? [...CL] : ['claude'],
-    ...(top ? {} : scoped) };
+  const claudeTop = top || dir === '.claude';
+  const hosts = base === 'CLAUDE.md' ? [...CL] : ['claude'];
+  return { kind: claudeTop ? 'instructions' : 'scoped', host: 'claude', hosts, ...(claudeTop ? {} : scoped) };
 }
 
 // ---------------------------------------------------------------------------
@@ -194,12 +199,13 @@ const COPILOT_ALIAS_TO_CANON = {
   write: ['Write'], search: ['Grep', 'Glob'], agent: ['Agent'], 'custom-agent': ['Agent'], task: ['Agent'],
   web: ['WebFetch', 'WebSearch'], todo: ['TodoWrite'],
 };
-const CLAUDE_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'NotebookRead', 'Grep', 'Glob', 'Agent',
-  'Task', 'WebFetch', 'WebSearch', 'TodoWrite', 'Skill', 'AskUserQuestion', 'BashOutput', 'KillShell', 'Monitor', 'PowerShell'];
+const CLAUDE_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'NotebookRead', 'Grep', 'Glob',
+  'Agent', 'Task', 'WebFetch', 'WebSearch', 'TodoWrite', 'Skill', 'AskUserQuestion', 'BashOutput', 'KillShell',
+  'Monitor', 'PowerShell'];
 const CANON_TO_COPILOT_ALIAS = {
-  Bash: 'execute', PowerShell: 'execute', Read: 'read', NotebookRead: 'read', Edit: 'edit', Write: 'edit', MultiEdit: 'edit',
-  NotebookEdit: 'edit', Grep: 'search', Glob: 'search', Agent: 'agent', Task: 'agent', WebFetch: 'web', WebSearch: 'web',
-  TodoWrite: 'todo',
+  Bash: 'execute', PowerShell: 'execute', Read: 'read', NotebookRead: 'read', Edit: 'edit', Write: 'edit',
+  MultiEdit: 'edit', NotebookEdit: 'edit', Grep: 'search', Glob: 'search', Agent: 'agent', Task: 'agent',
+  WebFetch: 'web', WebSearch: 'web', TodoWrite: 'todo',
 };
 
 /** Copilot agent `tools` → Claude tool names. `null` = all tools. */
@@ -224,43 +230,46 @@ export function toolsCanonicalToCopilot(list) {
 }
 
 const COPILOT_EVENT_TO_PASCAL = {
-  sessionStart: 'SessionStart', sessionEnd: 'SessionEnd', userPromptSubmitted: 'UserPromptSubmit', preToolUse: 'PreToolUse',
-  postToolUse: 'PostToolUse', postToolUseFailure: 'PostToolUseFailure', agentStop: 'Stop', subagentStart: 'SubagentStart',
-  subagentStop: 'SubagentStop', preCompact: 'PreCompact', permissionRequest: 'PermissionRequest', notification: 'Notification',
+  sessionStart: 'SessionStart', sessionEnd: 'SessionEnd', userPromptSubmitted: 'UserPromptSubmit',
+  preToolUse: 'PreToolUse', postToolUse: 'PostToolUse', postToolUseFailure: 'PostToolUseFailure', agentStop: 'Stop',
+  subagentStart: 'SubagentStart', subagentStop: 'SubagentStop', preCompact: 'PreCompact',
+  permissionRequest: 'PermissionRequest', notification: 'Notification',
 };
 const PASCAL_TO_COPILOT_EVENT = Object.fromEntries(Object.entries(COPILOT_EVENT_TO_PASCAL).map(([a, b]) => [b, a]));
 const COPILOT_ONLY_EVENTS = ['errorOccurred', 'userPromptTransformed'];
 const EVENTS = {
-  claude: ['SessionStart', 'Setup', 'SessionEnd', 'UserPromptSubmit', 'UserPromptExpansion', 'Stop', 'StopFailure', 'PreToolUse',
-    'PermissionRequest', 'PermissionDenied', 'PostToolUse', 'PostToolUseFailure', 'PostToolBatch', 'SubagentStart', 'SubagentStop',
-    'TaskCreated', 'TaskCompleted', 'TeammateIdle', 'PreCompact', 'PostCompact', 'PreModelSwitch', 'PostModelSwitch', 'Elicitation',
-    'ElicitationResult', 'Notification', 'MessageDisplay', 'InstructionsLoaded', 'ConfigChange', 'CwdChanged', 'DirectoryAdded',
-    'FileChanged', 'WorktreeCreate', 'WorktreeRemove'],
+  claude: ['SessionStart', 'Setup', 'SessionEnd', 'UserPromptSubmit', 'UserPromptExpansion', 'Stop', 'StopFailure',
+    'PreToolUse', 'PermissionRequest', 'PermissionDenied', 'PostToolUse', 'PostToolUseFailure', 'PostToolBatch',
+    'SubagentStart', 'SubagentStop', 'TaskCreated', 'TaskCompleted', 'TeammateIdle', 'PreCompact', 'PostCompact',
+    'PreModelSwitch', 'PostModelSwitch', 'Elicitation', 'ElicitationResult', 'Notification', 'MessageDisplay',
+    'InstructionsLoaded', 'ConfigChange', 'CwdChanged', 'DirectoryAdded', 'FileChanged', 'WorktreeCreate',
+    'WorktreeRemove'],
   codex: ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest', 'PostToolUse', 'Stop',
     'SubagentStart', 'SubagentStop', 'PreCompact', 'PostCompact', 'PreModelRequest', 'PostModelRequest', 'Interrupt'],
 };
 // Events that take a matcher: in Claude Code all but these, in Codex only these.
 const CLAUDE_NO_MATCHER = ['UserPromptSubmit', 'PostToolBatch', 'Stop', 'TeammateIdle', 'TaskCreated', 'TaskCompleted',
   'CwdChanged', 'WorktreeCreate', 'WorktreeRemove', 'MessageDisplay'];
-const CODEX_MATCHER_EVENTS = ['PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact', 'SessionStart',
-  'SessionEnd', 'SubagentStart', 'SubagentStop'];
+const CODEX_MATCHER_EVENTS = ['PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact',
+  'SessionStart', 'SessionEnd', 'SubagentStart', 'SubagentStop'];
 const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied'];
 // Handler fields each host supports beyond command and timeout (kept when porting between them).
 const HOOK_EXTRAS = { copilot: [], claude: ['async', 'asyncRewake', 'onFailure', 'if', 'statusMessage', 'once'],
   codex: ['async', 'statusMessage', 'additionalContextLimit'] };
 
 const CANON_IDENTITY = Object.fromEntries(CLAUDE_TOOLS.map((t) => [t, t]));
-const COPILOT_TOOL_TO_CANON = { ...CANON_IDENTITY, bash: 'Bash', powershell: 'Bash', view: 'Read', create: 'Write', edit: 'Edit',
-  str_replace: 'Edit', str_replace_editor: 'Edit', grep: 'Grep', glob: 'Glob', task: 'Agent' };
+const COPILOT_TOOL_TO_CANON = { ...CANON_IDENTITY, bash: 'Bash', powershell: 'Bash', view: 'Read', create: 'Write',
+  edit: 'Edit', str_replace: 'Edit', str_replace_editor: 'Edit', grep: 'Grep', glob: 'Glob', task: 'Agent' };
 const CODEX_TOOL_TO_CANON = { ...CANON_IDENTITY, apply_patch: 'Edit', spawn_agent: 'Agent' };
-const CANON_TO_COPILOT_TOOL = { Bash: 'bash', Read: 'view', Write: 'create', Edit: 'edit', MultiEdit: 'edit', Grep: 'grep',
-  Glob: 'glob', Agent: 'task', Task: 'task' };
-const CANON_TO_CODEX_TOOL = { Bash: 'Bash', Write: 'Write', Edit: 'Edit', MultiEdit: 'Edit', Agent: 'Agent', Task: 'Agent' };
+const CANON_TO_COPILOT_TOOL = { Bash: 'bash', Read: 'view', Write: 'create', Edit: 'edit', MultiEdit: 'edit',
+  Grep: 'grep', Glob: 'glob', Agent: 'task', Task: 'task' };
+const CANON_TO_CODEX_TOOL = { Bash: 'Bash', Write: 'Write', Edit: 'Edit', MultiEdit: 'Edit', Agent: 'Agent',
+  Task: 'Agent' };
 
 /** Translate a matcher that is a plain name list; regex matchers are returned unchanged with `regex: true`. */
 function translateMatcher(matcher, table, { keepUnknown = true } = {}) {
-  if (matcher == null || matcher === '' || matcher === '*') return { matcher: matcher ?? null, unknown: [], regex: false };
-  const m = String(matcher);
+  const m = matcher == null ? '' : String(matcher);
+  if (m === '' || m === '*') return { matcher: matcher ?? null, unknown: [], regex: false };
   if (!/^[A-Za-z0-9_|, -]+$/.test(m)) return { matcher: m, unknown: [], regex: true };
   const names = m.split(/[|,]/).map((s) => s.trim()).filter(Boolean);
   const out = names.filter((n) => table[n] || keepUnknown).map((n) => table[n] || n);
@@ -271,22 +280,24 @@ function translateMatcher(matcher, table, { keepUnknown = true } = {}) {
 // Hooks: one intermediate form (IR), parsed from and rendered to each host's file.
 
 function parseJsonText(text, file) {
-  try { return JSON.parse(stripBom(String(text))); } catch (err) { throw usageError(`${file}: not valid JSON (${err.message})`); }
+  try { return JSON.parse(stripBom(String(text))); } catch (err) {
+    throw usageError(`${file}: not valid JSON (${err.message})`);
+  }
 }
 
 /** One handler as IR: `exec {program, args}` or shell strings (`posix`, `windows` + `windowsShell`). */
 function hookEntry(h, host, event, matcher, file, notes) {
   const e = { event, matcher, exec: null, posix: null, windows: null, windowsShell: null, timeout: h.timeout ?? null,
     cwd: null, env: null, extra: {}, source: host };
-  const argv = (program, args) => ({ program: String(program ?? ''), args: Array.isArray(args) ? args.map(String) : [] });
+  const argv = (prog, args) => ({ program: String(prog ?? ''), args: Array.isArray(args) ? args.map(String) : [] });
   if (host === 'copilot') {
     const shared = h.command && !h.exec ? h.command : null;
     if (h.exec) e.exec = argv(h.exec, h.args);
-    Object.assign(e, { posix: h.bash ?? shared, windows: h.powershell ?? shared, timeout: h.timeoutSec ?? h.timeout ?? null,
+    Object.assign(e, { posix: h.bash ?? shared, windows: h.powershell ?? shared, timeout: h.timeoutSec ?? e.timeout,
       cwd: h.cwd ?? null, env: h.env && typeof h.env === 'object' ? h.env : null });
     if (!e.exec && !e.posix && h.command && Array.isArray(h.args)) e.exec = argv(h.command, h.args);
     if (e.windows) e.windowsShell = 'powershell';
-    if (h.command && (h.bash || h.powershell)) notes.push(`${file}: an entry has both "command" and bash/powershell; bash/powershell win`);
+    if (h.command && (h.bash || h.powershell)) notes.push(`${file}: "command" next to bash/powershell is ignored`);
   } else if (host === 'claude') {
     if (Array.isArray(h.args)) e.exec = argv(h.command, h.args);
     else if (h.shell === 'powershell') Object.assign(e, { windows: h.command ?? null, windowsShell: 'powershell' });
@@ -313,6 +324,7 @@ export function parseHookConfig(text, host, file = 'hooks.json') {
   const dropped = [];
   const notes = [];
   const entries = [];
+  const drop = (field, reason, value) => dropped.push(dropRow(file, field, reason, value));
   const hooks = parseJsonText(text, file)?.hooks;
   if (!hooks || typeof hooks !== 'object') return { entries, dropped, notes: [`${file} has no "hooks" object`] };
   for (const [evKey, list] of Object.entries(hooks)) {
@@ -320,7 +332,7 @@ export function parseHookConfig(text, host, file = 'hooks.json') {
     const event = camel ? COPILOT_EVENT_TO_PASCAL[evKey] || evKey
       : EVENTS.claude.includes(evKey) || EVENTS.codex.includes(evKey) ? evKey : null;
     if (!event || !Array.isArray(list)) {
-      dropped.push(dropRow(file, `hooks.${evKey}`, event ? 'event value is not an array' : `unknown ${host} hook event`));
+      drop(`hooks.${evKey}`, event ? 'event value is not an array' : `unknown ${host} hook event`);
       continue;
     }
     const table = camel ? COPILOT_TOOL_TO_CANON : host === 'codex' ? CODEX_TOOL_TO_CANON : CANON_IDENTITY;
@@ -328,15 +340,15 @@ export function parseHookConfig(text, host, file = 'hooks.json') {
       for (const h of (Array.isArray(item.hooks) ? item.hooks : [item]).filter((x) => x && typeof x === 'object')) {
         const type = h.type || 'command';
         if (type !== 'command') {
-          dropped.push(dropRow(file, `hooks.${evKey}[].type`, `"${type}" handlers are not ported (only command hooks)`, type));
+          drop(`hooks.${evKey}[].type`, `"${type}" handlers are not ported (only command hooks)`, type);
           continue;
         }
         for (const k of host === 'copilot' ? ['windows', 'linux', 'osx', 'hookSpecificOutput'] : []) {
-          if (k in h) dropped.push(dropRow(file, `hooks.${evKey}[].${k}`, 'VS Code Local-harness key; Copilot CLI and the cloud agent ignore it'));
+          if (k in h) drop(`hooks.${evKey}[].${k}`, 'VS Code Local-harness key; Copilot CLI and cloud agent ignore it');
         }
         const tm = translateMatcher(h.matcher ?? item.matcher ?? null, table);
         const e = hookEntry(h, host, event, tm.matcher, file, notes);
-        if (!e.exec && !e.posix && !e.windows) { dropped.push(dropRow(file, `hooks.${evKey}[]`, 'entry has no command')); continue; }
+        if (!e.exec && !e.posix && !e.windows) { drop(`hooks.${evKey}[]`, 'entry has no command'); continue; }
         if (tm.regex) e.matcherRegex = true;
         entries.push(e);
       }
@@ -350,9 +362,10 @@ const relativeArg = (a) => !/^[-$/~\\]|^[A-Za-z]:|^[a-z]+:\/\//i.test(a) && (a.i
 
 /** Copilot preToolUse fails closed when the command crashes: print {} when the runtime is missing (§7.7). */
 function copilotGuard(prog, bash, ps) {
-  if (!prog || !/^[A-Za-z0-9_.-]+$/.test(prog)) return { bash, ps };
+  if (!/^[A-Za-z0-9_.-]+$/.test(prog || '')) return { bash, ps };
+  const call = ps.startsWith('& ') ? ps : `& ${ps}`;
   return { bash: `command -v ${prog} >/dev/null 2>&1 && ${bash} || echo {}`,
-    ps: `if (Get-Command ${prog} -ErrorAction SilentlyContinue) { $o = ${ps.startsWith('& ') ? ps : `& ${ps}`} 2>$null; `
+    ps: `if (Get-Command ${prog} -ErrorAction SilentlyContinue) { $o = ${call} 2>$null; `
       + 'if ($LASTEXITCODE -eq 0 -and $o) { $o } else { \'{}\' } } else { \'{}\' }; exit 0' };
 }
 
@@ -366,18 +379,19 @@ function copilotHook(e, ev, argv, { guard, pluginRoot }, manual, notes) {
   } else {
     if (e.posix) out.bash = e.posix;
     if (e.windows) out.powershell = e.windowsShell === 'cmd' ? `cmd /c ${e.windows}` : e.windows;
-    if (e.windowsShell === 'cmd') manual.add(`Check the PowerShell command of the ${ev} hook: it wraps the cmd.exe command in "cmd /c".`);
+    if (e.windowsShell === 'cmd') manual.add(`Check the PowerShell command of the ${ev} hook (it wraps "cmd /c").`);
     if (!out.bash) manual.add(`Write a bash command for the ${ev} hook; the cloud agent runs only bash/command.`);
-    if (!out.powershell) manual.add(`Write a PowerShell command for the ${ev} hook; Copilot on Windows runs the powershell field.`);
+    if (!out.powershell) manual.add(`Write a PowerShell command for the ${ev} hook; Copilot on Windows runs it.`);
   }
   if (e.cwd || (pluginRoot && ev === 'preToolUse')) out.cwd = e.cwd || '${PLUGIN_ROOT}';
   if (e.env) out.env = e.env;
   out.timeoutSec = e.timeout ?? 30;
-  if (Number(out.timeoutSec) > 30) notes.add(`The ${ev} hook keeps a ${out.timeoutSec} s timeout; Copilot expects at most 30 s.`);
+  if (Number(out.timeoutSec) > 30) notes.add(`The ${ev} hook keeps its ${out.timeoutSec} s timeout (Copilot: <= 30).`);
   if (e.matcher && TOOL_EVENTS.includes(e.event)) {
-    const tm = e.matcherRegex ? { matcher: e.matcher, unknown: [] } : translateMatcher(e.matcher, CANON_TO_COPILOT_TOOL);
+    const tm = e.matcherRegex ? { matcher: e.matcher, unknown: [] }
+      : translateMatcher(e.matcher, CANON_TO_COPILOT_TOOL);
     out.matcher = tm.matcher;
-    if (tm.unknown.length) manual.add(`Matcher tool names without a Copilot equivalent were kept as-is: ${tm.unknown.join(', ')}.`);
+    if (tm.unknown.length) manual.add(`Matcher names with no Copilot equivalent were kept: ${tm.unknown.join(', ')}.`);
   }
   return out;
 }
@@ -385,32 +399,39 @@ function copilotHook(e, ev, argv, { guard, pluginRoot }, manual, notes) {
 /** The Claude Code or Codex handler for one IR entry. */
 function pascalHook(e, argv, target, pluginRoot, drop, manual) {
   const h = { type: 'command' };
+  const win = e.windowsShell === 'cmd' ? 'cmd.exe' : 'PowerShell';
   if (target === 'claude' && argv && pluginRoot) [h.command, ...h.args] = argv; // exec form with ${CLAUDE_PLUGIN_ROOT}
   else if (target === 'claude' && argv) {
-    // Repository settings: Copilot CLI and VS Code run these hooks too (in bash and PowerShell, exec
+    // Repository settings: Copilot CLI and VS Code run these hooks too (in bash and PowerShell; exec
     // form undocumented), so one shell string; ${CLAUDE_PROJECT_DIR} would not expand there.
     h.command = joinPosix(argv);
     if (argv.slice(1).some(relativeArg)) {
-      manual.add('Script paths in .claude/settings.json hooks are repository-relative (Copilot runs them too): start the hosts at the repository root.');
+      manual.add('Hook script paths in .claude/settings.json are repository-relative (Copilot runs them too): '
+        + 'start the hosts at the repository root.');
     }
   } else if (target === 'claude') {
     h.command = e.posix || e.windows;
     if (e.posix && e.windows && e.windows !== e.posix) {
-      drop('powershell/commandWindows', 'Claude Code runs one command per hook (Git Bash on Windows when installed, else PowerShell)', e.windows);
+      drop('powershell/commandWindows', 'Claude Code runs one command per hook (Git Bash on Windows, else PowerShell)',
+        e.windows);
     }
     if (!e.posix) {
       h.shell = 'powershell';
-      manual.add(`The ${e.event} hook only had a ${e.windowsShell === 'cmd' ? 'cmd.exe' : 'PowerShell'} command; Claude Code runs it with shell: powershell; check it.`);
+      manual.add(`The ${e.event} hook only had a ${win} command; it now runs with shell: powershell.`);
     }
   } else if (argv) Object.assign(h, { command: joinPosix(argv), commandWindows: joinCmd(argv) });
   else {
     const simple = e.windows && e.windowsShell !== 'cmd' ? splitSimpleCommand(e.windows) : null;
     if (e.posix) h.command = e.posix;
-    if (e.windows) h.commandWindows = e.windowsShell === 'cmd' ? e.windows : simple ? joinCmd(simple) : `pwsh -NoProfile -Command ${JSON.stringify(e.windows)}`;
-    if (e.windows && e.windowsShell !== 'cmd' && !simple) {
-      manual.add(`Check the Windows command of the ${e.event} hook: Codex runs commandWindows in cmd.exe, so the PowerShell command was wrapped in pwsh -Command.`);
+    if (e.windowsShell === 'cmd' || simple) h.commandWindows = simple ? joinCmd(simple) : e.windows;
+    else if (e.windows) {
+      h.commandWindows = `pwsh -NoProfile -Command ${JSON.stringify(e.windows)}`;
+      manual.add(`Check the Windows command of the ${e.event} hook: it runs in cmd.exe, wrapped in pwsh -Command.`);
     }
-    if (!h.command) { h.command = h.commandWindows; manual.add(`Write a POSIX command for the ${e.event} hook (only a Windows command existed).`); }
+    if (!h.command) {
+      h.command = h.commandWindows;
+      manual.add(`Write a POSIX command for the ${e.event} hook (it had only a ${win} one).`);
+    }
     if (!h.commandWindows) manual.add(`Add commandWindows to the ${e.event} hook if Windows users run Codex.`);
   }
   if (e.timeout != null) h.timeout = Number(e.timeout);
@@ -418,6 +439,19 @@ function pascalHook(e, argv, target, pluginRoot, drop, manual) {
   if (e.cwd) drop('cwd', `${HOST_NAME[target]} hooks have no cwd`, e.cwd);
   if (e.env) drop('env', `${HOST_NAME[target]} hooks have no env`, Object.keys(e.env).join(','));
   return h;
+}
+
+/** The matcher a Claude Code or Codex event takes, `undefined` to skip the entry. */
+function pascalMatcher(e, target, drop, notes) {
+  const takes = target === 'claude' ? !CLAUDE_NO_MATCHER.includes(e.event) : CODEX_MATCHER_EVENTS.includes(e.event);
+  if (e.matcher && !takes) notes.add(`${e.event} ignores matchers in ${target}; the matcher was omitted.`);
+  if (!e.matcher || !takes) return null;
+  if (target !== 'codex' || !TOOL_EVENTS.includes(e.event) || e.matcherRegex) return e.matcher;
+  const tm = translateMatcher(e.matcher, CANON_TO_CODEX_TOOL, { keepUnknown: false });
+  const only = 'Codex hooks see Bash, apply_patch (Edit/Write) and Agent only';
+  if (tm.unknown.length) drop('matcher', only, tm.unknown.join('|'));
+  if (!tm.matcher) drop(`hooks.${e.event}`, 'no matcher tool name exists in Codex; entry skipped');
+  return tm.matcher || undefined;
 }
 
 /**
@@ -432,46 +466,42 @@ export function renderHookConfig(entries, target, { file = 'hooks', guard = fals
   const notes = new Set();
   const hooks = {};
   const drop = (field, reason, value) => dropped.push(dropRow(file, field, reason, value));
-  const rootVar = (a) => (!pluginRoot ? a : target === 'claude'
-    ? a.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, '${CLAUDE_PLUGIN_ROOT}/').replace(/\$\{PLUGIN_ROOT\}/g, '${CLAUDE_PLUGIN_ROOT}')
-    : a.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, '${PLUGIN_ROOT}'));
+  const PROJECT = /^\$\{CLAUDE_PROJECT_DIR\}\//;
+  const rootVar = (a) => (!pluginRoot ? a
+    : target !== 'claude' ? a.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, '${PLUGIN_ROOT}')
+      : a.replace(PROJECT, '${CLAUDE_PLUGIN_ROOT}/').replace(/\$\{PLUGIN_ROOT\}/g, '${CLAUDE_PLUGIN_ROOT}'));
   const rebase = (a) => {
-    if ((pluginRoot && target === 'claude') || !/^\$\{CLAUDE_PROJECT_DIR\}\//.test(a)) return a;
-    notes.add('Paths under ${CLAUDE_PROJECT_DIR} became repository-relative; the hook must run from the repository root.');
-    return a.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, '');
+    if ((pluginRoot && target === 'claude') || !PROJECT.test(a)) return a;
+    notes.add('Paths under ${CLAUDE_PROJECT_DIR} became repository-relative; run the hook from the repository root.');
+    return a.replace(PROJECT, '');
   };
   for (const e of entries) {
     const argv = e.exec ? [e.exec.program, ...e.exec.args.map(rebase)].map(rootVar) : null;
-    const event = target === 'copilot' ? PASCAL_TO_COPILOT_EVENT[e.event] || (COPILOT_ONLY_EVENTS.includes(e.event) && e.event)
-      : EVENTS[target].includes(e.event) && e.event;
+    const event = target !== 'copilot' ? EVENTS[target].includes(e.event) && e.event
+      : PASCAL_TO_COPILOT_EVENT[e.event] || (COPILOT_ONLY_EVENTS.includes(e.event) && e.event);
     if (!event) { drop(`hooks.${e.event}`, `${HOST_NAME[target]} has no ${e.event} event`); continue; }
-    for (const [k, v] of Object.entries(e.extra)) if (!HOOK_EXTRAS[target].includes(k)) drop(k, `${HOST_NAME[target]} hooks have no "${k}"`, v);
+    for (const [k, v] of Object.entries(e.extra)) {
+      if (!HOOK_EXTRAS[target].includes(k)) drop(k, `${HOST_NAME[target]} hooks have no "${k}"`, v);
+    }
     if (target === 'copilot') {
       (hooks[event] ||= []).push(copilotHook(e, event, argv, { guard, pluginRoot }, manual, notes));
       continue;
     }
-    let matcher = e.matcher;
-    if (e.matcher && !(target === 'claude' ? !CLAUDE_NO_MATCHER.includes(e.event) : CODEX_MATCHER_EVENTS.includes(e.event))) {
-      notes.add(`${e.event} ignores matchers in ${target}; the matcher was omitted.`);
-      matcher = null;
-    } else if (e.matcher && target === 'codex' && TOOL_EVENTS.includes(e.event) && !e.matcherRegex) {
-      const tm = translateMatcher(e.matcher, CANON_TO_CODEX_TOOL, { keepUnknown: false });
-      if (tm.unknown.length) drop('matcher', 'Codex hooks see Bash, apply_patch (alias Edit/Write) and Agent only', tm.unknown.join('|'));
-      if (!tm.matcher) { drop(`hooks.${e.event}`, 'no matcher tool name exists in Codex; entry skipped'); continue; }
-      matcher = tm.matcher;
-    }
-    const groups = (hooks[e.event] ||= []);
+    const matcher = pascalMatcher(e, target, drop, notes);
+    if (matcher === undefined) continue;
+    const groups = (hooks[event] ||= []);
     let g = groups.find((x) => (x.matcher ?? null) === matcher);
     if (!g) groups.push((g = matcher ? { matcher, hooks: [] } : { hooks: [] }));
     g.hooks.push(pascalHook(e, argv, target, pluginRoot, drop, manual));
   }
   if (entries.some((e) => e.source !== target)) {
     manual.add(target === 'copilot'
-      ? "Hook handlers must print Copilot's output shape: top-level additionalContext / permissionDecision / decision (no hookSpecificOutput)."
+      ? "Hook handlers must print Copilot's output shape: top-level additionalContext / permissionDecision / decision."
       : `Hook handlers must print ${HOST_NAME[target]}'s output shape (hookSpecificOutput / decision)`
         + (target === 'codex' ? '; Codex rejects unknown output fields.' : ", not Copilot's top-level fields."));
   }
-  return { doc: target === 'copilot' ? { version: 1, hooks } : { hooks }, dropped, manual: [...manual], notes: [...notes] };
+  const doc = target === 'copilot' ? { version: 1, hooks } : { hooks };
+  return { doc, dropped, manual: [...manual], notes: [...notes] };
 }
 
 function jsonObject(text) {
@@ -497,22 +527,24 @@ export function mergeHooks(existingText, doc) {
 // MCP servers: `mcpServers` JSON (Claude, Copilot), VS Code `servers`, Agent Plugins mcp.json, Codex TOML.
 
 const tomlKey = (k) => (/^[A-Za-z0-9_-]+$/.test(k) ? k : JSON.stringify(k));
+const tomlPairs = (v) => Object.entries(v).map(([k, x]) => `${tomlKey(k)} = ${tomlValue(x)}`).join(', ');
 const tomlValue = (v) => (Array.isArray(v) ? `[${v.map(tomlValue).join(', ')}]`
-  : v && typeof v === 'object' ? `{ ${Object.entries(v).map(([k, x]) => `${tomlKey(k)} = ${tomlValue(x)}`).join(', ')} }`
+  : v && typeof v === 'object' ? `{ ${tomlPairs(v)} }`
     : typeof v === 'boolean' || typeof v === 'number' ? String(v) : JSON.stringify(String(v)));
 
 const ENV_REF = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}$/;
 const INPUT_RE = /\$\{input:([A-Za-z0-9_.-]+)(?::[^}]*)?\}/g;
 const LOOPBACK = /^http:\/\/(localhost|127\.|\[::1\])/i;
+const MCP_KEYS = ['type', 'command', 'args', 'env', 'cwd', 'url', 'headers', 'tools'];
 const CODEX_MCP_KEYS = ['command', 'args', 'env', 'env_vars', 'cwd', 'url', 'http_headers', 'env_http_headers',
   'bearer_token_env_var', 'enabled_tools', 'enabled'];
 const inputEnvName = (id) => id.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'INPUT';
 const isAllTools = (tools) => !tools || (tools.length === 1 && tools[0] === '*');
 
 function parseCodexServer(name, s) {
-  const env = { ...(s.env || {}) };
+  const env = { ...s.env };
   for (const v of s.env_vars || []) { const n = typeof v === 'string' ? v : v?.name; if (n) env[n] = `\${${n}}`; }
-  const headers = { ...(s.http_headers || {}) };
+  const headers = { ...s.http_headers };
   for (const [h, envName] of Object.entries(s.env_http_headers || {})) headers[h] = `\${${envName}}`;
   if (s.bearer_token_env_var) headers.Authorization = `Bearer \${${s.bearer_token_env_var}}`;
   return { name, transport: s.url ? 'http' : 'stdio', command: s.command ?? null, args: (s.args || []).map(String), env,
@@ -521,44 +553,51 @@ function parseCodexServer(name, s) {
 }
 
 /**
- * Parse an MCP config into `{ servers[{name, transport, command, args, env, cwd, url, headers, tools}], dropped[], manual[] }`.
- * `dialect`: 'mcpServers' (.mcp.json, .github/mcp.json), 'vscode' (`servers`, `${input:}`), 'agent-plugins', 'toml'.
+ * Parse an MCP config into `{ servers[{name, transport, command, args, env, cwd, url, headers, tools}], dropped[],
+ * manual[] }`. `dialect`: 'mcpServers' (.mcp.json, .github/mcp.json), 'vscode' (`servers`, `${input:}`),
+ * 'agent-plugins' or 'toml' (Codex config.toml).
  */
 export function parseMcpConfig(text, dialect, file = 'mcp config') {
   const dropped = [];
   const manual = [];
+  const servers = [];
   if (dialect === 'toml') {
-    const map = parseToml(String(text ?? ''), { lenient: true }).value?.mcp_servers || {};
-    const servers = Object.entries(map).filter(([, s]) => s && typeof s === 'object').map(([name, s]) => {
-      for (const k of Object.keys(s)) if (!CODEX_MCP_KEYS.includes(k)) dropped.push(dropRow(file, `mcp_servers.${name}.${k}`, 'Codex-only MCP setting'));
-      return parseCodexServer(name, s);
-    });
+    for (const [name, s] of Object.entries(parseToml(String(text ?? ''), { lenient: true }).value?.mcp_servers || {})) {
+      if (!s || typeof s !== 'object') continue;
+      for (const k of Object.keys(s).filter((x) => !CODEX_MCP_KEYS.includes(x))) {
+        dropped.push(dropRow(file, `mcp_servers.${name}.${k}`, 'Codex-only MCP setting'));
+      }
+      servers.push(parseCodexServer(name, s));
+    }
     return { servers, dropped, manual };
   }
   const doc = parseJsonText(text, file);
   const inputs = new Map((Array.isArray(doc?.inputs) ? doc.inputs : []).map((x) => [String(x.id), x]));
-  const map = dialect === 'vscode' ? doc?.servers || {} : doc?.mcpServers || (doc && !doc.servers && !doc.$schema ? doc : {});
+  const bare = doc && !doc.servers && !doc.$schema ? doc : {};
+  const map = (dialect === 'vscode' ? doc?.servers : doc?.mcpServers || bare) || {};
   // VS Code ${input:id} prompts become ${ID} environment references (password inputs are never written).
   const fix = (s) => String(s).replace(INPUT_RE, (_, id) => {
     const secret = inputs.get(id)?.password ? '; password inputs are never written to files' : '';
-    manual.push(`Set the environment variable ${inputEnvName(id)} before starting the host (it replaces the VS Code input "${id}"${secret}).`);
+    manual.push(`Set the environment variable ${inputEnvName(id)} before starting the host (it replaces the VS Code `
+      + `input "${id}"${secret}).`);
     return `\${${inputEnvName(id)}}`;
   });
   const fixMap = (o) => Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, fix(v)]));
-  const servers = [];
-  for (const [name, s] of Object.entries(map).filter(([, x]) => x && typeof x === 'object')) {
+  for (const [name, s] of Object.entries(map)) {
+    if (!s || typeof s !== 'object') continue;
     const t = String(s.type || (s.url ? 'http' : 'stdio')).toLowerCase();
-    const transport = t === 'sse' ? 'sse' : ['http', 'streamable-http', 'streamablehttp'].includes(t) ? 'http' : 'stdio';
-    servers.push({ name, transport, command: s.command ?? null, args: (s.args || []).map(fix), env: fixMap(s.env), cwd: s.cwd ?? null,
-      url: s.url ? fix(s.url) : null, headers: fixMap(s.headers), tools: Array.isArray(s.tools) ? s.tools : null });
-    for (const k of Object.keys(s).filter((x) => !['type', 'command', 'args', 'env', 'cwd', 'url', 'headers', 'tools'].includes(x))) {
-      dropped.push(dropRow(file, `${dialect === 'vscode' ? 'servers' : 'mcpServers'}.${name}.${k}`,
-        k === 'envFile' ? 'VS Code-only; load the env file yourself or set the variables' : 'host-specific MCP field',
+    const transport = t === 'sse' ? 'sse' : /^(http|streamable-?http)$/.test(t) ? 'http' : 'stdio';
+    servers.push({ name, transport, command: s.command ?? null, args: (s.args || []).map(fix), env: fixMap(s.env),
+      cwd: s.cwd ?? null, url: s.url ? fix(s.url) : null, headers: fixMap(s.headers),
+      tools: Array.isArray(s.tools) ? s.tools : null });
+    for (const k of Object.keys(s).filter((x) => !MCP_KEYS.includes(x))) {
+      const why = k === 'envFile' ? 'VS Code-only; load the env file yourself' : 'host-specific MCP field';
+      dropped.push(dropRow(file, `${dialect === 'vscode' ? 'servers' : 'mcpServers'}.${name}.${k}`, why,
         typeof s[k] === 'string' ? s[k] : undefined));
     }
   }
   const used = new Set([...JSON.stringify(map).matchAll(INPUT_RE)].map((m) => m[1]));
-  for (const id of inputs.keys()) if (!used.has(id)) dropped.push(dropRow(file, `inputs.${id}`, 'unused VS Code input'));
+  for (const id of inputs.keys()) if (!used.has(id)) dropped.push(dropRow(file, `inputs.${id}`, 'unused input'));
   return { servers, dropped, manual };
 }
 
@@ -568,18 +607,18 @@ function codexServerToml(s, file, dropped, manual) {
   const literal = {};
   const fromEnv = {};
   if (s.transport === 'sse') {
-    dropped.push(dropRow(file, `${s.name}.type`, 'Codex supports stdio and streamable HTTP; check that the endpoint speaks streamable HTTP', 'sse'));
+    dropped.push(dropRow(file, `${s.name}.type`, 'Codex speaks stdio and streamable HTTP; check the endpoint', 'sse'));
   }
   if (s.transport === 'stdio') {
     kv('command', s.command || '');
     if (s.args.length) kv('args', s.args);
     for (const [k, v] of Object.entries(s.env || {})) {
       if (ENV_REF.exec(v)?.[1] === k) fromEnv[k] = k;
-      else if (/\$\{/.test(v)) manual.push(`Codex does not expand "${v}" in env; set ${k} for ${s.name} in the environment Codex starts from.`);
+      else if (/\$\{/.test(v)) manual.push(`Codex does not expand "${v}" in env: set ${k} for ${s.name} yourself.`);
       else literal[k] = v;
     }
-    if (Object.keys(literal).length) kv('env', literal);
-    if (Object.keys(fromEnv).length) kv('env_vars', Object.keys(fromEnv));
+    if (some(literal)) kv('env', literal);
+    if (some(fromEnv)) kv('env_vars', Object.keys(fromEnv));
     if (s.cwd) kv('cwd', s.cwd);
   } else {
     kv('url', s.url || '');
@@ -587,11 +626,11 @@ function codexServerToml(s, file, dropped, manual) {
       const bearer = /^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(v);
       if (/^authorization$/i.test(h) && bearer) kv('bearer_token_env_var', bearer[1]);
       else if (ENV_REF.test(v)) fromEnv[h] = ENV_REF.exec(v)[1];
-      else if (/\$\{/.test(v)) manual.push(`Header ${h} of ${s.name} mixes text and a variable; Codex supports whole-value env_http_headers only.`);
+      else if (/\$\{/.test(v)) manual.push(`Header ${h} of ${s.name} mixes text and a variable (Codex: whole values).`);
       else literal[h] = v;
     }
-    if (Object.keys(literal).length) kv('http_headers', literal);
-    if (Object.keys(fromEnv).length) kv('env_http_headers', fromEnv);
+    if (some(literal)) kv('http_headers', literal);
+    if (some(fromEnv)) kv('env_http_headers', fromEnv);
   }
   if (!isAllTools(s.tools)) kv('enabled_tools', s.tools);
   if (s.enabled === false) kv('enabled', false);
@@ -602,35 +641,37 @@ function codexServerToml(s, file, dropped, manual) {
 function agentPluginsServer(s, file, dropped) {
   const e = { type: s.transport === 'http' ? 'streamable-http' : s.transport };
   const drop = (field, reason, value) => dropped.push(dropRow(file, `${s.name}.${field}`, reason, value));
+  const keep = (map, test, field, reason) => {
+    const out = {};
+    for (const [k, v] of Object.entries(map || {})) {
+      if (test(v)) out[k] = v;
+      else drop(`${field}.${k}`, reason, field === 'env' ? v : undefined);
+    }
+    return out;
+  };
   if (s.transport === 'stdio') {
     const parts = /\s/.test(s.command || '') ? splitSimpleCommand(s.command) : null;
     e.command = parts ? parts[0] : s.command || '';
     const args = [...(parts ? parts.slice(1) : []), ...s.args];
     if (args.length) e.args = args;
-    const env = {};
-    for (const [k, v] of Object.entries(s.env || {})) {
-      if (!/\$\{(?!PLUGIN_ROOT\}|PLUGIN_DATA\})/.test(v)) env[k] = v;
-      else drop(`env.${k}`, 'Agent Plugins expands only ${PLUGIN_ROOT} and ${PLUGIN_DATA}; users must set this variable themselves', v);
-    }
-    if (Object.keys(env).length) e.env = env;
-    if (s.cwd && /^(\.\/|\$\{PLUGIN_ROOT\}|\$\{PLUGIN_DATA\})/.test(s.cwd)) e.cwd = s.cwd;
+    const env = keep(s.env, (v) => !/\$\{(?!PLUGIN_ROOT\}|PLUGIN_DATA\})/.test(v), 'env',
+      'Agent Plugins expands only ${PLUGIN_ROOT} and ${PLUGIN_DATA}; users must set this variable themselves');
+    if (some(env)) e.env = env;
+    if (/^(\.\/|\$\{PLUGIN_ROOT\}|\$\{PLUGIN_DATA\})/.test(s.cwd || '')) e.cwd = s.cwd;
     else if (s.cwd) drop('cwd', 'Agent Plugins cwd must start with ./, ${PLUGIN_ROOT} or ${PLUGIN_DATA}', s.cwd);
   } else {
     e.url = s.url;
-    const headers = {};
-    for (const [h, v] of Object.entries(s.headers || {})) {
-      if (!/\$\{/.test(v)) headers[h] = v;
-      else drop(`headers.${h}`, 'Agent Plugins never expands variables in headers and forbids secrets there; the host must handle authorization');
-    }
-    if (Object.keys(headers).length) e.headers = headers;
+    const headers = keep(s.headers, (v) => !/\$\{/.test(v), 'headers',
+      'Agent Plugins never expands variables in headers and forbids secrets there; the host must handle authorization');
+    if (some(headers)) e.headers = headers;
   }
   if (s.tools) drop('tools', 'Agent Plugins mcp.json has no tools allow-list');
   return e;
 }
 
 /**
- * Render servers for a target: 'claude' (.mcp.json), 'copilot' (.github/mcp.json), 'codex'
- * (config.toml text), 'agent-plugins' (plugin mcp.json). Returns `{ doc | text, blocks?, dropped[], manual[] }`.
+ * Render servers for a target: 'claude' (.mcp.json), 'copilot' (.github/mcp.json), 'codex' (config.toml text)
+ * or 'agent-plugins' (plugin mcp.json). Returns `{ doc | text, blocks?, dropped[], manual[] }`.
  */
 export function renderMcpConfig(servers, target, { file = 'mcp' } = {}) {
   const dropped = [];
@@ -643,20 +684,22 @@ export function renderMcpConfig(servers, target, { file = 'mcp' } = {}) {
   for (const s of servers) {
     if (target === 'agent-plugins') { out[s.name] = agentPluginsServer(s, file, dropped); continue; }
     const e = { type: target === 'copilot' && s.transport === 'stdio' ? 'local' : s.transport };
-    if (s.transport !== 'stdio') Object.assign(e, { url: s.url, ...(Object.keys(s.headers || {}).length ? { headers: s.headers } : {}) });
+    if (s.transport !== 'stdio') Object.assign(e, { url: s.url }, some(s.headers) ? { headers: s.headers } : {});
     else {
-      Object.assign(e, { command: s.command || '', ...(s.args.length ? { args: s.args } : {}), ...(Object.keys(s.env || {}).length ? { env: s.env } : {}) });
-      if (s.cwd) dropped.push(dropRow(file, `${s.name}.cwd`, `${HOST_NAME[target]} servers have no documented cwd`, s.cwd));
+      Object.assign(e, { command: s.command || '' }, s.args.length ? { args: s.args } : {});
+      if (some(s.env)) e.env = s.env;
     }
+    if (s.cwd) dropped.push(dropRow(file, `${s.name}.cwd`, `${HOST_NAME[target]} servers have no cwd`, s.cwd));
     if (target === 'copilot') e.tools = s.tools?.length ? s.tools : ['*'];
     else if (!isAllTools(s.tools)) {
-      dropped.push(dropRow(file, `${s.name}.tools`, 'Claude Code .mcp.json has no tools allow-list; use permissions instead', s.tools.join(',')));
+      const why = 'Claude Code .mcp.json has no tools allow-list; use permissions instead';
+      dropped.push(dropRow(file, `${s.name}.tools`, why, s.tools.join(',')));
     }
-    if (/^http:\/\//i.test(e.url || '') && !LOOPBACK.test(e.url)) manual.push(`${s.name}: use https for non-loopback MCP URLs.`);
+    if (/^http:\/\//i.test(e.url || '') && !LOOPBACK.test(e.url)) manual.push(`${s.name}: use https (remote URL).`);
     out[s.name] = e;
   }
-  const schema = target === 'agent-plugins' ? { $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json' } : {};
-  return { doc: { ...schema, mcpServers: out }, dropped, manual };
+  const doc = target === 'agent-plugins' ? { $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json' } : {};
+  return { doc: { ...doc, mcpServers: out }, dropped, manual };
 }
 
 /**
@@ -665,17 +708,17 @@ export function renderMcpConfig(servers, target, { file = 'mcp' } = {}) {
  * (a token in `env`, for example) is ever printed.
  */
 export function cloudAgentMcp(servers) {
-  const secret = (n) => (n.startsWith('COPILOT_MCP_') ? n : `COPILOT_MCP_${n}`);
-  const refs = (v) => String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g, (_, n) => `\${${secret(n)}}`);
+  const secret = (n) => `\${${n.startsWith('COPILOT_MCP_') ? n : `COPILOT_MCP_${n}`}}`;
+  const refs = (v) => String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g, (_, n) => secret(n));
   const header = (h, v) => (/\$\{/.test(v) || !/auth|token|key|secret|cookie/i.test(h) ? refs(v)
-    : `\${${secret(h.toUpperCase().replace(/[^A-Z0-9]+/g, '_'))}}`);
-  const cloud = servers.map((s) => ({ ...s,
-    env: Object.fromEntries(Object.entries(s.env || {}).map(([k, v]) => [k, `\${${secret(ENV_REF.exec(v)?.[1] || k.toUpperCase())}}`])),
-    headers: Object.fromEntries(Object.entries(s.headers || {}).map(([h, v]) => [h, header(h, v)])) }));
+    : secret(h.toUpperCase().replace(/[^A-Z0-9]+/g, '_')));
+  const map = (o, fn) => Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, fn(k, v)]));
+  const cloud = servers.map((s) => ({ ...s, env: map(s.env, (k, v) => secret(ENV_REF.exec(v)?.[1] || k.toUpperCase())),
+    headers: map(s.headers, header) }));
   const names = uniq(JSON.stringify(cloud.map((s) => [s.env, s.headers])).match(/COPILOT_MCP_[A-Z0-9_]+/g) || []);
-  const doc = JSON.stringify(renderMcpConfig(cloud, 'copilot').doc);
-  return `Copilot cloud agent reads MCP servers only from repository Settings > Copilot > MCP servers; paste: ${doc}`
-    + (names.length ? ` and add the Agents secrets ${names.join(', ')}.` : '');
+  const secrets = names.length ? ` and add the Agents secrets ${names.join(', ')}.` : '';
+  return 'Copilot cloud agent reads MCP servers only from repository Settings > Copilot > MCP servers; paste: '
+    + JSON.stringify(renderMcpConfig(cloud, 'copilot').doc) + secrets;
 }
 
 /** Add the rendered servers to an existing `mcpServers` file (servers already present are kept). */
@@ -690,21 +733,24 @@ export function mergeMcp(existingText, doc) {
 export function mergeToml(existingText, blocks) {
   const have = parseToml(existingText, { lenient: true }).value?.mcp_servers || {};
   let text = existingText;
-  for (const b of blocks.filter((x) => !(x.name in have))) text += (text && !text.endsWith('\n') ? '\n' : '') + (text.trim() ? '\n' : '') + b.text;
+  for (const b of blocks.filter((x) => !(x.name in have))) {
+    text += (text && !text.endsWith('\n') ? '\n' : '') + (text.trim() ? '\n' : '') + b.text;
+  }
   return text;
 }
 
 // ---------------------------------------------------------------------------
 // Markdown artifacts: instructions, scoped rules, agents, prompts, commands, chat modes, skills
 
-const markerLine = (src) => `<!-- generated by agentic-developer-companion port from ${src}; edit the source and re-run tooling port -->`;
-const stripMarker = (text) => String(text).replace(/^<!-- generated by agentic-developer-companion port from [^\n]*-->\r?\n/, '');
+const MARKER = 'generated by agentic-developer-companion port from';
+const markerLine = (src) => `<!-- ${MARKER} ${src}; edit the source and re-run tooling port -->`;
+const stripMarker = (text) => String(text).replace(new RegExp(`^<!-- ${MARKER} [^\\n]*-->\\r?\\n`), '');
 const IMPORT_RE = /(^|[\s(])@((?:\.{1,2}\/|[A-Za-z0-9_])[A-Za-z0-9_./-]*\.[A-Za-z0-9]+)(?=[\s),.;:]|$)/g;
 const trimBody = (s) => String(s).replace(/^\n+/, '');
 
-/** `@path` imports (Claude Code, Copilot CLI) outside code blocks and inline code: `[{ ref, line }]`. */
+/** `@path` imports (Claude Code, Copilot CLI) outside code blocks and inline code. */
 const findImports = (text) => markdownLines(text).flatMap((l) => (l.code ? []
-  : [...l.prose.matchAll(IMPORT_RE)].map((m) => ({ ref: m[2], line: l.n }))));
+  : [...l.prose.matchAll(IMPORT_RE)].map((m) => m[2])));
 
 /** Inline `@imports` recursively (depth 4, cycles skipped). Returns `{ text, missing[], files[] }`. */
 export function inlineImports(text, absFile, depth = 0, seen = new Set()) {
@@ -733,64 +779,61 @@ export function inlineImports(text, absFile, depth = 0, seen = new Set()) {
   return { text: lines.join('\n'), missing, files };
 }
 
-const sectionMarks = (id) => [`<!-- adc:port begin ${id} -->`, `<!-- adc:port end ${id} -->`];
-
-/** A merge function that replaces (or appends) the port-managed section for `id`. */
-function sectionMerge(id, block) {
-  const [begin, end] = sectionMarks(id);
+/** A merge function that replaces (or appends) the port-managed section for `id`; `strip` removes it. */
+function portSection(id, block = '') {
+  const [begin, end] = [`<!-- adc:port begin ${id} -->`, `<!-- adc:port end ${id} -->`];
   const full = `${begin}\n${block.replace(/\n+$/, '')}\n${end}\n`;
-  return (cur = '') => {
-    const [a, b] = [cur.indexOf(begin), cur.indexOf(end)];
+  const find = (cur) => [cur.indexOf(begin), cur.indexOf(end)];
+  const merge = (cur = '') => {
+    const [a, b] = find(cur);
     if (a >= 0 && b > a) return cur.slice(0, a) + full + cur.slice(b + end.length).replace(/^\r?\n/, '');
     return cur + (cur && !cur.endsWith('\n') ? '\n' : '') + (cur.trim() ? '\n' : '') + full;
   };
-}
-
-/** Text without the port-managed section for `id` (so a file's own imports can be inspected). */
-function stripPortSection(text, id) {
-  const [begin, end] = sectionMarks(id);
-  const [a, b] = [text.indexOf(begin), text.indexOf(end)];
-  return a >= 0 && b > a ? text.slice(0, a) + text.slice(b + end.length) : text;
+  merge.strip = (cur) => {
+    const [a, b] = find(cur);
+    return a >= 0 && b > a ? cur.slice(0, a) + cur.slice(b + end.length) : cur;
+  };
+  return merge;
 }
 
 function convertInstructions(src, cls, targets, acc) {
   const raw = stripMarker(src.text);
   const inlined = inlineImports(raw, src.abs);
-  for (const ref of inlined.missing) acc.manual.push(`Import @${ref} in ${src.rel} does not resolve; fix it before porting.`);
+  for (const ref of inlined.missing) acc.step(`Import @${ref} in ${src.rel} does not resolve; fix it first.`);
   const base = path.posix.basename(src.rel);
-  const native = (h) => acc.notes.push(`${h}: reads ${src.rel} natively`);
+  const native = (h) => acc.note(`${h}: reads ${src.rel} natively`);
   for (const host of targets) {
     if (host === 'codex') {
       if (['AGENTS.md', 'AGENTS.override.md'].includes(base)) { native(host); continue; }
-      if (base === 'CLAUDE.md' && findImports(raw).some((i) => path.posix.basename(i.ref) === 'AGENTS.md')) {
-        acc.notes.push('codex: AGENTS.md is already the shared source; the Claude-only notes in CLAUDE.md are not ported');
+      if (base === 'CLAUDE.md' && findImports(raw).some((r) => path.posix.basename(r) === 'AGENTS.md')) {
+        acc.note('codex: AGENTS.md is the shared source; the Claude-only notes in CLAUDE.md are not ported');
         continue;
       }
       const content = `${markerLine(src.rel)}\n${trimBody(inlined.text)}`;
-      if (inlined.files.length) acc.manual.push('Codex has no @import: imported files were inlined into AGENTS.md; re-run tooling port after editing them.');
-      if (Buffer.byteLength(content) > 32768) acc.manual.push(`AGENTS.md would be ${Buffer.byteLength(content)} bytes; Codex loads at most 32 KiB of AGENTS.md.`);
+      const bytes = Buffer.byteLength(content);
+      if (inlined.files.length) acc.step('Codex has no @import: imports were inlined; re-run the port after edits.');
+      if (bytes > 32768) acc.step(`AGENTS.md would be ${bytes} bytes; Codex loads at most 32 KiB of AGENTS.md.`);
       acc.outputs.push({ path: 'AGENTS.md', content, host, kind: 'instructions' });
-      acc.manual.push(base === 'CLAUDE.local.md' ? 'CLAUDE.local.md is personal; consider keeping it out of the shared AGENTS.md.'
-        : `Copilot reads AGENTS.md as well as ${base}, so these rules now load twice in Copilot: keep the shared rules in AGENTS.md, `
-          + `host-only notes in ${base}, and give Claude Code an @AGENTS.md import.`);
+      acc.step(base === 'CLAUDE.local.md' ? 'CLAUDE.local.md is personal; keep it out of the shared AGENTS.md.'
+        : `Copilot reads AGENTS.md as well as ${base}, so these rules now load twice in Copilot: keep the shared rules `
+          + `in AGENTS.md, host-only notes in ${base}, and give Claude Code an @AGENTS.md import.`);
     } else if (host === 'claude') {
       if (['CLAUDE.md', 'CLAUDE.local.md'].includes(base)) { native(host); continue; }
-      const merge = sectionMerge(src.rel, `@${src.rel}\n`);
+      const merge = portSection(src.rel, `@${src.rel}\n`);
       // A CLAUDE.md that already imports the source (hand-written or ported) stays as it is.
-      const imports = (cur) => findImports(stripPortSection(cur, src.rel)).some((i) => toPosix(i.ref).replace(/^\.\//, '') === src.rel);
-      acc.outputs.push({ path: 'CLAUDE.md', content: merge(`${markerLine(src.rel)}\n`), merge: (cur) => (imports(cur) ? cur : merge(cur)),
-        host, kind: 'instructions' });
-      if (base === 'AGENTS.md') acc.notes.push('claude: Claude Code reads AGENTS.md only when no CLAUDE.md exists; the @AGENTS.md import keeps one source');
-      else acc.manual.push(`Copilot CLI also reads CLAUDE.md: check \`copilot instruction list --json\` that ${src.rel} is not loaded twice.`);
+      const imports = (cur) => findImports(merge.strip(cur)).some((r) => toPosix(r).replace(/^\.\//, '') === src.rel);
+      const content = merge(`${markerLine(src.rel)}\n`);
+      const keep = (cur) => (imports(cur) ? cur : merge(cur));
+      acc.outputs.push({ path: 'CLAUDE.md', content, merge: keep, host, kind: 'instructions' });
+      if (base === 'AGENTS.md') acc.note('claude: reads AGENTS.md only without CLAUDE.md; the import keeps one source');
+      else acc.step(`Copilot CLI also reads CLAUDE.md: check it loads ${src.rel} once (copilot instruction list).`);
     } else if (base === 'AGENTS.md' || src.rel === '.github/copilot-instructions.md') {
       native(host);
-      if (base === 'AGENTS.md') acc.manual.push('Copilot code review reads only .github/copilot-instructions.md and path-specific files; put review rules there.');
+      if (base === 'AGENTS.md') acc.step('Copilot code review reads only copilot-instructions.md and scoped files.');
     } else {
-      if (base === 'AGENTS.override.md') acc.manual.push('AGENTS.override.md is a Codex-only local override; porting it to Copilot makes it shared.');
+      if (base === 'AGENTS.override.md') acc.step('AGENTS.override.md is a local Codex override; now it is shared.');
       acc.outputs.push({ path: '.github/copilot-instructions.md', content: inlined.text, host, kind: 'instructions' });
-      if (['CLAUDE.md', 'GEMINI.md'].includes(base)) {
-        acc.manual.push(`Copilot CLI and the cloud agent also read ${base}: keep one of the two files minimal so the rules do not load twice.`);
-      }
+      if (['CLAUDE.md', 'GEMINI.md'].includes(base)) acc.step(`Copilot also reads ${base}: keep one of the two short.`);
     }
   }
 }
@@ -806,37 +849,39 @@ function convertScoped(src, cls, targets, acc) {
   const base = path.posix.basename(src.rel);
   const d = src.fm.data;
   const dir = cls.scopeDir || path.posix.dirname(src.rel);
-  const [topic, globs] = cls.host === 'copilot' && /\.instructions\.md$/.test(base) ? [base.replace(/\.instructions\.md$/, ''), asList(d.applyTo)]
-    : cls.host === 'claude' && /(^|\/)\.claude\/rules\//.test(src.rel) ? [base.replace(/\.md$/, ''), asList(d.paths)]
+  const [topic, globs] = /\.instructions\.md$/.test(base) ? [base.replace(/\.instructions\.md$/, ''), asList(d.applyTo)]
+    : /(^|\/)\.claude\/rules\//.test(src.rel) ? [base.replace(/\.md$/, ''), asList(d.paths)]
       : [toSkillName(dir), [`${dir}/**`]];
   const body = trimBody(src.fm.hasFrontmatter ? src.fm.body : stripMarker(src.fm.body));
   const always = !globs.length || globs.some((g) => g === '**' || g === '**/*');
-  const [description, excludeAgent] = [asText(d.description), asText(d.excludeAgent)];
-  const desc = description ? { description } : {};
+  const desc = d.description ? { description: asText(d.description) } : {};
   for (const host of targets) {
-    if (host === cls.host) { acc.notes.push(`${host}: native`); continue; }
-    if (excludeAgent && host !== 'copilot') acc.dropped.push(dropRow(src.rel, 'excludeAgent', `${host} has no excludeAgent`, excludeAgent));
+    if (host === cls.host) { acc.note(`${host}: native`); continue; }
+    if (d.excludeAgent && host !== 'copilot') {
+      acc.dropped.push(dropRow(src.rel, 'excludeAgent', `${host} has no excludeAgent`, asText(d.excludeAgent)));
+    }
     if (host === 'copilot') {
       const content = stringifyFrontmatter({ applyTo: always ? '**' : globs.join(','), ...desc }, `\n${body}`);
       acc.outputs.push({ path: `.github/instructions/${topic}.instructions.md`, content, host, kind: 'scoped' });
     } else if (host === 'claude') {
       const data = { ...(always ? {} : { paths: globs }), ...desc };
-      const content = Object.keys(data).length ? stringifyFrontmatter(data, `\n${body}`) : body;
+      const content = some(data) ? stringifyFrontmatter(data, `\n${body}`) : body;
       acc.outputs.push({ path: `.claude/rules/${topic}.md`, content, host, kind: 'scoped' });
-      if (always) acc.notes.push('claude: a rule without paths loads in every session');
+      if (always) acc.note('claude: a rule without paths loads in every session');
     } else {
       const byDir = new Map();
       for (const g of always ? ['**'] : globs) {
         const pre = globDirPrefix(g);
         byDir.set(pre, [...(byDir.get(pre) || []), g]);
         if (g === `${pre}/**` || (pre === '' && (g === '**' || g === '**/*'))) continue;
-        const where = pre || 'the repository root';
-        acc.dropped.push(dropRow(src.rel, 'applyTo', `Codex scopes AGENTS.md by directory only; the rules apply to every file under ${where}/`, g));
+        const why = `Codex scopes AGENTS.md by directory only; the rules apply to all of ${pre || 'the repository'}/`;
+        acc.dropped.push(dropRow(src.rel, 'applyTo', why, g));
       }
       for (const [pre, gl] of byDir) {
-        const title = description || asText(d.name) || topic;
-        const merge = sectionMerge(src.rel, `## ${title}\n\nApplies to: ${gl.map((g) => `\`${g}\``).join(', ')}\n\n${body.replace(/\n+$/, '')}\n`);
-        acc.outputs.push({ path: pre ? `${pre}/AGENTS.md` : 'AGENTS.md', content: merge(''), merge, host, kind: 'scoped' });
+        const title = desc.description || asText(d.name) || topic;
+        const applies = gl.map((g) => `\`${g}\``).join(', ');
+        const merge = portSection(src.rel, `## ${title}\n\nApplies to: ${applies}\n\n${body.replace(/\n+$/, '')}\n`);
+        acc.outputs.push({ path: `${pre ? `${pre}/` : ''}AGENTS.md`, content: merge(''), merge, host, kind: 'scoped' });
       }
     }
   }
@@ -844,20 +889,23 @@ function convertScoped(src, cls, targets, acc) {
 
 // Fields mapped explicitly between the hosts; every other field travels in `extra` (kept or reported).
 const AGENT_MAPPED = ['name', 'description', 'tools', 'model', 'user-invocable', 'disable-model-invocation', 'skills'];
-const AGENT_MAPPED_BY_HOST = { copilot: ['include-custom-instructions', 'reasoningEffort'], claude: ['omitClaudeMd', 'effort'] };
+const AGENT_MAPPED_BY_HOST = { copilot: ['include-custom-instructions', 'reasoningEffort'],
+  claude: ['omitClaudeMd', 'effort'] };
 
 /** Agent file → IR `{ name, description, tools (Claude names | null = all), model, ..., body, extra, errors[] }`. */
 export function parseAgent(text, host, rel) {
   const fm = parseFrontmatter(text);
   const d = fm.data;
   const ir = { name: asText(d.name) || path.posix.basename(rel).replace(/\.(agent|chatmode)\.md$|\.md$/, ''),
-    description: asText(d.description), tools: null, toolsUnknown: [], model: asText(d.model), userInvocable: asBool(d['user-invocable']),
-    disableModelInvocation: asBool(d['disable-model-invocation']), skills: d.skills != null ? asList(d.skills) : null,
-    body: trimBody(fm.body), extra: {}, source: host, errors: fm.errors.map((e) => e.message) };
+    description: asText(d.description), tools: null, toolsUnknown: [], model: asText(d.model),
+    userInvocable: asBool(d['user-invocable']), disableModelInvocation: asBool(d['disable-model-invocation']),
+    skills: d.skills != null ? asList(d.skills) : null, body: trimBody(fm.body), extra: {}, source: host,
+    errors: fm.errors.map((e) => e.message) };
   if (host === 'copilot') {
     if (d.tools != null) ({ tools: ir.tools, unknown: ir.toolsUnknown } = toolsCopilotToCanonical(asList(d.tools)));
     // Copilot subagents get no repository instructions unless this is true (default false).
-    Object.assign(ir, { includeInstructions: asBool(d['include-custom-instructions']) === true, effort: asText(d.reasoningEffort) });
+    ir.includeInstructions = asBool(d['include-custom-instructions']) === true;
+    ir.effort = asText(d.reasoningEffort);
     if (ir.disableModelInvocation == null && asBool(d.infer) === false) ir.disableModelInvocation = true;
   } else {
     const list = asList(d.tools);
@@ -879,42 +927,42 @@ export function renderAgent(ir, host, { file = ir.name, pluginScoped = false } =
   const opt = (cond, obj) => (cond ? obj : {});
   const flags = { ...opt(ir.userInvocable != null, { 'user-invocable': ir.userInvocable }),
     ...opt(ir.disableModelInvocation != null, { 'disable-model-invocation': ir.disableModelInvocation }) };
-  if (ir.model && ir.source !== host) manual.push(`Check that model "${ir.model}" is a valid ${HOST_NAME[host]} model name for ${ir.name}.`);
+  const base = { ...opt(ir.model, { model: ir.model }), ...opt(ir.skills, { skills: ir.skills }) };
+  if (ir.model && ir.source !== host) manual.push(`${ir.name}: check "${ir.model}" is a ${HOST_NAME[host]} model.`);
   if (host === 'copilot') {
     const t = ir.tools ? toolsCanonicalToCopilot(ir.tools) : null;
     if (t?.unmapped.length) drop('tools', 'no Copilot tool alias', t.unmapped.join(', '));
     const effort = /^(low|medium|high)$/.test(ir.effort || '');
     if (ir.effort && !effort) drop('effort', 'no matching Copilot reasoningEffort value', ir.effort);
-    const data = { name: ir.name, description: ir.description ?? '', ...opt(t, { tools: t?.tools }), ...opt(ir.model, { model: ir.model }),
-      ...flags, ...opt(ir.includeInstructions, { 'include-custom-instructions': true }), ...opt(ir.skills, { skills: ir.skills }),
+    const data = { name: ir.name, description: ir.description ?? '', ...opt(t, { tools: t?.tools }), ...base, ...flags,
+      ...opt(ir.includeInstructions, { 'include-custom-instructions': true }),
       ...opt(effort, { reasoningEffort: ir.effort }) };
     for (const k of Object.keys(ir.extra)) {
       if (ir.source === 'copilot') data[k] = ir.extra[k];
-      else drop(k, k === 'disallowedTools' ? 'Copilot agents have no deny list; narrow tools instead' : `Copilot agents have no "${k}"`);
+      else drop(k, k === 'disallowedTools' ? 'no deny list in Copilot; narrow tools' : `Copilot agents have no "${k}"`);
     }
-    if (ir.body.length > 30000) manual.push(`${ir.name}: the body has ${ir.body.length} characters; Copilot agents allow at most 30,000.`);
+    if (ir.body.length > 30000) manual.push(`${ir.name}: the body has ${ir.body.length} characters (Copilot: 30,000).`);
     const content = stringifyFrontmatter(data, `\n${ir.body}`, { flowKeys: ['tools', 'skills'] });
     return { path: `.github/agents/${agentFileName(ir.name)}.agent.md`, content, dropped, manual };
   }
   const name = String(ir.name).replace(/:/g, '-');
   if (name !== ir.name) manual.push(`Claude Code agent names cannot contain ":"; renamed ${ir.name} to ${name}.`);
   if (!ir.description) manual.push(`${ir.name}: Claude Code requires a description for subagents.`);
-  const data = { name, description: ir.description ?? '', ...opt(ir.tools, { tools: ir.tools?.join(', ') }), ...opt(ir.model, { model: ir.model }),
-    ...opt(ir.skills, { skills: ir.skills }), ...opt(ir.effort, { effort: ir.effort }), ...opt(!ir.includeInstructions, { omitClaudeMd: true }), ...flags };
+  const data = { name, description: ir.description ?? '', ...opt(ir.tools, { tools: ir.tools?.join(', ') }), ...base,
+    ...opt(ir.effort, { effort: ir.effort }), ...opt(!ir.includeInstructions, { omitClaudeMd: true }), ...flags };
   if (!ir.includeInstructions && ir.source === 'copilot') {
-    manual.push(`${ir.name}: Copilot subagents get no repository instructions without include-custom-instructions: true, so the Claude Code `
-      + 'agent sets omitClaudeMd: true; remove it to give the agent CLAUDE.md.');
+    manual.push(`${ir.name}: the Copilot agent gets no repository instructions (no include-custom-instructions), `
+      + 'so the Claude Code agent sets omitClaudeMd: true; remove it to give the agent CLAUDE.md.');
   }
-  if (ir.toolsUnknown.length) manual.push(`${ir.name}: tool names ${ir.toolsUnknown.join(', ')} are not Copilot aliases; check them in Claude Code.`);
+  if (ir.toolsUnknown.length) manual.push(`${ir.name}: check the tools ${ir.toolsUnknown.join(', ')} (no alias).`);
   for (const k of Object.keys(ir.extra)) {
     if (ir.source !== 'claude') drop(k, `Claude Code subagents have no "${k}"`);
-    else if (pluginScoped && ['hooks', 'mcpServers', 'permissionMode'].includes(k)) drop(k, 'plugin subagents ignore hooks, mcpServers and permissionMode');
+    else if (pluginScoped && ['hooks', 'mcpServers', 'permissionMode'].includes(k)) drop(k, 'plugin agents ignore it');
     else data[k] = ir.extra[k];
   }
-  if (ir.source !== 'claude' && Object.keys(flags).length) {
-    manual.push(`${ir.name}: user-invocable / disable-model-invocation are kept for round trips; Claude Code subagents do not document them.`);
-  }
-  return { path: `.claude/agents/${name}.md`, content: stringifyFrontmatter(data, `\n${ir.body}`, { flowKeys: ['skills'] }), dropped, manual };
+  if (ir.source !== 'claude' && some(flags)) manual.push(`${ir.name}: invocation flags are kept for round trips.`);
+  const content = stringifyFrontmatter(data, `\n${ir.body}`, { flowKeys: ['skills'] });
+  return { path: `.claude/agents/${name}.md`, content, dropped, manual };
 }
 
 /** The first sentence of a description (at most 200 characters). */
@@ -926,7 +974,8 @@ export function firstSentence(text) {
 /** 25-64 characters for Codex's metadata.short-description, or null. */
 export function shortDescription(text) {
   let s = firstSentence(text).replace(/[.!?]$/, '');
-  if (s.length > 64) { const cut = s.slice(0, 64); s = cut.lastIndexOf(' ') > 25 ? cut.slice(0, cut.lastIndexOf(' ')) : cut; }
+  const cut = s.slice(0, 64);
+  if (s.length > 64) s = cut.lastIndexOf(' ') > 25 ? cut.slice(0, cut.lastIndexOf(' ')) : cut;
   return s.length >= 25 ? s : null;
 }
 
@@ -934,35 +983,38 @@ export function shortDescription(text) {
 export function renderOpenAiYaml({ name, description, implicit = true }) {
   const sd = shortDescription(description);
   const prompt = `Use $${name}: ${firstSentence(description) || 'help with this task.'}`;
-  return stringifyYaml({ interface: { display_name: name, ...(sd ? { short_description: sd } : {}), default_prompt: prompt },
-    policy: { allow_implicit_invocation: Boolean(implicit) } });
+  const iface = { display_name: name, ...(sd ? { short_description: sd } : {}), default_prompt: prompt };
+  return stringifyYaml({ interface: iface, policy: { allow_implicit_invocation: Boolean(implicit) } });
 }
 
 function skillFile({ name, description, extra = {}, host, body }) {
   const sd = host === 'codex' ? shortDescription(description) : null;
   const data = { name, description: description || `Runs the ${name} workflow.`,
-    ...Object.fromEntries(Object.entries(extra).filter(([, v]) => v != null)), ...(sd ? { metadata: { 'short-description': sd } } : {}) };
+    ...Object.fromEntries(Object.entries(extra).filter(([, v]) => v != null)),
+    ...(sd ? { metadata: { 'short-description': sd } } : {}) };
   return stringifyFrontmatter(data, `\n${body}`);
 }
 
-const PROMPT_VARS = new RegExp('\\$\\{(input:[^}]+|selection|selectedText|file|fileBasename|fileDirname|fileBasenameNoExtension'
-  + '|workspaceFolder|workspaceFolderBasename)\\}|#(file|tool):[^\\s,;)]*[^\\s,;).]', 'g');
+const PROMPT_VARS = new RegExp('\\$\\{(input:[^}]+|selection|selectedText|file|fileBasename|fileDirname'
+  + '|fileBasenameNoExtension|workspaceFolder|workspaceFolderBasename)\\}|#(file|tool):[^\\s,;)]*[^\\s,;).]', 'g');
 const CLAUDE_PLACEHOLDERS = /\$ARGUMENTS(\[\d+\])?|\$\d\b|\$\{CLAUDE_[A-Z_]+\}|(^|\s)!`[^`]+`/m;
-const PROMPT_FIELDS = ['name', 'description', 'argument-hint', 'agent', 'model', 'tools', 'allowed-tools', 'disable-model-invocation'];
-const placeholderStep = (dir, host) => `${dir}/SKILL.md uses Claude-only placeholders or !\`cmd\` blocks; ${host} does not expand them.`;
+const PROMPT_FIELDS = ['name', 'description', 'argument-hint', 'agent', 'model', 'tools', 'allowed-tools',
+  'disable-model-invocation'];
+const placeholderStep = (dir, host) => `${dir}/SKILL.md has Claude-only placeholders or !\`cmd\` (not in ${host}).`;
 
 function convertPromptLike(src, cls, targets, acc) {
   const d = src.fm.data;
   const base = path.posix.basename(src.rel);
-  const label = cls.kind === 'command' ? (/\.claude\/commands\/(.+)\.md$/.exec(src.rel)?.[1] || base.replace(/\.md$/, '')).split('/').join('-')
+  const command = /\.claude\/commands\/(.+)\.md$/.exec(src.rel)?.[1].split('/').join('-');
+  const label = cls.kind === 'command' ? command || base.replace(/\.md$/, '')
     : asText(d.name) || base.replace(/\.prompt\.md$/, '');
   const name = toSkillName(label);
-  if (name !== label) acc.notes.push(`skill name "${name}" derived from "${label}"`);
+  if (name !== label) acc.note(`skill name "${name}" derived from "${label}"`);
   const body = trimBody(src.fm.body);
   let description = asText(d.description);
   if (!description) {
     description = firstSentence(body.replace(/^#.*$/m, '')) || `Runs the ${name} prompt.`;
-    acc.manual.push(`${src.rel} has no description; "${description}" was derived from the body. Rewrite it as what + when + boundary.`);
+    acc.step(`${src.rel} has no description; "${description}" was derived: rewrite it (what + when + boundary).`);
   }
   const drop = (field, reason, value) => acc.dropped.push(dropRow(src.rel, field, reason, value));
   for (const k of Object.keys(d)) if (!PROMPT_FIELDS.includes(k)) drop(k, 'not a skill field');
@@ -972,45 +1024,44 @@ function convertPromptLike(src, cls, targets, acc) {
   const vars = uniq([...`${description}\n${body}`.matchAll(PROMPT_VARS)].map((m) => m[0]));
   for (const host of targets) {
     const dir = `${SKILL_DIRS[host]}/${name}`;
-    const extra = {};
-    if (host !== 'codex') extra['argument-hint'] = asText(d['argument-hint']);
-    else if (d['argument-hint'] != null) drop('argument-hint', 'Codex ignores argument-hint');
+    const extra = host === 'codex' ? {} : { 'argument-hint': asText(d['argument-hint']) };
+    if (host === 'codex' && d['argument-hint'] != null) drop('argument-hint', 'Codex ignores argument-hint');
     if (cls.kind === 'prompt') {
       if (host !== 'codex') extra['disable-model-invocation'] = true;
-      if (vars.length) acc.manual.push(`Rewrite prompt-file variables ${vars.join(', ')} in ${dir}/SKILL.md: skills receive the words after the skill name instead.`);
+      if (vars.length) acc.step(`Rewrite the prompt-file variables ${vars.join(', ')} in ${dir}/SKILL.md.`);
     } else {
       if (d['allowed-tools'] != null) extra['allowed-tools'] = asText(d['allowed-tools']).replace(/,\s*/g, ' ');
       if (host !== 'codex') extra['disable-model-invocation'] = asBool(d['disable-model-invocation']);
       if (d.model != null && host === 'claude') extra.model = asText(d.model);
       else if (d.model != null) drop('model', `${host} skills have no model field`, asText(d.model));
-      if (host !== 'claude' && CLAUDE_PLACEHOLDERS.test(body)) acc.manual.push(placeholderStep(dir, host));
-      if (host === 'claude') acc.manual.push(`Delete ${src.rel} once the skill works: a skill with the same name takes precedence, and two copies drift.`);
+      if (host !== 'claude' && CLAUDE_PLACEHOLDERS.test(body)) acc.step(placeholderStep(dir, host));
+      if (host === 'claude') acc.step(`Delete ${src.rel} once the skill works (it wins; two copies drift).`);
     }
-    acc.outputs.push({ path: `${dir}/SKILL.md`, content: skillFile({ name, description, extra, host, body }), host, kind: 'skill' });
-    if (host === 'codex') {
-      const implicit = cls.kind !== 'prompt' && asBool(d['disable-model-invocation']) !== true;
-      acc.outputs.push({ path: `${dir}/agents/openai.yaml`, content: renderOpenAiYaml({ name, description, implicit }), host, kind: 'skill' });
-    }
+    const out = (p, content) => acc.outputs.push({ path: `${dir}/${p}`, content, host, kind: 'skill' });
+    out('SKILL.md', skillFile({ name, description, extra, host, body }));
+    const implicit = cls.kind !== 'prompt' && asBool(d['disable-model-invocation']) !== true;
+    if (host === 'codex') out('agents/openai.yaml', renderOpenAiYaml({ name, description, implicit }));
   }
 }
 
 function convertChatmode(src, cls, targets, acc) {
   const ir = parseAgent(src.text, 'copilot', src.rel);
   const tools = src.fm.data.tools != null ? asList(src.fm.data.tools) : null;
-  if (!ir.description) acc.manual.push(`${src.rel} has no description; Copilot agents require one.`);
-  if (tools) {
-    acc.manual.push(`Check the tools of ${ir.name}: chat-mode tool names (${tools.join(', ')}) are VS Code tool sets; agents use the `
-      + 'aliases read, edit, search, execute, agent, web and todo.');
+  if (!ir.description) acc.step(`${src.rel} has no description; Copilot agents require one.`);
+  if (tools) acc.step(`Check the tools of ${ir.name}: chat-mode tool sets (${tools.join(', ')}) are not aliases.`);
+  for (const k of Object.keys(src.fm.data).filter((x) => !['name', 'description', 'tools', 'model'].includes(x))) {
+    acc.dropped.push(dropRow(src.rel, k, 'not a custom-agent field'));
   }
-  for (const k of Object.keys(src.fm.data)) if (!['name', 'description', 'tools', 'model'].includes(k)) acc.dropped.push(dropRow(src.rel, k, 'not a custom-agent field'));
-  const data = { name: ir.name, description: ir.description || `${ir.name} agent`, ...(tools ? { tools } : {}), ...(ir.model ? { model: ir.model } : {}) };
+  const data = { name: ir.name, description: ir.description || `${ir.name} agent`, ...(tools ? { tools } : {}),
+    ...(ir.model ? { model: ir.model } : {}) };
   const content = stringifyFrontmatter(data, `\n${ir.body}`, { flowKeys: ['tools'] });
-  acc.outputs.push({ path: `.github/agents/${agentFileName(ir.name)}.agent.md`, content, host: 'copilot', kind: 'agent' });
+  const file = `.github/agents/${agentFileName(ir.name)}.agent.md`;
+  acc.outputs.push({ path: file, content, host: 'copilot', kind: 'agent' });
 }
 
 const SKILL_HOST_FIELDS = {
-  copilot: ['name', 'description', 'license', 'compatibility', 'metadata', 'allowed-tools', 'argument-hint', 'user-invocable',
-    'disable-model-invocation', 'context'],
+  copilot: ['name', 'description', 'license', 'compatibility', 'metadata', 'allowed-tools', 'argument-hint',
+    'user-invocable', 'disable-model-invocation', 'context'],
   codex: ['name', 'description', 'metadata'],
 };
 
@@ -1018,46 +1069,50 @@ function convertSkill(src, cls, targets, acc) {
   const absDir = path.dirname(src.abs);
   const d = src.fm.data;
   const name = asText(d.name) || path.basename(absDir);
-  if (name !== path.basename(absDir)) acc.manual.push(`Skill name "${name}" differs from its directory "${path.basename(absDir)}"; VS Code silently skips such skills.`);
+  if (name !== path.basename(absDir)) acc.step(`Skill name "${name}" differs from its directory; VS Code skips it.`);
   const files = listFiles(absDir, { ignore: COPY_IGNORE });
   for (const host of targets) {
-    if (cls.hosts.includes(host)) { acc.notes.push(`${host}: already loads ${cls.dir}`); continue; }
+    if (cls.hosts.includes(host)) { acc.note(`${host}: already loads ${cls.dir}`); continue; }
     const dir = `${SKILL_DIRS[host]}/${name}`;
-    for (const f of files) acc.outputs.push({ path: `${dir}/${f}`, content: fs.readFileSync(path.join(absDir, f)), host, kind: 'skill' });
-    for (const k of Object.keys(d).filter((x) => SKILL_HOST_FIELDS[host] && !SKILL_HOST_FIELDS[host].includes(x))) {
+    for (const f of files) {
+      acc.outputs.push({ path: `${dir}/${f}`, content: fs.readFileSync(path.join(absDir, f)), host, kind: 'skill' });
+    }
+    for (const k of Object.keys(d).filter((x) => SKILL_HOST_FIELDS[host]?.includes(x) === false)) {
       acc.dropped.push(dropRow(src.rel, k, `${host} ignores this SKILL.md field (copied unchanged)`));
     }
-    if (host !== 'claude' && CLAUDE_PLACEHOLDERS.test(src.fm.body)) acc.manual.push(placeholderStep(dir, host));
+    if (host !== 'claude' && CLAUDE_PLACEHOLDERS.test(src.fm.body)) acc.step(placeholderStep(dir, host));
     if (host === 'codex' && asBool(d['disable-model-invocation']) === true && !files.includes('agents/openai.yaml')) {
       const content = renderOpenAiYaml({ name, description: asText(d.description), implicit: false });
       acc.outputs.push({ path: `${dir}/agents/openai.yaml`, content, host, kind: 'skill' });
-      acc.notes.push('codex: disable-model-invocation became policy.allow_implicit_invocation: false in agents/openai.yaml');
+      acc.note('codex: disable-model-invocation became allow_implicit_invocation: false in agents/openai.yaml');
     }
-    acc.manual.push(`Keep ${dir} in sync with ${cls.dir}: re-run \`tooling port ${cls.dir} --to ${host} --force\` after editing the source.`);
+    acc.step(`Keep ${dir} in sync: re-run \`tooling port ${cls.dir} --to ${host} --force\` after edits.`);
   }
 }
 
 function convertAgent(src, cls, targets, acc) {
   const ir = parseAgent(src.text, cls.host, src.rel);
   for (const host of targets) {
-    if (host === cls.host) { acc.notes.push(`${host}: native`); continue; }
+    if (host === cls.host) { acc.note(`${host}: native`); continue; }
     if (host !== 'codex') {
-      if (host === 'copilot' && cls.host === 'claude') acc.notes.push('copilot: Copilot CLI also reads .claude/agents directly');
+      if (host === 'copilot' && cls.host === 'claude') acc.note('copilot: Copilot CLI also reads .claude/agents');
       const r = renderAgent(ir, host, { file: src.rel });
       acc.outputs.push({ path: r.path, content: r.content, host, kind: 'agent' });
       acc.dropped.push(...r.dropped);
-      acc.manual.push(...r.manual);
+      acc.step(...r.manual);
       continue;
     }
     const name = toSkillName(ir.name);
     const dir = `${CODEX_ONLY_SKILLS_DIR}/${name}`;
     const yaml = renderOpenAiYaml({ name, description: ir.description, implicit: ir.disableModelInvocation !== true });
-    acc.outputs.push({ path: `${dir}/SKILL.md`, content: skillFile({ name, description: ir.description, host, body: ir.body }), host, kind: 'skill' },
+    const skill = skillFile({ name, description: ir.description, host, body: ir.body });
+    acc.outputs.push({ path: `${dir}/SKILL.md`, content: skill, host, kind: 'skill' },
       { path: `${dir}/agents/openai.yaml`, content: yaml, host, kind: 'skill' });
-    if (ir.tools) acc.dropped.push(dropRow(src.rel, 'tools', 'Codex skills have no tool restriction; state limits in the body', ir.tools.join(', ')));
+    const why = 'Codex skills have no tool restriction; state limits in the body';
+    if (ir.tools) acc.dropped.push(dropRow(src.rel, 'tools', why, ir.tools.join(', ')));
     if (ir.model) acc.dropped.push(dropRow(src.rel, 'model', 'Codex skills have no model field', ir.model));
     for (const k of Object.keys(ir.extra)) acc.dropped.push(dropRow(src.rel, k, 'no Codex equivalent'));
-    acc.manual.push(`Codex has no custom agent files: ${ir.name} became the skill ${dir} (invoke it as $${name}). `
+    acc.step(`Codex has no custom agent files: ${ir.name} became the skill ${dir} (invoke it as $${name}). `
       + 'The .codex/agents/<name>.toml role format is unverified and was not generated.');
   }
 }
@@ -1065,102 +1120,113 @@ function convertAgent(src, cls, targets, acc) {
 function convertHooks(src, cls, targets, acc, { inPlace = false } = {}) {
   const parsed = parseHookConfig(src.text, cls.host, src.rel);
   acc.dropped.push(...parsed.dropped);
-  acc.notes.push(...parsed.notes);
+  acc.note(...parsed.notes);
   for (const host of targets) {
-    if (host === cls.host && !inPlace) { acc.notes.push(`${host}: native`); continue; }
+    if (host === cls.host && !inPlace) { acc.note(`${host}: native`); continue; }
     const r = renderHookConfig(parsed.entries, host, { file: src.rel });
     acc.dropped.push(...r.dropped);
-    acc.manual.push(...r.manual);
-    acc.notes.push(...r.notes);
+    acc.step(...r.manual);
+    acc.note(...r.notes);
     const stem = { claude: 'claude-settings', codex: 'codex-hooks' }[cls.host] || path.posix.basename(src.rel, '.json');
-    const target = inPlace ? src.rel : { copilot: `.github/hooks/${stem}.json`, claude: '.claude/settings.json', codex: '.codex/hooks.json' }[host];
+    const target = inPlace ? src.rel
+      : { copilot: `.github/hooks/${stem}.json`, claude: '.claude/settings.json', codex: '.codex/hooks.json' }[host];
     const how = inPlace ? { replace: true } : { merge: (cur) => mergeHooks(cur, r.doc) };
     acc.outputs.push({ path: target, content: json(r.doc), host, kind: 'hooks', ...how });
     if (host === 'claude' && cls.host === 'copilot') {
-      acc.manual.push('Copilot CLI and VS Code also run .claude/settings.json hooks: remove the .github/hooks original for local sessions, '
-        + 'or the hook runs twice (the cloud agent reads only .github/hooks).');
+      acc.step('Copilot CLI and VS Code also run .claude/settings.json hooks: remove the .github/hooks original '
+        + 'for local sessions, or the hook runs twice (the cloud agent reads only .github/hooks).');
     }
-    if (host === 'codex') acc.manual.push('Codex runs repository hooks only after the project is trusted and each hook is reviewed once in /hooks.');
+    if (host === 'codex') acc.step('Codex runs repository hooks only in trusted projects, after a review in /hooks.');
   }
 }
 
 function convertMcp(src, cls, targets, acc) {
   const parsed = parseMcpConfig(src.text, cls.dialect, src.rel);
   acc.dropped.push(...parsed.dropped);
-  acc.manual.push(...parsed.manual);
+  acc.step(...parsed.manual);
   for (const host of targets) {
     const native = host === 'claude' ? cls.dialect === 'mcpServers' && src.rel.endsWith('.mcp.json')
       : host === 'copilot' ? ['.mcp.json', '.github/mcp.json'].includes(src.rel) : cls.dialect === 'toml';
-    if (native) { acc.notes.push(`${host}: reads ${src.rel} natively`); continue; }
+    if (native) { acc.note(`${host}: reads ${src.rel} natively`); continue; }
     const r = renderMcpConfig(parsed.servers, host, { file: src.rel });
     acc.dropped.push(...r.dropped);
-    acc.manual.push(...r.manual);
+    acc.step(...r.manual);
     if (host === 'codex') {
-      acc.outputs.push({ path: '.codex/config.toml', content: r.text, merge: (cur) => mergeToml(cur, r.blocks), host, kind: 'mcp' });
-      acc.manual.push('Codex reads a repository .codex/config.toml only for trusted projects; or add the [mcp_servers] tables to ~/.codex/config.toml.');
+      const merge = (cur) => mergeToml(cur, r.blocks);
+      acc.outputs.push({ path: '.codex/config.toml', content: r.text, merge, host, kind: 'mcp' });
+      acc.step('Codex reads a repository .codex/config.toml only in trusted projects (or use ~/.codex/config.toml).');
     } else {
       const target = host === 'claude' ? '.mcp.json' : '.github/mcp.json';
       acc.outputs.push({ path: target, content: json(r.doc), merge: (cur) => mergeMcp(cur, r.doc), host, kind: 'mcp' });
     }
-    if (host === 'copilot') acc.manual.push(cloudAgentMcp(parsed.servers));
+    if (host === 'copilot') acc.step(cloudAgentMcp(parsed.servers));
   }
-  if (parsed.servers.some((s) => Object.values(s.env || {}).some((v) => v && !/\$\{/.test(v) && /(token|secret|key|password)/i.test(v)))) {
-    acc.manual.push('An env value looks like a literal credential; reference an environment variable instead.');
+  const literal = (v) => v && !/\$\{/.test(v) && /(token|secret|key|password)/i.test(v);
+  if (parsed.servers.some((s) => Object.values(s.env || {}).some(literal))) {
+    acc.step('An env value looks like a literal credential; reference an environment variable instead.');
   }
 }
 
 // ---------------------------------------------------------------------------
 // port() and the CLI command
 
-const CONVERTERS = { instructions: convertInstructions, scoped: convertScoped, agent: convertAgent, prompt: convertPromptLike,
-  command: convertPromptLike, chatmode: convertChatmode, skill: convertSkill, hooks: convertHooks, mcp: convertMcp };
+const CONVERTERS = { instructions: convertInstructions, scoped: convertScoped, agent: convertAgent,
+  prompt: convertPromptLike, command: convertPromptLike, chatmode: convertChatmode, skill: convertSkill,
+  hooks: convertHooks, mcp: convertMcp };
 const WITH_FRONTMATTER = ['scoped', 'agent', 'prompt', 'command', 'chatmode', 'skill'];
 
 /**
- * Translate one tooling artifact. `path` is relative to `cwd` (default: root); targets are written under `out`
- * (default: the repository root) at each host's canonical location.
- * Returns `{ source, targets, out, dry_run, written[], skipped[], backups[], dropped_fields[], manual_steps[], notes[] }`.
+ * Translate one tooling artifact. `path` is relative to `cwd` (default: root); targets are written under
+ * `out` (default: the repository root) at each host's canonical location. Returns `{ source, targets, out,
+ * dry_run, written[], skipped[], backups[], dropped_fields[], manual_steps[], notes[] }`.
  */
 export function port({ path: srcPath, from = null, to = 'all', out = null, root = null, cwd = null, dryRun = false,
   force = false, inPlace = false, backupDir = null } = {}) {
-  if (!srcPath) throw usageError('tooling port needs a path (e.g. tooling port .github/agents/reviewer.agent.md --to claude)');
+  if (!srcPath) throw usageError('tooling port needs a path (e.g. .github/agents/reviewer.agent.md)');
   const base = cwd || root || process.cwd();
   const rootDir = root || repoRoot(base) || base;
   let abs = path.resolve(base, srcPath);
   if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(srcPath)}`);
   if (fs.statSync(abs).isDirectory()) {
-    if (!fs.existsSync(path.join(abs, 'SKILL.md'))) throw usageError(`${toPosix(srcPath)} is a directory without SKILL.md; pass a file or a skill directory`);
+    if (!fs.existsSync(path.join(abs, 'SKILL.md'))) throw usageError(`${toPosix(srcPath)} has no SKILL.md`);
     abs = path.join(abs, 'SKILL.md');
   }
   const src = { abs, rel: relPosix(rootDir, abs) ?? toPosix(abs), text: readText(abs, '') };
   const cls = classifyArtifact(src.rel);
-  if (!cls) throw usageError(`cannot tell which tooling format ${src.rel} is; pass a file at its host location (see references/tooling-port.md)`);
+  if (!cls) throw usageError(`cannot tell which tooling format ${src.rel} is; pass a file at its host location`);
   if (from && !HOSTS.includes(from)) throw usageError(`--from must be copilot, claude or codex (got "${from}")`);
-  if (from && from !== cls.host && !['portable', 'vscode'].includes(cls.host)) throw usageError(`${src.rel} is a ${cls.host} ${cls.kind} file, not ${from}`);
-  if (!CONVERTERS[cls.kind]) throw usageError(`${cls.kind} files cannot be ported (use tooling plugin for plugin manifests)`);
+  if (from && from !== cls.host && !['portable', 'vscode'].includes(cls.host)) {
+    throw usageError(`${src.rel} is a ${cls.host} file, not ${from}`);
+  }
+  if (!CONVERTERS[cls.kind]) throw usageError(`${cls.kind} files cannot be ported (see tooling plugin for manifests)`);
   if (WITH_FRONTMATTER.includes(cls.kind)) {
     // A frontmatter that does not parse would port as an empty or wrong body: refuse instead.
     src.fm = parseFrontmatter(src.text);
-    if (src.fm.errors.length) throw usageError(`${src.rel}: ${src.fm.errors[0].message}; fix the frontmatter first (tooling lint shows every problem)`);
+    const err = src.fm.errors[0];
+    if (err) throw usageError(`${src.rel}: ${err.message}; fix the frontmatter first (see tooling lint)`);
   }
   const fromHost = cls.host === 'portable' && from ? from : cls.host;
   const targets = inPlace ? [cls.host] : !to || to === 'all' ? HOSTS.filter((h) => h !== fromHost)
     : uniq(String(to).split(',').map((s) => s.trim()).filter(Boolean));
-  for (const h of targets) if (!HOSTS.includes(h)) throw usageError(`--to must be copilot, claude, codex or all (got "${h}")`);
+  const bad = targets.find((h) => !HOSTS.includes(h));
+  if (bad) throw usageError(`--to must be copilot, claude, codex or all (got "${bad}")`);
   const acc = { outputs: [], dropped: [], manual: [], notes: [] };
+  Object.assign(acc, { step: (...m) => acc.manual.push(...m), note: (...m) => acc.notes.push(...m) });
   CONVERTERS[cls.kind](src, cls, targets, acc, { inPlace });
   const outRoot = out ? path.resolve(base, out) : rootDir;
   const applied = writeOutputs(acc.outputs, { root: outRoot, dryRun, force, mergeNeedsForce: true, backupDir });
   return { source: { path: src.rel, kind: cls.kind, host: fromHost }, targets, out: toPosix(path.relative(rootDir, outRoot) || '.'),
-    dry_run: Boolean(dryRun), written: applied.written, skipped: applied.skipped, backups: applied.backups, dropped_fields: acc.dropped,
-    manual_steps: uniq(acc.manual), notes: uniq(acc.notes) };
+    dry_run: Boolean(dryRun), ...applied, dropped_fields: acc.dropped, manual_steps: uniq(acc.manual), notes: uniq(acc.notes) };
 }
 
 /** Built-in migrations (§11.6); each maps to a port with a fixed source kind and target. */
 export const MIGRATIONS = Object.freeze({
-  'prompt-to-skill': { kinds: ['prompt'], host: 'copilot', describe: '.github/prompts/*.prompt.md -> skill with disable-model-invocation: true' },
-  'chatmode-to-agent': { kinds: ['chatmode'], host: 'copilot', describe: '.github/chatmodes/*.chatmode.md -> .github/agents/*.agent.md' },
-  'claude-commands-to-skills': { kinds: ['command'], host: 'claude', describe: '.claude/commands/**/*.md -> .claude/skills/<name>/SKILL.md' },
+  'prompt-to-skill': { kinds: ['prompt'], host: 'copilot',
+    describe: '.github/prompts/*.prompt.md -> skill with disable-model-invocation: true' },
+  'chatmode-to-agent': { kinds: ['chatmode'], host: 'copilot',
+    describe: '.github/chatmodes/*.chatmode.md -> .github/agents/*.agent.md' },
+  'claude-commands-to-skills': { kinds: ['command'], host: 'claude',
+    describe: '.claude/commands/**/*.md -> .claude/skills/<name>/SKILL.md' },
   'vscode-mcp-to-mcp-json': { kinds: ['mcp'], host: 'claude', dialect: 'vscode',
     describe: '.vscode/mcp.json (servers, ${input:}) -> .mcp.json (mcpServers, ${VAR})' },
   'copilot-hooks-to-camel': { kinds: ['hooks'], host: 'copilot', inPlace: true,
@@ -1173,29 +1239,33 @@ export function migrationSources(kind, root, cwd, p) {
   if (!spec) throw usageError(`unknown migration "${kind}" (expected ${Object.keys(MIGRATIONS).join(', ')})`);
   const abs = path.resolve(cwd, p);
   if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(p)}`);
-  const isSource = (rel) => { const c = classifyArtifact(rel); return c && spec.kinds.includes(c.kind) && (!spec.dialect || c.dialect === spec.dialect); };
+  const ok = (rel) => {
+    const c = classifyArtifact(rel);
+    return c && spec.kinds.includes(c.kind) && (!spec.dialect || c.dialect === spec.dialect);
+  };
   const dir = fs.statSync(abs).isDirectory();
-  const out = (dir ? listFiles(abs, { ignore: COPY_IGNORE }).map((f) => path.join(abs, f)) : [abs]).map((f) => relPosix(root, f) ?? toPosix(f))
-    .filter((rel) => !dir || isSource(rel));
-  const bad = out.find((rel) => !isSource(rel));
+  const files = dir ? listFiles(abs, { ignore: COPY_IGNORE }).map((f) => path.join(abs, f)) : [abs];
+  const out = files.map((f) => relPosix(root, f) ?? toPosix(f)).filter((rel) => !dir || ok(rel));
+  const bad = out.find((rel) => !ok(rel));
   if (bad) throw usageError(`${bad} is not a source for ${kind} (${spec.describe})`);
   if (!out.length) throw usageError(`no ${spec.describe.split(' ->')[0]} files under ${toPosix(p)}`);
   return out;
 }
 
 /** Run a migration; returns the merged port results plus `{ migration, describe, sources[] }`. */
-export function migrate(kind, { path: p, root, cwd = null, host = null, dryRun = false, force = false, backupDir = null } = {}) {
+export function migrate(kind, { path: p, root, cwd = null, host = null, dryRun = false, force = false, backupDir }) {
   const spec = MIGRATIONS[kind];
   const sources = migrationSources(kind, root, cwd || root, p);
   const keys = ['written', 'skipped', 'backups', 'dropped_fields', 'manual_steps', 'notes'];
   const merged = { migration: kind, describe: spec.describe, sources, ...Object.fromEntries(keys.map((k) => [k, []])) };
   for (const rel of sources) {
-    const r = port({ path: rel, root, cwd: root, to: host || spec.host, dryRun, force: force || Boolean(spec.inPlace), inPlace: Boolean(spec.inPlace), backupDir });
+    const r = port({ path: rel, root, cwd: root, to: host || spec.host, dryRun, force: force || Boolean(spec.inPlace),
+      inPlace: Boolean(spec.inPlace), backupDir });
     for (const k of keys) merged[k].push(...r[k]);
   }
   if (kind === 'copilot-hooks-to-camel') {
-    merged.manual_steps.push('camelCase events send camelCase payloads (toolName, toolArgs as a JSON string) instead of the snake_case ones '
-      + 'PascalCase events got; update the handler.');
+    merged.manual_steps.push('camelCase events send camelCase payloads (toolName, toolArgs as a JSON string) '
+      + 'instead of the snake_case ones PascalCase events got; update the handler.');
   }
   return { ...merged, manual_steps: uniq(merged.manual_steps), notes: uniq(merged.notes) };
 }
@@ -1208,11 +1278,13 @@ export const portCommand = defineCommand({
     if (positionals.length !== 1) throw usageError('tooling port takes one path');
     const root = repoRoot(ctx.cwd) || ctx.cwd;
     prepareStateDir({ ...ctx, cwd: root }, { create: false });
-    const res = port({ path: positionals[0], from: values.from || null, to: values.to || 'all', out: values.out || null, root, cwd: ctx.cwd,
-      dryRun: ctx.dryRun, force: Boolean(values.force), backupDir: backupDirFactory(ctx, root, 'tooling', 'backups') });
+    const backupDir = backupDirFactory(ctx, root, 'tooling', 'backups');
+    const res = port({ path: positionals[0], from: values.from || null, to: values.to || 'all', out: values.out || null,
+      root, cwd: ctx.cwd, dryRun: ctx.dryRun, force: Boolean(values.force), backupDir });
     const n = res.written.filter((w) => w.action !== 'unchanged').length;
     const what = `${n} file(s) ${ctx.dryRun ? 'planned' : 'written'}, ${res.skipped.length} skipped`;
-    return { result: res, exit: EXIT.OK, summary: `${res.source.kind} ${res.source.path} -> ${res.targets.join(', ')}: ${what}, `
-      + `${res.dropped_fields.length} dropped field(s), ${res.manual_steps.length} manual step(s)` };
+    const counts = `${res.dropped_fields.length} dropped field(s), ${res.manual_steps.length} manual step(s)`;
+    const summary = `${res.source.kind} ${res.source.path} -> ${res.targets.join(', ')}: ${what}, ${counts}`;
+    return { result: res, exit: EXIT.OK, summary };
   },
 });

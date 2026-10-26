@@ -303,6 +303,21 @@ test('secrets in CI commands and the live token never reach the result or detect
   } finally { cleanup(dir); }
 });
 
+test('a cd line in a CI script moves the commands after it; the workspace variable names the checkout', async () => {
+  const dir = writeFiles(tmpDir(), {
+    '.github/workflows/ci.yml': 'on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: |\n          cd frontend\n'
+      + '          npm ci\n          npm test\n          cd "$GITHUB_WORKSPACE"\n          go test ./...\n'
+      + '      - shell: pwsh\n        run: |\n          Set-Location -Path frontend\n          npm test -- --ci\n',
+    'frontend/package.json': { scripts: { test: 'vitest' }, devDependencies: { vitest: '2' } }, 'go.mod': 'module m\n',
+  });
+  try {
+    const res = await detect({ root: dir, platform: 'linux', which: () => true, env: {} });
+    assert.deepEqual(res.ci.steps.map((s) => [s.cmd, s.cwd, s.project, s.line]), [['npm test', 'frontend', 'frontend', 9],
+      ['go test ./...', '.', '.', 11], ['npm test -- --ci', 'frontend', 'frontend', 15]]);
+    assert.deepEqual(res.projects.map((p) => [p.root, p.runners.map((r) => r.name)]), [['.', ['go']], ['frontend', ['vitest']]]);
+  } finally { cleanup(dir); }
+});
+
 test('CI directories that leave the checkout are never probed and never become projects', async () => {
   const outside = tmpDir('adc-detect-outside-');
   const dir = writeFiles(path.join(outside, 'repo'), {

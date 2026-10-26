@@ -304,7 +304,8 @@ async function runProbe(probe, { baseEnv, creds, runId, sessionId, tmpDir, redac
     : res.exit == null && res.error ? ['unverified', 'SPAWN_FAILED'] : res.exit === 0 ? ['pass', null]
       : [127, 9009].includes(res.exit) ? ['unverified', 'RUNNER_MISSING']
         : ['fail', [401, 403].includes(httpStatus) ? 'AUTH_REJECTED' : 'PROBE_FAILED'];
-  const output = redact([res.stdout, res.stderr && `--- stderr ---\n${res.stderr}`].filter(Boolean).join('\n'));
+  const output = redact([res.stdout, res.stderr && `--- stderr ---\n${res.stderr}`,
+    res.error && `--- could not start the probe in ${probe.cwd_rel}: ${res.error}`].filter(Boolean).join('\n'));
   return { status, reason, exit_code: res.exit, duration_ms: res.ms, output, truncated: res.truncated, result,
     httpStatus };
 }
