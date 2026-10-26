@@ -173,8 +173,10 @@ export function hostHomes({ env = process.env, home = null } = {}) {
 }
 
 export function makeContext(values = {}) {
-  const cwd = path.resolve(values.cwd || process.cwd());
-  if (!fs.existsSync(cwd)) throw usageError(`--cwd does not exist: ${cwd}`);
+  const given = path.resolve(values.cwd || process.cwd());
+  if (!fs.existsSync(given)) throw usageError(`--cwd does not exist: ${given}`);
+  // Resolved, so it compares equal to the repository root git reports (macOS /var -> /private/var).
+  const cwd = realPath(given);
   const markers = headlessMarkers(values);
   return {
     cwd,
@@ -210,7 +212,8 @@ export function defineCommand({ name, usage = '', options = {}, positionals = tr
 /** A command whose first positional selects a subcommand defined with defineCommand. */
 export function defineGroup({ name, usage = '', subcommands, defaultSub = null }) {
   const handler = async (argv) => {
-    const sub = argv[0] && !argv[0].startsWith('-') ? argv[0] : defaultSub;
+    const asksHelp = ['help', '--help', '-h'].includes(argv[0]);
+    const sub = asksHelp ? 'help' : argv[0] && !argv[0].startsWith('-') ? argv[0] : defaultSub;
     const rest = argv[0] === sub ? argv.slice(1) : argv;
     if (!sub || sub === 'help') {
       const text = usage || `${name} <${Object.keys(subcommands).join('|')}>`;
@@ -353,7 +356,7 @@ export const toPosix = (p) => String(p).replace(/\\/g, '/');
 /** Repo-relative POSIX path, or null when `file` is outside `root`. */
 export function relPosix(root, file) {
   const rel = path.relative(root, path.resolve(root, file));
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return rel === '' ? '.' : null;
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return rel === '' ? '.' : null;
   return toPosix(rel);
 }
 
@@ -934,6 +937,12 @@ const LIVE_SECRET_NAME = /^ADC_LIVE_TOKEN$|^ADC_LIVE_\w*(?:TOKEN|SECRET|KEY|PASS
 const TOKEN_REDACTED = ['ADC_LIVE_TOKEN', '[REDACTED]'].join('=');
 
 /** Live-test credentials in `env` (ADC_LIVE_TOKEN, ADC_LIVE_*TOKEN|SECRET|KEY|PASSWORD) as redactLiterals input. */
+/** The environment without live-test credentials, for every project or tool process we start. */
+export function toolEnv(env = process.env) {
+  const live = new Set(liveSecrets(env, { min: 1 }).map((s) => s.name));
+  return live.size ? Object.fromEntries(Object.entries(env).filter(([k]) => !live.has(k))) : env;
+}
+
 export function liveSecrets(env = process.env, { min = 4 } = {}) {
   return Object.entries(env || {})
     .filter(([k, v]) => LIVE_SECRET_NAME.test(k) && typeof v === 'string' && v.trim().length >= min)

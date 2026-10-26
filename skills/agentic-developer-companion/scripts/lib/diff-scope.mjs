@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   defineCommand, EXIT, which, runTool, sha256, asciiJson, toPosix, truncate, redactLiterals, readText, readInput,
-  matchGlob, tmpRoot, nonce, ensureDir, parseVersion, versionGte, liveSecrets, parseJsonl, makeCheck, log,
+  matchGlob, tmpRoot, nonce, ensureDir, parseVersion, versionGte, liveSecrets, parseJsonl, makeCheck, log, toolEnv,
 } from './core.mjs';
 import { emptyTree, diffNameStatus, diffLines, lsTree } from './git.mjs';
 import { prepareTarget, snapshotExcludes } from './state.mjs';
@@ -16,7 +16,7 @@ import { detect } from './detect.mjs';
 import * as M from './markers.mjs';
 import {
   parseManifest, isParsableManifest, manifestDelta, lockFor, lockIndex, lockHas, lockManager, normPypi, goSumNeeded,
-  blobReader, toolEnv,
+  blobReader,
 } from './deps.mjs';
 
 export const CHECK_FM = Object.freeze({

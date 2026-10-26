@@ -59,7 +59,7 @@ const HELP = [
   '  coverage-delta    changed-line coverage',
   '  mutation-scope    mutation testing on changed files',
   '  flake-probe       repeat and shuffle changed tests',
-  '  evidence          init | add | claims | waive | finalize | render | status',
+  '  evidence          init | add | claims | waive | finalize | render | status | score',
   '  trace             spec -> diff traceability skeleton',
   'Test engineering:',
   '  scaffold          e2e-web | e2e-api | e2e-cli | live | regress | ci-gate | flake | tooling kinds',

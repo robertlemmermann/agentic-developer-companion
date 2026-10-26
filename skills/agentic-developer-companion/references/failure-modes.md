@@ -142,8 +142,7 @@ Write "guidance-only mode" in the ledger you write yourself.
 
 One scenario per documented strategy, materialized committed and uncommitted by
 `tests/unit/diff-scope.test.mjs` in the companion's source repository (run it alone or with
-`node tests/selftest.mjs --only diffs`; the fixtures are the `diffs` section of
-`tests/fixtures/table.json`, kept in `tests/fixtures/_parts/diffs.json`). The diff-scope /
+`node tests/selftest.mjs --only diffs`; the fixtures are in `tests/fixtures/diffs.json`). The diff-scope /
 deps-check column is asserted there; the other columns state the design, and the test keeps
 all three identical to the fixture. The same file runs every planted check of section 2
 committed and uncommitted, plus over 90 per-ecosystem scenarios and over 45 false-positive

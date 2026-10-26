@@ -238,10 +238,12 @@ export function parseUnifiedDiff(text) {
     else if (line.startsWith('rename from ')) { cur.status = 'R'; cur.oldPath = line.slice(12); }
     else if (line.startsWith('rename to ')) cur.path = line.slice(10);
     else if (line.startsWith('Binary files ')) cur.binary = true;
-    else if (line.startsWith('--- ')) {
+    // `--- ` / `+++ ` are file headers only before the first hunk; inside a hunk they are content
+    // (a removed `-- comment` line, an added `++ x` line).
+    else if (!hunk && line.startsWith('--- ')) {
       const p = unquote(line.slice(4).trim());
       if (p !== '/dev/null') cur.oldPath = p.replace(/^a\//, '');
-    } else if (line.startsWith('+++ ')) {
+    } else if (!hunk && line.startsWith('+++ ')) {
       const p = unquote(line.slice(4).trim());
       if (p !== '/dev/null') cur.path = p.replace(/^b\//, '');
       else cur.path = cur.oldPath;

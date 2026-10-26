@@ -18,9 +18,7 @@ import {
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
-  const table = path.join(FIX, 'table.json');
-  if (fs.existsSync(table)) { const t = JSON.parse(fs.readFileSync(table, 'utf8')); if (t[name]) return t[name]; }
-  return JSON.parse(fs.readFileSync(path.join(FIX, '_parts', `${name}.json`), 'utf8'));
+  return JSON.parse(fs.readFileSync(path.join(FIX, `${name}.json`), 'utf8'));
 }
 
 const ADC = core.ADC_SCRIPT;
@@ -278,7 +276,7 @@ test('malformed inputs never break detection: bad JSON, BOM, CRLF, unparseable Y
 });
 
 test('own source files carry no secret-shaped literals', () => {
-  const files = [path.join(core.SKILL_DIR, 'scripts', 'lib', 'detect.mjs'), fileURLToPath(import.meta.url), path.join(FIX, '_parts', 'detect.json')];
+  const files = [path.join(core.SKILL_DIR, 'scripts', 'lib', 'detect.mjs'), fileURLToPath(import.meta.url), path.join(FIX, 'detect.json')];
   for (const f of files) assert.deepEqual(scanSecrets(fs.readFileSync(f, 'utf8')).map((h) => `${h.id}:${h.line}`), [], f);
 });
 

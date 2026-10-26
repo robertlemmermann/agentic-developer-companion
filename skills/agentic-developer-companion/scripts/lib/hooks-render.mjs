@@ -11,7 +11,7 @@ import {
   writeJsonAtomic, IS_WINDOWS,
 } from './core.mjs';
 import { appendExclude, checkIgnore, repoRoot } from './git.mjs';
-import { prepareStateDir, resolveStateDir, statePaths } from './state.mjs';
+import { prepareStateDir, resolveStateDir, statePaths, assertStateUntracked } from './state.mjs';
 import { LEVELS } from './hook-dialects.mjs';
 
 export { LEVELS };
@@ -705,8 +705,14 @@ function humanRender(res) {
   return lines.join('\n');
 }
 
+/** Every CLI command refuses (exit 3) while the state dir is tracked by git (plan §7.3). */
+function refuseTrackedState(ctx, root) {
+  if (root) assertStateUntracked(resolveStateDir({ cwd: root, stateDirOption: ctx.stateDirOption }));
+}
+
 async function runRender(ctx, values) {
   const root = repoRoot(ctx.cwd);
+  refuseTrackedState(ctx, root);
   const env = process.env;
   if (values.remove) {
     const sel = { host: values.host || null, scope: values.scope || null, root, env };
@@ -767,7 +773,9 @@ export const listCommand = defineCommand({
   usage: 'hooks list [--json]  (registered hooks of this skill: user config files plus the current repository)',
   positionals: false,
   run: async (ctx) => {
-    const hooks = listRegisteredHooks({ root: repoRoot(ctx.cwd) });
+    const root = repoRoot(ctx.cwd);
+    refuseTrackedState(ctx, root);
+    const hooks = listRegisteredHooks({ root });
     const line = (h) => `${h.host} (${h.scope}, ${h.level || '?'}) ${h.file}: ${h.events.join(', ')}`
       + `${h.present === false ? ' [recorded, missing]' : ''}`
       + `${h.matches_current === false ? ' [differs from current render]' : ''}`;

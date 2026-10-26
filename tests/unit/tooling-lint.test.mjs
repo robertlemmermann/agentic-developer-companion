@@ -17,9 +17,7 @@ import { toolingCommand } from '../../skills/agentic-developer-companion/scripts
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
-  const table = path.join(FIX, 'table.json');
-  if (fs.existsSync(table)) { const t = JSON.parse(fs.readFileSync(table, 'utf8')); if (t[name]) return t[name]; }
-  return JSON.parse(fs.readFileSync(path.join(FIX, '_parts', `${name}.json`), 'utf8'));
+  return JSON.parse(fs.readFileSync(path.join(FIX, `${name}.json`), 'utf8'));
 }
 
 const SKILL_DIR = core.SKILL_DIR;

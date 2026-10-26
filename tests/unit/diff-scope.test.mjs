@@ -18,9 +18,7 @@ import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
-  const table = path.join(FIX, 'table.json');
-  if (fs.existsSync(table)) { const t = JSON.parse(fs.readFileSync(table, 'utf8')); if (t[name]) return t[name]; }
-  return JSON.parse(fs.readFileSync(path.join(FIX, '_parts', `${name}.json`), 'utf8'));
+  return JSON.parse(fs.readFileSync(path.join(FIX, `${name}.json`), 'utf8'));
 }
 
 const ADC = core.ADC_SCRIPT;
@@ -318,7 +316,7 @@ describe('markers', () => {
     const files = core.listFiles(core.SKILL_DIR).filter((f) => !/\.(?:png|jpg|gif|ico)$/.test(f));
     // Hard-fail on everything that ships plus this work package's own tests and fixtures; other
     // work packages' test files are reported (selftest's footprint area enforces them).
-    const own = (f) => !f.startsWith('tests/') || f === 'tests/unit/diff-scope.test.mjs' || f === 'tests/fixtures/_parts/diffs.json';
+    const own = (f) => !f.startsWith('tests/') || f === 'tests/unit/diff-scope.test.mjs' || f === 'tests/fixtures/diffs.json';
     const hits = [];
     const elsewhere = [];
     for (const f of files) {
@@ -1184,4 +1182,11 @@ describe('adc.mjs end to end', () => {
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.ok(!fs.existsSync(path.join(dir, '.adc')));
   });
+});
+
+test('redactDeep never returns a subtree nested deeper than its limit unredacted', () => {
+  let deep = 'leaf';
+  for (let i = 0; i < 80; i++) deep = { k: deep };
+  const out = JSON.stringify(M.redactDeep(deep, (s) => s.toUpperCase()));
+  assert.ok(!out.includes('"leaf"') && out.includes('[REDACTED:TOO_DEEP]'));
 });

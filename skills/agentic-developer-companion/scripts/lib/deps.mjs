@@ -9,7 +9,7 @@ import path from 'node:path';
 import { builtinModules } from 'node:module';
 import {
   defineCommand, EXIT, runTool, which, sha256, asciiJson, toPosix, truncate, redactLiterals, IS_WINDOWS, tmpRoot,
-  readText, nonce, stripBom, lastLine, liveSecrets, makeCheck,
+  readText, nonce, stripBom, lastLine, liveSecrets, makeCheck, toolEnv,
 } from './core.mjs';
 import {
   emptyTree, diffNameStatus, diffLines, gitRaw, readBlobs, showFile, lsTree, worktreeAdd, worktreeRemove,
@@ -29,14 +29,6 @@ const toml = (text) => parseToml(text, { lenient: true }).value;
 const lastUseful = (s) => truncate(lastLine(s), 200);
 const NON_REGISTRY = new Set(['local', 'git', 'url']);
 
-/**
- * `env` without the live-test credentials (ADC_LIVE_TOKEN, ADC_LIVE_*KEY|SECRET|...): package managers
- * and scanners never need them, and some run project code (a pnpmfile, a Python build backend).
- */
-export function toolEnv(env = process.env) {
-  const live = new Set(liveSecrets(env, { min: 1 }).map((s) => s.name));
-  return live.size ? Object.fromEntries(Object.entries(env).filter(([k]) => !live.has(k))) : env;
-}
 
 // ---------------------------------------------------------------------------
 // Blob reads

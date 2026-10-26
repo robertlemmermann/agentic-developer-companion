@@ -960,7 +960,8 @@ export function redactDeep(value, redact, opts = {}, key = '', depth = 0) {
     if (secretKeys && key && SECRET_NAME.test(key) && value && !/^\$/.test(value)) return '[REDACTED]';
     return redact(value);
   }
-  if (!value || typeof value !== 'object' || depth > 64) return value;
+  if (!value || typeof value !== 'object') return value;
+  if (depth > 64) return '[REDACTED:TOO_DEEP]'; // never return a deep subtree unredacted
   if (Array.isArray(value)) return value.map((v) => redactDeep(v, redact, opts, key, depth + 1));
   const out = {};
   for (const [k, v] of Object.entries(value)) out[keys ? redact(k) : k] = redactDeep(v, redact, opts, k, depth + 1);

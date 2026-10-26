@@ -546,3 +546,31 @@ test('makeCheck fills every ledger field (plan §9.2)', () => {
   assert.deepEqual([c.id, c.status, c.reason, c.project, c.data.n], ['CK-LIVE', 'pass', null, '.', 1]);
   assert.notEqual(core.makeCheck({}).findings, core.makeCheck({}).findings, 'fresh arrays per check');
 });
+
+test('relPosix keeps in-repo names that start with two dots', () => {
+  const root = path.resolve('/repo');
+  assert.equal(core.relPosix(root, path.join(root, '..notes.md')), '..notes.md');
+  assert.equal(core.relPosix(root, path.join(root, '..', 'x')), null);
+  assert.equal(core.relPosix(root, root), '.');
+});
+
+test('parseUnifiedDiff treats --- and +++ inside a hunk as content', () => {
+  const text = ['diff --git a/q.sql b/q.sql', '--- a/q.sql', '+++ b/q.sql', '@@ -1,2 +1,2 @@',
+    '--- a SQL comment', '+++ plus content', ' kept', ''].join('\n');
+  const [f] = git.parseUnifiedDiff(text);
+  assert.equal(f.path, 'q.sql');
+  assert.deepEqual(f.removed.map((l) => l.text), ['-- a SQL comment']);
+  assert.deepEqual(f.added.map((l) => l.text), ['++ plus content']);
+});
+
+test('a command group prints its usage and exits 0 on --help', () => {
+  for (const argv of [['evidence', '--help'], ['tooling', '-h'], ['hooks', 'help']]) {
+    const r = spawnSync(process.execPath, [ADC, ...argv], { encoding: 'utf8' });
+    assert.equal(r.status, 0, argv.join(' '));
+  }
+});
+
+test('toolEnv drops live credentials only', () => {
+  const env = core.toolEnv({ PATH: '/bin', ADC_LIVE_TOKEN: 'abcdefgh', HOME: '/h' });
+  assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH']);
+});
