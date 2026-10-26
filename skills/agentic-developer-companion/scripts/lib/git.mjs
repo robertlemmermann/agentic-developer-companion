@@ -1,9 +1,12 @@
 // Git layer: repository identity, base resolution (§7.4), the working-tree snapshot (§7.5),
 // temp worktrees, and diff parsing. Every call goes through `git` with an argument array.
 
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { envError, unverifiable, usageError, run, nonce, tmpRoot, ensureDir, toPosix, versionGte, parseVersion } from './core.mjs';
+import {
+  envError, unverifiable, usageError, run, nonce, tmpRoot, ensureDir, toPosix, versionGte, parseVersion, readText,
+} from './core.mjs';
 
 export const MIN_GIT = '2.31.0';
 const SNAPSHOT_IDENT = {
@@ -206,15 +209,24 @@ export function diffLines(root, from, to, paths = []) {
   return parseUnifiedDiff(out);
 }
 
+/**
+ * Parse unified diff text. Per file: `{ path, oldPath, status, binary, added, removed, hunks }`
+ * where `hunks` are `{ oldStart, oldCount, newStart, newCount, added: [{line, text}], removed }`.
+ */
 export function parseUnifiedDiff(text) {
   const files = [];
   let cur = null;
+  let hunk = null;
   let oldLine = 0;
   let newLine = 0;
-  const unquote = (s) => (s.startsWith('"') && s.endsWith('"') ? JSON.parse(s) : s);
+  const unquote = (s) => {
+    if (!(s.startsWith('"') && s.endsWith('"'))) return s;
+    try { return JSON.parse(s); } catch { return s.slice(1, -1); }
+  };
   for (const line of String(text).split('\n')) {
     if (line.startsWith('diff --git ')) {
-      cur = { path: null, oldPath: null, status: 'M', binary: false, added: [], removed: [] };
+      hunk = null;
+      cur = { path: null, oldPath: null, status: 'M', binary: false, added: [], removed: [], hunks: [] };
       const m = /^diff --git (?:"?a\/)(.+?)"? (?:"?b\/)(.+?)"?$/.exec(line);
       if (m) { cur.oldPath = m[1]; cur.path = m[2]; }
       files.push(cur);
@@ -234,11 +246,24 @@ export function parseUnifiedDiff(text) {
       if (p !== '/dev/null') cur.path = p.replace(/^b\//, '');
       else cur.path = cur.oldPath;
     } else if (line.startsWith('@@')) {
-      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-      if (m) { oldLine = Number(m[1]); newLine = Number(m[2]); }
-    } else if (line.startsWith('+')) cur.added.push({ line: newLine++, text: line.slice(1) });
-    else if (line.startsWith('-')) cur.removed.push({ line: oldLine++, text: line.slice(1) });
-    else if (line.startsWith('\\')) { /* "\ No newline at end of file" */ }
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (m) {
+        oldLine = Number(m[1]);
+        newLine = Number(m[3]);
+        const count = (v) => (v == null ? 1 : Number(v));
+        hunk = { oldStart: oldLine, oldCount: count(m[2]), newStart: newLine, newCount: count(m[4]) };
+        Object.assign(hunk, { added: [], removed: [] });
+        cur.hunks.push(hunk);
+      }
+    } else if (line.startsWith('+')) {
+      const l = { line: newLine++, text: line.slice(1) };
+      cur.added.push(l);
+      if (hunk) hunk.added.push(l);
+    } else if (line.startsWith('-')) {
+      const l = { line: oldLine++, text: line.slice(1) };
+      cur.removed.push(l);
+      if (hunk) hunk.removed.push(l);
+    } else if (line.startsWith('\\')) { /* "\ No newline at end of file" */ }
   }
   for (const f of files) {
     if (f.status === 'D') f.path = f.oldPath;
@@ -253,14 +278,99 @@ export function showFile(root, rev, file) {
   return res.exit === 0 ? res.stdout : null;
 }
 
-export function lsTree(root, rev) {
-  const out = gitTry(root, ['-c', 'core.quotePath=false', 'ls-tree', '-r', '--name-only', '-z', rev]);
-  return out == null ? [] : out.split('\0').filter(Boolean);
+/**
+ * Files of a tree-ish (recursive): paths, or with `entries` `[{ mode, type, sha, path }]` (blobs
+ * and submodule commits). `paths` limits the listing; entries keep repository-root paths.
+ */
+export function lsTree(root, rev, { paths = [], entries = false } = {}) {
+  const args = ['-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', entries ? '--full-tree' : '--name-only', rev];
+  const out = gitTry(root, paths.length ? [...args, '--', ...paths] : args);
+  if (out == null) return [];
+  const recs = out.split('\0').filter(Boolean);
+  if (!entries) return recs;
+  return recs.map((r) => /^(\d+) (\w+) ([0-9a-f]+)\t(.*)$/s.exec(r)).filter(Boolean)
+    .map((m) => ({ mode: m[1], type: m[2], sha: m[3], path: m[4] }));
 }
 
-export function lsFiles(root, pathspecs = []) {
-  const out = gitTry(root, ['-c', 'core.quotePath=false', 'ls-files', '-z', '--', ...pathspecs]);
-  return out == null ? [] : out.split('\0').filter(Boolean);
+/**
+ * Raw contents of many objects in one `git cat-file --batch`: `specs` are object names or
+ * `<rev>:<path>`. Returns Map(spec → Buffer | null); a missing object maps to null.
+ */
+export function readBlobs(root, specs) {
+  const list = [...new Set(specs.map(String))];
+  const out = new Map(list.map((x) => [x, null]));
+  if (!list.length) return out;
+  if (list.some((x) => /[\r\n]/.test(x))) throw usageError('readBlobs: object names cannot contain newlines');
+  const res = spawnSync('git', ['cat-file', '--batch'],
+    { cwd: root, input: list.join('\n') + '\n', maxBuffer: 1024 * 1024 * 1024, windowsHide: true });
+  if (res.error && res.error.code === 'ENOENT') throw envError('NO_GIT', 'git is not on PATH (Git 2.31+ is required)');
+  if (res.status !== 0) {
+    throw unverifiable('GIT_FAILED', `git cat-file --batch failed: ${String(res.stderr || '').trim().split('\n')[0]}`);
+  }
+  const buf = res.stdout;
+  let pos = 0;
+  for (const spec of list) {
+    const nl = buf.indexOf(10, pos);
+    if (nl < 0) break;
+    const header = buf.subarray(pos, nl).toString('utf8').split(' ');
+    pos = nl + 1;
+    if (header[header.length - 1] === 'missing' || header.length < 3) continue;
+    const size = Number(header[2]);
+    out.set(spec, buf.subarray(pos, pos + size));
+    pos += size + 1;
+  }
+  return out;
+}
+
+/**
+ * Tracked paths matching `pathspecs` ([] when git fails). `strict`: null when git fails, for
+ * callers that must tell "nothing tracked" from "could not ask" (the hooks' tracked-state check).
+ */
+export function lsFiles(root, pathspecs = [], { timeoutMs, strict = false } = {}) {
+  let res;
+  try {
+    const args = ['-c', 'core.quotePath=false', 'ls-files', '-z', '--', ...pathspecs];
+    res = gitRaw(root, args, timeoutMs ? { timeoutMs } : {});
+  } catch (err) {
+    if (strict) return null;
+    throw err;
+  }
+  if (res.exit !== 0) return strict ? null : [];
+  return res.stdout.split('\0').filter(Boolean);
+}
+
+/** `git status --porcelain=v1 -z` including untracked files (no optional locks), or null on failure. */
+export function statusPorcelain(root, paths = []) {
+  const args = ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all'];
+  const res = gitRaw(root, paths.length ? [...args, '--', ...paths] : args);
+  return res.exit === 0 ? res.stdout : null;
+}
+
+/**
+ * Add `entry` (e.g. `/.adc/`) to the repository's exclude file, never a committed change. The
+ * file is `excludeFile` when given (git-free: hooks pass `<common git dir>/info/exclude`), else
+ * `git rev-parse --git-path info/exclude` (linked worktrees and submodules). `aliases` are
+ * equivalent spellings that count as present. Returns `{ ok, written, excludeFile, entry, error? }`.
+ */
+export function appendExclude(root, entry, {
+  comment = 'agentic-developer-companion state (never commit)', aliases = [], excludeFile = null,
+} = {}) {
+  let file = excludeFile;
+  try {
+    file = file || gitPath(root, 'info/exclude');
+    const current = readText(file, '') || '';
+    const lines = current.split(/\r?\n/).map((l) => l.trim());
+    if ([entry, ...aliases].some((e) => lines.includes(e))) {
+      return { ok: true, written: false, excludeFile: toPosix(file), entry };
+    }
+    ensureDir(path.dirname(file));
+    const sep = current && !current.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(file, `${sep}${comment ? `# ${comment}\n` : ''}${entry}\n`);
+    return { ok: true, written: true, excludeFile: toPosix(file), entry };
+  } catch (err) {
+    const excluded = file ? toPosix(file) : null;
+    return { ok: false, written: false, excludeFile: excluded, entry, error: err.code || err.message };
+  }
 }
 
 /** True when git would ignore `file` (relative to root). */

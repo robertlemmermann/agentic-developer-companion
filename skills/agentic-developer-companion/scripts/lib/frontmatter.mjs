@@ -764,6 +764,31 @@ export function parseYaml(text) {
   return doc.value;
 }
 
+const DOC_MARKER = /^(?:---|\.\.\.)[ \t]*(?:#.*)?$/;
+
+/**
+ * Every document of a YAML stream (CI files, `---`-separated configs): one value per document,
+ * null for a document that does not parse. Never throws.
+ */
+export function parseYamlAll(text) {
+  const lines = String(text ?? '').replace(/^\ufeff/, '').split(/\r?\n/);
+  const docs = [];
+  let start = 0;
+  const flush = (end) => {
+    const chunk = lines.slice(start, end);
+    if (!chunk.some((l) => !isBlank(l) && !DOC_MARKER.test(l) && !/^%/.test(l))) return;
+    const doc = parseYamlDocument(chunk.join('\n') + '\n', { lineOffset: start });
+    docs.push(doc.errors.length ? null : doc.value);
+  };
+  for (let i = 0; i < lines.length; i++) {
+    // A `---` line opens the next document (and stays in it: `--- value` is valid); `...` ends one.
+    if (/^---(?:[ \t]|$)/.test(lines[i])) { flush(i); start = i; }
+    else if (/^\.\.\.[ \t]*$/.test(lines[i])) { flush(i); start = i + 1; }
+  }
+  flush(lines.length);
+  return docs;
+}
+
 const FM_OPEN = /^---[ \t]*$/;
 const FM_CLOSE = /^(?:---|\.\.\.)[ \t]*$/;
 
@@ -867,8 +892,12 @@ function quoteDouble(s) {
     (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 }
 
+// Keys stay plain when YAML 1.2 reads them back as the same string: `on:` and `yes:` are written
+// bare, as GitHub workflows and host docs do (only YAML 1.1 values are quoted defensively).
+const YAML11_BOOL = /^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF)$/;
+
 function stringifyKey(k) {
-  return PLAIN_KEY.test(k) && plainSafe(k) ? k : quoteDouble(k);
+  return PLAIN_KEY.test(k) && (plainSafe(k) || YAML11_BOOL.test(k)) ? k : quoteDouble(k);
 }
 
 function foldable(s) {
@@ -920,17 +949,20 @@ function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-function stringifyNode(v, indent, width) {
+const QUOTE_KEYS = ['applyTo', 'paths', 'excludeAgent'];
+const flowItem = (v, o) => (typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : stringifyScalar(v, 0, o.width));
+
+function stringifyNode(v, indent, o, quote = false) {
   const pad = ' '.repeat(indent);
   if (Array.isArray(v)) {
     if (!v.length) return null;
     return v.map((item) => {
       if (isPlainObject(item) && Object.keys(item).some((x) => item[x] !== undefined)) {
-        const inner = stringifyNode(item, indent + 2, width).replace(/^ +/, '');
+        const inner = stringifyNode(item, indent + 2, o).replace(/^ +/, '');
         return `${pad}- ${inner}`;
       }
-      if (Array.isArray(item) && item.length) return `${pad}-\n${stringifyNode(item, indent + 2, width)}`;
-      return `${pad}- ${inlineValue(item, indent, width)}`;
+      if (Array.isArray(item) && item.length) return `${pad}-\n${stringifyNode(item, indent + 2, o)}`;
+      return `${pad}- ${inlineValue(item, indent, o, quote)}`;
     }).join('\n');
   }
   if (isPlainObject(v)) {
@@ -939,32 +971,107 @@ function stringifyNode(v, indent, width) {
     return keys.map((k) => {
       const val = v[k];
       const key = `${pad}${stringifyKey(k)}:`;
-      if ((isPlainObject(val) && Object.keys(val).some((x) => val[x] !== undefined)) || (Array.isArray(val) && val.length)) {
-        return `${key}\n${stringifyNode(val, indent + 2, width)}`;
+      const q = o.quoteKeys.includes(k);
+      const scalars = Array.isArray(val) && val.length && val.every((x) => x === null || typeof x !== 'object');
+      if (scalars && o.flowKeys.includes(k)) {
+        return `${key} [${val.map((x) => flowItem(x, o)).join(', ')}]`;
       }
-      return `${key} ${inlineValue(val, indent, width)}`;
+      if ((isPlainObject(val) && Object.keys(val).some((x) => val[x] !== undefined)) || (Array.isArray(val) && val.length)) {
+        return `${key}\n${stringifyNode(val, indent + 2, o, q)}`;
+      }
+      return `${key} ${inlineValue(val, indent, o, q)}`;
     }).join('\n');
   }
-  return pad + stringifyScalar(v, indent, width);
+  return pad + stringifyScalar(v, indent, o.width);
 }
 
-function inlineValue(v, indent, width) {
+function inlineValue(v, indent, o, quote = false) {
   if (Array.isArray(v)) return '[]';
   if (isPlainObject(v)) return '{}';
-  return stringifyScalar(v, indent, width);
+  if (quote && typeof v === 'string') return quoteDouble(v);
+  return stringifyScalar(v, indent, o.width);
 }
 
-/** YAML text for `value` (block style, insertion order, LF line endings). */
-export function stringifyYaml(value, { width = 80 } = {}) {
+/**
+ * YAML text for `value` (block style, insertion order, LF line endings). `flowKeys`: keys whose
+ * scalar lists are written `[a, b]` (agent `tools`; strictyaml rejects flow style in SKILL.md);
+ * `quoteKeys`: keys whose strings are always double-quoted (glob fields the hosts document quoted).
+ */
+export function stringifyYaml(value, { width = 80, flowKeys = [], quoteKeys = QUOTE_KEYS } = {}) {
+  const o = { width, flowKeys, quoteKeys };
   if (Array.isArray(value) || isPlainObject(value)) {
-    const out = stringifyNode(value, 0, width);
+    const out = stringifyNode(value, 0, o);
     return out === null ? (Array.isArray(value) ? '[]\n' : '{}\n') : out + '\n';
   }
   return stringifyScalar(value, 0, width) + '\n';
 }
 
-/** `---\n<yaml>---\n` followed by `body` when given; parseFrontmatter reads it back unchanged. */
+/**
+ * `---\n<yaml>---\n` followed by `body` when given; parseFrontmatter reads it back unchanged.
+ * The second argument may be the stringifyYaml options instead of a body.
+ */
 export function stringifyFrontmatter(data, body = null, opts = {}) {
+  if (body !== null && typeof body === 'object') { opts = body; body = null; }
   const yaml = data && Object.keys(data).length ? stringifyYaml(data, opts) : '';
   return `---\n${yaml}---\n${body == null ? '' : body}`;
+}
+
+// ---------------------------------------------------------------------------
+// Markdown bodies
+
+/**
+ * Lines of a Markdown text with fenced-code state: `{ n, raw, code, fenceStart?, fenceEnd?, lang? }`
+ * for code lines, `{ n, raw, code: false, prose }` otherwise, where `prose` has inline code spans
+ * blanked (same length, so columns stay valid).
+ */
+export function markdownLines(text) {
+  const out = [];
+  let fence = null;
+  const lines = String(text ?? '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const m = /^\s*(`{3,}|~{3,})(.*)$/.exec(raw);
+    if (fence) {
+      if (m && m[1][0] === fence.ch && m[1].length >= fence.len && m[2].trim() === '') {
+        out.push({ n: i + 1, raw, code: true, fenceEnd: true, lang: fence.lang });
+        fence = null;
+      } else out.push({ n: i + 1, raw, code: true, lang: fence.lang });
+      continue;
+    }
+    if (m) {
+      fence = { ch: m[1][0], len: m[1].length, lang: m[2].trim().split(/\s+/)[0] || '' };
+      out.push({ n: i + 1, raw, code: true, fenceStart: true, lang: fence.lang });
+      continue;
+    }
+    out.push({ n: i + 1, raw, code: false, prose: raw.replace(/(`+)[^`]*?\1/g, (x) => ' '.repeat(x.length)) });
+  }
+  return out;
+}
+
+/** Inline and reference-style link targets outside code: `[{ line, target }]` (`<...>` unwrapped). */
+export function markdownLinks(text) {
+  const links = [];
+  for (const l of markdownLines(text)) {
+    if (l.code) continue;
+    const re = /!?\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>]*>|[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)(?:\s+["'(][^)]*)?\)/g;
+    let m;
+    while ((m = re.exec(l.prose))) links.push({ line: l.n, target: m[1].replace(/^<|>$/g, '') });
+    const ref = /^\s{0,3}\[[^\]]+\]:\s*(\S+)/.exec(l.prose);
+    if (ref) links.push({ line: l.n, target: ref[1].replace(/^<|>$/g, '') });
+  }
+  return links;
+}
+
+/** A link that leaves the file tree: a URL scheme (not file: or a drive letter), `#anchor` or `//host`. */
+export function isExternalLink(target) {
+  const t = String(target);
+  const scheme = /^[a-z][a-z0-9+.-]*:/i.test(t) && !/^[a-zA-Z]:[\\/]/.test(t) && !/^file:/i.test(t);
+  return scheme || t.startsWith('#') || t.startsWith('//');
+}
+
+/** The file path of a link target: anchor and query removed, percent-decoding applied. */
+export function linkPath(target) {
+  let t = String(target).split('#')[0].split('?')[0];
+  try { t = decodeURIComponent(t); } catch {}
+  return t;
 }

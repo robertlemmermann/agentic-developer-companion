@@ -1,402 +1,246 @@
-// Test-engineering scaffolds (plan §10): e2e-web, e2e-api, e2e-cli, live, regress, ci-gate and
-// flake, rendered from assets/templates/<family>.tmpl with detected values. Tooling kinds
-// (instructions, skill, agent, prompt, hooks, mcp, plugin) are delegated to tooling.mjs.
-// Nothing is written without --write; an existing file is never overwritten without --force
-// (additive merges into ignore files and the probe manifest are the only in-place edits).
+// Test-engineering scaffolds (plan §10) rendered from assets/templates/<family>.tmpl with detected values;
+// tooling kinds go to tooling.mjs. Nothing is written without --write and no existing file is replaced
+// without --force; additive merges (ignore lines, probes.json entries) are the only in-place edits. Next
+// steps and per-runner CI data live in the templates, so guidance, data and generated files stay in step.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  EXIT, usageError, envError, parseOpts, makeContext, loadBundle, renderString, readText, readJson,
-  writeFileAtomic, ensureDir, toPosix, relPosix, stamp, today, generatedBy, skillVersion, SKILL_DIR,
-  SKILL_NAME, truncate,
+  EXIT, SKILL_DIR, SKILL_NAME, usageError, envError, parseOpts, makeContext, loadBundle, renderString, readText,
+  readJson, listFiles, toPosix, relPosix, today, generatedBy, skillVersion, truncate, isDir, numberOption,
+  selectSections, shellWords,
 } from './core.mjs';
-import { repoRoot, checkIgnore, lsFiles } from './git.mjs';
-import { prepareStateDir, materializeTemplates } from './state.mjs';
+import { repoRoot, checkIgnore } from './git.mjs';
+import { prepareStateDir, materializeTemplates, writeOutputs, backupDirFactory } from './state.mjs';
+import { detect } from './detect.mjs';
+import { parseToml } from './formats.mjs';
+import { scaffoldTooling, TOOLING_KINDS, TOOLING_SCAFFOLD_OPTIONS } from './tooling.mjs';
 
 export const TEST_KINDS = Object.freeze(['e2e-web', 'e2e-api', 'e2e-cli', 'live', 'regress', 'ci-gate', 'flake']);
-/** Mirror of tooling.mjs TOOLING_KINDS (that module is the source of truth and is loaded lazily). */
-export const TOOLING_KINDS = Object.freeze(['instructions', 'skill', 'agent', 'prompt', 'hooks', 'mcp', 'plugin']);
-const FAMILY = Object.freeze({ 'e2e-web': 'e2e', 'e2e-api': 'e2e', 'e2e-cli': 'e2e', live: 'live', regress: 'regress', 'ci-gate': 'ci-gate', flake: 'flake' });
 
-/** Languages each kind can render; the first one is the fallback when detection finds none. */
-export const KIND_LANGS = Object.freeze({
-  'e2e-web': ['ts', 'python'],
-  'e2e-api': ['ts', 'js', 'python', 'java', 'dotnet'],
-  'e2e-cli': ['ts', 'js', 'python', 'go', 'rust'],
-  live: ['ts', 'js', 'python'],
-  regress: ['ts', 'js', 'python', 'go', 'rust', 'java', 'dotnet', 'ruby'],
-  'ci-gate': null,
-  flake: null,
-});
+/** Languages per kind with their default output dir (the first is used when detection finds none). */
+const KINDS = {
+  'e2e-web': { ts: 'e2e/web', python: 'tests/e2e/web' },
+  'e2e-api': { ts: 'e2e/api', js: 'e2e/api', python: 'tests/e2e/api', java: 'src/test/java/e2e',
+    dotnet: 'tests/E2E.Api' },
+  'e2e-cli': { ts: 'e2e/cli', js: 'e2e/cli', python: 'tests/e2e/cli', go: 'e2e/cli', rust: 'tests' },
+  live: { ts: 'tests/live', js: 'tests/live', python: 'tests/live' },
+  // null: the project root (a Go test lives in the package it tests).
+  regress: { ts: 'test/regression', js: 'test/regression', python: 'tests/regression', go: null, rust: 'tests',
+    java: 'src/test/java/regression', dotnet: 'tests/Regression', ruby: 'spec/regression' },
+};
 
-export const SCAFFOLD_OPTIONS = Object.freeze({
-  kind: { type: 'string' }, lang: { type: 'string' }, for: { type: 'string' }, out: { type: 'string' },
-  write: { type: 'boolean' }, force: { type: 'boolean' }, checklist: { type: 'string' },
-  'base-url': { type: 'string' }, journeys: { type: 'string' }, 'health-path': { type: 'string' },
-  bin: { type: 'string' }, pact: { type: 'string' }, audit: { type: 'boolean' },
-  issue: { type: 'string' }, behavior: { type: 'string' }, level: { type: 'string' }, characterize: { type: 'boolean' },
-  'synthetic-cost': { type: 'string' }, schedule: { type: 'string' },
-  'test-cmd': { type: 'string' }, os: { type: 'string' }, threshold: { type: 'string' }, 'max-flaky': { type: 'string' },
-  test: { type: 'string' }, 'skill-path': { type: 'string' },
-});
+const OPTIONS = Object.fromEntries([
+  ...['kind', 'lang', 'for', 'out', 'checklist', 'base-url', 'journeys', 'health-path', 'bin', 'pact', 'issue',
+    'behavior', 'level', 'synthetic-cost', 'cost-header', 'cost-header-kind', 'schedule', 'test-cmd', 'os',
+    'threshold', 'max-flaky', 'test', 'skill-path'].map((k) => [k, { type: 'string' }]),
+  ...['write', 'force', 'audit', 'characterize'].map((k) => [k, { type: 'boolean' }]),
+]);
 
 const USAGE = `usage: node <skill>/scripts/adc.mjs scaffold <kind> [options] [--write] [--force] [--json]
 
-Test engineering (plan section 10):
-  e2e-web   Playwright project (TypeScript or Python): config, fixtures, page objects, smoke test,
-            first journeys, sharded workflow.   --base-url u  --journeys "a,b,c"  --audit (harden an
-            existing suite: prioritized fix list, writes nothing)
-  e2e-api   HTTP API tests: client fixture, contract snapshots, negative cases; Schemathesis
-            workflow when an OpenAPI document exists; Pact consumer skeleton with --pact <provider>
-  e2e-cli   spawn-based CLI harness with golden files, exit-code/stderr checks, --help smoke.  --bin "cmd"
-  live      tests/live probe project for \`adc.mjs live run\`: read-only probes, gated synthetic probes,
-            probes.json, runbook, checklist, scheduled workflow, .adc/ templates.
-            --checklist <file> (synthetic probes only when it has no TODO line)  --synthetic-cost n
-  regress   regression test for a bug: --issue <id> --behavior "<what must hold>" [--level unit|integration|e2e]
-            [--characterize]; repro notes in .adc/repro/
-  ci-gate   GitHub Actions gate: "Merge OK" aggregate, path filter, full suite with retries off, reports,
-            changed-line coverage, diff-scope ratchet, secret scan, audit.  --os linux,windows,macos
-            --threshold 80  --test-cmd "<cmd>"  --for copilot|claude|codex (agent verify job)
-  flake     quarantine policy, registry and workflow; --test <id> adds a diagnosis report in .adc/repro/
-Tooling kinds (delegated to \`tooling scaffold\`): instructions skill agent prompt hooks mcp plugin
+  e2e-web  [--lang ts|python] [--base-url u] [--journeys "a,b,c"] [--for copilot|claude|codex|all] [--audit]
+  e2e-api  [--lang ts|js|python|java|dotnet] [--base-url u] [--health-path /health] [--pact <provider>]
+  e2e-cli  [--lang ts|js|python|go|rust] [--bin "<command>"]
+  live     [--lang ts|js|python] [--checklist f] [--synthetic-cost n] [--cost-header h [--cost-header-kind
+           per_request|cumulative]] [--base-url u] [--health-path p] [--schedule "<cron>"]
+  regress  --issue <id|URL> --behavior "<what must hold>" [--level unit|integration|e2e] [--characterize]
+  ci-gate  [--os linux,windows,macos] [--threshold 80] [--max-flaky 0] [--test-cmd "<cmd>"] [--for hosts]
+  flake    [--test <id>] [--max-flaky 0]
+  instructions | skill | agent | prompt | hooks | mcp | plugin   (delegated to \`tooling scaffold\`)
 
-Common: --lang <l>  --out <dir>  --for <host>  --skill-path <dir>.  Without --write nothing is written
-(the result lists the files). Existing files are never overwritten without --force (a backup goes to
-.adc/backups/scaffold/); .gitignore and probes.json entries are merged in.`;
+Common: --out <dir>, --skill-path <vendored skill dir> (live, ci-gate). Without --write nothing is written
+(the result lists the files); existing files are kept unless --force (backup in .adc/backups/scaffold/).
+Playbooks: references/{e2e,live,regress,ci-gate,flake}.md`;
 
 // ---------------------------------------------------------------------------
-// Small helpers
-
-const CI_HEADER = (kind) => `# generated by ${SKILL_NAME} ci-gate: ${kind} workflow (${generatedBy()}, ${today()})`;
+// Rendering, paths, inputs and detection
 
 /** Render a template; GitHub Actions `${{ ... }}` expressions pass through untouched. */
-export function renderTemplate(text, vars) {
-  const kept = [];
-  const masked = String(text).replace(/\$\{\{[\s\S]*?\}\}/g, (m) => `\u0000${kept.push(m) - 1}\u0000`);
-  return renderString(masked, vars).replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)]);
-}
+export const renderTemplate = (text, vars) => renderString(text, vars, { actions: true });
 
-/**
- * Sections of a bundle for this render. Every attribute must agree with the filter (a missing
- * filter key excludes the section); `when`/`unless` test the feature set; `name`, `scope` and
- * `mode` are descriptive; `part=fragment` sections are only returned for `part: 'fragment'`.
- */
-export function pickSections(sections, filter = {}, features = new Set()) {
-  const wantFragment = filter.part === 'fragment';
-  return sections.filter((s) => {
-    if ((s.attrs.part === 'fragment') !== wantFragment) return false;
-    return Object.entries(s.attrs).every(([k, v]) => {
-      const alts = String(v).split('|');
-      if (k === 'part' || k === 'name' || k === 'scope' || k === 'mode') return true;
-      if (k === 'when') return alts.some((a) => features.has(a));
-      if (k === 'unless') return !alts.some((a) => features.has(a));
-      return k in filter && filter[k] != null && alts.includes(String(filter[k]));
-    });
-  });
-}
+/** Sections whose attributes all match the filter (when/unless test `features`); fragments only for part=fragment. */
+export const pickSections = (sections, filter = {}, features = new Set()) =>
+  selectSections(sections, filter, { strict: true, features, loose: ['part', 'name', 'scope', 'mode'] })
+    .filter((s) => (s.attrs.part === 'fragment') === (filter.part === 'fragment'));
 
-function fragment(bundle, name, filter, vars, features) {
-  const hit = pickSections(bundle, { ...filter, part: 'fragment' }, features).find((s) => s.attrs.name === name);
+const fragments = (bundle, name, filter, features) =>
+  pickSections(bundle, { ...filter, part: 'fragment' }, features).filter((s) => s.attrs.name === name);
+
+/** One named fragment, rendered, without its final newline. */
+function fragment(bundle, name, filter, vars, features = new Set()) {
+  const hit = fragments(bundle, name, filter, features)[0];
   if (!hit) throw envError('TEMPLATE_MISSING', `template fragment "${name}" not found for ${JSON.stringify(filter)}`);
   return renderTemplate(hit.content, vars).replace(/\n$/, '');
 }
+
+/** The bundle's `next` fragments for this render, one next step per non-empty line. */
+const nextSteps = (bundle, filter, features, vars) => fragments(bundle, 'next', filter, features)
+  .flatMap((s) => renderTemplate(s.content, vars).split('\n')).map((l) => l.trim()).filter(Boolean);
+
+/** A JSON data fragment of ci-gate.tmpl: `runners` (how each runner runs in CI) or `audits`. */
+const ciData = (name) => JSON.parse(fragments(loadBundle('ci-gate'), name, {}, new Set())[0].content);
 
 export function slugify(text, max = 48) {
   const s = String(text || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/g, '');
   return s || 'item';
 }
-const ident = (text, max = 48) => slugify(text, max).replace(/-/g, '_');
-const pascal = (text) => slugify(text).split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+const ident = (text, max) => slugify(text, max).replace(/-/g, '_');
+const pascal = (text) => slugify(text).split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join('');
 
 /** Single-quoted JS/TS string literal. */
-export function jsString(text) {
-  return `'${String(text).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\u2028|\u2029/g, ' ')}'`;
-}
-/** Double-quoted string literal valid in Python, Go, Rust, Java and C# for the characters we emit. */
-export function cString(text) {
-  return `"${String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\t/g, '\\t')}"`;
-}
-/** Free text that is safe inside comments and test titles of every target language. */
-function plainText(text, max = 120) {
-  return truncate(String(text || '').replace(/[\r\n\t]+/g, ' ').replace(/\*\//g, '* /').replace(/[`$\\{}]/g, '').replace(/['"]/g, '').trim(), max);
-}
+export const jsString = (text) => `'${String(text).replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+  .replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\u2028|\u2029/g, ' ')}'`;
+/** Double-quoted literal, valid in Python, Go, Rust, Java and C# for the characters it can contain. */
+export const cString = (text) => `"${String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\t/g, '\\t')}"`;
+/** Free text that is safe inside comments, strings and test titles of every target language. */
+const plainText = (text, max = 120) => truncate(String(text || '').replace(/[\r\n\t]+/g, ' ')
+  .replace(/\*\//g, '* /').replace(/[`$\\{}'"]/g, '').trim(), max);
 
-/**
- * ESM -> CommonJS for the scaffold's own JavaScript templates (Jest without ESM support).
- * Handles exactly the import/export forms the templates use.
- */
+/** ESM -> CommonJS for the templates' own import/export forms (Jest without ESM support). */
 export function toCommonJs(text) {
   const exported = [];
   let out = String(text)
     .replace(/^import (\w+) from '([^']+)';$/gm, "const $1 = require('$2');")
-    .replace(/^import \{ ([^}]+) \} from '([^']+)';$/gm, (_, names, mod) => `const { ${names.replace(/\s+as\s+/g, ': ')} } = require('${mod}');`)
+    .replace(/^import \{ ([^}]+) \} from '([^']+)';$/gm,
+      (_, names, mod) => `const { ${names.replace(/\s+as\s+/g, ': ')} } = require('${mod}');`)
     .replace(/^import \* as (\w+) from '([^']+)';$/gm, "const $1 = require('$2');")
-    .replace(/^export (async function|function|const|let|class) (\w+)/gm, (_, decl, name) => { exported.push(name); return `${decl} ${name}`; })
+    .replace(/^export (async function|function|const|let|class) (\w+)/gm, (_, decl, name) => {
+      exported.push(name);
+      return `${decl} ${name}`;
+    })
     .replace(/require\('(\.{1,2}\/[^']+)\.mjs'\)/g, "require('$1.cjs')");
   if (exported.length) out = out.replace(/\n*$/, `\n\nmodule.exports = { ${exported.join(', ')} };\n`);
   return out;
 }
 
-const exists = (root, rel) => fs.existsSync(path.join(root, ...String(rel).split('/')));
-const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
-
-function readPackageJson(dir) {
-  return readJson(path.join(dir, 'package.json'), null);
+/** Split a --bin command line into argv (quotes respected, no shell features, backslashes kept). */
+export function splitArgv(line) {
+  const argv = shellWords(line);
+  if (!argv) throw usageError('--bin has an unterminated quote');
+  return argv;
 }
 
-function skillHomepage() {
-  const text = readText(path.join(SKILL_DIR, 'SKILL.md'), '') || '';
-  const m = /^\s+homepage:\s*["']?(https:\/\/[^\s"']+)["']?\s*$/m.exec(text);
-  return m ? m[1].replace(/\/+$/, '') : `https://github.com/robertlemmermann/${SKILL_NAME}`;
+const abs = (root, rel) => path.join(root, ...String(rel).split('/'));
+const joinOut = (out, rel) => (!out || out === '.' ? rel : `${out}/${rel}`);
+const under = (rel, dir) => dir === '.' || rel === dir || rel.startsWith(`${dir}/`);
+const within = (dir, p) => !/^\.\.(?:[\\/]|$)/.test(path.relative(dir, p)) && !path.isAbsolute(path.relative(dir, p));
+const ciHeader = (kind) => `# generated by ${SKILL_NAME} ci-gate: ${kind} workflow (${generatedBy()}, ${today()})`;
+const helperHeader = () => `generated by ${SKILL_NAME} ci-gate: gate helper (${generatedBy()})`;
+const projectDir = (env) => abs(env.root, env.projectRoot);
+const projectPkg = (env) => readJson(path.join(projectDir(env), 'package.json'), null) || {};
+/** A repo-relative path as seen from the project root (the tests run from there). */
+const projectRelative = (env, rel) => toPosix(path.relative(projectDir(env), abs(env.root, rel))) || '.';
+
+function httpUrl(url, hint = '') {
+  if (/^https?:\/\/[^\s'"`]+$/.test(url) && !/^https?:\/\/[^/]*@/.test(url)) return url;
+  throw usageError(`--base-url must be an http(s) URL without credentials${hint}`);
 }
 
-/** The companion inside the target repository (vendored), as a repo-relative POSIX path, or null. */
-function vendoredSkill(env, explicit) {
-  const root = env.root;
-  const candidates = explicit ? [path.resolve(env.ctx.cwd, explicit)] : ['.github/skills', '.agents/skills', '.claude/skills'].map((d) => path.join(root, d, SKILL_NAME));
-  for (const c of candidates) {
-    const rel = relPosix(root, c);
-    if (rel && rel !== '.' && exists(root, `${rel}/scripts/adc.mjs`)) return rel;
-  }
-  if (explicit) throw usageError(`--skill-path ${explicit}: no scripts/adc.mjs inside the repository at that path`);
-  return null;
+function httpPath(p) {
+  if (/^\/[A-Za-z0-9._~!$&()*+,;=:@%/-]*$/.test(String(p).trim())) return String(p).trim();
+  throw usageError(`--health-path must be an absolute URL path such as /health (got "${p}")`);
 }
 
-// ---------------------------------------------------------------------------
-// Detection: what the templates need from detect.mjs (loaded lazily; tolerated when absent)
-
-const LANG_OF = { typescript: 'ts', javascript: 'js', python: 'python', go: 'go', rust: 'rust', java: 'java', kotlin: 'java', csharp: 'dotnet', fsharp: 'dotnet', vb: 'dotnet', ruby: 'ruby' };
-const NODE_FLAVORS = ['vitest', 'jest', 'node-test', 'mocha', 'bun'];
-
-async function runDetect(root, state) {
-  try {
-    const mod = await import('./detect.mjs');
-    if (typeof mod.detect !== 'function') return { result: null, error: 'detect.mjs has no detect()' };
-    const stateInfo = state && fs.existsSync(state.dir) ? state : null;
-    return { result: await mod.detect({ root, stateInfo, write: false }), error: null };
-  } catch (err) {
-    return { result: null, error: String(err && err.message ? err.message : err) };
-  }
+function parseFor(text) {
+  const all = ['copilot', 'claude', 'codex'];
+  const list = String(text || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const bad = list.find((h) => h !== 'all' && !all.includes(h));
+  if (bad) throw usageError(`--for must be copilot, claude, codex or all (got "${bad}")`);
+  return list.includes('all') ? all : [...new Set(list)];
 }
 
-function under(rel, dir) {
-  return dir === '.' || rel === dir || rel.startsWith(`${dir}/`);
-}
+// detect languages and ecosystems -> template language (also the accepted --lang aliases).
+const LANG_OF = {
+  typescript: 'ts', javascript: 'js', node: 'js', python: 'python', py: 'python', python3: 'python', go: 'go',
+  golang: 'go', rust: 'rust', java: 'java', kotlin: 'java', jvm: 'java', csharp: 'dotnet', fsharp: 'dotnet',
+  vb: 'dotnet', 'c#': 'dotnet', dotnet: 'dotnet', ruby: 'ruby',
+};
+const RUN_CMD = { vitest: 'npx vitest run', jest: 'npx jest', 'node-test': 'node --test', bun: 'bun test',
+  mocha: 'npx mocha' };
+// Where describe/it come from per runner (mocha: globals).
+const TEST_API = { vitest: 'vitest', jest: '@jest/globals', 'node-test': 'node:test', bun: 'bun:test' };
+
+const unitRunners = (p) => ((p && p.runners) || []).filter((r) => r && r.kind !== 'e2e');
+const firstManager = (p) => (p && p.managers && p.managers[0]) || {};
+const ecosystemOf = (p) => (p && p.ecosystems && p.ecosystems[0]) || (unitRunners(p)[0] || {}).ecosystem || null;
 
 /** The project that owns `outRel` (longest root), else the root project, else the first one. */
 function pickProject(det, outRel) {
-  const projects = det && Array.isArray(det.projects) ? det.projects : [];
-  if (!projects.length) return null;
-  if (outRel) {
-    const owners = projects.filter((p) => under(outRel, toPosix(p.root || '.')));
-    if (owners.length) return owners.sort((a, b) => String(b.root).length - String(a.root).length)[0];
-  }
-  return projects.find((p) => (p.root || '.') === '.') || projects[0];
+  const projects = (det && det.projects) || [];
+  const owner = outRel && [...projects].sort((a, b) => String(b.root).length - String(a.root).length)
+    .find((p) => under(outRel, toPosix(p.root || '.')));
+  return owner || projects.find((p) => (p.root || '.') === '.') || projects[0] || null;
 }
 
-const unitRunners = (p) => (p && Array.isArray(p.runners) ? p.runners.filter((r) => r && r.kind !== 'e2e') : []);
-
-function nodeFlavor(p) {
-  const names = unitRunners(p).map((r) => r.name);
-  return NODE_FLAVORS.find((f) => names.includes(f)) || 'node-test';
+/** --lang, else the detected language when the kind has a template for it; `out` is its default dir. */
+function resolveLang(env, { strict = false } = {}) {
+  const allowed = Object.keys(KINDS[env.kind]);
+  const p = env.project || {};
+  const given = env.values.lang && String(env.values.lang).toLowerCase();
+  const detected = [...(p.languages || []), ...(p.ecosystems || [])].map((l) => LANG_OF[l]).find(Boolean);
+  const lang = given ? LANG_OF[given] || given : allowed.includes(detected) ? detected : allowed[0];
+  if (given && !allowed.includes(lang)) throw usageError(`${env.kind} supports --lang ${allowed.join(', ')}`);
+  if (!given && strict && detected && detected !== lang) {
+    throw usageError(`${env.kind} has no template for ${detected}; pass --lang ${allowed.join('|')} or write the test `
+      + `by hand (references/${env.kind === 'regress' ? 'regress' : 'e2e'}.md)`);
+  }
+  return { lang, out: env.outRel || KINDS[env.kind][lang] || env.projectRoot };
 }
 
-function projectLang(p) {
-  for (const l of (p && p.languages) || []) if (LANG_OF[l]) return LANG_OF[l];
-  const eco = (p && p.ecosystems) || [];
-  if (eco.includes('node')) return 'js';
-  if (eco.includes('python')) return 'python';
-  if (eco.includes('go')) return 'go';
-  if (eco.includes('rust')) return 'rust';
-  if (eco.includes('dotnet')) return 'dotnet';
-  if (eco.includes('jvm')) return 'java';
-  if (eco.includes('ruby')) return 'ruby';
-  return null;
+/** Runner flavor, CommonJS (Jest with JavaScript), test header and import specifiers for Node templates. */
+function nodeSetup(env, lang) {
+  if (!['ts', 'js'].includes(lang)) return { flavor: null, cjs: false, vars: {} };
+  const names = unitRunners(env.project).map((r) => r.name);
+  const flavor = ['vitest', 'jest', 'node-test', 'mocha', 'bun'].find((f) => names.includes(f)) || 'node-test';
+  const cjs = lang === 'js' && flavor === 'jest';
+  const ext = lang === 'ts' ? 'ts' : cjs ? 'cjs' : 'mjs';
+  // Node's type stripping (node --test) needs the .ts extension; bundling runners resolve bare specifiers.
+  const imp = (spec) => (lang === 'js' ? `${spec}.${ext}` : flavor === 'node-test' ? `${spec}.ts` : spec);
+  const from = TEST_API[flavor];
+  const api = from ? `import { describe, it } from '${from}';` : '// describe and it are mocha globals';
+  const header = cjs ? toCommonJs(api).trim() : api;
+  return { flavor, cjs, imp, run: RUN_CMD[flavor], vars: { test_header: header, ext } };
 }
 
-function resolveLang(kind, values, project, { strict = false } = {}) {
-  const allowed = KIND_LANGS[kind];
-  if (!allowed) return null;
-  if (values.lang) {
-    const l = String(values.lang).toLowerCase().replace(/^typescript$/, 'ts').replace(/^javascript$/, 'js')
-      .replace(/^(py|python3)$/, 'python').replace(/^(csharp|c#|\.net|net)$/, 'dotnet').replace(/^(kotlin|jvm)$/, 'java').replace(/^golang$/, 'go');
-    if (!allowed.includes(l)) throw usageError(`${kind} supports --lang ${allowed.join(', ')} (got "${values.lang}")`);
-    return l;
-  }
-  const detected = projectLang(project);
-  if (detected && allowed.includes(detected)) return detected;
-  if (strict && detected) {
-    throw usageError(`${kind} has no template for ${detected}; pass --lang ${allowed.join('|')} or write the test by hand (see references/${FAMILY[kind] === 'e2e' ? 'e2e' : kind}.md)`);
-  }
-  return allowed[0];
+/** The companion vendored inside the target repository (repo-relative POSIX path), or null. */
+function vendoredSkill(env, explicit) {
+  const candidates = explicit ? [path.resolve(env.ctx.cwd, explicit)]
+    : ['.github/skills', '.agents/skills', '.claude/skills'].map((d) => abs(env.root, `${d}/${SKILL_NAME}`));
+  const hit = candidates.map((c) => relPosix(env.root, c))
+    .find((rel) => rel && rel !== '.' && fs.existsSync(abs(env.root, `${rel}/scripts/adc.mjs`)));
+  if (!hit && explicit) throw usageError(`--skill-path ${explicit}: no scripts/adc.mjs inside the repository there`);
+  return hit || null;
+}
+
+/** The workflow step that sets ADC to the vendored skill or to a pinned fetch of it. */
+function getAdcStep(vendored, vars) {
+  const bundle = loadBundle('ci-gate');
+  if (vendored) return fragment(bundle, 'get-adc-vendored', {}, { ...vars, skill_rel: vendored });
+  const m = /^\s+homepage:\s*["']?(https:\/\/[^\s"']+)/m.exec(readText(path.join(SKILL_DIR, 'SKILL.md'), ''));
+  const repo = m ? m[1].replace(/\/+$/, '') : `https://github.com/robertlemmermann/${SKILL_NAME}`;
+  return fragment(bundle, 'get-adc-pinned', {}, { ...vars, adc_repo: repo, adc_ref: `v${skillVersion()}` });
 }
 
 // ---------------------------------------------------------------------------
-// Runner knowledge for CI commands (flags only; detect.mjs owns detection)
+// Outputs: render, merge, apply
 
-/** Retries-off flags appended in CI (plan §7.4 table). */
-export const RETRIES_OFF = Object.freeze({
-  vitest: '--retry=0', playwright: '--retries=0', pytest: '-p no:rerunfailures', go: '-count=1',
-  maven: '-Dsurefire.rerunFailingTestsCount=0', mocha: '--retries 0', bun: '--rerun-each 1', cypress: '--config retries=0',
-});
+const commonVars = (env, extra) => ({ generated_by: generatedBy(), version: skillVersion(), date: today(),
+  skill_name: SKILL_NAME, default_branch: env.defaultBranch, ...extra });
 
-/** How each runner selects (`only`) or excludes (`skip`) tests tagged for quarantine (plan §10.4). */
-export const QUARANTINE_FILTERS = Object.freeze({
-  playwright: { only: '--grep @quarantine', skip: '--grep-invert @quarantine' },
-  vitest: { only: "-t '@quarantine'", skip: "-t '^(?!.*@quarantine)'" },
-  jest: { only: "-t '@quarantine'", skip: "-t '^(?!.*@quarantine)'" },
-  'node-test': { only: '--test-name-pattern=@quarantine', skip: '--test-skip-pattern=@quarantine' },
-  mocha: { only: '--grep @quarantine', skip: '--grep @quarantine --invert' },
-  pytest: { only: '-m quarantine', skip: '-m "not quarantine"' },
-  go: { only: "-run 'Quarantine'", skip: "-skip 'Quarantine'" },
-  cargo: { only: '-- --ignored', skip: '' },
-  rspec: { only: '--tag quarantine', skip: '--tag ~quarantine' },
-  dotnet: { only: '--filter "Category=quarantine"', skip: '--filter "Category!=quarantine"' },
-  maven: { only: '-Dgroups=quarantine', skip: '-DexcludedGroups=quarantine' },
-});
-
-/**
- * The CI test step for one project: full suite, retries off, a machine-readable report.
- * Returns { cmd, format, report, env } with POSIX paths relative to the project root.
- */
-export function ciTestCommand(runner, { reportDir = 'reports', testCmd = null, quarantine = false } = {}) {
-  if (testCmd) return { cmd: `${testCmd} 2>&1 | tee ${reportDir}/test-output.log`, format: 'summary', report: `${reportDir}/test-output.log`, env: {}, runner: 'custom' };
-  const name = runner.name;
-  const base = runner.cmd;
-  const q = quarantine && QUARANTINE_FILTERS[name] ? QUARANTINE_FILTERS[name].skip : '';
-  const parts = [base];
-  const env = {};
-  let format = runner.report && runner.report.format ? runner.report.format : 'summary';
-  let report = null;
-  let tail = '';
-  switch (name) {
-    case 'node-test':
-      parts.push(`--test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=${reportDir}/junit.xml`);
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    case 'vitest':
-      parts.push(`${RETRIES_OFF.vitest} --reporter=default --reporter=junit --outputFile.junit=${reportDir}/junit.xml`);
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    case 'jest':
-      parts.push(`--json --outputFile=${reportDir}/jest.json`);
-      report = `${reportDir}/jest.json`; format = 'jest-json'; break;
-    case 'mocha':
-      parts.push(`${RETRIES_OFF.mocha} --reporter xunit --reporter-option output=${reportDir}/junit.xml`);
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    case 'bun':
-      parts.push(`--reporter=junit --reporter-outfile=${reportDir}/junit.xml`);
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    case 'pytest':
-      parts.push(`${RETRIES_OFF.pytest} --junit-xml=${reportDir}/junit.xml`);
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    case 'go':
-      parts.push(`${RETRIES_OFF.go} -json`);
-      tail = ` > ${reportDir}/go-test.jsonl`;
-      report = `${reportDir}/go-test.jsonl`; format = 'go-test-json'; break;
-    case 'cargo':
-    case 'nextest':
-      // Plain cargo test in CI: no JUnit without a nextest profile; the text parser counts tests.
-      parts.length = 0; parts.push('cargo test --no-fail-fast');
-      tail = ` 2>&1 | tee ${reportDir}/cargo-test.txt`;
-      report = `${reportDir}/cargo-test.txt`; format = 'cargo-text'; break;
-    case 'dotnet':
-      parts.push(`--logger "trx;LogFileName=results.trx" --results-directory ${reportDir}`);
-      report = `${reportDir}/**/*.trx`; format = 'trx'; break;
-    case 'maven':
-      parts.push(RETRIES_OFF.maven);
-      report = 'target/surefire-reports/TEST-*.xml'; format = 'junit'; break;
-    case 'gradle':
-      report = 'build/test-results/test/TEST-*.xml'; format = 'junit'; break;
-    case 'rspec':
-      parts.push(`--format progress --format json --out ${reportDir}/rspec.json`);
-      report = `${reportDir}/rspec.json`; format = 'rspec-json'; break;
-    case 'playwright':
-      parts.push('--reporter=list,junit');
-      env.PLAYWRIGHT_JUNIT_OUTPUT_NAME = `${reportDir}/junit.xml`;
-      report = `${reportDir}/junit.xml`; format = 'junit'; break;
-    default:
-      if (!base) return null;
-      tail = ` 2>&1 | tee ${reportDir}/test-output.log`;
-      report = `${reportDir}/test-output.log`; format = 'summary';
-  }
-  if (q) {
-    // Runner options must precede `--` passthrough for cargo; everything else appends.
-    parts.push(q);
-  }
-  return { cmd: parts.filter(Boolean).join(' ') + tail, format, report, env, runner: name };
-}
-
-/** Coverage command + report for the changed-line gate, or null when no producer is known to exist. */
-function ciCoverage(runner, project, root) {
-  const deps = nodeDeps(root, project);
-  switch (runner && runner.name) {
-    case 'jest': return { cmd: `${runner.cmd} --coverage --coverageReporters=lcov`, report: 'coverage/lcov.info', tool: 'diff-cover' };
-    case 'vitest':
-      return deps.has('@vitest/coverage-v8') || deps.has('@vitest/coverage-istanbul')
-        ? { cmd: `${runner.cmd} --coverage.enabled --coverage.reporter=lcov`, report: 'coverage/lcov.info', tool: 'diff-cover' } : null;
-    case 'node-test': return { cmd: `${runner.cmd} --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info`, report: 'coverage/lcov.info', tool: 'diff-cover' };
-    case 'pytest': return pythonHas(root, project, 'pytest-cov') ? { cmd: `${runner.cmd} --cov --cov-report=xml:coverage.xml`, report: 'coverage.xml', tool: 'diff-cover' } : null;
-    case 'go': return { cmd: 'go test ./... -count=1 -coverprofile=coverage.out', report: 'coverage.out', tool: 'adc' };
-    default: return null;
-  }
-}
-
-function nodeDeps(root, project) {
-  const pkg = readPackageJson(path.join(root, ...String((project && project.root) || '.').split('/'))) || {};
-  return new Set([...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})]);
-}
-
-function pythonHas(root, project, name) {
-  const dir = path.join(root, ...String((project && project.root) || '.').split('/'));
-  const texts = ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'dev-requirements.txt', 'setup.cfg', 'uv.lock', 'poetry.lock']
-    .map((f) => readText(path.join(dir, f), '') || '').join('\n').toLowerCase();
-  return texts.includes(name.toLowerCase());
-}
-
-// ---------------------------------------------------------------------------
-// Preparing a render
-
-async function prepare(kind, ctx, values) {
-  const root = repoRoot(ctx.cwd) || ctx.cwd;
-  if (root === SKILL_DIR || root.startsWith(SKILL_DIR + path.sep)) throw usageError('refusing to scaffold into the companion skill itself; pass --cwd <target repository>');
-  // Refuses (exit 3) while anything under the state dir is tracked; creates nothing here.
-  const state = prepareStateDir({ ...ctx, cwd: root }, { create: false });
-  const write = Boolean(values.write) && !ctx.dryRun;
-  let outRel = null;
-  if (values.out) {
-    const abs = path.resolve(ctx.cwd, values.out);
-    outRel = relPosix(root, abs);
-    if (outRel == null) throw usageError(`--out must stay inside ${toPosix(root)} (got ${values.out})`);
-    const top = outRel.split('/')[0];
-    if (top === '.git' || (state.rel && under(outRel, state.rel))) throw usageError(`--out must not point into ${top === '.git' ? '.git' : state.rel}`);
-  }
-  const det = await runDetect(root, state);
-  const project = pickProject(det.result, outRel);
-  return {
-    kind, ctx, values, root, state, write, force: Boolean(values.force), outRel, det: det.result, detectError: det.error,
-    project, projectRoot: toPosix((project && project.root) || '.'),
-    defaultBranch: (det.result && det.result.default_branch) || 'main',
-  };
-}
-
-const commonVars = (env, extra = {}) => ({
-  generated_by: generatedBy(), version: skillVersion(), date: today(), skill_name: SKILL_NAME,
-  default_branch: env.defaultBranch, ...extra,
-});
-
-/** Join an out-relative template path to the out directory (repo-relative POSIX). */
-const joinOut = (out, rel) => (!out || out === '.' ? rel : `${out}/${rel}`);
-
-function renderFiles(bundle, filter, features, vars, { out, transform = null } = {}) {
+// scope=repo: repo-relative path; scope=state: in the state dir; else under `out`. mode=lines merges ignore
+// lines; mode=keep never replaces an existing file.
+function renderFiles(bundle, filter, features, vars, out, { cjs = false } = {}) {
   return pickSections(bundle, filter, features).map((s) => {
     const rel = renderTemplate(s.path, vars);
-    let content = renderTemplate(s.content, vars);
-    if (transform) content = transform(rel, content);
-    const repoScope = s.attrs.scope === 'repo';
-    const o = { path: repoScope ? rel : joinOut(out, rel), content };
+    const content = renderTemplate(s.content, vars);
+    const target = s.attrs.scope === 'repo' ? rel : joinOut(out, rel);
+    const o = { path: cjs ? target.replace(/\.mjs$/, '.cjs') : target, content: cjs ? toCommonJs(content) : content };
     if (s.attrs.scope === 'state') o.state = rel;
     if (s.attrs.mode === 'lines') o.merge = mergeLines(content);
+    if (s.attrs.mode === 'keep') o.merge = (current) => current;
     return o;
   });
 }
@@ -414,472 +258,6 @@ export function mergeLines(content) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Applying outputs
-
-function backupFactory(env) {
-  let dir = null;
-  return () => {
-    if (dir) return dir;
-    const info = prepareStateDir({ ...env.ctx, cwd: env.root }, { create: true });
-    dir = ensureDir(path.join(info.dir, 'backups', 'scaffold', stamp()));
-    return dir;
-  };
-}
-
-/** Write (or plan) every output. Never overwrites without --force; merges are additive. */
-export function applyOutputs(outputs, env) {
-  const written = [];
-  const skipped = [];
-  const backups = [];
-  const seen = new Set();
-  const backupDir = backupFactory(env);
-  let stateReady = false;
-  for (const o of outputs) {
-    const abs = o.state ? path.join(env.state.dir, ...o.state.split('/')) : path.join(env.root, ...o.path.split('/'));
-    const shown = o.state ? (relPosix(env.root, abs) || toPosix(abs)) : o.path;
-    if (seen.has(abs)) continue;
-    seen.add(abs);
-    if (!o.state && (relPosix(env.root, abs) == null || o.path.split('/').includes('..'))) {
-      skipped.push({ path: shown, reason: 'outside the repository' });
-      continue;
-    }
-    if (isDir(abs)) { skipped.push({ path: shown, reason: 'a directory exists at this path' }); continue; }
-    let current = null;
-    try { current = fs.readFileSync(abs, 'utf8'); } catch {}
-    let next = o.content;
-    let action = 'create';
-    if (current != null) {
-      action = 'overwrite';
-      if (o.merge) {
-        try { next = o.merge(current); action = 'merge'; } catch (err) {
-          if (!env.force) { skipped.push({ path: shown, reason: `cannot merge (${err.message}); use --force to replace it`, planned: 'overwrite' }); continue; }
-          next = o.content;
-        }
-      }
-      if (next === current || next.replace(/\r\n/g, '\n') === current.replace(/\r\n/g, '\n')) {
-        written.push({ path: shown, action: 'unchanged', bytes: Buffer.byteLength(current) });
-        continue;
-      }
-      if (action === 'overwrite' && !env.force) {
-        skipped.push({ path: shown, reason: 'exists (use --force to overwrite; a backup is kept)', planned: 'overwrite' });
-        continue;
-      }
-    }
-    if (env.write) {
-      if (o.state && !stateReady) { prepareStateDir({ ...env.ctx, cwd: env.root }, { create: true }); stateReady = true; }
-      if (current != null && action === 'overwrite') {
-        const b = path.join(backupDir(), ...shown.replace(/^(\.\.\/)+/, '').split('/'));
-        ensureDir(path.dirname(b));
-        fs.writeFileSync(b, current);
-        backups.push(toPosix(b));
-      }
-      writeFileAtomic(abs, next);
-    }
-    written.push({ path: shown, action: env.write ? action : `would-${action}`, bytes: Buffer.byteLength(next) });
-  }
-  return { written, skipped, backups };
-}
-
-// ---------------------------------------------------------------------------
-// e2e-web
-
-function webServerInfo(env) {
-  const pdir = path.join(env.root, ...env.projectRoot.split('/'));
-  const pkg = readPackageJson(pdir);
-  if (!pkg || !pkg.scripts) return null;
-  const script = ['start', 'preview', 'dev'].find((s) => typeof pkg.scripts[s] === 'string');
-  if (!script) return null;
-  const mgr = (env.project && env.project.managers && env.project.managers[0] && env.project.managers[0].name) || 'npm';
-  const runner = { npm: `npm run ${script}`, pnpm: `pnpm run ${script}`, yarn: `yarn ${script}`, bun: `bun run ${script}` }[mgr] || `npm run ${script}`;
-  const body = pkg.scripts[script];
-  const port = /\bvite\b/.test(body) ? (script === 'dev' ? 5173 : 4173) : /\bnext\b|\breact-scripts\b|\bremix\b/.test(body) ? 3000 : 3000;
-  const install = (env.project.managers && env.project.managers[0] && env.project.managers[0].install) || 'npm ci';
-  return { cmd: runner, port, install, script };
-}
-
-function parseJourneys(text) {
-  return String(text || '').split(/[,;\n]/).map((j) => plainText(j, 80)).filter(Boolean).slice(0, 3);
-}
-
-async function buildE2eWeb(env) {
-  const { values } = env;
-  const lang = resolveLang('e2e-web', values, env.project);
-  const out = env.outRel || (lang === 'python' ? 'tests/e2e/web' : 'e2e/web');
-  const bundle = loadBundle('e2e');
-  const features = new Set();
-  const server = lang === 'ts' ? webServerInfo(env) : null;
-  const baseUrl = values['base-url'] || `http://localhost:${server ? server.port : 3000}`;
-  if (!/^https?:\/\/[^\s'"`]+$/.test(baseUrl) || /^https?:\/\/[^/]*@/.test(baseUrl)) throw usageError('--base-url must be an http(s) URL without credentials');
-  const journeys = parseJourneys(values.journeys);
-  const relToProject = toPosix(path.relative(path.join(env.root, ...out.split('/')), path.join(env.root, ...env.projectRoot.split('/')))) || '.';
-  const vars = commonVars(env, {
-    out, base_url: baseUrl, package_name: `${slugify(path.basename(env.root))}-e2e-web`,
-    header: CI_HEADER('e2e-web'), project_dir: relToProject,
-  });
-  vars.web_server = server ? fragment(bundle, 'web-server', { kind: 'web', lang }, { ...vars, server_cmd: jsString(server.cmd).slice(1, -1), server_cwd: relToProject }, features) : '';
-  vars.app_install = server ? fragment(bundle, 'app-install', { kind: 'web', lang }, { ...vars, install_cmd: server.install, project_root: env.projectRoot }, features) : '';
-  const outputs = renderFiles(bundle, { kind: 'web', lang }, features, vars, { out });
-  for (const j of journeys) {
-    const slug = slugify(j, 40);
-    const jv = { ...vars, journey: j, journey_js: jsString(j), journey_py: cString(j), slug, slug_ident: ident(j, 40) };
-    const sec = pickSections(bundle, { kind: 'web', lang, part: 'fragment' }, features).find((s) => s.attrs.name === 'journey');
-    if (!sec) throw envError('TEMPLATE_MISSING', 'journey fragment missing');
-    const rel = lang === 'python' ? `test_web_${jv.slug_ident}.py` : `tests/${slug}.spec.ts`;
-    outputs.push({ path: joinOut(out, rel), content: renderTemplate(sec.content, jv) });
-  }
-  const hosts = parseFor(values.for);
-  const next = [
-    lang === 'ts' ? `cd ${out} && npm install && npx playwright install --with-deps   (creates package-lock.json: commit it; CI runs npm ci)`
-      : `python -m pip install -r ${out}/requirements-e2e.txt && python -m playwright install --with-deps chromium`,
-    lang === 'ts' ? `cd ${out} && npx playwright test --project=chromium   (E2E_BASE_URL=<url> to test a running app${server ? `; otherwise \`${server.cmd}\` is started` : ''})`
-      : `python -m pytest ${out} --browser chromium --tracing retain-on-failure`,
-    journeys.length ? `implement the ${journeys.length} journey test(s) and remove test.fixme/skip; until then verify reports them under CK-SKIP` : 'add the first user journeys with --journeys "sign up,search,checkout" (first three are scaffolded)',
-    'repository variables for CI: E2E_BASE_URL (optional), E2E_USERNAME; secret E2E_PASSWORD (only when the app needs a login)',
-  ];
-  if (!server && lang === 'ts') next.push('no start/preview/dev script was found: set E2E_BASE_URL or add a webServer block to playwright.config.ts');
-  for (const h of hosts) next.push(...playwrightAgentSteps(h));
-  return { lang, out, outputs, next_steps: next, data: { journeys, base_url: baseUrl, web_server: server ? server.cmd : null, for: hosts } };
-}
-
-function parseFor(text) {
-  if (!text) return [];
-  const all = ['copilot', 'claude', 'codex'];
-  const list = String(text).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (list.includes('all')) return all;
-  for (const h of list) if (!all.includes(h)) throw usageError(`--for must be copilot, claude, codex or all (got "${h}")`);
-  return [...new Set(list)];
-}
-
-function playwrightAgentSteps(host) {
-  const mcp = {
-    claude: 'claude mcp add playwright npx @playwright/mcp@latest',
-    codex: 'codex mcp add playwright npx "@playwright/mcp@latest"',
-    copilot: 'add {"type":"local","command":"npx","args":["@playwright/mcp@latest"],"tools":["*"]} under "mcpServers.playwright" in ~/.copilot/mcp-config.json (the Copilot cloud agent ships the Playwright MCP server already)',
-  }[host];
-  return [
-    `${host}: npx playwright init-agents --loop=${host}   (planner/generator/healer agents; regenerate after every Playwright upgrade; on Windows the generated MCP entry runs \`cmd /c npx ...\`)`,
-    `${host}: Playwright MCP: ${mcp}`,
-  ];
-}
-
-// ---------------------------------------------------------------------------
-// e2e-web --audit: hardening an existing suite (prioritized fix list; writes nothing)
-
-const AUDIT_RULES = [
-  { id: 'fixed-sleep', priority: 'P1', re: /\bwaitForTimeout\s*\(|\btime\.sleep\s*\(|\bawait\s+new\s+Promise\s*\(\s*\(?\s*\w*\s*\)?\s*=>\s*setTimeout\b|\bcy\.wait\s*\(\s*\d/, fix: 'wait on a condition instead: web-first assertions (expect(locator).toBeVisible()), page.waitForResponse, or expect.poll' },
-  { id: 'focused-test', priority: 'P1', re: /\b(?:test|it|describe)\.only\s*\(/, fix: 'remove .only; set forbidOnly: !!process.env.CI in the config' },
-  { id: 'networkidle', priority: 'P2', re: /['"]networkidle['"]/, fix: "networkidle is discouraged: wait for the element or response the test needs" },
-  { id: 'serial-mode', priority: 'P2', re: /\bdescribe\.serial\s*\(|mode\s*:\s*['"]serial['"]/, fix: 'serial mode means shared state between tests: give each test its own data (fixtures, per-worker accounts)' },
-  { id: 'hardcoded-url', priority: 'P2', re: /\b(?:goto|get|post|put|delete|fetch)\s*\(\s*['"`]https?:\/\/(?:localhost|127\.0\.0\.1|[\w.-]+\.(?:com|net|org|io|dev))/, fix: 'use relative URLs with use.baseURL (E2E_BASE_URL) so the suite runs against any environment' },
-  { id: 'brittle-selector', priority: 'P3', re: /\bpage\.\$\$?\s*\(|locator\s*\(\s*['"`](?:\/\/|xpath=)|\.nth-child\(/, fix: 'prefer getByRole / getByLabel / getByTestId over CSS structure and XPath' },
-  { id: 'force-click', priority: 'P3', re: /\{\s*force\s*:\s*true\s*\}/, fix: 'force: true skips actionability checks and hides real bugs; wait for the element to be actionable' },
-  { id: 'in-test-retries', priority: 'P2', re: /describe\.configure\s*\(\s*\{[^}]*retries\s*:\s*[1-9]/, fix: 'retries belong in the config, CI only, with failOnFlakyTests (flake policy)' },
-];
-
-function auditE2eWeb(env) {
-  const root = env.root;
-  const files = (lsFiles(root).length ? lsFiles(root) : []).map(toPosix);
-  const all = files.length ? files : walk(root);
-  const configs = all.filter((f) => /(^|\/)playwright\.config\.(?:[cm]?[jt]s)$/.test(f));
-  const pyConfigured = all.some((f) => /(^|\/)conftest\.py$/.test(f)) && all.some((f) => /test_.*\.py$/.test(f) && /playwright/.test(readText(path.join(root, f), '') || ''));
-  const specs = all.filter((f) => /\.(?:spec|test)\.[cm]?[jt]sx?$|\.cy\.[jt]sx?$/.test(f) || (/(^|\/)test_[^/]*\.py$/.test(f) && pyConfigured))
-    .filter((f) => !f.includes('node_modules/'));
-  const items = [];
-  const add = (priority, rule, file, line, evidence, fix) => items.push({ priority, rule, file, line, evidence: truncate(evidence.trim(), 160), fix });
-  for (const cfg of configs) {
-    const text = (readText(path.join(root, cfg), '') || '').replace(/\r\n/g, '\n');
-    const lineOf = (re) => { const i = text.split('\n').findIndex((l) => re.test(l)); return i === -1 ? null : i + 1; };
-    if (!/forbidOnly/.test(text)) add('P2', 'no-forbid-only', cfg, null, 'forbidOnly not set', 'add forbidOnly: !!process.env.CI');
-    const retries = /retries\s*:\s*([^,\n]+)/.exec(text);
-    if (retries && !/failOnFlakyTests/.test(text)) add('P1', 'retries-hide-flakes', cfg, lineOf(/retries\s*:/), retries[0], 'retried passes are silent: add failOnFlakyTests: !!process.env.CI (Playwright 1.52+) or --fail-on-flaky-tests');
-    if (retries && /^\s*[3-9]\d*\s*$|^\s*\d{2,}/.test(retries[1])) add('P1', 'unbounded-retries', cfg, lineOf(/retries\s*:/), retries[0], 'more than 2 retries hides real failures; keep retries: process.env.CI ? 2 : 0');
-    if (retries && /^\s*[1-9]/.test(retries[1])) add('P2', 'retries-outside-ci', cfg, lineOf(/retries\s*:/), retries[0], 'retry only in CI: retries: process.env.CI ? 2 : 0');
-    const trace = /trace\s*:\s*['"]([\w-]+)['"]/.exec(text);
-    if (!trace) add('P2', 'no-trace', cfg, null, 'use.trace not set', "set use.trace: 'retain-on-failure' so CI failures can be debugged");
-    else if (trace[1] === 'off') add('P2', 'trace-off', cfg, lineOf(/trace\s*:/), trace[0], "use 'retain-on-failure' (keep 'off' only for authenticated live probes)");
-    else if (trace[1] === 'on') add('P3', 'trace-always', cfg, lineOf(/trace\s*:/), trace[0], "'on' records every test; 'retain-on-failure' keeps only what you need");
-    if (!/junit/.test(text)) add('P3', 'no-junit', cfg, null, 'no junit reporter', "add ['junit', { outputFile: 'test-results/junit.xml' }] so CI can publish and count results");
-    if (!/baseURL/.test(text)) add('P2', 'no-base-url', cfg, null, 'use.baseURL not set', 'read the base URL from the environment (E2E_BASE_URL) instead of hard-coding hosts in tests');
-  }
-  let tagged = 0;
-  for (const f of specs.slice(0, 2000)) {
-    const text = readText(path.join(root, f), '') || '';
-    if (/@smoke|@regression|tag\s*:\s*['"]@/.test(text)) tagged++;
-    text.split(/\r?\n/).forEach((l, i) => {
-      for (const r of AUDIT_RULES) if (r.re.test(l)) add(r.priority, r.id, f, i + 1, l, r.fix);
-      if (/process\.env\.\w+(?!\s*(?:\?\?|\|\|))[\s,)]/.test(l) && /(?:goto|request|fetch|baseURL)/.test(l)) add('P3', 'env-without-default', f, i + 1, l, 'give environment-dependent URLs a default or fail fast with a clear message');
-    });
-  }
-  if (specs.length && !tagged) add('P3', 'no-tags', specs[0], null, 'no @smoke/@regression tags in any spec', "tag tests ({ tag: '@smoke' }) so CI can run a fast subset with --grep @smoke");
-  if (!configs.length && !pyConfigured) add('P1', 'no-suite', '.', null, 'no playwright.config.* found', 'scaffold one: scaffold e2e-web --write');
-  const order = { P1: 0, P2: 1, P3: 2 };
-  items.sort((a, b) => order[a.priority] - order[b.priority] || a.file.localeCompare(b.file) || (a.line || 0) - (b.line || 0));
-  return { configs, files_scanned: specs.length, items: items.slice(0, 200), truncated: items.length > 200, counts: { P1: items.filter((x) => x.priority === 'P1').length, P2: items.filter((x) => x.priority === 'P2').length, P3: items.filter((x) => x.priority === 'P3').length } };
-}
-
-function walk(root) {
-  const out = [];
-  const skip = new Set(['node_modules', '.git', '.adc', 'dist', 'build', '.venv', 'venv', 'target']);
-  const rec = (dir, depth) => {
-    if (depth > 8 || out.length > 20000) return;
-    let entries = [];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (skip.has(e.name)) continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) rec(full, depth + 1);
-      else if (e.isFile()) out.push(toPosix(path.relative(root, full)));
-    }
-  };
-  rec(root, 0);
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// e2e-api
-
-function findOpenApi(root) {
-  const names = ['openapi.yaml', 'openapi.yml', 'openapi.json', 'swagger.yaml', 'swagger.yml', 'swagger.json'];
-  for (const dir of ['', 'docs', 'api', 'spec', 'specs', 'openapi', 'schema']) {
-    for (const n of names) {
-      const rel = dir ? `${dir}/${n}` : n;
-      if (exists(root, rel)) return rel;
-    }
-  }
-  return null;
-}
-
-async function buildE2eApi(env) {
-  const { values } = env;
-  const lang = resolveLang('e2e-api', values, env.project);
-  const defaults = { ts: 'e2e/api', js: 'e2e/api', python: 'tests/e2e/api', java: 'src/test/java/e2e', dotnet: 'tests/E2E.Api' };
-  const out = env.outRel || defaults[lang];
-  const bundle = loadBundle('e2e');
-  const flavor = ['ts', 'js'].includes(lang) ? nodeFlavor(env.project) : null;
-  const cjs = lang === 'js' && flavor === 'jest';
-  const features = new Set();
-  const openapi = findOpenApi(env.root);
-  if (openapi) features.add('openapi');
-  const provider = values.pact ? slugify(values.pact) : null;
-  if (provider) {
-    if (!['ts', 'js'].includes(lang)) throw usageError('--pact skeletons are rendered for TypeScript/JavaScript only; for other stacks follow the Pact notes in references/e2e.md');
-    features.add('pact');
-  }
-  const baseUrl = values['base-url'] || 'http://localhost:3000';
-  if (!/^https?:\/\/[^\s'"`]+$/.test(baseUrl) || /^https?:\/\/[^/]*@/.test(baseUrl)) throw usageError('--base-url must be an http(s) URL without credentials');
-  const healthPath = normalizeHttpPath(values['health-path'] || '/health');
-  const contractsDir = `${out}/contracts`;
-  const contractsFromProject = projectRelative(env, contractsDir);
-  const vars = commonVars(env, {
-    out, base_url: baseUrl, health_path: healthPath, header: CI_HEADER('e2e-api'),
-    contracts_dir: contractsFromProject,
-    test_header: nodeTestHeader(flavor, cjs), ext: lang === 'ts' ? 'ts' : cjs ? 'cjs' : 'mjs',
-    consumer: slugify(path.basename(env.root)), provider: provider || 'provider',
-    openapi: openapi || '', java_package: 'e2e', dotnet_ns: 'E2E.Api',
-  });
-  vars.client_import = nodeImport('./client', lang, flavor, cjs);
-  vars.contract_import = nodeImport('./contract', lang, flavor, cjs);
-  const outputs = renderFiles(bundle, { kind: 'api', lang }, features, vars, { out, transform: cjs ? (rel, c) => toCommonJs(c) : null });
-  if (cjs) for (const o of outputs) o.path = o.path.replace(/\.mjs$/, '.cjs');
-  const next = [];
-  if (['ts', 'js'].includes(lang)) {
-    next.push(`run: ${runCmdFor(flavor, `${out}/api.e2e.test.${vars.ext}`)}   (E2E_API_BASE_URL, optional E2E_API_TOKEN and E2E_API_PROTECTED_PATHS=/a,/b for negative auth tests)`);
-    if (lang === 'ts' && flavor === 'node-test') next.push('TypeScript under node --test: Node 24 strips types natively; for tsc --noEmit allow .ts import extensions (allowImportingTsExtensions)');
-    if (provider) next.push(`npm i -D @pact-foundation/pact && run the Pact consumer test; then verify on the provider and gate deploys with \`pact-broker can-i-deploy --pacticipant ${vars.consumer} --version <sha> --to-environment production\``);
-  } else if (lang === 'python') next.push(`python -m pip install -r ${out}/requirements-e2e.txt && python -m pytest ${out}`);
-  else if (lang === 'java') next.push('add test dependencies io.rest-assured:rest-assured and org.junit.jupiter:junit-jupiter, then `mvn -B test -Dtest=ApiE2ETest` (or gradle test --tests e2e.ApiE2ETest)');
-  else if (lang === 'dotnet') next.push(`dotnet test ${out}   (add the project to the solution: dotnet sln add ${out}/E2E.Api.csproj)`);
-  next.push(`contract snapshots are written to ${contractsDir}/ on the first local run (never in CI); review and commit them`);
-  if (openapi) next.push(`Schemathesis runs against ${openapi} only from the manual api-fuzz workflow on dev/staging: it creates and deletes data`);
-  return { lang, out, outputs, next_steps: next, data: { flavor, openapi, pact: provider, base_url: baseUrl, health_path: healthPath } };
-}
-
-function normalizeHttpPath(p) {
-  const s = String(p).trim();
-  if (!/^\/[A-Za-z0-9._~!$&()*+,;=:@%/-]*$/.test(s)) throw usageError(`--health-path must be an absolute URL path such as /health (got "${p}")`);
-  return s;
-}
-
-function projectRelative(env, repoRel) {
-  const p = env.projectRoot;
-  return p === '.' ? repoRel : repoRel.startsWith(`${p}/`) ? repoRel.slice(p.length + 1) : toPosix(path.relative(path.join(env.root, ...p.split('/')), path.join(env.root, ...repoRel.split('/'))));
-}
-
-function nodeTestHeader(flavor, cjs) {
-  const line = {
-    vitest: "import { describe, it } from 'vitest';",
-    jest: "import { describe, it } from '@jest/globals';",
-    'node-test': "import { describe, it } from 'node:test';",
-    bun: "import { describe, it } from 'bun:test';",
-    mocha: '// describe and it are mocha globals',
-  }[flavor || 'node-test'];
-  return cjs ? toCommonJs(line).trim() : line;
-}
-
-/** Relative import specifier of a sibling helper for the runner (Node type stripping needs `.ts`). */
-function nodeImport(spec, lang, flavor, cjs) {
-  if (lang === 'ts') return flavor === 'node-test' ? `${spec}.ts` : spec;
-  return `${spec}.${cjs ? 'cjs' : 'mjs'}`;
-}
-
-function runCmdFor(flavor, file) {
-  return {
-    vitest: `npx vitest run ${file}`, jest: `npx jest ${file}`, 'node-test': `node --test ${file}`,
-    bun: `bun test ${file}`, mocha: `npx mocha ${file}`,
-  }[flavor || 'node-test'];
-}
-
-// ---------------------------------------------------------------------------
-// e2e-cli
-
-function nodeCliTarget(env) {
-  const pdir = path.join(env.root, ...env.projectRoot.split('/'));
-  const pkg = readPackageJson(pdir) || {};
-  let name = pkg.name ? String(pkg.name).replace(/^@[^/]+\//, '') : path.basename(pdir);
-  let bin = null;
-  if (typeof pkg.bin === 'string') bin = pkg.bin;
-  else if (pkg.bin && typeof pkg.bin === 'object') { const k = Object.keys(pkg.bin)[0]; if (k) { name = k; bin = pkg.bin[k]; } }
-  return bin ? { name, script: toPosix(path.normalize(bin)).replace(/^\.\//, '') } : { name, script: null };
-}
-
-function pyCliTarget(env) {
-  const pdir = path.join(env.root, ...env.projectRoot.split('/'));
-  const text = (readText(path.join(pdir, 'pyproject.toml'), '') || '').replace(/\r\n/g, '\n');
-  const sec = /^\[project\.scripts\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(text);
-  if (sec) {
-    const m = /^\s*["']?([A-Za-z0-9_.-]+)["']?\s*=\s*["']([A-Za-z0-9_.]+):([A-Za-z0-9_.]+)["']/m.exec(sec[1]);
-    if (m) return { name: m[1], module: m[2], func: m[3] };
-  }
-  return null;
-}
-
-function goCliTarget(env) {
-  const pdir = path.join(env.root, ...env.projectRoot.split('/'));
-  const gomod = readText(path.join(pdir, 'go.mod'), '') || '';
-  const mod = /^module\s+(\S+)/m.exec(gomod);
-  if (!mod) return null;
-  const isMain = (dir) => { try { return fs.readdirSync(dir).some((f) => f.endsWith('.go') && !f.endsWith('_test.go') && /^package\s+main\b/m.test(readText(path.join(dir, f), '') || '')); } catch { return false; } };
-  if (isMain(pdir)) return { module: mod[1], pkg: '.', name: path.basename(mod[1]) };
-  const cmd = path.join(pdir, 'cmd');
-  if (isDir(cmd)) {
-    for (const d of fs.readdirSync(cmd).sort()) if (isMain(path.join(cmd, d))) return { module: mod[1], pkg: `./cmd/${d}`, name: d };
-  }
-  return { module: mod[1], pkg: null, name: path.basename(mod[1]) };
-}
-
-function rustCliTarget(env) {
-  const pdir = path.join(env.root, ...env.projectRoot.split('/'));
-  const text = (readText(path.join(pdir, 'Cargo.toml'), '') || '').replace(/\r\n/g, '\n');
-  const bins = [...text.matchAll(/^\[\[bin\]\]\s*\n(?:[^[]*?\n)*?\s*name\s*=\s*"([^"]+)"/gm)].map((m) => m[1]);
-  if (bins.length) return { name: bins[0] };
-  const pkg = /^\[package\][\s\S]*?^\s*name\s*=\s*"([^"]+)"/m.exec(text);
-  if (pkg && fs.existsSync(path.join(pdir, 'src', 'main.rs'))) return { name: pkg[1] };
-  return null;
-}
-
-/** Split a --bin command line into argv (quotes respected; no shell features). */
-export function splitArgv(line) {
-  const out = [];
-  let cur = '';
-  let quote = null;
-  let any = false;
-  for (const ch of String(line).trim()) {
-    if (quote) { if (ch === quote) quote = null; else cur += ch; continue; }
-    if (ch === '"' || ch === "'") { quote = ch; any = true; continue; }
-    if (/\s/.test(ch)) { if (cur || any) { out.push(cur); cur = ''; any = false; } continue; }
-    cur += ch;
-  }
-  if (quote) throw usageError('--bin has an unterminated quote');
-  if (cur || any) out.push(cur);
-  return out;
-}
-
-async function buildE2eCli(env) {
-  const { values } = env;
-  const lang = resolveLang('e2e-cli', values, env.project, { strict: true });
-  const defaults = { ts: 'e2e/cli', js: 'e2e/cli', python: 'tests/e2e/cli', go: 'e2e/cli', rust: 'tests' };
-  let out = env.outRel || defaults[lang];
-  const bundle = loadBundle('e2e');
-  const features = new Set();
-  const flavor = ['ts', 'js'].includes(lang) ? nodeFlavor(env.project) : null;
-  const cjs = lang === 'js' && flavor === 'jest';
-  const argv = values.bin ? splitArgv(values.bin) : null;
-  if (argv && !argv.length) throw usageError('--bin needs a command');
-  const vars = commonVars(env, { out });
-  const next = [];
-  let cliName = 'cli';
-  if (['ts', 'js'].includes(lang)) {
-    const t = nodeCliTarget(env);
-    cliName = t.name;
-    // A Node script runs with the current Node (no shell, no .cmd shim); anything else as given.
-    const script = argv ? (/\.(?:[cm]?js|[cm]?ts)$/.test(argv[0]) ? argv[0] : null) : t.script;
-    let cliArgv;
-    if (script) cliArgv = ['process.execPath', `path.resolve(PROJECT_ROOT, ${jsString(script)})`, ...(argv ? argv.slice(1) : []).map(jsString)];
-    else if (argv) cliArgv = argv.map(jsString);
-    else throw usageError('no "bin" entry in package.json: pass --bin "<command to start the CLI>"');
-    if (argv) cliName = path.basename(argv[0]).replace(/\.[^.]+$/, '') || cliName;
-    Object.assign(vars, {
-      cli_name: plainText(cliName, 60), cli_argv: `[${cliArgv.join(', ')}]`,
-      golden_dir: projectRelative(env, `${out}/golden`), test_header: nodeTestHeader(flavor, cjs),
-      harness_import: nodeImport('./harness', lang, flavor, cjs), ext: lang === 'ts' ? 'ts' : cjs ? 'cjs' : 'mjs',
-    });
-    next.push(`run: ${runCmdFor(flavor, `${projectRelative(env, out)}/cli.e2e.test.${vars.ext}`)}   (from ${env.projectRoot === '.' ? 'the repository root' : env.projectRoot}; the first local run writes golden/*.golden, CI never does)`);
-  } else if (lang === 'python') {
-    const t = pyCliTarget(env);
-    let cli;
-    if (argv) cli = `[${argv.map(cString).join(', ')}]`;
-    else if (t) cli = `[sys.executable, "-c", ${cString(`import sys; from ${t.module} import ${t.func}; sys.exit(${t.func}())`)}]`;
-    else throw usageError('no [project.scripts] entry in pyproject.toml: pass --bin "<command to start the CLI>"');
-    cliName = argv ? path.basename(argv[0]) : t.name;
-    Object.assign(vars, { cli_name: plainText(cliName, 60), cli_argv: cli });
-    next.push(`run: python -m pytest ${out}   (the first local run writes golden/*.golden; UPDATE_GOLDEN=1 accepts reviewed changes)`);
-  } else if (lang === 'go') {
-    const t = goCliTarget(env);
-    if (!t) throw usageError('no go.mod found for the Go CLI harness');
-    const pkg = argv ? argv[0] : t.pkg;
-    if (!pkg) throw usageError('no main package found (looked at the module root and cmd/*): pass --bin ./cmd/<name>');
-    cliName = argv ? path.basename(argv[0]) : t.name;
-    Object.assign(vars, { cli_name: plainText(cliName, 60), go_pkg: cString(pkg.startsWith('.') || pkg.includes('/') ? pkg : `./${pkg}`), go_package: ident(path.basename(out), 30) || 'e2e' });
-    next.push(`run: go test ./${out}/...   (go test ./${out}/... -update rewrites golden files after review)`);
-  } else if (lang === 'rust') {
-    const t = rustCliTarget(env);
-    const name = argv ? argv[0] : t && t.name;
-    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) throw usageError('no binary target in Cargo.toml: pass --bin <bin-name> ([[bin]] name)');
-    cliName = name;
-    if (out !== 'tests' && !out.endsWith('/tests')) next.push('note: Cargo only builds integration tests from the crate\'s tests/ directory');
-    Object.assign(vars, { cli_name: plainText(name, 60), bin_name: name });
-    next.push('run: cargo test --test cli_e2e   (UPDATE_GOLDEN=1 cargo test --test cli_e2e rewrites golden files after review)');
-  }
-  const outputs = renderFiles(bundle, { kind: 'cli', lang }, features, vars, { out, transform: cjs ? (rel, c) => toCommonJs(c) : null });
-  if (cjs) for (const o of outputs) o.path = o.path.replace(/\.mjs$/, '.cjs');
-  if (cjs) next.push('Jest without ESM support: the files are CommonJS (.cjs); jest finds *.test.cjs by default');
-  next.push('adapt INVALID_ARGS and add one golden test per command; normalize() masks paths, temp dirs, timestamps and durations');
-  return { lang, out, outputs, next_steps: next, data: { flavor, cli: cliName } };
-}
-
-// ---------------------------------------------------------------------------
-// live (plan §10.3): the probe project for `adc.mjs live run`
-
-export const LIVE_IGNORES = Object.freeze(['test-results/', 'playwright-report/', 'blob-report/', '*.har', 'node_modules/', '.pytest_cache/']);
-
-/** The checklist gate: missing, or the number of lines containing TODO (same rule as the runner). */
-export function checklistGate(file) {
-  const text = readText(file);
-  if (text == null) return { path: toPosix(file), exists: false, open: null, ok: false, reason: 'CHECKLIST_MISSING' };
-  const lines = text.split(/\r?\n/);
-  const open = lines.filter((l) => l.includes('TODO'));
-  return { path: toPosix(file), exists: true, open: open.length, open_items: open.slice(0, 20).map((l) => truncate(l.trim(), 120)), ok: open.length === 0, reason: open.length ? 'CHECKLIST_OPEN' : null, text };
-}
-
-function syntheticCost(values, checklistText) {
-  const raw = values['synthetic-cost'] ?? (/estimated (?:credits|cost)[^:\n]*:\s*([0-9]+(?:\.[0-9]+)?)/i.exec(checklistText || '') || [])[1];
-  if (raw == null) return null;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) throw usageError('--synthetic-cost must be a non-negative number of credits per synthetic probe run');
-  return n;
-}
-
 /** Additive merge of probe entries into an existing probes.json (by id; existing entries win). */
 export function mergeProbes(probes) {
   return (current) => {
@@ -893,541 +271,703 @@ export function mergeProbes(probes) {
   };
 }
 
-function cronOf(values) {
-  if (!values.schedule) return '17 */6 * * *';
-  const c = String(values.schedule).trim();
-  if (!/^[0-9*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$/.test(c)) throw usageError('--schedule must be a 5-field cron expression, e.g. "17 */6 * * *" (UTC; avoid minute 0)');
-  return c;
+/** Write (or plan) every output: never replaces a file without --force; a replaced file is backed up. */
+function applyOutputs(outputs, env) {
+  if (env.write && outputs.some((o) => o.state)) prepareStateDir({ ...env.ctx, cwd: env.root });
+  const located = outputs.map((o) => {
+    if (!o.state) return o;
+    const absPath = abs(env.state.dir, o.state);
+    return { ...o, absPath, path: relPosix(env.root, absPath) || toPosix(absPath) };
+  });
+  const backupDir = backupDirFactory(env.ctx, env.root, 'backups', 'scaffold');
+  return writeOutputs(located, { root: env.root, dryRun: !env.write, force: env.force, backupDir });
+}
+
+// ---------------------------------------------------------------------------
+// e2e-web (plan §10.2)
+
+function webServerInfo(env) {
+  const scripts = projectPkg(env).scripts || {};
+  const script = ['start', 'preview', 'dev'].find((s) => typeof scripts[s] === 'string');
+  if (!script) return null;
+  const mgr = firstManager(env.project);
+  const cmd = `${{ pnpm: 'pnpm run', yarn: 'yarn', bun: 'bun run' }[mgr.name] || 'npm run'} ${script}`;
+  const port = /\bvite\b/.test(scripts[script]) ? (script === 'dev' ? 5173 : 4173) : 3000;
+  return { cmd, port, install: mgr.install || 'npm ci' };
+}
+
+async function buildE2eWeb(env) {
+  const { values } = env;
+  const { lang, out } = resolveLang(env);
+  const bundle = loadBundle('e2e');
+  const filter = { kind: 'web', lang };
+  const server = lang === 'ts' ? webServerInfo(env) : null;
+  const baseUrl = httpUrl(values['base-url'] || `http://localhost:${server ? server.port : 3000}`);
+  const journeys = `${values.journeys || ''}`.split(/[,;\n]/).map((j) => plainText(j, 80)).filter(Boolean).slice(0, 3);
+  const hosts = parseFor(values.for);
+  const features = new Set([server ? 'server' : 'no-server', journeys.length ? 'journeys' : 'no-journeys', ...hosts]);
+  const vars = commonVars(env, {
+    out, base_url: baseUrl, package_name: `${slugify(path.basename(env.root))}-e2e-web`, header: ciHeader('e2e-web'),
+    server_cmd: server ? server.cmd : '', journey_count: String(journeys.length),
+  });
+  const serverCwd = toPosix(path.relative(abs(env.root, out), projectDir(env))) || '.';
+  vars.web_server = server ? fragment(bundle, 'web-server', filter,
+    { ...vars, server_cmd: jsString(server.cmd).slice(1, -1), server_cwd: serverCwd }) : '';
+  vars.app_install = server ? fragment(bundle, 'app-install', filter,
+    { ...vars, install_cmd: server.install, project_root: env.projectRoot }) : '';
+  const outputs = renderFiles(bundle, filter, features, vars, out);
+  for (const j of journeys) {
+    const jv = { ...vars, journey: j, journey_js: jsString(j), journey_py: cString(j), slug_ident: ident(j, 40) };
+    const rel = lang === 'python' ? `test_web_${jv.slug_ident}.py` : `tests/${slugify(j, 40)}.spec.ts`;
+    outputs.push({ path: joinOut(out, rel), content: `${fragment(bundle, 'journey', filter, jv)}\n` });
+  }
+  return {
+    lang, out, outputs, next: nextSteps(bundle, filter, features, vars),
+    data: { journeys, base_url: baseUrl, web_server: server ? server.cmd : null, for: hosts },
+  };
+}
+
+// e2e-web --audit: hardening an existing suite into a prioritized fix list; nothing is written.
+// Spec lines: [priority, rule, pattern, fix].
+const SPEC_RULES = [
+  ['P1', 'fixed-sleep', /\bwaitForTimeout\s*\(|\btime\.sleep\s*\(|=>\s*setTimeout\b|\bcy\.wait\s*\(\s*\d/,
+    'wait on a condition: web-first assertions (expect(locator).toBeVisible()), waitForResponse, expect.poll'],
+  ['P1', 'focused-test', /\b(?:test|it|describe)\.only\s*\(/, 'remove .only; set forbidOnly: !!process.env.CI'],
+  ['P2', 'serial-mode', /\bdescribe\.serial\s*\(|mode\s*:\s*['"]serial['"]/,
+    'serial mode shares state between tests: give each test its own data (fixtures, per-worker accounts)'],
+  ['P2', 'hardcoded-url', /\b(?:goto|get|post|put|delete|fetch)\s*\(\s*['"`]https?:\/\//,
+    'use relative URLs with use.baseURL (E2E_BASE_URL) so the suite runs against any environment'],
+  ['P3', 'brittle-selector', /\bpage\.\$\$?\s*\(|locator\s*\(\s*['"`](?:\/\/|xpath=)|\.nth-child\(/,
+    'prefer getByRole / getByLabel / getByTestId over CSS structure and XPath'],
+  ['P3', 'force-click', /\{\s*force\s*:\s*true\s*\}/, 'force: true skips actionability checks and hides real bugs'],
+];
+// Config files: [priority, rule, applies(text, retries value), line pattern, fix].
+const CONFIG_RULES = [
+  ['P1', 'retries-hide-flakes', (t, r) => r && !/failOnFlakyTests/.test(t), /retries\s*:/,
+    'retried passes are silent: add failOnFlakyTests: !!process.env.CI (Playwright 1.52+)'],
+  ['P1', 'unbounded-retries', (t, r) => /^\s*(?:[3-9]|\d{2,})\s*$/.test(r || ''), /retries\s*:/, 'at most 2 retries'],
+  ['P2', 'retries-outside-ci', (t, r) => /^\s*[1-9]/.test(r || ''), /retries\s*:/, 'retries: process.env.CI ? 2 : 0'],
+  ['P2', 'no-forbid-only', (t) => !/forbidOnly/.test(t), null, 'add forbidOnly: !!process.env.CI'],
+  ['P2', 'no-trace', (t) => !/trace\s*:/.test(t), null, "set use.trace: 'retain-on-failure'"],
+  ['P2', 'trace-off', (t) => /trace\s*:\s*['"]off['"]/.test(t), /trace\s*:/,
+    "use 'retain-on-failure' ('off' only for authenticated live probes)"],
+  ['P2', 'no-base-url', (t) => !/baseURL/.test(t), null, 'read use.baseURL from E2E_BASE_URL'],
+  ['P3', 'no-junit', (t) => !/junit/.test(t), null, 'add a junit reporter so CI can publish and count the results'],
+];
+
+function auditE2eWeb(env) {
+  const all = listFiles(env.root);
+  const text = (f) => (readText(abs(env.root, f), '') || '').replace(/\r\n/g, '\n');
+  const configs = all.filter((f) => /(^|\/)playwright\.config\.[cm]?[jt]s$/.test(f));
+  const pyTests = all.filter((f) => /(^|\/)test_[^/]*\.py$/.test(f));
+  const pySuite = all.some((f) => /(^|\/)conftest\.py$/.test(f)) && pyTests.some((f) => /playwright/.test(text(f)));
+  const specs = all.filter((f) => /\.(?:spec|test|cy)\.[cm]?[jt]sx?$/.test(f)).concat(pySuite ? pyTests : []);
+  const items = [];
+  const add = (priority, rule, file, line, evidence, fix) =>
+    items.push({ priority, rule, file, line, evidence: truncate(String(evidence).trim(), 160), fix });
+  for (const cfg of configs) {
+    const t = text(cfg);
+    const lines = t.split('\n');
+    const retries = (/retries\s*:\s*([^,\n]+)/.exec(t) || [])[1];
+    for (const [priority, rule, applies, lineRe, fix] of CONFIG_RULES.filter((r) => r[2](t, retries))) {
+      const i = lineRe ? lines.findIndex((l) => lineRe.test(l)) : -1;
+      add(priority, rule, cfg, i === -1 ? null : i + 1, i === -1 ? `${rule} (${cfg})` : lines[i], fix);
+    }
+  }
+  let tagged = 0;
+  for (const f of specs.slice(0, 2000)) {
+    const t = text(f);
+    if (/@smoke|@regression|tag\s*:\s*['"]@/.test(t)) tagged++;
+    const hits = (l, i) => SPEC_RULES.forEach(([p, id, re, fix]) => re.test(l) && add(p, id, f, i + 1, l, fix));
+    t.split('\n').forEach(hits);
+  }
+  if (specs.length && !tagged) add('P3', 'no-tags', specs[0], null, 'no @smoke/@regression tag', "{ tag: '@smoke' }");
+  if (!configs.length && !pySuite) add('P1', 'no-suite', '.', null, 'no playwright config', 'scaffold e2e-web --write');
+  const rank = (x) => Number(x.priority[1]);
+  items.sort((a, b) => rank(a) - rank(b) || a.file.localeCompare(b.file) || (a.line || 0) - (b.line || 0));
+  const counts = Object.fromEntries(['P1', 'P2', 'P3'].map((p) => [p, items.filter((x) => x.priority === p).length]));
+  return { configs, files_scanned: specs.length, items: items.slice(0, 200), truncated: items.length > 200, counts };
+}
+
+// ---------------------------------------------------------------------------
+// e2e-api and e2e-cli
+
+const OPENAPI_FILES = ['', 'docs/', 'api/', 'spec/', 'specs/', 'openapi/', 'schema/']
+  .flatMap((d) => ['openapi', 'swagger'].flatMap((n) => ['yaml', 'yml', 'json'].map((e) => `${d}${n}.${e}`)));
+
+async function buildE2eApi(env) {
+  const { values } = env;
+  const { lang, out } = resolveLang(env);
+  const bundle = loadBundle('e2e');
+  const node = nodeSetup(env, lang);
+  const openapi = OPENAPI_FILES.find((rel) => fs.existsSync(abs(env.root, rel))) || null;
+  if (values.pact && !node.flavor) {
+    throw usageError('--pact skeletons are rendered for TypeScript/JavaScript only (Pact notes: references/e2e.md)');
+  }
+  const features = new Set([node.flavor, openapi && 'openapi', values.pact && 'pact']);
+  const filter = { kind: 'api', lang };
+  const vars = commonVars(env, {
+    out, header: ciHeader('e2e-api'), openapi: openapi || '', contracts_dir: projectRelative(env, `${out}/contracts`),
+    base_url: httpUrl(values['base-url'] || 'http://localhost:3000'),
+    health_path: httpPath(values['health-path'] || '/health'),
+    consumer: slugify(String(projectPkg(env).name || path.basename(env.root)).replace(/^@[^/]+\//, '')),
+    provider: values.pact ? slugify(values.pact) : 'provider', ...node.vars,
+  });
+  if (node.flavor) {
+    Object.assign(vars, { client_import: node.imp('./client'), contract_import: node.imp('./contract'),
+      run_cmd: `${node.run} ${projectRelative(env, `${out}/api.e2e.test.${vars.ext}`)}` });
+  }
+  const data = { flavor: node.flavor, openapi, pact: values.pact ? vars.provider : null, base_url: vars.base_url };
+  return {
+    lang, out, outputs: renderFiles(bundle, filter, features, vars, out, { cjs: node.cjs }),
+    next: nextSteps(bundle, filter, features, vars), data: { ...data, health_path: vars.health_path },
+  };
+}
+
+function nodeCliTarget(env) {
+  const pkg = projectPkg(env);
+  let name = pkg.name ? String(pkg.name).replace(/^@[^/]+\//, '') : path.basename(projectDir(env));
+  let bin = typeof pkg.bin === 'string' ? pkg.bin : null;
+  const first = pkg.bin && typeof pkg.bin === 'object' ? Object.entries(pkg.bin)[0] : null;
+  if (first) [name, bin] = first;
+  return { name, script: bin ? toPosix(path.normalize(bin)).replace(/^\.\//, '') : null };
+}
+
+const toml = (env, file) => parseToml(readText(path.join(projectDir(env), file), ''), { lenient: true }).value || {};
+
+function pyCliTarget(env) {
+  const [name, entry] = Object.entries((toml(env, 'pyproject.toml').project || {}).scripts || {})[0] || [];
+  const m = /^([A-Za-z0-9_.]+):([A-Za-z0-9_.]+)$/.exec(String(entry || '').trim());
+  return m ? { name, module: m[1], func: m[2] } : null;
+}
+
+function goCliTarget(env) {
+  const dir = projectDir(env);
+  const mod = /^module\s+(\S+)/m.exec(readText(path.join(dir, 'go.mod'), '') || '');
+  if (!mod) return null;
+  const isMain = (d) => isDir(d) && fs.readdirSync(d).some((f) => f.endsWith('.go') && !f.endsWith('_test.go')
+    && /^package\s+main\b/m.test(readText(path.join(d, f), '') || ''));
+  if (isMain(dir)) return { pkg: '.', name: path.basename(mod[1]) };
+  const cmd = path.join(dir, 'cmd');
+  const sub = isDir(cmd) ? fs.readdirSync(cmd).sort().find((d) => isMain(path.join(cmd, d))) : null;
+  return { pkg: sub ? `./cmd/${sub}` : null, name: sub || path.basename(mod[1]) };
+}
+
+function rustCliTarget(env) {
+  const cargo = toml(env, 'Cargo.toml');
+  const bin = [].concat(cargo.bin || []).map((b) => b && b.name).find(Boolean);
+  const main = cargo.package && fs.existsSync(path.join(projectDir(env), 'src', 'main.rs'));
+  return bin || (main ? cargo.package.name : null);
+}
+
+async function buildE2eCli(env) {
+  const { values } = env;
+  const { lang, out } = resolveLang(env, { strict: true });
+  const bundle = loadBundle('e2e');
+  const node = nodeSetup(env, lang);
+  const argv = values.bin == null ? null : splitArgv(values.bin);
+  if (argv && !argv.length) throw usageError('--bin needs a command');
+  const vars = commonVars(env, { out, ...node.vars });
+  const missing = (where) => usageError(`no entry point in ${where}: pass --bin "<command to start the CLI>"`);
+  let name;
+  if (node.flavor) {
+    const t = nodeCliTarget(env);
+    // A Node script runs with the current Node (no shell, no .cmd shim); anything else as given.
+    const script = argv ? (/\.[cm]?[jt]s$/.test(argv[0]) ? argv[0] : null) : t.script;
+    if (!argv && !script) throw missing('package.json "bin"');
+    name = argv ? path.basename(argv[0]).replace(/\.[^.]+$/, '') || t.name : t.name;
+    const cli = script
+      ? ['process.execPath', `path.resolve(PROJECT_ROOT, ${jsString(script)})`, ...(argv || []).slice(1).map(jsString)]
+      : argv.map(jsString);
+    Object.assign(vars, {
+      cli_argv: `[${cli.join(', ')}]`, golden_dir: projectRelative(env, `${out}/golden`),
+      harness_import: node.imp('./harness'),
+      run_cmd: `${node.run} ${projectRelative(env, out)}/cli.e2e.test.${vars.ext}`,
+      run_from: env.projectRoot === '.' ? 'the repository root' : env.projectRoot,
+    });
+  } else if (lang === 'python') {
+    const t = pyCliTarget(env);
+    if (!argv && !t) throw missing('pyproject.toml [project.scripts]');
+    name = argv ? path.basename(argv[0]) : t.name;
+    vars.cli_argv = argv ? `[${argv.map(cString).join(', ')}]`
+      : `[sys.executable, "-c", ${cString(`import sys; from ${t.module} import ${t.func}; sys.exit(${t.func}())`)}]`;
+  } else if (lang === 'go') {
+    const t = goCliTarget(env);
+    const pkg = argv ? argv[0] : t && t.pkg;
+    if (!pkg) throw missing('go.mod (a main package at the module root or in cmd/*); --bin ./cmd/<name>');
+    name = argv ? path.basename(argv[0]) : t.name;
+    vars.go_pkg = cString(/^\.|\//.test(pkg) ? pkg : `./${pkg}`);
+    vars.go_package = ident(path.basename(out), 30);
+  } else {
+    name = argv ? argv[0] : rustCliTarget(env);
+    if (!/^[A-Za-z0-9_-]+$/.test(name || '')) throw missing('Cargo.toml (a [[bin]] or src/main.rs); --bin <bin name>');
+    vars.bin_name = name;
+  }
+  vars.cli_name = plainText(name, 60);
+  const filter = { kind: 'cli', lang };
+  const features = new Set([node.cjs && 'cjs', lang === 'rust' && !/(^|\/)tests$/.test(out) && 'outside-tests']);
+  return {
+    lang, out, outputs: renderFiles(bundle, filter, features, vars, out, { cjs: node.cjs }),
+    next: nextSteps(bundle, filter, features, vars), data: { flavor: node.flavor, cli: name },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// live (plan §10.3): a plain probe project for `adc.mjs live run`, which owns credentials and budget
+
+/** The checklist gate: missing, or the number of lines containing TODO (the runner's rule). */
+export function checklistGate(file) {
+  const text = readText(file);
+  if (text == null) return { path: toPosix(file), exists: false, open: null, ok: false, reason: 'CHECKLIST_MISSING' };
+  const open = text.split(/\r?\n/).filter((l) => l.includes('TODO'));
+  const openItems = open.slice(0, 20).map((l) => truncate(l.trim(), 120));
+  const reason = open.length ? 'CHECKLIST_OPEN' : null;
+  return { path: toPosix(file), exists: true, open: open.length, open_items: openItems, ok: !reason, reason, text };
+}
+
+const PROBE_FORMS = {
+  ts: [(f) => `npx playwright test ${f} --reporter=junit`, (k, n) => `probes/${k}/${n}.spec.ts`],
+  js: [(f) => `node --test --test-reporter=junit ${f}`, (k, n) => `probes/${k}/${n}.test.mjs`],
+  python: [(f) => `python -m pytest ${f} -p no:cacheprovider -q`, (k, n) => `probes/${k}/test_${ident(n)}.py`],
+};
+
+/** Manifest entries: read-only probes cost 1; synthetic ones carry the estimate the owner gave. */
+function liveProbes(lang, out, syntheticCost, values) {
+  const header = values['cost-header'];
+  const kind = values['cost-header-kind'] || 'per_request';
+  if (header && !/^[A-Za-z0-9-]{1,100}$/.test(header)) throw usageError('--cost-header must be an HTTP header name');
+  if (!['per_request', 'cumulative'].includes(kind)) throw usageError('--cost-header-kind: per_request or cumulative');
+  const [cmd, file] = PROBE_FORMS[lang];
+  const probe = (k, name, cost, timeout) => ({
+    id: `${k}/${name}`, kind: k, cmd: cmd(file(k, name)), cwd: out, cost, timeout_s: timeout,
+    ...(header ? { cost_header: header, cost_header_kind: kind } : {}),
+  });
+  const synthetic = syntheticCost == null ? [] : [probe('synthetic', 'create-and-cleanup', syntheticCost, 300)];
+  return [probe('readonly', 'health', 1, 120), ...synthetic];
 }
 
 async function buildLive(env) {
   const { values, root } = env;
-  const lang = resolveLang('live', values, env.project);
-  const out = env.outRel || 'tests/live';
+  const { lang, out } = resolveLang(env);
   const bundle = loadBundle('live');
-  const features = new Set();
-  const checklistPath = values.checklist ? path.resolve(env.ctx.cwd, values.checklist) : path.join(root, ...out.split('/'), 'live-checklist.md');
-  const gate = checklistGate(checklistPath);
-  const inProject = path.join(root, ...out.split('/'), 'live-checklist.md');
-  const synthetic = { enabled: false, reason: gate.reason, checklist: relPosix(root, checklistPath) || toPosix(checklistPath), open: gate.open, open_items: gate.open_items || [] };
-  let cost = null;
-  if (gate.ok) {
-    cost = syntheticCost(values, gate.text);
-    if (cost == null) throw usageError('the checklist is complete; synthetic probes also need their estimated cost: add "Estimated credits per synthetic run: <n>" to the checklist or pass --synthetic-cost <n>');
-    features.add('synthetic');
-    Object.assign(synthetic, { enabled: true, reason: null, cost });
+  const checklistOut = joinOut(out, 'live-checklist.md');
+  const inProject = abs(root, checklistOut);
+  const checklist = values.checklist ? path.resolve(env.ctx.cwd, values.checklist) : inProject;
+  const gate = checklistGate(checklist);
+  const shown = relPosix(root, checklist) || toPosix(checklist);
+  const answered = (/estimated (?:credits|cost)[^:\n]*:\s*(\d+(?:\.\d+)?)/i.exec(gate.text) || [])[1];
+  const estimate = values['synthetic-cost'] ?? answered;
+  if (gate.ok && estimate == null) {
+    throw usageError('the checklist is complete; synthetic probes also need their estimated cost: add "Estimated '
+      + 'credits per synthetic run: <n>" to the checklist or pass --synthetic-cost <n>');
   }
-  const healthPath = normalizeHttpPath(values['health-path'] || '/health');
-  const baseUrl = values['base-url'] || 'https://staging.example.invalid';
-  if (!/^https?:\/\/[^\s'"`]+$/.test(baseUrl) || /^https?:\/\/[^/]*@/.test(baseUrl)) throw usageError('--base-url must be an http(s) URL without credentials (the token goes into .adc/.env.live)');
+  const cost = gate.ok ? numberOption({ 'synthetic-cost': estimate }, 'synthetic-cost', 0, { allowZero: true }) : null;
+  const cron = values.schedule ? String(values.schedule).trim() : '17 */6 * * *';
+  if (!/^[0-9*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$/.test(cron)) throw usageError('--schedule must be a 5-field cron (UTC)');
   const vendored = vendoredSkill(env, values['skill-path']);
+  const features = new Set([gate.ok ? 'synthetic' : 'no-synthetic', vendored ? 'vendored' : 'pinned']);
   const vars = commonVars(env, {
-    out, base_url: baseUrl, health_path: healthPath, header: CI_HEADER('live'), cron: cronOf(values),
-    package_name: `${slugify(path.basename(root))}-live-probes`, synthetic_cost: cost == null ? 'TODO' : String(cost),
+    out, cron, header: ciHeader('live'), package_name: `${slugify(path.basename(root))}-live-probes`,
+    base_url: httpUrl(values['base-url'] || 'https://staging.example.invalid', ' (the token goes into .adc/.env.live)'),
+    health_path: httpPath(values['health-path'] || '/health'), synthetic_cost: cost == null ? 'TODO' : String(cost),
+    checklist: shown, gate_reason: gate.exists ? `${gate.open} TODO line(s) in ${shown}` : `${shown} is missing`,
+    synthetic_env_note: gate.ok ? ', and in "live-write" (required reviewers) for the synthetic job' : '',
   });
   vars.get_adc = getAdcStep(vendored, vars);
-  vars.probe_setup = fragment(bundle, 'probe-setup', { lang }, vars, features);
-  vars.synthetic_env_note = features.has('synthetic') ? ', and in "live-write" (required reviewers) for the synthetic job' : '';
-  vars.synthetic_job = features.has('synthetic') ? fragment(bundle, 'synthetic-job', { lang }, { ...vars, get_adc: vars.get_adc, probe_setup: vars.probe_setup }, features) : '';
-  const outputs = renderFiles(bundle, { lang }, features, vars, { out });
-  // The checklist: the template when none exists in the project; the answered file when given elsewhere.
-  if (gate.ok && path.resolve(checklistPath) !== path.resolve(inProject)) {
-    outputs.push({ path: joinOut(out, 'live-checklist.md'), content: gate.text.replace(/\r\n/g, '\n') });
+  vars.probe_setup = fragment(bundle, 'probe-setup', { lang }, vars);
+  vars.synthetic_job = gate.ok ? fragment(bundle, 'synthetic-job', { lang }, vars) : '';
+  const outputs = renderFiles(bundle, { lang }, features, vars, out);
+  // The checklist: the answered file when it was given elsewhere, else the template while none exists.
+  if (gate.ok && path.resolve(checklist) !== path.resolve(inProject)) {
+    outputs.push({ path: checklistOut, content: gate.text.replace(/\r\n/g, '\n') });
+  } else if (!fs.existsSync(inProject)) {
+    outputs.push({ path: checklistOut, content: `${fragment(bundle, 'checklist', { lang }, vars)}\n` });
   }
-  if (!gate.ok || path.resolve(checklistPath) === path.resolve(inProject)) {
-    const sec = pickSections(bundle, { lang, part: 'fragment' }, features).find((s) => s.attrs.name === 'checklist');
-    if (!fs.existsSync(inProject)) outputs.push({ path: joinOut(out, 'live-checklist.md'), content: renderTemplate(sec.content, vars) });
-  }
-  const probes = liveProbes(lang, out, features.has('synthetic') ? cost : null);
-  outputs.push({ path: joinOut(out, 'probes.json'), content: JSON.stringify({ schema: 'adc-probes/1', probes }, null, 2) + '\n', merge: mergeProbes(probes) });
-  outputs.push({ path: joinOut(out, '.gitignore'), content: LIVE_IGNORES.join('\n') + '\n', merge: mergeLines(LIVE_IGNORES.join('\n')) });
-  const next = [
-    lang === 'ts' ? `cd ${out} && npm install   (creates package-lock.json: commit it; the workflow runs npm ci; API probes need no browsers)`
-      : lang === 'js' ? `${out} needs nothing installed: node:test + fetch (Node 24)` : `python -m pip install -r ${out}/requirements-live.txt`,
-    'ask the user to put the token into .adc/.env.live in their own editor (ADC_LIVE_TOKEN=..., optional ADC_LIVE_BASE_URL); never open that file yourself',
-    `node <skill>/scripts/adc.mjs live run --dry-run --json, then live run --json (budget: 2,500 credits per session and per day)`,
-    'CI: environment "live" with secret ADC_LIVE_TOKEN; repository variables LIVE_TESTS_ENABLED=true (kill switch), ADC_LIVE_BASE_URL, optional ADC_LIVE_BUDGET (ci class, max 10,000)',
-  ];
-  if (!synthetic.enabled) next.unshift(`synthetic (write) probes were NOT generated: ${gate.exists ? `${gate.open} TODO line(s) in ${synthetic.checklist}` : `${synthetic.checklist} does not exist yet`}. Answer every checklist item with the user, record the answers, then re-run with --checklist ${synthetic.checklist} --write`);
-  if (!vendored) next.push(`the workflow fetches ${SKILL_NAME} v${skillVersion()} at run time; pin a commit SHA in ADC_REF, or vendor the skill into .github/skills/ (references/install.md)`);
-  return { lang, out, outputs, next_steps: next, data: { synthetic, health_path: healthPath, base_url: baseUrl, probes: probes.map((p) => p.id), vendored_skill: vendored } };
+  const probes = liveProbes(lang, out, cost, values);
+  const manifest = `${JSON.stringify({ schema: 'adc-probes/1', probes }, null, 2)}\n`;
+  outputs.push({ path: joinOut(out, 'probes.json'), content: manifest, merge: mergeProbes(probes) });
+  const synthetic = { enabled: gate.ok, reason: gate.reason, checklist: shown, open: gate.open };
+  synthetic.open_items = gate.open_items || [];
+  if (gate.ok) synthetic.cost = cost;
+  const data = { synthetic, health_path: vars.health_path, base_url: vars.base_url, vendored_skill: vendored };
+  data.probes = probes.map((x) => x.id);
+  return { lang, out, outputs, next: nextSteps(bundle, { lang }, features, vars), data };
 }
-
-function liveProbes(lang, out, syntheticCostValue) {
-  const cmd = {
-    ts: (f) => `npx playwright test ${f} --reporter=junit`,
-    js: (f) => `node --test --test-reporter=junit ${f}`,
-    python: (f) => `python -m pytest ${f} -p no:cacheprovider -q`,
-  }[lang];
-  const file = {
-    ts: (kind, name) => `probes/${kind}/${name}.spec.ts`,
-    js: (kind, name) => `probes/${kind}/${name}.test.mjs`,
-    python: (kind, name) => `probes/${kind}/test_${name.replace(/-/g, '_')}.py`,
-  }[lang];
-  const probes = [{ id: 'readonly/health', kind: 'readonly', cmd: cmd(file('readonly', 'health')), cwd: out, cost: 1, timeout_s: 120 }];
-  if (syntheticCostValue != null) probes.push({ id: 'synthetic/create-and-cleanup', kind: 'synthetic', cmd: cmd(file('synthetic', 'create-and-cleanup')), cwd: out, cost: syntheticCostValue, timeout_s: 300 });
-  return probes;
-}
-
-/** The workflow step that sets ADC to a vendored copy of the skill or a pinned fetch of it. */
-function getAdcStep(vendored, vars) {
-  const bundle = loadBundle('ci-gate');
-  return vendored
-    ? fragment(bundle, 'get-adc-vendored', {}, { ...vars, skill_rel: vendored }, new Set())
-    : fragment(bundle, 'get-adc-pinned', {}, { ...vars, adc_repo: skillHomepage(), adc_ref: `v${skillVersion()}` }, new Set());
-}
-
-/** Toolchain setup steps for a project's CI jobs (always Node 24 too: adc.mjs and gate.mjs need it). */
-function setupFor(p, vars) {
-  const bundle = loadBundle('ci-gate');
-  const root = toPosix((p && p.root) || '.');
-  const dir = root === '.' ? '' : `${root}/`;
-  const mgr = p && p.managers && p.managers[0] ? p.managers[0] : {};
-  const eco = (p && ecosystemOf(p)) || 'node';
-  const pdir = (rel) => path.join(vars.repo_root, ...root.split('/'), rel);
-  const v = { ...vars, project_root: root, project_dir: dir, lockfile: lockfileOf(p || {}), node_cache: nodeCacheOf(p || {}) };
-  let name = 'setup-node';
-  if (eco === 'node') {
-    name = mgr.name === 'pnpm' ? 'setup-pnpm' : mgr.name === 'yarn' ? 'setup-yarn' : mgr.name === 'bun' ? 'setup-bun' : v.node_cache && v.lockfile ? 'setup-node-cache' : 'setup-node';
-  } else if (eco === 'python') {
-    name = 'setup-python';
-    v.python_version = fs.existsSync(pdir('.python-version')) ? `python-version-file: ${dir}.python-version` : "python-version: '3.12'";
-    v.python_tool = mgr.name === 'uv' ? '      - uses: astral-sh/setup-uv@v7'
-      : mgr.name === 'poetry' ? '      - name: Install Poetry\n        run: |\n          pipx install poetry' : '';
-  } else if (eco === 'go') name = 'setup-go';
-  else if (eco === 'rust') name = 'setup-rust';
-  else if (eco === 'dotnet') {
-    name = 'setup-dotnet';
-    v.dotnet_version = fs.existsSync(pdir('global.json')) ? `global-json-file: ${dir}global.json` : "dotnet-version: '8.0.x'";
-  } else if (eco === 'jvm') {
-    name = 'setup-java';
-    const runner = (p.runners || []).map((r) => r.name);
-    v.java_cache = runner.includes('maven') ? 'cache: maven' : runner.includes('gradle') ? 'cache: gradle' : '';
-  } else if (eco === 'ruby') name = 'setup-ruby';
-  return fragment(bundle, name, {}, v, new Set());
-}
-
-const gateHeaderJs = () => `generated by ${SKILL_NAME} ci-gate: gate helper (${generatedBy()})`;
 
 /** After writing the live project: owner-only .adc/ templates and the ignore post-condition. */
 function liveAfterWrite(env, out) {
-  const res = { state: null, gitignore: null, findings: [] };
   const info = prepareStateDir({ ...env.ctx, cwd: env.root }, { create: true });
   const mat = materializeTemplates(info);
-  res.state = { dir: toPosix(info.dir), exclude: info.exclude, budget: mat.budget, env_live: mat.envLive };
-  if (!mat.envLive.created && mat.envLive.reason) res.findings.push({ id: 'LIVE-ENV-FILE', severity: 'fail', file: mat.envLive.path, line: null, message: mat.envLive.reason, evidence: '' });
-  if (!repoRoot(env.root)) {
-    res.gitignore = { verified: false, reason: 'not a git repository; check the ignore rules by hand', paths: [] };
-    return res;
+  const state = { dir: toPosix(info.dir), exclude: info.exclude, budget: mat.budget, env_live: mat.envLive };
+  const fail = (id, file, message, evidence = '') => ({ id, severity: 'fail', file, line: null, message, evidence });
+  const { created, reason, path: envPath } = mat.envLive;
+  const findings = created || !reason ? [] : [fail('LIVE-ENV-FILE', envPath, reason)];
+  if (!repoRoot(env.root)) return { state, findings, gitignore: { verified: false, reason: 'not a git repository' } };
+  // Traces, HAR files and reports record request headers, so every one of them must stay out of git.
+  const paths = ['test-results/x.xml', 'playwright-report/index.html', 'blob-report/x.zip', 'trace.har']
+    .map((p) => joinOut(out, p)).map((p) => ({ path: p, ignored: checkIgnore(env.root, p) }));
+  for (const p of paths.filter((x) => !x.ignored)) {
+    const message = `${p.path} would not be ignored by git (traces and reports record request headers); fix the `
+      + `ignore rules (an in-tree negation overrides ${out}/.gitignore)`;
+    findings.push(fail('LIVE-GITIGNORE', p.path, message, `git check-ignore -q ${p.path}`));
   }
-  const checks = ['test-results/x.xml', 'playwright-report/index.html', 'blob-report/x.zip', 'trace.har'].map((p) => `${out}/${p}`);
-  const paths = checks.map((p) => ({ path: p, ignored: checkIgnore(env.root, p) }));
-  const ok = paths.every((p) => p.ignored);
-  res.gitignore = { verified: ok, paths };
-  if (!ok) {
-    for (const p of paths.filter((x) => !x.ignored)) {
-      res.findings.push({ id: 'LIVE-GITIGNORE', severity: 'fail', file: p.path, line: null, message: `${p.path} would not be ignored by git (traces and reports record request headers); fix the ignore rules (an in-tree negation overrides ${out}/.gitignore)`, evidence: `git check-ignore -q ${p.path}` });
-    }
-  }
-  return res;
+  return { state, findings, gitignore: { verified: paths.every((p) => p.ignored), paths } };
 }
 
 // ---------------------------------------------------------------------------
 // regress (plan §10.1)
 
-const REGRESS_DEFAULT_OUT = {
-  ts: 'test/regression', js: 'test/regression', python: 'tests/regression', go: '.', rust: 'tests',
-  java: 'src/test/java/regression', dotnet: 'tests/Regression', ruby: 'spec/regression',
-};
-
-function goPackageName(dir) {
-  try {
-    for (const f of fs.readdirSync(dir).sort()) {
-      if (!f.endsWith('.go')) continue;
-      const m = /^package\s+(\w+)/m.exec(readText(path.join(dir, f), '') || '');
-      if (m) return m[1].replace(/_test$/, '');
-    }
-  } catch {}
-  return null;
-}
-
 async function buildRegress(env) {
   const { values } = env;
   if (!values.issue) throw usageError('regress needs --issue <id or URL> (the bug the test pins down)');
-  if (!values.behavior) throw usageError('regress needs --behavior "<what must hold>" (it names the test: test_<issue>_<behavior>)');
+  if (!values.behavior) throw usageError('regress needs --behavior "<what must hold>" (it names the test)');
   const level = values.level ? String(values.level) : 'unit';
   if (!['unit', 'integration', 'e2e'].includes(level)) throw usageError('--level must be unit, integration or e2e');
-  const lang = resolveLang('regress', values, env.project, { strict: true });
-  const issueRaw = String(values.issue).trim();
-  const urlNum = /\/(?:issues|pull)\/(\d+)\b/.exec(issueRaw);
-  const issueId = urlNum ? urlNum[1] : issueRaw.replace(/^#/, '');
-  const issueSlug = ident(issueId, 24) || 'issue';
-  const issueRef = /^\d+$/.test(issueId) ? `#${issueId}` : plainText(issueId, 40);
-  const issueLink = /^https?:\/\//.test(issueRaw) ? plainText(issueRaw, 200) : /^\d+$/.test(issueId) ? `${issueRef} (link it with "Fixes ${issueRef}" in the PR)` : issueRef;
-  const behavior = plainText(values.behavior, 100);
-  const behaviorIdent = ident(behavior, 48);
-  const testName = `test_${issueSlug}_${behaviorIdent}`;
-  const flavor = ['ts', 'js'].includes(lang) ? nodeFlavor(env.project) : null;
-  const cjs = lang === 'js' && flavor === 'jest';
-  let out = env.outRel || REGRESS_DEFAULT_OUT[lang];
-  if (lang === 'go' && !env.outRel) out = env.projectRoot;
-  const bundle = loadBundle('regress');
-  const features = new Set([level]);
-  if (values.characterize) {
-    if (!['ts', 'js', 'python'].includes(lang)) throw usageError('--characterize templates exist for TypeScript, JavaScript and Python; elsewhere use insta (Rust), goldie (Go) or Verify (.NET), see references/regress.md');
-    features.add('characterize');
+  const { lang, out } = resolveLang(env, { strict: true });
+  const node = nodeSetup(env, lang);
+  if (values.characterize && !['ts', 'js', 'python'].includes(lang)) {
+    throw usageError('--characterize templates exist for TypeScript, JavaScript and Python; elsewhere use insta '
+      + '(Rust), goldie (Go) or Verify (.NET), see references/regress.md');
   }
-  const ext = lang === 'ts' ? 'ts' : cjs ? 'cjs' : 'mjs';
-  const goPkg = lang === 'go' ? (goPackageName(path.join(env.root, ...out.split('/'))) || ident(path.basename(path.resolve(env.root, out)), 30) || 'main') : null;
+  const raw = String(values.issue).trim();
+  const issueId = (/\/(?:issues|pull)\/(\d+)\b/.exec(raw) || [])[1] || raw.replace(/^#/, '');
+  const issue = ident(issueId, 24);
+  const numeric = /^\d+$/.test(issueId);
+  const issueRef = numeric ? `#${issueId}` : plainText(issueId, 40);
+  const behavior = plainText(values.behavior, 100);
+  const testName = `test_${issue}_${ident(behavior, 48)}`;
   const fileName = {
-    ts: `${issueSlug}-${slugify(behavior, 40)}.test.ts`, js: `${issueSlug}-${slugify(behavior, 40)}.test.${ext}`,
-    python: `test_${issueSlug}_${behaviorIdent}.py`, go: `regression_${issueSlug}_test.go`, rust: `regression_${issueSlug}.rs`,
-    java: `Issue${pascal(issueSlug)}${pascal(behavior).slice(0, 40)}Test.java`, dotnet: `Issue${pascal(issueSlug)}RegressionTests.cs`,
-    ruby: `issue_${issueSlug}_spec.rb`,
+    ts: `${issue}-${slugify(behavior, 40)}.test.ts`, js: `${issue}-${slugify(behavior, 40)}.test.${node.vars.ext}`,
+    python: `${testName}.py`, go: `regression_${issue}_test.go`, rust: `regression_${issue}.rs`,
+    java: `Issue${pascal(issue)}${pascal(behavior).slice(0, 40)}Test.java`, ruby: `issue_${issue}_spec.rb`,
+    dotnet: `Issue${pascal(issue)}RegressionTests.cs`,
   }[lang];
   const testPath = joinOut(out, fileName);
-  const slug = `${issueSlug}-${slugify(behavior, 32)}`;
+  const slug = `${issue}-${slugify(behavior, 32)}`;
+  const runCmd = node.flavor ? `${node.run} ${projectRelative(env, testPath)}` : {
+    python: `python -m pytest ${testPath}`, go: `go test ./${joinOut(out, '...')} -run 'Test_${issue}_'`,
+    rust: `cargo test --test regression_${issue}`, java: `mvn -B test -Dtest=${fileName.replace(/\.java$/, '')}`,
+    dotnet: 'dotnet test --filter "Category=regression"', ruby: `bundle exec rspec ${testPath}`,
+  }[lang];
+  const goDir = abs(env.root, out);
+  const goFiles = lang === 'go' && isDir(goDir) ? fs.readdirSync(goDir).filter((f) => f.endsWith('.go')).sort() : [];
+  const goPackage = goFiles.map((f) => (/^package\s+(\w+)/m.exec(readText(abs(goDir, f), '')) || [])[1]).find(Boolean);
+  const link = /^https?:\/\//.test(raw) ? plainText(raw, 200)
+    : numeric ? `${issueRef} (link it with "Fixes ${issueRef}" in the PR)` : issueRef;
   const vars = commonVars(env, {
-    out, issue_ref: issueRef, issue_link: issueLink, behavior, test_name: testName, test_path: testPath,
-    test_header: nodeTestHeader(flavor, cjs), slug, file_name: fileName, level,
-    go_package: goPkg, go_test_name: `Test_${issueSlug}_${behaviorIdent}`, class_name: fileName.replace(/\.(java|cs)$/, ''),
-    java_package: 'regression', dotnet_ns: 'Regression', characterize_name: `${issueSlug}-${slugify(behavior, 32)}`,
-    golden_dir: projectRelative(env, `${out}/__golden__`), py_test_name: testName,
-    run_cmd: lang === 'ts' || lang === 'js' ? runCmdFor(flavor, projectRelative(env, testPath))
-      : { python: `python -m pytest ${testPath}`, go: `go test ./${out === '.' ? '' : `${out}/`}... -run 'Test_${issueSlug}_'`, rust: `cargo test --test regression_${issueSlug}`, java: `mvn -B test -Dtest=${fileName.replace(/\.java$/, '')}`, dotnet: `dotnet test --filter "Category=regression"`, ruby: `bundle exec rspec ${testPath}` }[lang],
+    out, issue_ref: issueRef, issue_link: link, behavior, test_name: testName, py_test_name: testName, slug, level,
+    test_path: testPath, file_name: fileName, class_name: fileName.replace(/\.(java|cs)$/, ''),
+    go_test_name: `T${testName.slice(1)}`, characterize_name: slug, run_cmd: runCmd, state_rel: env.state.rel || '.adc',
+    go_package: goPackage ? goPackage.replace(/_test$/, '') : ident(path.basename(goDir), 30),
+    golden_dir: projectRelative(env, `${out}/__golden__`), ...node.vars,
   });
-  const outputs = renderFiles(bundle, { lang }, features, vars, { out, transform: cjs ? (rel, c) => toCommonJs(c) : null });
-  for (const o of outputs) if (cjs) o.path = o.path.replace(/\.mjs$/, '.cjs');
-  const next = [
-    `reproduce first: fill .adc/repro/${slug}/repro.md with the failing command and its output; if the bug does not reproduce, stop (no speculative test)`,
-    `replace the placeholder failure in ${testPath} with the real call and assertion; keep the issue link`,
-    `red-green proof: node <skill>/scripts/adc.mjs clean-run --red-green ${testPath} --json   (must fail with an assertion on the base, pass on the snapshot)`,
-    `run it: ${vars.run_cmd}`,
-  ];
-  if (lang === 'python') next.push('the "regression" marker is registered by the generated conftest.py; keep it if pytest runs with --strict-markers');
-  if (lang === 'java') next.push('JUnit 5 is required (@Tag("regression")); add org.junit.jupiter:junit-jupiter if the build lacks it');
-  return { lang, out, outputs, next_steps: next, data: { issue: issueRef, test_name: testName, test_file: testPath, level, flavor, repro: `${(env.state.rel || '.adc')}/repro/${slug}/` } };
+  const features = new Set([level, values.characterize && 'characterize']);
+  const bundle = loadBundle('regress');
+  const data = { issue: issueRef, test_name: testName, test_file: testPath, level, flavor: node.flavor };
+  return {
+    lang, out, outputs: renderFiles(bundle, { lang }, features, vars, out, { cjs: node.cjs }),
+    next: nextSteps(bundle, { lang }, features, vars), data: { ...data, repro: `${vars.state_rel}/repro/${slug}/` },
+  };
 }
 
 // ---------------------------------------------------------------------------
-// ci-gate (plan §10.5)
+// ci-gate (plan §10.5); per-runner CI flags are ci-gate.tmpl's `runners` data (detect.mjs owns detection)
 
-const OS_RUNNERS = { linux: 'ubuntu-latest', ubuntu: 'ubuntu-latest', windows: 'windows-latest', macos: 'macos-latest', mac: 'macos-latest', darwin: 'macos-latest' };
+/** CI test step for one project (full suite, retries off, a report): { cmd, format, report, env, runner } or null. */
+export function ciTestCommand(runner, { reportDir = 'reports', testCmd = null, quarantine = false } = {}) {
+  const fill = (s) => String(s || '').replace(/<d>/g, reportDir);
+  const known = testCmd ? null : ciData('runners')[runner.name];
+  if (!known) {
+    // A command the companion does not know: its own output is the report (summary-line parsing).
+    const cmd = testCmd || runner.cmd;
+    return cmd ? { cmd: `${cmd} 2>&1 | tee ${reportDir}/test-output.log`, format: 'summary',
+      report: `${reportDir}/test-output.log`, env: {}, runner: testCmd ? 'custom' : runner.name } : null;
+  }
+  const parts = [known.cmd || runner.cmd, fill(known.ci), quarantine && known.skip].filter(Boolean);
+  const env = Object.fromEntries(Object.entries(known.env || {}).map(([k, v]) => [k, fill(v)]));
+  const report = fill(known.report || '<d>/junit.xml');
+  return { cmd: parts.join(' ') + fill(known.tail), format: known.format || 'junit', report, env, runner: runner.name };
+}
 
+/** Coverage command and report for the changed-line gate, or null when no producer is known to exist. */
+function ciCoverage(runner, env, p) {
+  const c = (ciData('runners')[runner.name] || {}).coverage;
+  if (!c) return null;
+  const dir = abs(env.root, toPosix(p.root || '.'));
+  const pkg = readJson(path.join(dir, 'package.json'), null) || {};
+  const manifests = ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'setup.cfg', 'uv.lock']
+    .map((f) => readText(path.join(dir, f), '')).join('\n').toLowerCase();
+  const declared = (d) => (pkg.dependencies || {})[d] || (pkg.devDependencies || {})[d] || manifests.includes(d);
+  if (c.requires && !c.requires.some(declared)) return null;
+  return { cmd: c.cmd.replace('<cmd>', runner.cmd), report: c.report, tool: c.tool || 'diff-cover' };
+}
+
+const SETUP = { python: 'python', go: 'go', rust: 'rust', dotnet: 'dotnet', jvm: 'java', ruby: 'ruby' };
+
+/** Toolchain setup steps for a project's CI jobs (always with Node 24: adc.mjs and gate.mjs need it). */
+function setupFor(p, vars) {
+  const bundle = loadBundle('ci-gate');
+  const root = toPosix(p.root || '.');
+  const dir = root === '.' ? '' : `${root}/`;
+  const mgr = firstManager(p);
+  const has = (f) => fs.existsSync(abs(vars.repo_root, joinOut(root, f)));
+  const lockfile = mgr.lockfile ? joinOut(root, mgr.lockfile) : '';
+  const runners = (p.runners || []).map((r) => r.name);
+  const v = {
+    ...vars, project_root: root, project_dir: dir, lockfile,
+    node_cache: ['npm', 'pnpm', 'yarn'].includes(mgr.name) && lockfile ? mgr.name : '',
+    python_version: has('.python-version') ? `python-version-file: ${dir}.python-version` : "python-version: '3.12'",
+    dotnet_version: has('global.json') ? `global-json-file: ${dir}global.json` : "dotnet-version: '8.0.x'",
+    java_cache: ['maven', 'gradle'].filter((r) => runners.includes(r)).map((r) => `cache: ${r}`)[0] || '',
+  };
+  v.python_tool = ['uv', 'poetry'].includes(mgr.name) ? fragment(bundle, `python-tool-${mgr.name}`, {}, v) : '';
+  const node = ['pnpm', 'yarn', 'bun'].includes(mgr.name) ? mgr.name : v.node_cache ? 'node-cache' : 'node';
+  return fragment(bundle, `setup-${SETUP[ecosystemOf(p)] || node}`, {}, v);
+}
+
+/** --os, else the OSes the repository's workflows already use, else Linux. */
 function osMatrix(env) {
+  const labels = { linux: 'ubuntu-latest', windows: 'windows-latest', macos: 'macos-latest' };
   if (env.values.os) {
-    const list = String(env.values.os).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    const mapped = list.map((o) => OS_RUNNERS[o] || (/^(ubuntu|windows|macos)-[\w.]+$/.test(o) ? o : null));
-    if (mapped.includes(null)) throw usageError('--os takes linux, windows, macos (or runner labels such as ubuntu-24.04)');
-    return [...new Set(mapped)];
+    const list = String(env.values.os).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+      .map((o) => labels[o] || (/^(ubuntu|windows|macos)-[\w.]+$/.test(o) ? o : null));
+    if (!list.length || list.includes(null)) throw usageError('--os takes linux, windows, macos or runner labels');
+    return [...new Set(list)];
   }
-  // The OSes the repository's existing workflows already use; Linux alone otherwise.
-  const seen = new Set();
-  const files = (env.det && env.det.ci && env.det.ci.files) || [];
-  for (const f of files) {
-    const text = readText(path.join(env.root, ...String(f).split('/')), '') || '';
-    for (const m of text.matchAll(/\b(ubuntu|windows|macos)-(?:latest|[\d.]+)\b/g)) seen.add(`${m[1]}-latest`);
-  }
-  return seen.size ? ['ubuntu-latest', 'windows-latest', 'macos-latest'].filter((o) => seen.has(o)) : ['ubuntu-latest'];
-}
-
-function ecosystemOf(p) {
-  const eco = (p.ecosystems || [])[0];
-  return eco || (p.runners && p.runners[0] && p.runners[0].ecosystem) || null;
-}
-
-function ciProjects(env) {
-  const projects = env.det && Array.isArray(env.det.projects) ? env.det.projects : [];
-  return projects.filter((p) => (p.runners || []).some((r) => r && r.cmd) || env.values['test-cmd']);
-}
-
-function indent(text, n) {
-  const pad = ' '.repeat(n);
-  return String(text).split('\n').map((l) => (l ? pad + l : l)).join('\n');
+  const text = ((env.det.ci && env.det.ci.files) || []).map((f) => readText(abs(env.root, f), '')).join('\n');
+  const seen = Object.values(labels).filter((o) => new RegExp(`\\b${o.slice(0, -7)}-(?:latest|[\\d.]+)\\b`).test(text));
+  return seen.length ? seen : ['ubuntu-latest'];
 }
 
 /** The quarantine registry written by `scaffold flake` (adc-quarantine/1), repo-relative, or null. */
-function findRegistry(root) {
-  for (const dir of ['tests', 'test', 'spec', '.']) {
-    const rel = dir === '.' ? 'quarantine.json' : `${dir}/quarantine.json`;
-    const doc = readJson(path.join(root, ...rel.split('/')), null);
-    if (doc && doc.schema === 'adc-quarantine/1') return rel;
-  }
-  return null;
-}
+const findRegistry = (root) => ['tests', 'test', 'spec', '.'].map((d) => joinOut(d, 'quarantine.json'))
+  .find((rel) => (readJson(abs(root, rel), null) || {}).schema === 'adc-quarantine/1') || null;
+
+const PUBLISHER = { junit: 'java-junit', 'go-test-json': 'golang-json', trx: 'dotnet-trx', 'rspec-json': 'rspec-json' };
 
 async function buildCiGate(env) {
   const { values, root } = env;
   const bundle = loadBundle('ci-gate');
-  const features = new Set();
-  const threshold = values.threshold == null ? 80 : Number(values.threshold);
-  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) throw usageError('--threshold must be a percentage between 0 and 100');
-  const maxFlaky = values['max-flaky'] == null ? 0 : Number(values['max-flaky']);
-  if (!Number.isInteger(maxFlaky) || maxFlaky < 0) throw usageError('--max-flaky must be a non-negative integer');
+  const threshold = numberOption(values, 'threshold', 80, { allowZero: true });
+  if (threshold > 100) throw usageError('--threshold is a percentage from 0 to 100');
+  const maxFlaky = numberOption(values, 'max-flaky', 0, { integer: true, allowZero: true });
   const hosts = parseFor(values.for);
   const os = osMatrix(env);
-  const projects = values['test-cmd'] ? [pickProject(env.det, env.outRel) || { root: '.', ecosystems: [], runners: [], managers: [] }] : ciProjects(env);
-  if (!projects.length) throw envError('NO_RUNNER', 'no test runner was detected; pass --test-cmd "<the command that runs the whole suite>"');
+  const testCmd = values['test-cmd'] || null;
+  const projects = testCmd ? [env.project || { root: '.' }]
+    : (env.det.projects || []).filter((p) => (p.runners || []).some((r) => r && r.cmd));
+  const noRunner = 'pass --test-cmd "<the command that runs the whole suite>"';
+  if (!projects.length) throw envError('NO_RUNNER', `no test runner was detected; ${noRunner}`);
   const registry = findRegistry(root);
+  const [runners, auditCmds] = [ciData('runners'), ciData('audits')];
   const vendored = vendoredSkill(env, values['skill-path']);
   const base = commonVars(env, {
-    header: CI_HEADER('ci-gate'), header_js: gateHeaderJs(), threshold: String(threshold), max_flaky: String(maxFlaky),
+    header: ciHeader('ci-gate'), header_js: helperHeader(), threshold: String(threshold), max_flaky: String(maxFlaky),
     os_list: os.join(', '), registry: registry || 'tests/quarantine.json', repo_root: root,
+    agent_hosts: hosts.join(', '),
   });
   base.get_adc = getAdcStep(vendored, base);
-  const jobs = [];
-  const testJobIds = [];
-  const gateJobs = [];
-  const audits = [];
-  const notes = [];
+  const [jobs, testJobs, gateJobs, audits, notes] = [[], [], [], [], []];
   for (const p of projects) {
     const proot = toPosix(p.root || '.');
     const slug = proot === '.' ? 'root' : slugify(proot, 30);
-    const eco = ecosystemOf(p) || 'node';
     const runner = unitRunners(p).find((r) => r.cmd) || null;
-    const step = runner || values['test-cmd'] ? ciTestCommand(runner || { name: 'custom', cmd: null }, { testCmd: values['test-cmd'] || null, quarantine: Boolean(registry) }) : null;
-    const install = (p.managers && p.managers[0] && p.managers[0].install) || '';
-    const dir = proot === '.' ? '' : `${proot}/`;
+    const { install, name: mgr = '' } = firstManager(p);
     const v = {
-      ...base, slug, project_root: proot, project_dir: dir, project_label: proot === '.' ? 'repository root' : proot,
+      ...base, slug, project_root: proot, project_dir: proot === '.' ? '' : `${proot}/`, setup: setupFor(p, base),
+      project_label: proot === '.' ? 'repository root' : proot, os_matrix: os.map((o) => `"${o}"`).join(', '),
       install_cmd: install || `echo "no frozen install command was detected for ${proot}; add one here"`,
-      os_matrix: os.map((o) => `"${o}"`).join(', '), setup: setupFor(p, base),
     };
     if (!install) notes.push(`${proot}: no frozen install command was detected; edit the "Install (frozen)" steps`);
+    const step = runner || testCmd ? ciTestCommand(runner || {}, { testCmd, quarantine: Boolean(registry) }) : null;
     if (step) {
+      const envLines = Object.entries(step.env).map(([k, x]) => `          ${k}: ${x}`);
       Object.assign(v, {
-        test_cmd: step.cmd, report_format: step.format, report_path: step.report, report_upload: `${dir}${step.report}`,
-        runner_name: step.runner, publisher: publisherFor(step.format),
-        test_env: Object.keys(step.env).length ? `\n        env:\n${Object.entries(step.env).map(([k, val]) => `          ${k}: ${val}`).join('\n')}` : '',
+        test_cmd: step.cmd, report_format: step.format, report_path: step.report, runner_name: step.runner,
+        report_upload: `${v.project_dir}${step.report}`, publisher: PUBLISHER[step.format] || '',
+        test_env: envLines.length ? `\n        env:\n${envLines.join('\n')}` : '',
       });
-      v.publish = v.publisher ? fragment(bundle, 'publish-junit', {}, v, features) : '';
-      jobs.push(fragment(bundle, 'test-job', {}, v, features));
-      testJobIds.push(`test-${slug}`);
+      v.publish = v.publisher ? fragment(bundle, 'publish-junit', {}, v) : '';
+      jobs.push(fragment(bundle, 'test-job', {}, v));
+      testJobs.push(`test-${slug}`);
     }
-    const cov = values['test-cmd'] || !runner ? null : ciCoverage(runner, p, root);
+    const cov = testCmd || !runner ? null : ciCoverage(runner, env, p);
     if (cov) {
       gateJobs.push(`coverage-${slug}`);
-      jobs.push(fragment(bundle, cov.tool === 'adc' ? 'coverage-job-adc' : 'coverage-job', {}, { ...v, coverage_cmd: cov.cmd, coverage_report: cov.report }, features));
-    } else if (!values['test-cmd'] && runner) notes.push(`${proot}: no changed-line coverage producer is known for ${runner ? runner.name : 'this runner'}; add one (references/ci-gate.md) and a coverage job`);
+      const covVars = { ...v, coverage_cmd: cov.cmd, coverage_report: cov.report };
+      jobs.push(fragment(bundle, cov.tool === 'adc' ? 'coverage-job-adc' : 'coverage-job', {}, covVars));
+    } else if (runner && !testCmd) {
+      notes.push(`${proot}: no changed-line coverage producer known for ${runner.name} (references/ci-gate.md)`);
+    }
     const pw = (p.runners || []).find((r) => r.name === 'playwright');
     if (pw) {
       gateJobs.push(`e2e-${slug}`);
-      jobs.push(fragment(bundle, 'e2e-job', {}, { ...v, e2e_cmd: `${pw.cmd}${registry ? ` ${QUARANTINE_FILTERS.playwright.skip}` : ''}` }, features));
+      const e2eCmd = registry ? `${pw.cmd} ${runners.playwright.skip}` : pw.cmd;
+      jobs.push(fragment(bundle, 'e2e-job', {}, { ...v, e2e_cmd: e2eCmd }));
     }
-    const audit = auditCommand(eco, p);
-    if (audit) audits.push(fragment(bundle, 'audit-step', {}, { ...v, audit_cmd: audit, audit_name: `${eco} dependency audit (${proot})` }, features));
+    const eco = ecosystemOf(p) || 'node';
+    const audit = auditCmds[`${eco}:${mgr}`] || auditCmds[eco];
+    const auditName = `${eco} dependency audit (${proot})`;
+    if (audit) audits.push(fragment(bundle, 'audit-step', {}, { ...v, audit_cmd: audit, audit_name: auditName }));
   }
-  if (!testJobIds.length && !gateJobs.length) throw envError('NO_RUNNER', 'no CI test command could be built for the detected runners; pass --test-cmd "<the command that runs the whole suite>"');
-  const needs = ['changes', ...testJobIds, ...gateJobs, 'ratchet', 'secrets', ...(registry ? ['quarantine'] : [])];
-  const metrics = ['executed', 'passed', 'failed', 'skipped', 'flaky'];
+  if (!testJobs.length && !gateJobs.length) throw envError('NO_RUNNER', `no CI test command was built; ${noRunner}`);
+  const needs = ['changes', ...testJobs, ...gateJobs, 'ratchet', 'secrets', ...(registry ? ['quarantine'] : [])];
+  const outputsOf = (job) => ['executed', 'passed', 'failed', 'skipped', 'flaky']
+    .map((k) => `      ${k}: \${{ needs.${job}.outputs.${k} }}`).join('\n');
   const vars = {
     ...base, test_jobs: jobs.join('\n\n'), needs_list: needs.join(', '),
-    merge_outputs: testJobIds.length ? `    outputs:\n${metrics.map((k) => `      ${k}: \${{ needs.${testJobIds[0]}.outputs.${k} }}`).join('\n')}` : '',
-    audit_steps: audits.length ? audits.join('\n') : fragment(bundle, 'audit-none', {}, base, features),
-    agent_jobs: hosts.map((h) => fragment(bundle, `agent-${h}`, {}, base, features)).join('\n'),
-    quarantine_job: registry ? fragment(bundle, 'quarantine-job', {}, base, features) : '',
+    merge_outputs: testJobs.length ? `    outputs:\n${outputsOf(testJobs[0])}` : '',
+    audit_steps: audits.length ? audits.join('\n') : fragment(bundle, 'audit-none', {}, base),
+    agent_jobs: hosts.map((h) => fragment(bundle, `agent-${h}`, {}, base)).join('\n'),
+    quarantine_job: registry ? fragment(bundle, 'quarantine-job', {}, base) : '',
   };
-  const outputs = renderFiles(bundle, {}, features, vars, { out: '.' });
+  const features = new Set([vendored ? 'vendored' : 'pinned', hosts.length && 'agents', registry && 'registry']);
+  const outputs = renderFiles(bundle, {}, features, vars, '.');
   for (const o of outputs) if (o.path.endsWith('.yml')) o.content = o.content.replace(/\n{3,}/g, '\n\n');
-  const next = [
-    'branch protection or ruleset: require ONLY the "Merge OK" check (jobs skipped by the path filter then never leave a required check "Expected")',
-    `changed-line coverage is reported first; set the repository variable ADC_COVERAGE_ENFORCE=true to enforce ${threshold}% (ADC_COVERAGE_MIN overrides the threshold)`,
-    'the ratchet runs adc.mjs diff-scope against the base: fail-severity findings fail the gate, other findings become annotations',
-    'gitleaks: commit a .gitleaks-baseline.json (gitleaks git --report-path .gitleaks-baseline.json) when the history has accepted findings',
-    'the dependency audit job is informational (not part of Merge OK); read its output on every PR',
-    `upload adc-counts-*.json artifacts feed \`clean-run --base-counts <file>\`; job outputs executed/passed/failed/skipped/flaky are also workflow_call outputs`,
-  ];
-  if (!vendored) next.push(`CI fetches ${SKILL_NAME} v${skillVersion()} (ADC_REF); pin a commit SHA there, or vendor the skill into .github/skills/${SKILL_NAME}`);
-  if (hosts.length) next.push(`agent verify job(s) for ${hosts.join(', ')}: add the secret(s) the job names; they run only on PRs by authors in the ADC_AGENT_AUTHORS variable (default Copilot), are informational and cost money`);
-  if (registry) next.push(`quarantined tests (${registry}) are excluded from the gate and checked for owner, issue and expiry`);
-  next.push(...notes);
-  return { lang: null, out: '.github', outputs, next_steps: next, data: { os, projects: projects.map((p) => toPosix(p.root || '.')), threshold, max_flaky: maxFlaky, quarantine: registry, agent_hosts: hosts, vendored_skill: vendored, jobs: needs } };
-}
-
-function lockfileOf(p) {
-  const m = p.managers && p.managers[0];
-  const root = toPosix(p.root || '.');
-  return m && m.lockfile ? (root === '.' ? m.lockfile : `${root}/${m.lockfile}`) : '';
-}
-
-function nodeCacheOf(p) {
-  const m = p.managers && p.managers[0];
-  return m && ['npm', 'pnpm', 'yarn'].includes(m.name) && m.lockfile ? m.name : '';
-}
-
-function publisherFor(format) {
-  return { junit: 'java-junit', 'go-test-json': 'golang-json', trx: 'dotnet-trx', 'rspec-json': 'rspec-json' }[format] || null;
-}
-
-function auditCommand(eco, p) {
-  const mgr = p.managers && p.managers[0] && p.managers[0].name;
-  switch (eco) {
-    case 'node': return mgr === 'pnpm' ? 'pnpm audit --audit-level=high' : mgr === 'yarn' ? 'yarn npm audit --severity high' : 'npm audit --audit-level=high';
-    case 'python': return mgr === 'uv' ? 'uv export --format requirements-txt --no-hashes > audit-requirements.txt && pipx run pip-audit -r audit-requirements.txt' : 'pipx run pip-audit';
-    case 'rust': return 'cargo install cargo-audit --locked && cargo audit';
-    case 'go': return 'go run golang.org/x/vuln/cmd/govulncheck@latest ./...';
-    case 'dotnet': return 'dotnet list package --vulnerable --include-transitive';
-    case 'ruby': return 'gem install bundler-audit && bundle-audit check --update';
-    default: return null;
-  }
+  const data = { os, projects: projects.map((p) => toPosix(p.root || '.')), threshold, max_flaky: maxFlaky };
+  return {
+    lang: null, out: '.github', outputs, next: [...nextSteps(bundle, {}, features, vars), ...notes],
+    data: { ...data, quarantine: registry, agent_hosts: hosts, vendored_skill: vendored, jobs: needs },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // flake (plan §10.4)
 
 async function buildFlake(env) {
-  const { values, root } = env;
-  const bundle = loadBundle('flake');
-  const gateBundle = loadBundle('ci-gate');
-  const features = new Set();
+  const { values } = env;
   const out = env.outRel || 'tests';
-  const p = env.project;
-  const runner = unitRunners(p)[0] || ((p && p.runners) || [])[0] || null;
-  const e2e = ((p && p.runners) || []).find((r) => r.kind === 'e2e') || null;
-  const maxFlaky = values['max-flaky'] == null ? 0 : Number(values['max-flaky']);
-  if (!Number.isInteger(maxFlaky) || maxFlaky < 0) throw usageError('--max-flaky must be a non-negative integer');
+  const p = env.project || { root: '.', ecosystems: ['node'] };
+  const runner = unitRunners(p)[0] || (p.runners || [])[0] || null;
+  const e2e = (p.runners || []).find((r) => r.kind === 'e2e');
   const testId = values.test ? plainText(values.test, 160) : null;
-  if (testId) features.add('diagnosis');
-  const q = runner && QUARANTINE_FILTERS[runner.name];
+  const maxFlaky = numberOption(values, 'max-flaky', 0, { integer: true, allowZero: true });
+  const probeTests = testId ? ` --tests ${cString(testId)}` : '';
+  const { only, skip } = (runner && ciData('runners')[runner.name]) || {};
+  const see = '(see references/flake.md)';
   const vars = commonVars(env, {
-    out, header: CI_HEADER('flake'), header_js: gateHeaderJs(), max_flaky: String(maxFlaky), runner_name: runner ? runner.name : 'unknown',
-    quarantine_run: runner && runner.cmd && q && q.only ? `${runner.cmd} ${q.only}` : 'echo "::error::no quarantine selector is known for this runner; edit this step (references/flake.md)"; exit 1',
-    quarantine_skip: q && q.skip ? q.skip : '(see references/flake.md)',
-    quarantine_only: q && q.only ? q.only : '(see references/flake.md)',
-    e2e_runner: e2e ? e2e.name : 'none', test_id: testId || '', slug: testId ? slugify(testId, 40) : '',
-    flake_probe: testId ? `node <skill>/scripts/adc.mjs flake-probe --tests ${cString(testId)} --times 20 --json` : '',
-    install_cmd: (p && p.managers && p.managers[0] && p.managers[0].install) || 'echo "no frozen install command was detected; add one here"',
-    project_root: env.projectRoot, registry: `${out}/quarantine.json`, repo_root: root,
+    out, header: ciHeader('flake'), header_js: helperHeader(), max_flaky: String(maxFlaky),
+    runner_name: runner ? runner.name : 'unknown', e2e_runner: e2e ? e2e.name : 'none',
+    quarantine_run: runner && runner.cmd && only ? `${runner.cmd} ${only}`
+      : 'echo "::error::no quarantine selector is known for this runner; edit this step (references/flake.md)"; exit 1',
+    quarantine_skip: skip || see, quarantine_only: only || see, test_id: testId || '', slug: slugify(testId, 40),
+    flake_probe: `node <skill>/scripts/adc.mjs flake-probe${probeTests} --times 20 --json`,
+    install_cmd: firstManager(p).install || 'echo "no frozen install command was detected; add one here"',
+    registry: joinOut(out, 'quarantine.json'), policy: joinOut(out, 'flaky-test-policy.md'),
+    project_root: env.projectRoot, repo_root: env.root, state_rel: env.state.rel || '.adc',
   });
-  vars.setup = setupFor(p || { root: '.', ecosystems: ['node'], managers: [], runners: [] }, vars);
-  const outputs = renderFiles(bundle, {}, features, vars, { out });
-  // The helper the ci-gate workflow uses; identical content, so whichever scaffold runs second leaves it unchanged.
-  outputs.push(...renderFiles(gateBundle, {}, new Set(['gate-script-only']), vars, { out: '.' }));
-  const registry = { schema: 'adc-quarantine/1', max_flaky: maxFlaky, max_days: 30, policy: `${out}/flaky-test-policy.md`, tests: [] };
-  outputs.push({ path: joinOut(out, 'quarantine.json'), content: JSON.stringify(registry, null, 2) + '\n' });
-  const next = [
-    `detect: node <skill>/scripts/adc.mjs flake-probe ${testId ? `--tests ${cString(testId)} ` : ''}--times 20 --json   (shuffled where the runner supports it; seeds recorded)`,
-    `quarantine a test: tag it @quarantine (selected by ${vars.quarantine_only}), add {id, owner, issue, added, expires, reason} to ${out}/quarantine.json, and exclude it from the merge gate (${vars.quarantine_skip})`,
-    'scaffold ci-gate after this (or re-run it with --force): it excludes quarantined tests and checks the registry when the registry exists',
-    'never use `gh run rerun --failed` to get green: it hides flakes',
-  ];
-  if (testId) next.unshift(`diagnosis report: ${(env.state.rel || '.adc')}/repro/flake/${vars.slug}/diagnosis.md (evidence runs, class, fix, verification)`);
-  return { lang: null, out, outputs, next_steps: next, data: { runner: runner ? runner.name : null, max_flaky: maxFlaky, test: testId } };
+  vars.setup = setupFor(p, vars);
+  const features = new Set(testId ? ['diagnosis'] : []);
+  const bundle = loadBundle('flake');
+  // The helper the ci-gate workflow uses: identical content, so whichever scaffold runs second leaves it unchanged.
+  const outputs = [...renderFiles(bundle, {}, features, vars, out),
+    ...renderFiles(loadBundle('ci-gate'), {}, new Set(['gate-script-only']), vars, '.')];
+  return {
+    lang: null, out, outputs, next: nextSteps(bundle, {}, features, vars),
+    data: { runner: runner ? runner.name : null, max_flaky: maxFlaky, test: testId },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Entry points
 
-const BUILDERS = { 'e2e-web': buildE2eWeb, 'e2e-api': buildE2eApi, 'e2e-cli': buildE2eCli, live: buildLive, regress: buildRegress, 'ci-gate': buildCiGate, flake: buildFlake };
+const BUILDERS = {
+  'e2e-web': buildE2eWeb, 'e2e-api': buildE2eApi, 'e2e-cli': buildE2eCli, live: buildLive, regress: buildRegress,
+  'ci-gate': buildCiGate, flake: buildFlake,
+};
 
-async function delegateTooling(kind, ctx, values) {
-  let mod;
-  try { mod = await import('./tooling.mjs'); } catch (err) { throw envError('NOT_IMPLEMENTED', `tooling scaffolds are not available in this build (${err.message})`); }
-  if (typeof mod.scaffoldTooling !== 'function') throw envError('NOT_IMPLEMENTED', 'tooling.mjs has no scaffoldTooling()');
-  const res = await mod.scaffoldTooling(kind, { ctx, values });
-  return { kind, delegated: 'tooling scaffold', ...res };
+async function prepare(kind, ctx, values) {
+  const root = repoRoot(ctx.cwd) || ctx.cwd;
+  const outAbs = values.out ? path.resolve(ctx.cwd, values.out) : null;
+  if ([ctx.cwd, root, outAbs].some((p) => p && within(SKILL_DIR, p))) {
+    throw usageError('refusing to scaffold into the companion skill itself; pass --cwd <target repository>');
+  }
+  // Exit 3 while anything under the state dir is tracked; nothing is created here.
+  const state = prepareStateDir({ ...ctx, cwd: root }, { create: false });
+  const outRel = outAbs ? relPosix(root, outAbs) : null;
+  if (outAbs && outRel == null) throw usageError(`--out must stay inside ${toPosix(root)} (got ${values.out})`);
+  if (outRel && (outRel.split('/')[0] === '.git' || (state.rel && under(outRel, state.rel)))) {
+    throw usageError(`--out must not point into .git or ${state.rel || 'the state dir'} (got ${values.out})`);
+  }
+  const det = await detect({ root, stateInfo: fs.existsSync(state.dir) ? state : null, write: false });
+  const project = pickProject(det, outRel);
+  return {
+    kind, ctx, values, root, state, outRel, det, project, projectRoot: toPosix((project && project.root) || '.'),
+    write: Boolean(values.write) && !ctx.dryRun, force: Boolean(values.force),
+    defaultBranch: det.default_branch || 'main',
+  };
 }
 
-/**
- * Render one scaffold. `values` are the parsed CLI options (write, force, lang, out, ...).
- * Returns { kind, lang, out, dry_run, written[], skipped[], backups[], next_steps[], ... , exit }.
- */
+/** Render one scaffold from parsed CLI `values`; the result lists written[], skipped[], next_steps[] and exit. */
 export async function scaffold({ kind, ctx, values = {} }) {
-  if (!kind) throw usageError(`scaffold needs a kind: ${[...TEST_KINDS, ...TOOLING_KINDS].join(', ')}`);
-  if (TOOLING_KINDS.includes(kind)) return { ...(await delegateTooling(kind, ctx, values)), exit: EXIT.OK };
-  if (!TEST_KINDS.includes(kind)) throw usageError(`unknown scaffold kind "${kind}" (expected ${[...TEST_KINDS, ...TOOLING_KINDS].join(', ')})`);
+  const kinds = [...TEST_KINDS, ...TOOLING_KINDS].join(', ');
+  if (!kind) throw usageError(`scaffold needs a kind: ${kinds}`);
+  if (TOOLING_KINDS.includes(kind)) {
+    return { kind, delegated: 'tooling scaffold', ...(await scaffoldTooling(kind, { ctx, values })), exit: EXIT.OK };
+  }
+  if (!TEST_KINDS.includes(kind)) throw usageError(`unknown scaffold kind "${kind}" (expected ${kinds})`);
   const env = await prepare(kind, ctx, values);
-  const detected = env.project ? {
-    summary: env.det && env.det.summary, project: env.projectRoot, languages: env.project.languages || [],
-    runner: (unitRunners(env.project)[0] || {}).name || null, manager: (env.project.managers && env.project.managers[0] && env.project.managers[0].name) || null,
-    default_branch: env.defaultBranch,
-  } : { summary: env.det ? env.det.summary : null, project: null, error: env.detectError };
+  const detected = { summary: env.det.summary || null, project: env.project ? env.projectRoot : null,
+    runner: (unitRunners(env.project)[0] || {}).name || null, manager: firstManager(env.project).name || null };
   if (kind === 'e2e-web' && values.audit) {
     const audit = auditE2eWeb(env);
-    return {
-      kind, mode: 'audit', root: toPosix(env.root), dry_run: true, detected, audit, written: [], skipped: [],
-      next_steps: audit.items.length ? ['fix P1 items first; each item names the rule, the location and the fix', 'then scaffold missing pieces with scaffold e2e-web --write (existing files are kept)'] : ['no hardening items found'],
-      exit: audit.counts.P1 || audit.counts.P2 ? EXIT.FINDINGS : EXIT.OK,
-    };
+    const next = audit.items.length ? ['fix P1 items first; each item names the rule, the location and the fix',
+      'then add missing pieces with scaffold e2e-web --write (existing files are kept)'] : ['no hardening items found'];
+    const exit = audit.counts.P1 || audit.counts.P2 ? EXIT.FINDINGS : EXIT.OK;
+    const res = { kind, mode: 'audit', root: toPosix(env.root), dry_run: true, detected, audit, written: [] };
+    return { ...res, next_steps: next, exit };
   }
   const plan = await BUILDERS[kind](env);
   const applied = applyOutputs(plan.outputs, env);
-  const result = {
-    kind, lang: plan.lang, root: toPosix(env.root), out: plan.out, dry_run: !env.write, detected,
-    written: applied.written, skipped: applied.skipped, backups: applied.backups,
-    next_steps: [...plan.next_steps], ...plan.data,
+  const res = {
+    kind, lang: plan.lang, root: toPosix(env.root), out: plan.out, dry_run: !env.write, detected, ...applied,
+    next_steps: plan.next, ...plan.data, exit: EXIT.OK,
   };
-  let exit = EXIT.OK;
-  if (kind === 'live') {
-    if (env.write) {
-      const after = liveAfterWrite(env, plan.out);
-      Object.assign(result, { state: after.state, gitignore: after.gitignore, findings: after.findings });
-      const runnerGate = checklistGate(path.join(env.root, ...plan.out.split('/'), 'live-checklist.md'));
-      if (result.synthetic && result.synthetic.enabled && !runnerGate.ok) {
-        result.next_steps.unshift(`the runner reads ${plan.out}/live-checklist.md, which still has ${runnerGate.open ?? 'no'} TODO line(s): copy the answered checklist there (or re-run with --force), or synthetic probes stay SYNTHETIC_GATED`);
-      }
-      if (after.findings.length) exit = EXIT.FINDINGS;
-    } else {
-      result.state = { dir: toPosix(env.state.dir), planned: ['exclude entry', 'budget.json', '.env.live (empty, owner-only)'] };
-      result.gitignore = { verified: null, reason: 'dry run: verified with git check-ignore after --write' };
+  const checklist = joinOut(plan.out, 'live-checklist.md');
+  if (kind === 'live' && env.write) {
+    Object.assign(res, liveAfterWrite(env, plan.out));
+    const runnerGate = checklistGate(abs(env.root, checklist));
+    if (res.synthetic.enabled && !runnerGate.ok) {
+      res.next_steps.unshift(`the runner reads ${checklist}, which has ${runnerGate.open ?? 'no'} TODO line(s): `
+        + 'copy the answered checklist there (or re-run with --force), or synthetic probes stay SYNTHETIC_GATED');
     }
+    if (res.findings.length) res.exit = EXIT.FINDINGS;
+  } else if (kind === 'live') {
+    res.state = { dir: toPosix(env.state.dir), planned: ['exclude entry', 'budget.json', '.env.live (empty, 0600)'] };
+    res.gitignore = { verified: null, reason: 'dry run: verified with git check-ignore after --write' };
   }
   if (!env.write) {
     const n = applied.written.filter((w) => w.action !== 'unchanged').length;
-    result.next_steps.unshift(`dry run: nothing was written; show the user these ${n} file(s), then re-run with --write`);
+    res.next_steps.unshift(`dry run: nothing was written; show the user these ${n} file(s), then re-run with --write`);
   }
-  if (applied.skipped.length) result.next_steps.unshift(`${applied.skipped.length} existing file(s) were left alone (listed in skipped); compare and merge by hand, or re-run with --force (backups go to .adc/backups/scaffold/)`);
-  result.exit = exit;
-  return result;
+  if (applied.skipped.length) {
+    res.next_steps.unshift(`${applied.skipped.length} existing file(s) were left alone (listed in skipped); merge by `
+      + 'hand, or re-run with --force (backups go to .adc/backups/scaffold/)');
+  }
+  return res;
 }
 
-function human(res) {
-  if (res.mode === 'audit') {
-    const lines = [`e2e-web audit: ${res.audit.files_scanned} spec file(s), ${res.audit.configs.length} config(s): ${res.audit.counts.P1} P1, ${res.audit.counts.P2} P2, ${res.audit.counts.P3} P3`];
-    for (const i of res.audit.items) lines.push(`  ${i.priority} ${i.rule.padEnd(20)} ${i.file}${i.line ? `:${i.line}` : ''}  ${i.fix}`);
-    return lines.join('\n');
-  }
-  const lines = [`scaffold ${res.kind}${res.lang ? ` (${res.lang})` : ''}${res.dry_run ? ' [dry run]' : ''}`];
-  for (const w of res.written || []) lines.push(`  ${String(w.action).padEnd(15)} ${w.path}`);
-  for (const s of res.skipped || []) lines.push(`  ${'skipped'.padEnd(15)} ${s.path}  (${s.reason})`);
-  for (const n of res.next_steps || []) lines.push(`next: ${n}`);
-  for (const f of res.findings || []) lines.push(`FINDING ${f.id}: ${f.message}`);
-  return lines.join('\n');
-}
-
-function preScanKind(argv) {
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--kind') return argv[i + 1] || null;
-    if (a.startsWith('--kind=')) return a.slice(7);
-  }
-  const first = argv.find((a) => !a.startsWith('-'));
-  return first || null;
-}
-
-/** `scaffold <kind> [options]` (also `--kind <kind>`); tooling kinds accept tooling's options. */
+/** `scaffold <kind> [options]` (also `--kind <kind>`); tooling kinds also accept tooling's options. */
 export async function scaffoldCommand(argv) {
-  const kind = preScanKind(argv);
-  let options = SCAFFOLD_OPTIONS;
-  if (TOOLING_KINDS.includes(kind)) {
-    try {
-      const t = await import('./tooling.mjs');
-      if (t.TOOLING_SCAFFOLD_OPTIONS) options = { ...t.TOOLING_SCAFFOLD_OPTIONS, ...SCAFFOLD_OPTIONS };
-    } catch {}
-  }
-  const { values, positionals } = parseOpts(argv, options);
+  const at = argv.indexOf('--kind');
+  const guess = at >= 0 ? argv[at + 1]
+    : (argv.find((a) => a.startsWith('--kind=')) || '').slice(7) || argv.find((a) => !a.startsWith('-'));
+  const tooling = TOOLING_KINDS.includes(guess) ? TOOLING_SCAFFOLD_OPTIONS : {};
+  const { values, positionals } = parseOpts(argv, { ...tooling, ...OPTIONS });
   if (values.help) return { result: { usage: USAGE }, exit: EXIT.OK, human: USAGE, summary: '' };
-  const k = values.kind || positionals[0] || null;
-  if (values.kind && positionals[0] && positionals[0] !== values.kind) throw usageError(`two kinds given: ${positionals[0]} and --kind ${values.kind}`);
-  const ctx = makeContext(values);
-  const res = await scaffold({ kind: k, ctx, values });
-  const { exit, ...result } = res;
+  if (values.kind && positionals[0] && positionals[0] !== values.kind) {
+    throw usageError(`two kinds given: ${positionals[0]} and --kind ${values.kind}`);
+  }
+  const kind = values.kind || positionals[0] || null;
+  const { exit, ...result } = await scaffold({ kind, ctx: makeContext(values), values });
   const n = (result.written || []).filter((w) => w.action !== 'unchanged').length;
-  const summary = result.mode === 'audit'
-    ? `${result.audit.items.length} hardening item(s): ${result.audit.counts.P1} P1, ${result.audit.counts.P2} P2, ${result.audit.counts.P3} P3`
-    : `${k}${result.lang ? ` (${result.lang})` : ''}: ${n} file(s) ${result.dry_run ? 'planned (dry run)' : 'written'}, ${(result.skipped || []).length} skipped${result.findings && result.findings.length ? `, ${result.findings.length} finding(s)` : ''}`;
-  return { result, exit: exit ?? EXIT.OK, summary, human: human(result) };
+  const findings = result.findings && result.findings.length ? `, ${result.findings.length} finding(s)` : '';
+  const counts = result.audit && ['P1', 'P2', 'P3'].map((k) => `${result.audit.counts[k]} ${k}`).join(', ');
+  const kept = (result.skipped || []).length;
+  const done = `${n} file(s) ${result.dry_run ? 'planned (dry run)' : 'written'}, ${kept} skipped`;
+  const summary = result.mode === 'audit' ? `${result.audit.items.length} hardening item(s): ${counts}`
+    : `${kind}${result.lang ? ` (${result.lang})` : ''}: ${done}${findings}`;
+  return { result, exit, summary };
 }
 scaffoldCommand.commandName = 'scaffold';
 scaffoldCommand.usage = USAGE;
-

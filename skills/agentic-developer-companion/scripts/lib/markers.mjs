@@ -4,7 +4,7 @@
 // structural detectors (try blocks that swallow assertions, Rust inline test modules).
 // Imports only core.mjs: hooks load this module, so no git, no filesystem, no network.
 
-import { toPosix } from './core.mjs';
+import { toPosix, matchAny, redactLiterals, liveSecrets, redactLiveToken } from './core.mjs';
 
 // ---------------------------------------------------------------------------
 // Languages
@@ -796,3 +796,116 @@ export const CATALOGS = Object.freeze({
   skip: SKIP_MARKERS, suppress: SUPPRESSIONS, swallow: SWALLOW_PATTERNS, retry: IN_SOURCE_RETRIES,
   ci: CI_WEAKENING, assert: ASSERTION_LINE, cases: TEST_CASE_LINE, secrets: SECRET_PATTERNS,
 });
+
+// ---------------------------------------------------------------------------
+// Test files (shared by detect, diff-scope, probes, trace and the post-edit hook)
+
+/** Globs for test files no detected project owns (and for projects that report none). */
+export const DEFAULT_TEST_GLOBS = Object.freeze(['**/__tests__/**', '**/*.{test,spec}.*', '**/*_{test,spec}.*',
+  '**/test_*.py', '**/conftest.py', '**/*_test.go', '**/*_spec.rb', 'test/**', 'tests/**', 'spec/**',
+  '**/src/test/**', '**/*.cy.*', '**/*Tests/**', '**/*.Tests/**']);
+
+const relOf = (file) => {
+  let f = toPosix(String(file || '')).replace(/^(?:\.\/)+/, '');
+  while (f.startsWith('./')) f = f.slice(2);
+  return f.replace(/\/+$/, '');
+};
+
+/** The project owning a repo-relative file (or an absolute one under `detectResult.repo_root`): longest root wins. */
+export function projectForFile(file, detectResult) {
+  const projects = detectResult && Array.isArray(detectResult.projects) ? detectResult.projects : [];
+  let rel = toPosix(String(file || ''));
+  if (/^(?:\/|[A-Za-z]:\/)/.test(rel) && detectResult && detectResult.repo_root) {
+    const base = toPosix(detectResult.repo_root).replace(/\/+$/, '');
+    if (rel.startsWith(`${base}/`)) rel = rel.slice(base.length + 1);
+  }
+  rel = relOf(rel);
+  let best = null;
+  for (const p of projects) {
+    const r = relOf(p && p.root ? p.root : '.') || '.';
+    const root = r === '.' ? '' : r;
+    if (root && rel !== root && !rel.startsWith(`${root}/`)) continue;
+    if (!best || root.length > best.len) best = { p, len: root.length };
+  }
+  return best ? best.p : null;
+}
+
+/**
+ * Is `file` a test file? Path heuristics (classifyPath) unless `heuristic: false`, then the
+ * owning project's test globs (DEFAULT_TEST_GLOBS when no project owns it or it lists none;
+ * `codeOnly`: globs count only for source files, so fixtures under tests/ stay data), then, with
+ * `content`, a Rust file holding `#[cfg(test)]` / `#[test]`.
+ */
+export function isTestFile(file, detectResult = null, { content = null, heuristic = true, codeOnly = false } = {}) {
+  const rel = relOf(file);
+  if (!rel) return false;
+  if (heuristic && classifyPath(rel).test) return true;
+  if (content != null && /\.rs$/.test(rel) && /#\[(?:cfg\(test\)|test\])/.test(String(content))) return true;
+  if (codeOnly && !isCodeFile(rel)) return false;
+  const p = projectForFile(rel, detectResult);
+  const root = p ? relOf(p.root || '.') : '';
+  const sub = root && root !== '.' ? (rel === root ? '' : rel.slice(root.length + 1)) : rel;
+  const own = p && Array.isArray(p.test_globs) ? p.test_globs.filter((g) => typeof g === 'string') : [];
+  return matchAny(sub, own.length ? own : DEFAULT_TEST_GLOBS);
+}
+
+/** Lockfile base name (lower case) → package manager. */
+export const LOCKFILE_MANAGERS = Object.freeze({
+  'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'pnpm-lock.yaml': 'pnpm', 'yarn.lock': 'yarn',
+  'bun.lock': 'bun', 'bun.lockb': 'bun', 'uv.lock': 'uv', 'poetry.lock': 'poetry', 'pdm.lock': 'pdm',
+  'pipfile.lock': 'pipenv', 'go.sum': 'go', 'cargo.lock': 'cargo', 'gemfile.lock': 'bundler',
+  'composer.lock': 'composer', 'packages.lock.json': 'nuget', 'gradle.lockfile': 'gradle',
+  'package.resolved': 'swiftpm', 'pubspec.lock': 'pub', 'mix.lock': 'mix', 'flake.lock': 'nix', 'deno.lock': 'deno',
+});
+
+// ---------------------------------------------------------------------------
+// Redaction for output, logs and the ledger (shape findings use redactSecrets' masking instead)
+
+// Credential-named assignments (`API_TOKEN=...`, `password: ...`) whose value has no known shape.
+const NAMED_SECRET = /\b([A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)[A-Za-z0-9_]*)(\s*[=:]\s*)(?!\$|\[REDACTED)(["']?)([^\s"']{4,})\3/gi;
+const SECRET_KEY_NAME = /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)/i;
+
+/**
+ * A sync redactor: the raw, URL-encoded and base64 forms of `literals` ([{name, value}]) and of
+ * the live credentials in `env`, the ADC_LIVE_TOKEN shapes, then every SECRET_PATTERNS match
+ * (the captured value, else the whole match) as `[REDACTED:<id>]`; `names` also blanks the values
+ * of credential-named assignments. Unlike redactSecrets, no plausibility filter applies: output
+ * redaction errs on the side of hiding.
+ */
+export function makeRedactor({ literals = [], env = process.env, names = false } = {}) {
+  const lits = [...literals.filter((l) => l && l.value && String(l.value).length >= 4), ...liveSecrets(env)];
+  return (text) => {
+    if (typeof text !== 'string' || !text) return text;
+    let out = redactLiveToken(lits.length ? redactLiterals(text, lits) : text);
+    for (const p of SECRET_GLOBAL) {
+      const label = `[REDACTED:${p.id.replace(/^secret\./, '')}]`;
+      out = out.replace(p.g, (m, g1, g2) => {
+        const v = typeof g1 === 'string' && g1 ? g1 : typeof g2 === 'string' && g2 ? g2 : null;
+        return v ? m.replace(v, label) : label;
+      });
+    }
+    return names ? out.replace(NAMED_SECRET, (_, k, sep) => `${k}${sep}[REDACTED]`) : out;
+  };
+}
+
+/** Keys whose string values are digests or object names, never secrets (redacting them breaks verification). */
+export const HASH_KEY = /(?:sha256|^tree_digest|^session_nonce|^snapshot_commit|^base|^head|^prev|^tip|^sha|^tree|^commit|^cache_key)$/;
+
+/**
+ * `redact` applied to every string inside a JSON-like value. Strings under `keep` keys stay as
+ * they are; `keys` redacts object keys too; `secretKeys` blanks any string under a credential-like
+ * key (`API_TOKEN: ...` in an env map has no NAME= context for a pattern to match).
+ */
+export function redactDeep(value, redact, opts = {}, key = '', depth = 0) {
+  const { keep = HASH_KEY, keys = false, secretKeys = false } = opts;
+  if (typeof value === 'string') {
+    if (key && keep && keep.test(key)) return value;
+    if (secretKeys && key && SECRET_KEY_NAME.test(key) && value && !/^\$/.test(value)) return '[REDACTED]';
+    return redact(value);
+  }
+  if (!value || typeof value !== 'object' || depth > 64) return value;
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, redact, opts, key, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) out[keys ? redact(k) : k] = redactDeep(v, redact, opts, k, depth + 1);
+  return out;
+}

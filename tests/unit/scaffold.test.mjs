@@ -20,8 +20,10 @@ const HOME = path.join(TMP, 'home');
 fs.mkdirSync(HOME);
 after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
+// NODE_TEST_CONTEXT: a nested `node --test` that inherits it reports to this runner and exits 0.
 const MARKERS = ['ADC_HOME', 'ADC_LIVE_TOKEN', 'ADC_LIVE_BASE_URL', 'ADC_LIVE_TENANT', 'ADC_LIVE_BUDGET', 'LIVE_TESTS_ENABLED',
-  'CI', 'GITHUB_ACTIONS', 'COPILOT_CLI', 'COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'UPDATE_GOLDEN', 'UPDATE_CONTRACTS', 'GOLDEN_DIR'];
+  'CI', 'GITHUB_ACTIONS', 'COPILOT_CLI', 'COPILOT_AGENT_PROMPT', 'GITHUB_COPILOT_API_TOKEN', 'UPDATE_GOLDEN', 'UPDATE_CONTRACTS',
+  'GOLDEN_DIR', 'NODE_TEST_CONTEXT'];
 
 /** A clean environment: no host or CI markers, no live variables, an empty HOME. */
 function baseEnv(extra = {}) {
@@ -367,6 +369,7 @@ describe('rendering helpers', () => {
       const sections = core.loadBundle(name);
       assert.ok(sections.length > 3, `${name}.tmpl has sections`);
       for (const s of sections) {
+        if (s.path.startsWith('data/')) assert.equal(typeof JSON.parse(s.content), 'object', `${name}.tmpl ${s.path}: JSON data`);
         for (const k of Object.keys(s.attrs)) assert.ok(known.has(k), `${name}.tmpl ${s.path}: unknown attribute ${k}`);
         if (s.attrs.part === 'fragment') assert.ok(s.attrs.name, `${name}.tmpl ${s.path}: fragment without a name`);
         assert.ok(!s.content.includes('\r'), `${name}.tmpl ${s.path}: CR`);
@@ -441,6 +444,10 @@ describe('scaffold command', () => {
     const r = adc(['scaffold', 'flake'], { cwd: core.SKILL_DIR });
     assert.equal(r.status, 2);
     assert.match(r.json.error.message, /companion skill itself/);
+    // Also from the repository that contains the skill when --out points into the skill (a dry run).
+    const out = adc(['scaffold', 'flake', '--out', path.join(core.SKILL_DIR, 'tests')], { cwd: path.resolve(core.SKILL_DIR, '..', '..') });
+    assert.equal(out.status, 2);
+    assert.match(out.json.error.message, /companion skill itself/);
   });
 
   test('--help prints the usage', () => {
@@ -887,8 +894,11 @@ describe('live', () => {
     assert.equal(open.synthetic.reason, 'CHECKLIST_OPEN');
     assert.ok(open.synthetic.open > 5);
     assert.ok(open.next_steps.some((s) => /NOT generated/.test(s)));
-    const answered = template.replace(/TODO/g, 'answered by the owner').replace('Estimated credits per synthetic run: TODO', 'Estimated credits per synthetic run: 4');
-    fs.writeFileSync(path.join(dir, 'answers.md'), answered.replace('Estimated credits per synthetic run: answered by the owner', 'no cost line'));
+    // The cost line first: the blanket TODO replacement would otherwise answer it with prose.
+    const answered = template.replace('Estimated credits per synthetic run: TODO', 'Estimated credits per synthetic run: 4')
+      .replace(/TODO/g, 'answered by the owner');
+    assert.match(answered, /Estimated credits per synthetic run: 4/);
+    fs.writeFileSync(path.join(dir, 'answers.md'), answered.replace('Estimated credits per synthetic run: 4', 'no cost line'));
     assert.match(sc(dir, 'live', ['--checklist', 'answers.md'], { exit: 2 }).error.message, /estimated cost/);
     fs.writeFileSync(path.join(dir, 'tests/live/live-checklist.md'), answered);
     const res = sc(dir, 'live', ['--write', '--lang', 'js', '--checklist', 'tests/live/live-checklist.md']);
@@ -898,8 +908,9 @@ describe('live', () => {
     assert.equal(res.written.find((w) => w.path === 'tests/live/probes.json').action, 'merge');
     const probes = JSON.parse(read(dir, 'tests/live/probes.json')).probes;
     assert.deepEqual(probes.map((p) => [p.id, p.kind, p.cost]), [['readonly/health', 'readonly', 1], ['synthetic/create-and-cleanup', 'synthetic', 4]]);
-    const wf = read(dir, '.github/workflows/live-probes.yml');
-    assert.equal(res.written.find((w) => w.path === '.github/workflows/live-probes.yml').action !== 'overwrite' || wf.includes('live-write'), true);
+    // The first run's workflow has no synthetic job: it is kept without --force and replaced with it.
+    assert.ok(res.skipped.some((s) => s.path === '.github/workflows/live-probes.yml'), JSON.stringify(res.skipped));
+    assert.ok(!read(dir, '.github/workflows/live-probes.yml').includes('live-write'));
     const forced = sc(dir, 'live', ['--write', '--lang', 'js', '--checklist', 'tests/live/live-checklist.md', '--force']);
     assert.ok(forced.written.some((w) => w.path === '.github/workflows/live-probes.yml'));
     assert.match(read(dir, '.github/workflows/live-probes.yml'), /environment: live-write/);
@@ -917,6 +928,16 @@ describe('live', () => {
     assert.equal(read(other, 'tests/live/live-checklist.md'), answered);
     assert.ok(paths(copied).includes('tests/live/probes/synthetic/test_create_and_cleanup.py'));
     validateAll(other, copied);
+  });
+
+  test('--cost-header names the usage header in every generated probe entry', () => {
+    const dir = repo(nodeProject());
+    const res = sc(dir, 'live', ['--write', '--lang', 'js', '--cost-header', 'x-usage-credits', '--cost-header-kind', 'cumulative']);
+    assert.ok(res.written.some((w) => w.path === 'tests/live/probes.json'));
+    const [probe] = JSON.parse(read(dir, 'tests/live/probes.json')).probes;
+    assert.deepEqual([probe.cost, probe.cost_header, probe.cost_header_kind], [1, 'x-usage-credits', 'cumulative']);
+    assert.match(sc(dir, 'live', ['--cost-header', 'not a header'], { exit: 2 }).error.message, /--cost-header/);
+    assert.match(sc(dir, 'live', ['--cost-header', 'x-cost', '--cost-header-kind', 'daily'], { exit: 2 }).error.message, /cumulative/);
   });
 
   test('the ignore post-condition fails (exit 1) when a rule re-includes trace files', () => {
@@ -1125,6 +1146,12 @@ describe('flake', () => {
     assert.match(read(dir, '.adc/repro/flake/sum-handles-floats/diagnosis.md'), /flake-probe --tests "sum > handles floats" --times 20/);
     validateAll(dir, res);
     await assertNoSelfFindings(dir, res);
+    // The registry holds the team's quarantine entries: a re-run, even with --force, never replaces it.
+    const entry = { id: 'x', owner: '@team', issue: '#1', added: '2026-10-20', expires: '2026-11-10', reason: 'race' };
+    fs.writeFileSync(path.join(dir, 'tests/quarantine.json'), JSON.stringify({ schema: 'adc-quarantine/1', max_days: 30, tests: [entry] }));
+    const again = sc(dir, 'flake', ['--write', '--force']);
+    assert.equal(again.written.find((w) => w.path === 'tests/quarantine.json').action, 'unchanged');
+    assert.deepEqual(JSON.parse(read(dir, 'tests/quarantine.json')).tests, [entry]);
     // ci-gate after flake: identical gate helper (unchanged), quarantine exclusion and registry check.
     const gate = sc(dir, 'ci-gate', ['--write']);
     assert.equal(gate.written.find((w) => w.path === '.github/adc/gate.mjs').action, 'unchanged');

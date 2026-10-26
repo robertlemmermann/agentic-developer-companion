@@ -4,6 +4,7 @@
 # ADC_PROBE_RESULT from the runner's environment only. Rendered by scripts/lib/scaffold.mjs.
 # Attributes: lang=ts (Playwright API testing) | js (node:test + fetch) | python (pytest + httpx),
 # when=synthetic (only after the live safety checklist has no TODO line), scope=repo, part=fragment.
+# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
 
 @@@ file: package.json lang=ts @@@
 {
@@ -142,13 +143,9 @@ export async function request(method, urlPath, options = {}) {
     signal: AbortSignal.timeout(30_000),
   });
   const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    // Not JSON: keep the text.
-  }
   recordResult(res);
+  // JSON when the server says so (a malformed JSON body fails the probe); anything else stays text.
+  const json = /\bjson\b/i.test(res.headers.get('content-type') || '') && text ? JSON.parse(text) : null;
   return { status: res.status, headers: res.headers, text, json };
 }
 
@@ -501,3 +498,32 @@ jobs:
       - name: Install the probe project
         run: |
           python -m pip install -r {{out}}/requirements-live.txt
+
+@@@ file: .gitignore mode=lines @@@
+# Traces, HAR files and reports record request headers: they never reach git.
+test-results/
+playwright-report/
+blob-report/
+*.har
+node_modules/
+.pytest_cache/
+
+@@@ file: next/live-gated part=fragment name=next when=no-synthetic @@@
+synthetic (write) probes were NOT generated: {{gate_reason}}. Answer every checklist item with the user, record the answers, then re-run with --checklist {{checklist}} --write
+
+@@@ file: next/live-ts part=fragment name=next lang=ts @@@
+cd {{out}} && npm install   (creates package-lock.json: commit it; the workflow runs npm ci; API probes need no browsers)
+
+@@@ file: next/live-js part=fragment name=next lang=js @@@
+{{out}} needs nothing installed: node:test + fetch (Node 24)
+
+@@@ file: next/live-python part=fragment name=next lang=python @@@
+python -m pip install -r {{out}}/requirements-live.txt
+
+@@@ file: next/live part=fragment name=next @@@
+ask the user to put the token into .adc/.env.live in their own editor (ADC_LIVE_TOKEN=..., optional ADC_LIVE_BASE_URL); never open that file yourself
+node <skill>/scripts/adc.mjs live run --dry-run --json, then live run --json (budget: 2,500 credits per session and per day)
+CI: environment "live" with secret ADC_LIVE_TOKEN; repository variables LIVE_TESTS_ENABLED=true (kill switch), ADC_LIVE_BASE_URL, optional ADC_LIVE_BUDGET (ci class, max 10,000)
+
+@@@ file: next/live-pinned part=fragment name=next when=pinned @@@
+the workflow fetches {{skill_name}} v{{version}} at run time; pin a commit SHA in ADC_REF, or vendor the skill into .github/skills/ (references/install.md)

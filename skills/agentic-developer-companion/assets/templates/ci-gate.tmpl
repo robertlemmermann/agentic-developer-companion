@@ -4,7 +4,11 @@
 # scan and an informational dependency audit; plus .github/adc/gate.mjs, the dependency-free helper
 # the workflows call. Fragments (part=fragment) are assembled by scripts/lib/scaffold.mjs. Every
 # command is inserted into a YAML block scalar. Workflows start with the ci-gate header, which
-# makes a later `verify` report edits to them as findings rather than CK-CI failures.
+# makes a later `verify` report edits to them as findings rather than CK-CI failures. The JSON data
+# fragments say how each runner runs in CI: `ci` flags (retries off, a report in <d>), `tail`, `report`
+# (default <d>/junit.xml), `format` (default junit), `only`/`skip` for @quarantine tests, `coverage`
+# (`<cmd>` is the runner command; `requires`: a dependency that must be declared), and the audits.
+# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
 
 @@@ file: .github/workflows/ci-gate.yml unless=gate-script-only @@@
 {{header}}
@@ -427,6 +431,14 @@ jobs:
           {{python_version}}
 {{python_tool}}
 
+@@@ file: fragment/python-tool-uv part=fragment name=python-tool-uv @@@
+      - uses: astral-sh/setup-uv@v7
+
+@@@ file: fragment/python-tool-poetry part=fragment name=python-tool-poetry @@@
+      - name: Install Poetry
+        run: |
+          pipx install poetry
+
 @@@ file: fragment/setup-go part=fragment name=setup-go @@@
       - uses: actions/setup-node@v7
         with:
@@ -595,6 +607,54 @@ jobs:
           node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
           head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
           gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+@@@ file: data/runners.json part=fragment name=runners @@@
+{
+  "node-test": {"ci": "--test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=<d>/junit.xml", "only": "--test-name-pattern=@quarantine", "skip": "--test-skip-pattern=@quarantine", "coverage": {"cmd": "<cmd> --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info", "report": "coverage/lcov.info"}},
+  "vitest": {"ci": "--retry=0 --reporter=default --reporter=junit --outputFile.junit=<d>/junit.xml", "only": "-t '@quarantine'", "skip": "-t '^(?!.*@quarantine)'", "coverage": {"cmd": "<cmd> --coverage.enabled --coverage.reporter=lcov", "report": "coverage/lcov.info", "requires": ["@vitest/coverage-v8", "@vitest/coverage-istanbul"]}},
+  "jest": {"ci": "--json --outputFile=<d>/jest.json", "report": "<d>/jest.json", "format": "jest-json", "only": "-t '@quarantine'", "skip": "-t '^(?!.*@quarantine)'", "coverage": {"cmd": "<cmd> --coverage --coverageReporters=lcov", "report": "coverage/lcov.info"}},
+  "mocha": {"ci": "--retries 0 --reporter xunit --reporter-option output=<d>/junit.xml", "only": "--grep @quarantine", "skip": "--grep @quarantine --invert"},
+  "bun": {"ci": "--reporter=junit --reporter-outfile=<d>/junit.xml"},
+  "pytest": {"ci": "-p no:rerunfailures --junit-xml=<d>/junit.xml", "only": "-m quarantine", "skip": "-m \"not quarantine\"", "coverage": {"cmd": "<cmd> --cov --cov-report=xml:coverage.xml", "report": "coverage.xml", "requires": ["pytest-cov"]}},
+  "go": {"ci": "-count=1 -json", "tail": " > <d>/go-test.jsonl", "report": "<d>/go-test.jsonl", "format": "go-test-json", "only": "-run 'Quarantine'", "skip": "-skip 'Quarantine'", "coverage": {"cmd": "go test ./... -count=1 -coverprofile=coverage.out", "report": "coverage.out", "tool": "adc"}},
+  "cargo": {"cmd": "cargo test --no-fail-fast", "tail": " 2>&1 | tee <d>/cargo-test.txt", "report": "<d>/cargo-test.txt", "format": "cargo-text", "only": "-- --ignored"},
+  "nextest": {"cmd": "cargo test --no-fail-fast", "tail": " 2>&1 | tee <d>/cargo-test.txt", "report": "<d>/cargo-test.txt", "format": "cargo-text", "only": "-- --ignored"},
+  "dotnet": {"ci": "--logger \"trx;LogFileName=results.trx\" --results-directory <d>", "report": "<d>/**/*.trx", "format": "trx", "only": "--filter \"Category=quarantine\"", "skip": "--filter \"Category!=quarantine\""},
+  "maven": {"ci": "-Dsurefire.rerunFailingTestsCount=0", "report": "target/surefire-reports/TEST-*.xml", "only": "-Dgroups=quarantine", "skip": "-DexcludedGroups=quarantine"},
+  "gradle": {"report": "build/test-results/test/TEST-*.xml"},
+  "rspec": {"ci": "--format progress --format json --out <d>/rspec.json", "report": "<d>/rspec.json", "format": "rspec-json", "only": "--tag quarantine", "skip": "--tag ~quarantine"},
+  "playwright": {"ci": "--reporter=list,junit", "env": {"PLAYWRIGHT_JUNIT_OUTPUT_NAME": "<d>/junit.xml"}, "only": "--grep @quarantine", "skip": "--grep-invert @quarantine"}
+}
+
+@@@ file: data/audits.json part=fragment name=audits @@@
+{
+  "node": "npm audit --audit-level=high",
+  "node:pnpm": "pnpm audit --audit-level=high",
+  "node:yarn": "yarn npm audit --severity high",
+  "python": "pipx run pip-audit",
+  "python:uv": "uv export --format requirements-txt --no-hashes > audit-requirements.txt && pipx run pip-audit -r audit-requirements.txt",
+  "rust": "cargo install cargo-audit --locked && cargo audit",
+  "go": "go run golang.org/x/vuln/cmd/govulncheck@latest ./...",
+  "dotnet": "dotnet list package --vulnerable --include-transitive",
+  "ruby": "gem install bundler-audit && bundle-audit check --update"
+}
+
+@@@ file: next/ci-gate part=fragment name=next @@@
+branch protection or ruleset: require ONLY the "Merge OK" check (jobs skipped by the path filter then never leave a required check "Expected")
+changed-line coverage is reported first; set the repository variable ADC_COVERAGE_ENFORCE=true to enforce {{threshold}}% (ADC_COVERAGE_MIN overrides the threshold)
+the ratchet runs adc.mjs diff-scope against the base: fail-severity findings fail the gate, other findings become annotations
+gitleaks: commit a .gitleaks-baseline.json (gitleaks git --report-path .gitleaks-baseline.json) when the history has accepted findings
+the dependency audit job is informational (not part of Merge OK); read its output on every PR
+the adc-counts-*.json artifacts feed `clean-run --base-counts <file>`; the executed/passed/failed/skipped/flaky job outputs are also workflow_call outputs
+
+@@@ file: next/ci-gate-pinned part=fragment name=next when=pinned @@@
+CI fetches {{skill_name}} v{{version}} (ADC_REF); pin a commit SHA there, or vendor the skill into .github/skills/{{skill_name}}
+
+@@@ file: next/ci-gate-agents part=fragment name=next when=agents @@@
+agent verify job(s) for {{agent_hosts}}: add the secret(s) the job names; they run only on PRs by authors in the ADC_AGENT_AUTHORS variable (default Copilot), are informational and cost money
+
+@@@ file: next/ci-gate-registry part=fragment name=next when=registry @@@
+quarantined tests ({{registry}}) are excluded from the gate and checked for owner, issue and expiry
 
 @@@ file: .github/adc/gate.mjs @@@
 // {{header_js}}

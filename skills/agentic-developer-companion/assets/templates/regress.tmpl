@@ -2,6 +2,7 @@
 # tagged regression and linked to the issue, plus reproduction notes in the state dir (.adc/repro/).
 # Rendered by scripts/lib/scaffold.mjs. Attributes: lang, when=<feature>, scope=state (path relative
 # to the state dir, never committed). The placeholder failure keeps an unedited skeleton red.
+# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
 
 @@@ file: {{file_name}} lang=ts|js @@@
 {{test_header}}
@@ -176,7 +177,7 @@ fn {{test_name}}() {
 }
 
 @@@ file: {{file_name}} lang=java @@@
-package {{java_package}};
+package regression;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -208,7 +209,7 @@ class {{class_name}} {
 //   node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json
 using Xunit;
 
-namespace {{dotnet_ns}};
+namespace Regression;
 
 [Trait("Category", "regression")]
 public class {{class_name}}
@@ -307,3 +308,15 @@ if reproduced:
     print("{{issue_ref}} reproduced: {{behavior}} does not hold", file=sys.stderr)
     sys.exit(1)
 print("{{issue_ref}} not reproduced")
+
+@@@ file: next/regress part=fragment name=next @@@
+reproduce first: fill {{state_rel}}/repro/{{slug}}/repro.md with the failing command and its output; if the bug does not reproduce, stop (no speculative test)
+replace the placeholder failure in {{test_path}} with the real call and assertion; keep the issue link
+red-green proof: node <skill>/scripts/adc.mjs clean-run --red-green {{test_path}} --json   (must fail with an assertion on the base, pass on the snapshot)
+run it: {{run_cmd}}
+
+@@@ file: next/regress-python part=fragment name=next lang=python @@@
+the "regression" marker is registered by the generated conftest.py; keep it if pytest runs with --strict-markers
+
+@@@ file: next/regress-java part=fragment name=next lang=java @@@
+JUnit 5 is required (@Tag("regression")); add org.junit.jupiter:junit-jupiter if the build lacks it

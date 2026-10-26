@@ -1,7 +1,8 @@
 # flake scaffolds (plan §10.4): the quarantine policy, the weekly quarantine workflow and, with
-# --test, a diagnosis report in the state dir. The registry (quarantine.json) and the shared
-# .github/adc/gate.mjs helper are rendered by scripts/lib/scaffold.mjs. Attributes: scope=repo,
-# scope=state (never committed), when=diagnosis.
+# --test, a diagnosis report in the state dir; the registry (quarantine.json, mode=keep: an existing
+# registry is never replaced). The shared .github/adc/gate.mjs helper comes from ci-gate.tmpl.
+# Attributes: scope=repo, scope=state (never committed), when=diagnosis, mode=keep.
+# Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
 
 @@@ file: flaky-test-policy.md @@@
 # Flaky-test policy
@@ -51,8 +52,8 @@ owner and an expiry date, never a fix.
   `rerunFailingTestsCount`, Vitest `retry` with the flaky outcome in JUnit. Never for unit tests.
 - CI fails when more than {{max_flaky}} flaky test(s) are reported (`ci-gate --max-flaky`).
 - `gh run rerun --failed` hides flakes: a green re-run is not evidence.
-- In-source retries (`jest.retryTimes`, `@pytest.mark.flaky`, `describe.configure({ retries })`)
-  are findings in `verify` (CK-RETRY).
+- In-source retries (Jest retry counts, the pytest flaky marker, Playwright describe-level retries)
+  are findings in `verify` (CK-RETRY): retries belong in the CI configuration, with a flaky report.
 
 ## 5. Evidence
 
@@ -114,6 +115,15 @@ jobs:
         run: |
           {{quarantine_run}}
 
+@@@ file: quarantine.json mode=keep @@@
+{
+  "schema": "adc-quarantine/1",
+  "max_flaky": {{max_flaky}},
+  "max_days": 30,
+  "policy": "{{policy}}",
+  "tests": []
+}
+
 @@@ file: repro/flake/{{slug}}/diagnosis.md scope=state when=diagnosis @@@
 # Flake diagnosis: {{test_id}}
 
@@ -145,3 +155,12 @@ copy its conclusions into the PR description.
 ## 5. Quarantine (only if the fix cannot land now)
 
 - Entry in {{registry}} with owner, issue and expiry (at most 30 days): TODO
+
+@@@ file: next/flake-diagnosis part=fragment name=next when=diagnosis @@@
+diagnosis report: {{state_rel}}/repro/flake/{{slug}}/diagnosis.md (evidence runs, class, fix, verification)
+
+@@@ file: next/flake part=fragment name=next @@@
+detect: {{flake_probe}}   (shuffled where the runner supports it; seeds recorded)
+quarantine a test: tag it @quarantine (selected by {{quarantine_only}}), add {id, owner, issue, added, expires, reason} to {{registry}}, and exclude it from the merge gate ({{quarantine_skip}})
+scaffold ci-gate after this (or re-run it with --force): it excludes quarantined tests and checks the registry when the registry exists
+never use `gh run rerun --failed` to get green: it hides flakes

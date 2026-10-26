@@ -1,7 +1,7 @@
 // Shared runtime for every adc.mjs command: options, output, errors, files, processes,
 // globs, templates. Zero dependencies; Node 24+.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -78,6 +78,21 @@ export function parseOpts(argv, options = {}, { positionals = true } = {}) {
   }
 }
 
+/**
+ * A numeric option (`--timeout 600`): `def` when absent, else a positive number (`allowZero`:
+ * non-negative; `integer`: whole numbers only). Anything else is a usage error (exit 2).
+ */
+export function numberOption(values, name, def = null, { integer = false, allowZero = false } = {}) {
+  const raw = values ? values[name] : null;
+  if (raw == null || String(raw).trim() === '') return def;
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || (allowZero ? n < 0 : n <= 0) || (integer && !Number.isInteger(n))) {
+    const kind = `${allowZero ? 'non-negative' : 'positive'} ${integer ? 'integer' : 'number'}`;
+    throw usageError(`--${name} must be a ${kind} (got "${raw}")`);
+  }
+  return n;
+}
+
 /** Environment markers from plan §7.6 that make a command run non-interactively. */
 export function headlessMarkers(values = {}, env = process.env) {
   const markers = [];
@@ -114,6 +129,47 @@ export function runClass(values = {}, env = process.env) {
   if (isInteractiveTty(values, env)) return 'interactive';
   if (env.GITHUB_ACTIONS || env.CI) return 'ci';
   return 'agent';
+}
+
+const HOOKS_HOST = {
+  'copilot-cloud': 'copilot-cloud', 'copilot-cli': 'copilot', vscode: 'copilot',
+  'claude-code': 'claude', codex: 'codex',
+};
+
+/**
+ * The agent host running this process, from environment markers (§8.4), most specific first.
+ * Returns `{ tool, hooks, markers[], candidates[] }`: `tool` is 'copilot-cloud' | 'copilot-cli' |
+ * 'claude-code' | 'codex' | 'vscode' | 'unknown'; `hooks` is the hooks host ('copilot-cloud' |
+ * 'copilot' | 'claude' | 'codex') or null; `candidates` lists every host with a marker.
+ */
+export function hostFromEnv(env = process.env) {
+  const on = (k) => env[k] != null && env[k] !== '' && env[k] !== '0' && env[k] !== 'false';
+  const keys = Object.keys(env).filter(on);
+  const found = [];
+  const add = (host, markers) => { if (markers.length) found.push({ host, markers }); };
+  add('copilot-cloud', keys.filter((k) => k === 'COPILOT_AGENT_PROMPT' || k === 'GITHUB_COPILOT_API_TOKEN'));
+  add('copilot-cli', keys.filter((k) => k === 'COPILOT_CLI'));
+  // CLAUDE_CONFIG_DIR and CODEX_HOME are configuration that shell profiles set, not session markers.
+  add('claude-code', keys.filter((k) => k === 'CLAUDECODE' || (k.startsWith('CLAUDE_') && k !== 'CLAUDE_CONFIG_DIR')));
+  add('codex', keys.filter((k) => k.startsWith('CODEX_') && k !== 'CODEX_HOME'));
+  add('vscode', keys.filter((k) => (k === 'TERM_PROGRAM' && env[k] === 'vscode') || k === 'VSCODE_IPC_HOOK_CLI'));
+  const first = found[0] || null;
+  return {
+    tool: first ? first.host : 'unknown', hooks: first ? HOOKS_HOST[first.host] : null,
+    markers: first ? first.markers : [], candidates: found.map((f) => f.host),
+  };
+}
+
+/** Per-host config homes (absolute, native separators), honoring COPILOT_HOME, CLAUDE_CONFIG_DIR, CODEX_HOME. */
+export function hostHomes({ env = process.env, home = null } = {}) {
+  // Windows hosts use the profile directory; HOME there may be an MSYS path from Git Bash.
+  const h = home || (IS_WINDOWS ? env.USERPROFILE : env.HOME) || os.homedir();
+  return {
+    home: h,
+    copilot: env.COPILOT_HOME ? path.resolve(env.COPILOT_HOME) : path.join(h, '.copilot'),
+    claude: env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : path.join(h, '.claude'),
+    codex: env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : path.join(h, '.codex'),
+  };
 }
 
 export function makeContext(values = {}) {
@@ -220,7 +276,69 @@ export function truncate(text, max) {
   return s.length <= max ? s : s.slice(0, Math.max(0, max - 3)) + '...';
 }
 
+/** A plain object: not null, not an array. */
+export const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** `v` as an array: arrays unchanged, null / undefined / '' as [], anything else wrapped. */
+export const toArray = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]);
+/** Distinct values in first-seen order, without null, undefined and ''. */
+export const uniq = (list) => [...new Set(list.filter((x) => x != null && x !== ''))];
+/** First non-empty line of a text, trimmed ('' when there is none). */
+export const firstLine = (text) => String(text ?? '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) || '';
+/** Last non-empty line of a text, trimmed (tool errors end with the line that matters). */
+export const lastLine = (text) => String(text ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop() || '';
+/** 1-based line number of a character offset. */
+export const lineOf = (text, index) => (index <= 0 ? 1 : String(text).slice(0, index).split('\n').length);
+/** A value for a Markdown table cell: one line, pipes escaped, truncated. */
+export const mdCell = (value, max = 160) =>
+  truncate(String(value ?? '').replace(/\r?\n/g, ' ').replace(/\|/g, '\\|'), max);
+
+/** Progress note on stderr (silenced by ADC_QUIET=1); stdout is reserved for the JSON result. */
+export function log(msg) {
+  if (process.env.ADC_QUIET !== '1') process.stderr.write(`adc: ${msg}\n`);
+}
+
+/** JSON Lines records (objects only); blank, non-JSON and non-object lines are skipped. */
+export function parseJsonl(text) {
+  const out = [];
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const v = JSON.parse(line);
+      if (isObj(v)) out.push(v);
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * JSON with recursively sorted keys: the hashed form of ledger records. `undefined` becomes
+ * null in arrays and is dropped in objects; non-finite numbers become null (as JSON.stringify).
+ */
+export function canonicalJson(v) {
+  if (Array.isArray(v)) return `[${v.map((x) => canonicalJson(x === undefined ? null : x)).join(',')}]`;
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v).filter((k) => v[k] !== undefined).sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+  }
+  if (typeof v === 'number' && !Number.isFinite(v)) return 'null';
+  return JSON.stringify(v === undefined ? null : v);
+}
+
+/** A Check (plan §9.2, the evidence ledger entry every QA step returns) with defaults for unset fields. */
+export function makeCheck(fields) {
+  return {
+    id: null, fm: [], project: '.', status: 'unverified', reason: null, cost: 0, command: null, cwd: null,
+    exit_code: null, duration_ms: null, summary: '', output_sha256: null, artifacts: [], findings: [], data: {},
+    ...fields,
+  };
+}
+
 export const sha256 = (data) => createHash('sha256').update(data).digest('hex');
+/** sha256 of a file's bytes, or null when it cannot be read. */
+export function sha256File(file) {
+  try { return sha256(fs.readFileSync(file)); } catch { return null; }
+}
 export const nonce = () => randomBytes(16).toString('hex');
 export const nowIso = () => new Date().toISOString();
 /** Filesystem-safe UTC timestamp, e.g. 20261025T171243Z. */
@@ -237,6 +355,69 @@ export function relPosix(root, file) {
   const rel = path.relative(root, path.resolve(root, file));
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return rel === '' ? '.' : null;
   return toPosix(rel);
+}
+
+/** Absolute on either platform: POSIX `/x`, a drive path `C:\x` or `C:/x` (also when parsed on Linux). */
+export const isAbsolutePath = (p) => path.isAbsolute(String(p)) || /^[A-Za-z]:[\\/]/.test(String(p));
+
+/** Symlinks resolved along the longest existing prefix (macOS /var → /private/var); the rest kept. */
+export function realPath(p) {
+  const abs = path.resolve(String(p));
+  let cur = abs;
+  const rest = [];
+  for (let i = 0; i < 64; i++) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest.reverse()); } catch {}
+    const parent = path.dirname(cur);
+    if (parent === cur) return abs;
+    rest.push(path.basename(cur));
+    cur = parent;
+  }
+  return abs;
+}
+
+/** Same file system location (symlinks resolved; case-insensitive on Windows). */
+export function samePath(a, b) {
+  const x = toPosix(realPath(a));
+  const y = toPosix(realPath(b));
+  return IS_WINDOWS ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
+export function statOrNull(p) {
+  try { return fs.statSync(p); } catch { return null; }
+}
+export const isDir = (p) => Boolean(statOrNull(p)?.isDirectory());
+
+/** The nearest directory from `start` upwards that contains `rel`, or null (`stopAt` is the last one tried). */
+export function findUp(start, rel, { stopAt = null, maxDepth = 64 } = {}) {
+  let d = path.resolve(start);
+  for (let i = 0; i < maxDepth; i++) {
+    if (fs.existsSync(path.join(d, rel))) return d;
+    if (stopAt && path.resolve(d) === path.resolve(stopAt)) return null;
+    const parent = path.dirname(d);
+    if (parent === d) return null;
+    d = parent;
+  }
+  return null;
+}
+
+/** A fresh `adc-<label>-XXXXXX` directory under the OS temp dir. */
+export const makeTempDir = (label) => fs.mkdtempSync(path.join(os.tmpdir(), `adc-${label}-`));
+
+/** Text of a file argument relative to `cwd` (`-` reads stdin); a missing file is a usage error. */
+export function readInput(arg, cwd = process.cwd(), { what = 'file' } = {}) {
+  if (arg === '-') {
+    try { return stripBom(fs.readFileSync(0, 'utf8')); } catch { return ''; }
+  }
+  const file = path.resolve(cwd, String(arg));
+  const text = readText(file);
+  if (text == null) throw usageError(`${what} not found: ${toPosix(file)}`);
+  return text;
+}
+
+/** readInput parsed as JSON; invalid JSON is a usage error. */
+export function readJsonInput(arg, cwd = process.cwd(), { what = 'file' } = {}) {
+  const text = readInput(arg, cwd, { what });
+  try { return JSON.parse(text); } catch { throw usageError(`${arg === '-' ? 'stdin' : arg} is not valid JSON`); }
 }
 
 export function ensureDir(dir, mode) {
@@ -304,8 +485,13 @@ export async function withLock(lockFile, fn, { staleMs = 30_000, waitMs = 10_000
 const DEFAULT_WALK_IGNORE = new Set(['.git', 'node_modules', '.adc', '.venv', 'venv', '__pycache__',
   'target', 'dist', 'build', 'bin', 'obj', '.next', '.turbo', '.tox', 'vendor', 'coverage']);
 
-/** Recursive file list (POSIX paths relative to root), skipping heavy or generated folders. */
-export function listFiles(root, { ignore = DEFAULT_WALK_IGNORE, maxFiles = 50_000, maxDepth = 12 } = {}) {
+/**
+ * Recursive file list (POSIX paths relative to root, sorted per directory), skipping `ignore`d
+ * names (heavy or generated folders by default). `followSymlinks` lists linked files and folders.
+ */
+export function listFiles(root, {
+  ignore = DEFAULT_WALK_IGNORE, maxFiles = 50_000, maxDepth = 12, followSymlinks = false,
+} = {}) {
   const out = [];
   const walk = (dir, depth) => {
     if (out.length >= maxFiles || depth > maxDepth) return;
@@ -315,8 +501,10 @@ export function listFiles(root, { ignore = DEFAULT_WALK_IGNORE, maxFiles = 50_00
     for (const e of entries) {
       if (ignore.has(e.name)) continue;
       const full = path.join(dir, e.name);
-      if (e.isDirectory()) walk(full, depth + 1);
-      else if (e.isFile()) out.push(toPosix(path.relative(root, full)));
+      const st = followSymlinks && e.isSymbolicLink() ? statOrNull(full) : e;
+      if (!st) continue;
+      if (st.isDirectory()) walk(full, depth + 1);
+      else if (st.isFile()) out.push(toPosix(path.relative(root, full)));
       if (out.length >= maxFiles) return;
     }
   };
@@ -328,8 +516,10 @@ export function listFiles(root, { ignore = DEFAULT_WALK_IGNORE, maxFiles = 50_00
 // Globs (minimal: **, *, ?, {a,b}, [abc]); matched against POSIX paths
 
 const globCache = new Map();
-export function globToRegExp(glob) {
-  if (globCache.has(glob)) return globCache.get(glob);
+/** RegExp for a glob. `anchored`: a glob without a slash matches at the root only (no basename match). */
+export function globToRegExp(glob, { anchored = false } = {}) {
+  const key = anchored ? `\0${glob}` : glob;
+  if (globCache.has(key)) return globCache.get(key);
   let g = toPosix(glob.trim());
   if (g.startsWith('./')) g = g.slice(2);
   let re = '';
@@ -353,14 +543,13 @@ export function globToRegExp(glob) {
     } else re += c.replace(/[.+^$()|\\]/g, '\\$&');
   }
   // A glob without a slash matches at any depth (gitignore-style basename match).
-  const anchored = g.includes('/') ? `^${re}$` : `^(?:.*/)?${re}$`;
-  const rx = new RegExp(anchored);
-  globCache.set(glob, rx);
+  const rx = new RegExp(g.includes('/') || anchored ? `^${re}$` : `^(?:.*/)?${re}$`);
+  globCache.set(key, rx);
   return rx;
 }
 
-export const matchGlob = (file, glob) => globToRegExp(glob).test(toPosix(file));
-export const matchAny = (file, globs = []) => globs.some((g) => matchGlob(file, g));
+export const matchGlob = (file, glob, opts) => globToRegExp(glob, opts).test(toPosix(file));
+export const matchAny = (file, globs = [], opts) => globs.some((g) => matchGlob(file, g, opts));
 
 // ---------------------------------------------------------------------------
 // Processes
@@ -436,25 +625,284 @@ export function versionGte(actual, minimum) {
   return true;
 }
 
+/**
+ * Windows: npm installs CLIs as `.cmd` shims (next to an extensionless sh script) and Node
+ * cannot spawn those without a shell, so they become one quoted shell line. Elsewhere a no-op.
+ */
+function shimmed(cmd, args, shell) {
+  if (!IS_WINDOWS || shell) return { cmd, args, shell };
+  let file = String(cmd);
+  if (!path.extname(file) && /[\\/]/.test(file)) {
+    file = ['.exe', '.cmd', '.bat'].map((e) => file + e).find((f) => fs.existsSync(f)) || file;
+  }
+  if (!/\.(?:cmd|bat)$/i.test(file)) return { cmd: file, args, shell };
+  return { cmd: [quoteArg(file), ...args.map(quoteArg)].join(' '), args: [], shell: true };
+}
+
+/** `run` for installed CLIs: Windows `.cmd`/`.bat` shims go through the shell. Never throws. */
+export function runTool(exe, args = [], opts = {}) {
+  const s = shimmed(exe, args, false);
+  return s.shell ? runShell(s.cmd, opts) : run(s.cmd, s.args, opts);
+}
+
 /** `{ path, version, raw }` for a tool on PATH, or null when absent. `.cmd` shims run via the shell. */
 export function toolVersion(name, args = ['--version'], { timeoutMs = 10_000 } = {}) {
   const exe = which(name);
   if (!exe) return null;
-  const needsShell = IS_WINDOWS && /\.(cmd|bat)$/i.test(exe);
-  const res = needsShell
-    ? runShell([quoteArg(exe), ...args.map(quoteArg)].join(' '), { timeoutMs })
-    : run(exe, args, { timeoutMs });
+  const res = runTool(exe, args, { timeoutMs });
   const raw = (res.stdout || res.stderr || '').trim();
   const v = parseVersion(raw);
   return { path: toPosix(exe), version: v ? v.join('.') : null, raw: truncate(raw.split(/\r?\n/)[0] || '', 200) };
 }
 
-/** Quote one argument for the platform shell used by runShell. */
-export function quoteArg(arg) {
+// Async processes: own process group (POSIX) so a timeout or Ctrl-C also ends grandchildren.
+
+const ACTIVE = new Set();
+const CLEANUPS = new Set();
+let trapped = false;
+
+/**
+ * Kill a spawned child with its process group (POSIX: SIGTERM, then SIGKILL after `graceMs`;
+ * 0 kills at once) or its tree (Windows: taskkill /T /F). The group is signalled even when the
+ * leader already exited, because grandchildren holding the pipes would keep the run open.
+ */
+export function killTree(child, { graceMs = 2000 } = {}) {
+  if (!child || child.pid == null) return;
+  if (IS_WINDOWS) {
+    const opts = { windowsHide: true, stdio: 'ignore' };
+    if (child.exitCode === null) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], opts);
+    return;
+  }
+  const signal = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
+  if (graceMs <= 0) { signal('SIGKILL'); return; }
+  signal('SIGTERM');
+  setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, graceMs).unref();
+}
+
+/**
+ * On SIGINT / SIGTERM: kill every running spawnCapture child, run the registered cleanups
+ * (worktree removal, temp dirs), exit 130 / 143. Returns a function that unregisters `cleanup`.
+ */
+export function onInterrupt(cleanup = null) {
+  if (cleanup) CLEANUPS.add(cleanup);
+  if (!trapped) {
+    trapped = true;
+    for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+      process.on(sig, () => {
+        for (const c of ACTIVE) killTree(c, { graceMs: 0 });
+        for (const fn of CLEANUPS) { try { fn(); } catch {} }
+        process.exit(code);
+      });
+    }
+  }
+  return () => { if (cleanup) CLEANUPS.delete(cleanup); };
+}
+
+/** Keeps the last `max` bytes; a cut drops the partial first line, so no half secret escapes redaction. */
+function tailBuffer(max) {
+  const chunks = [];
+  let size = 0;
+  let dropped = 0;
+  return {
+    push(buf) {
+      chunks.push(buf);
+      size += buf.length;
+      while (size > max && chunks.length > 1) { const c = chunks.shift(); size -= c.length; dropped += c.length; }
+    },
+    text() {
+      let buf = Buffer.concat(chunks);
+      if (buf.length > max) { dropped += buf.length - max; buf = buf.subarray(buf.length - max); }
+      let s = buf.toString('utf8');
+      if (dropped) { const nl = s.indexOf('\n'); s = nl >= 0 ? s.slice(nl + 1) : ''; }
+      return { text: s, dropped };
+    },
+  };
+}
+
+/**
+ * Spawn without blocking: `command` with `args`, or a command line when `shell` is true
+ * (Windows `.cmd` shims are wrapped automatically). Options: `cwd, env, input, timeoutMs`,
+ * `maxBytes` (kept per stream, tail), `logFile` (append) / `captureFile` (truncate) receive both
+ * streams in arrival order, `onLine(line)` sees stdout lines and may return 'stop' to end the
+ * run early, `killGraceMs` (see killTree), `windowsVerbatimArguments`.
+ * Resolves `{ exit, signal, stdout, stderr, ms, timedOut, stopped, truncated, error }`; never rejects.
+ */
+export function spawnCapture(command, args = [], {
+  cwd, env, input = null, timeoutMs = 0, shell = false, maxBytes = 8 * 1024 * 1024, logFile = null, captureFile = null,
+  onLine = null, killGraceMs = 2000, windowsVerbatimArguments = false,
+} = {}) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const s = shimmed(command, args, shell);
+    const fds = [];
+    let child;
+    let timer = null;
+    let timedOut = false;
+    let stopped = false;
+    let error = null;
+    let done = false;
+    const out = tailBuffer(maxBytes);
+    const err = tailBuffer(maxBytes);
+    let partial = '';
+    const finish = (code, signal) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      ACTIVE.delete(child);
+      for (const fd of fds) { try { fs.closeSync(fd); } catch {} }
+      if (partial && onLine && !stopped) onLine(partial.replace(/\r$/, ''));
+      const o = out.text();
+      const e = err.text();
+      resolve({
+        exit: typeof code === 'number' ? code : null, signal: signal || null, stdout: o.text, stderr: e.text,
+        ms: Date.now() - started, timedOut, stopped, truncated: Boolean(o.dropped || e.dropped), error,
+      });
+    };
+    try {
+      if (logFile) fds.push(fs.openSync(logFile, 'a'));
+      if (captureFile) fds.push(fs.openSync(captureFile, 'w'));
+      child = spawn(s.cmd, s.args, {
+        cwd, env: env || process.env, shell: s.shell, windowsHide: true, detached: !IS_WINDOWS,
+        windowsVerbatimArguments,
+        stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      error = e.code || e.message;
+      finish(null, null);
+      return;
+    }
+    ACTIVE.add(child);
+    onInterrupt();
+    const tee = (buf) => { for (const fd of fds) { try { fs.writeSync(fd, buf); } catch {} } };
+    child.stdout.on('data', (buf) => {
+      out.push(buf);
+      tee(buf);
+      if (!onLine || stopped) return;
+      partial += buf.toString('utf8');
+      let nl;
+      while (!stopped && (nl = partial.indexOf('\n')) >= 0) {
+        const line = partial.slice(0, nl).replace(/\r$/, '');
+        partial = partial.slice(nl + 1);
+        if (onLine(line) === 'stop') { stopped = true; killTree(child, { graceMs: killGraceMs }); }
+      }
+    });
+    child.stderr.on('data', (buf) => { err.push(buf); tee(buf); });
+    if (input != null) { child.stdin.on('error', () => {}); child.stdin.end(input); }
+    const expire = () => { timedOut = true; killTree(child, { graceMs: killGraceMs }); };
+    if (timeoutMs > 0) timer = setTimeout(expire, timeoutMs);
+    child.on('error', (e) => { error = e.code || e.message; finish(null, null); });
+    child.on('close', finish);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Shell words: quoting and splitting
+
+const SAFE_ARG = /^[A-Za-z0-9_\-+=.,/:@%]+$/;
+
+/**
+ * Quote one argument for a shell: 'sh' (single quotes), 'sh-double' (double quotes with
+ * `"\$` + "`" escaped), 'pwsh' (single quotes, '' doubling), 'pwsh-double' (double quotes, backtick
+ * escapes), 'cmd' (double quotes, "" doubling). Safe tokens stay bare unless `always`.
+ */
+export function quoteFor(shell, arg, { always = false } = {}) {
   const s = String(arg);
-  if (s && /^[A-Za-z0-9_\-+=.,/:@%]+$/.test(s)) return s;
-  if (IS_WINDOWS) return '"' + s.replace(/"/g, '""') + '"';
-  return "'" + s.replace(/'/g, "'\\''") + "'";
+  if (!always && s && SAFE_ARG.test(s)) return s;
+  if (shell === 'sh') return "'" + s.replace(/'/g, "'\\''") + "'";
+  if (shell === 'sh-double') return `"${s.replace(/(["\\$`])/g, '\\$1')}"`;
+  if (shell === 'pwsh') return `'${s.replace(/'/g, "''")}'`;
+  if (shell === 'pwsh-double') return `"${s.replace(/([`"$])/g, '`$1')}"`;
+  if (shell === 'cmd') return '"' + s.replace(/"/g, '""') + '"';
+  throw new Error(`quoteFor: unknown shell "${shell}"`);
+}
+
+/** Quote one argument for the platform shell used by runShell. */
+export const quoteArg = (arg) => quoteFor(IS_WINDOWS ? 'cmd' : 'sh', arg);
+
+/**
+ * POSIX-sh word splitting. `plain` mode knows only quotes (no escapes, operators or comments).
+ * Returns `{ segments: [{ tokens, op }], unterminated }`.
+ */
+function scanShell(line, { redirects = 'drop', plain = false } = {}) {
+  const segments = [];
+  let seg = [];
+  let tok = null;
+  let dropNext = false;
+  let unterminated = false;
+  const push = () => {
+    if (tok === null) return;
+    if (dropNext) dropNext = false; else seg.push(tok);
+    tok = null;
+  };
+  const end = (op) => { push(); dropNext = false; if (seg.length) segments.push({ tokens: seg, op }); seg = []; };
+  const s = String(line ?? '').replace(/\r\n?/g, '\n');
+  for (let k = 0; k < s.length; k++) {
+    const c = s[k];
+    if (c === "'" || (plain && c === '"')) {
+      const e = s.indexOf(c, k + 1);
+      if (e === -1) unterminated = true;
+      tok = (tok ?? '') + (e === -1 ? s.slice(k + 1) : s.slice(k + 1, e));
+      k = e === -1 ? s.length : e;
+      continue;
+    }
+    if (plain) {
+      if (/\s/.test(c)) push(); else tok = (tok ?? '') + c;
+      continue;
+    }
+    if (c === '\\' && s[k + 1] === '\n') { k++; continue; }
+    if (c === '"') {
+      let j = k + 1;
+      let part = '';
+      while (j < s.length && s[j] !== '"') {
+        if (s[j] === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) {
+          part += s[j + 1] === '\n' ? '' : s[j + 1];
+          j += 2;
+        } else part += s[j++];
+      }
+      if (j >= s.length) unterminated = true;
+      tok = (tok ?? '') + part;
+      k = j;
+      continue;
+    }
+    if (c === '\\') { tok = (tok ?? '') + (s[k + 1] ?? ''); k++; continue; }
+    if (c === ' ' || c === '\t') { push(); continue; }
+    if (c === '#' && tok === null) { while (k < s.length && s[k] !== '\n') k++; k--; continue; }
+    if (c === '\n' || c === ';') { end(c === '\n' ? 'nl' : ';'); continue; }
+    if (c === '(' && tok === null) { end('('); continue; }
+    if (c === ')') { end(')'); continue; }
+    if (c === '&' && s[k + 1] === '&') { end('&&'); k++; continue; }
+    if (c === '|' && s[k + 1] === '|') { end('||'); k++; continue; }
+    if (c === '|') { end('|'); continue; }
+    if (c === '>' || c === '<' || (c === '&' && s[k + 1] === '>')) {
+      // A redirection: `[n]>`, `>>`, `&>`, `<`, `n>&m`. Its target is the next word.
+      let op = '';
+      if (tok !== null && /^\d+$/.test(tok)) { op = tok; tok = null; } else push();
+      op += c;
+      while (s[k + 1] === '>' || (s[k + 1] === '&' && s[k + 2] !== '&')) op += s[++k];
+      if (op.endsWith('&') && /[\d-]/.test(s[k + 1] ?? '')) { while (/[\d-]/.test(s[k + 1] ?? '')) op += s[++k]; }
+      else dropNext = redirects === 'drop';
+      if (redirects === 'keep') seg.push(op);
+      continue;
+    }
+    if (c === '&') { end('&'); continue; }
+    tok = (tok ?? '') + c;
+  }
+  end(null);
+  return { segments, unterminated };
+}
+
+/**
+ * Split a command line into simple commands: `[{ tokens, op }]` where `op` ends the segment
+ * ('&&' '||' ';' '|' '&' 'nl' '(' ')' or null). Quotes and backslashes follow POSIX sh, comments
+ * are dropped; redirections are dropped (`redirects: 'drop'`) or kept as an operator token
+ * followed by its target (`'keep'`, for guards that must see `> .adc/x`).
+ */
+export const splitShell = (line, opts) => scanShell(line, opts).segments;
+
+/** Words of an argv-style line (`--bin "node cli.js"`): quotes only, no shell features; null on an open quote. */
+export function shellWords(line) {
+  const r = scanShell(String(line ?? '').trim(), { plain: true });
+  return r.unterminated ? null : r.segments.flatMap((x) => x.tokens);
 }
 
 /** Per-repository directory under the OS temp dir (worktrees never live inside the repo). */
@@ -479,6 +927,33 @@ export function redactLiterals(text, secrets = []) {
     }
   }
   return out;
+}
+
+const LIVE_SECRET_NAME = /^ADC_LIVE_TOKEN$|^ADC_LIVE_\w*(?:TOKEN|SECRET|KEY|PASSWORD)/;
+// Built from parts so the skill tree carries no `NAME=value`-shaped token literal.
+const TOKEN_REDACTED = ['ADC_LIVE_TOKEN', '[REDACTED]'].join('=');
+
+/** Live-test credentials in `env` (ADC_LIVE_TOKEN, ADC_LIVE_*TOKEN|SECRET|KEY|PASSWORD) as redactLiterals input. */
+export function liveSecrets(env = process.env, { min = 4 } = {}) {
+  return Object.entries(env || {})
+    .filter(([k, v]) => LIVE_SECRET_NAME.test(k) && typeof v === 'string' && v.trim().length >= min)
+    .map(([name, value]) => ({ name, value: value.trim() }));
+}
+
+/**
+ * The live-test token removed from tool output: the `ADC_LIVE_TOKEN=<value>` shape (§10.3.1),
+ * its JSON/YAML form, the `Get-ChildItem Env:` table row, and the literal values of the
+ * live credentials in `env` (8+ characters: shorter ones would mangle ordinary words).
+ * Status text such as `ADC_LIVE_TOKEN: set (source: ...)` stays readable.
+ */
+export function redactLiveToken(text, env = {}) {
+  if (text == null) return text;
+  const out = String(text)
+    .replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, TOKEN_REDACTED)
+    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:\s*)(["'])[^"'\r\n]*\2/g, '$1$2[REDACTED]$2')
+    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:[ \t]*)(?!["'\s[]|(?:set|unset)\b)[^\s,}]+/g, '$1[REDACTED]')
+    .replace(/^(\s*ADC_LIVE_TOKEN[ \t]{2,})\S.*$/gm, '$1[REDACTED]');
+  return redactLiterals(out, liveSecrets(env, { min: 8 }));
 }
 
 // ---------------------------------------------------------------------------
@@ -521,17 +996,34 @@ export function loadBundle(name) {
   return parseBundle(text);
 }
 
-/** Sections whose attributes all agree with `filter` (attributes absent from a section match anything). */
-export function selectSections(sections, filter = {}) {
-  return sections.filter((s) => Object.entries(filter).every(([k, v]) => {
-    if (!(k in s.attrs)) return true;
-    return String(s.attrs[k]).split('|').includes(String(v));
+/**
+ * Sections whose attributes agree with `filter` (`a|b` values list alternatives). Default: an
+ * attribute absent from the section or the filter matches anything. `strict`: every section
+ * attribute must be matched by the filter, except the `loose` (descriptive) ones. With a
+ * `features` set, `when=` / `unless=` attributes test it.
+ */
+export function selectSections(sections, filter = {}, { strict = false, features = null, loose = [] } = {}) {
+  return sections.filter((s) => Object.entries(s.attrs).every(([k, v]) => {
+    const alts = String(v).split('|');
+    if (features && k === 'when') return alts.some((a) => features.has(a));
+    if (features && k === 'unless') return !alts.some((a) => features.has(a));
+    if (loose.includes(k)) return true;
+    if (filter[k] == null) return !strict;
+    return alts.includes(String(filter[k]));
   }));
 }
 
-export function renderString(template, vars = {}) {
-  return template.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_, key) => {
+/**
+ * Replace `{{var}}` placeholders; a missing value is an error. `actions: true` leaves GitHub
+ * Actions expressions (`${{ github.ref }}`) untouched for workflow templates.
+ */
+export function renderString(template, vars = {}, { actions = false } = {}) {
+  const kept = [];
+  const keep = (m) => `\u0000${kept.push(m) - 1}\u0000`;
+  const src = actions ? String(template).replace(/\$\{\{[\s\S]*?\}\}/g, keep) : String(template);
+  const out = src.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_, key) => {
     if (!(key in vars) || vars[key] == null) throw envError('TEMPLATE_VAR', `template variable "${key}" has no value`);
     return String(vars[key]);
   });
+  return actions ? out.replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)]) : out;
 }

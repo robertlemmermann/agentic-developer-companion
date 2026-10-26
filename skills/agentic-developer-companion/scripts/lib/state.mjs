@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   EXIT, AdcError, envError, ensureDir, readJson, readText, writeFileAtomic, writeJsonAtomic, withLock,
-  relPosix, toPosix, nowIso, run, IS_WINDOWS, TEMPLATES_DIR,
+  relPosix, toPosix, nowIso, run, stamp, realPath, isDir, isObj, redactLiveToken, IS_WINDOWS, TEMPLATES_DIR,
 } from './core.mjs';
-import { repoRoot, lsFiles, checkIgnore, gitPath } from './git.mjs';
+import { repoRoot, lsFiles, checkIgnore, appendExclude, requireRepo, resolveBase, createSnapshot } from './git.mjs';
 
 export const STATE_DIR_NAME = '.adc';
 export const DEFAULT_BUDGET = Object.freeze({ max_per_session: 2500, max_per_day: 2500, warn_at: 2000 });
@@ -15,10 +15,14 @@ const LOG_ROTATE_BYTES = 1024 * 1024;
 
 /**
  * Where the state dir lives: --state-dir > ADC_HOME > <repo root>/.adc (> <cwd>/.adc outside git).
+ * Pass `root` when the repository root is already known (hooks find it without git); a
+ * relative --state-dir then resolves against `cwd` (default: `root`).
  * Returns { dir, root, rel, insideRepo, source }.
  */
-export function resolveStateDir({ cwd = process.cwd(), stateDirOption = null, env = process.env } = {}) {
-  const root = repoRoot(cwd);
+export function resolveStateDir({ cwd = null, stateDirOption = null, env = process.env, root: knownRoot } = {}) {
+  const known = knownRoot !== undefined;
+  cwd = cwd || (known && knownRoot) || process.cwd();
+  const root = known ? knownRoot : repoRoot(cwd);
   let dir;
   let source;
   if (stateDirOption) { dir = path.resolve(cwd, stateDirOption); source = 'flag'; }
@@ -48,10 +52,10 @@ export function statePaths(dir) {
   };
 }
 
-/** Tracked files under the state dir (must be empty). */
-export function trackedStateFiles(info) {
+/** Tracked files under the state dir (must be empty). `strict`: null when git cannot tell (see git.lsFiles). */
+export function trackedStateFiles(info, { timeoutMs, strict = false } = {}) {
   if (!info.root || !info.insideRepo) return [];
-  return lsFiles(info.root, [`:(top)${info.rel}`]);
+  return lsFiles(info.root, [`:(top)${info.rel}`], { timeoutMs, strict });
 }
 
 /** Every CLI command refuses (exit 3) while anything under the state dir is tracked by git. */
@@ -66,26 +70,22 @@ export function assertStateUntracked(info) {
 
 /**
  * Add `/<rel>/` to the repository's exclude file (resolved with `git rev-parse --git-path
- * info/exclude`, so linked worktrees and submodules work). Never a committed change.
+ * info/exclude`, so linked worktrees and submodules work; `excludeFile` skips git). Never a
+ * committed change.
  */
-export function ensureExcluded(info) {
+export function ensureExcluded(info, { excludeFile = null } = {}) {
   if (!info.insideRepo) return { ok: true, needed: false };
-  const entry = `/${info.rel}/`;
-  let excludeFile;
-  try {
-    excludeFile = gitPath(info.root, 'info/exclude');
-    const current = readText(excludeFile, '');
-    const lines = current.split(/\r?\n/).map((l) => l.trim());
-    if (!lines.includes(entry) && !lines.includes(`/${info.rel}`) && !lines.includes(`${info.rel}/`)) {
-      ensureDir(path.dirname(excludeFile));
-      const sep = current && !current.endsWith('\n') ? '\n' : '';
-      fs.appendFileSync(excludeFile, `${sep}# agentic-developer-companion state (never commit)\n${entry}\n`);
-      return { ok: true, needed: true, written: true, excludeFile: toPosix(excludeFile), entry };
-    }
-    return { ok: true, needed: true, written: false, excludeFile: toPosix(excludeFile), entry };
-  } catch (err) {
-    return { ok: false, needed: true, written: false, excludeFile: excludeFile ? toPosix(excludeFile) : null, entry, error: err.code || err.message };
+  const r = appendExclude(info.root, `/${info.rel}/`, { aliases: [`/${info.rel}`, `${info.rel}/`], excludeFile });
+  return { needed: true, ...r };
+}
+
+/** Create the state dir owner-only (0700 / icacls) when missing; true when it is a directory. */
+export function createStateDir(info) {
+  if (!fs.existsSync(info.dir)) {
+    ensureDir(info.dir, 0o700);
+    setOwnerOnly(info.dir, { dir: true });
   }
+  return isDir(info.dir);
 }
 
 /** Is `<rel>/<sub>` ignored by git right now (exclude file, .gitignore, negations all applied)? */
@@ -104,9 +104,7 @@ export function prepareStateDir(ctx = {}, { create = true } = {}) {
   let exclude = { ok: true, needed: info.insideRepo };
   if (create) {
     exclude = ensureExcluded(info);
-    const existed = fs.existsSync(info.dir);
-    ensureDir(info.dir, 0o700);
-    if (!existed) setOwnerOnly(info.dir, { dir: true });
+    createStateDir(info);
   }
   return { ...info, paths: statePaths(info.dir), exclude, ignored: info.insideRepo ? stateIgnored(info, 'probe') : true };
 }
@@ -266,6 +264,160 @@ export function newestOpenSession(stateDir) {
   return best;
 }
 
+/**
+ * Evidence ledgers (`<state>/evidence/*.json` with an `adc-evidence/*` schema), newest first by
+ * `created_at` (verify's snapshot time; later `evidence add` calls do not make a ledger fresher),
+ * then by name. `max` reads only the most recently modified files (the stop hook reads 5);
+ * `evidenceDir` overrides `<stateDir>/evidence`. Returns `[{ file, name, created_at, finalized, verdict }]`.
+ */
+export function listLedgers(stateDir, { max = Infinity, evidenceDir = null } = {}) {
+  const dir = evidenceDir || statePaths(stateDir).evidence;
+  let names;
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  let files = names.map((name) => ({ name, file: path.join(dir, name) }));
+  if (Number.isFinite(max)) {
+    for (const f of files) { try { f.mtimeMs = fs.statSync(f.file).mtimeMs; } catch { f.mtimeMs = -1; } }
+    files = files.filter((f) => f.mtimeMs >= 0)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? 1 : -1)).slice(0, max);
+  }
+  const rows = [];
+  for (const f of files) {
+    const led = readJson(f.file, null);
+    if (!isObj(led) || !String(led.schema || '').startsWith('adc-evidence/')) continue;
+    const ts = [led.created_at, led.finalized_at, led.updated_at]
+      .find((t) => typeof t === 'string' && !Number.isNaN(Date.parse(t))) || '';
+    const verdict = typeof led.verdict === 'string' ? led.verdict : null;
+    rows.push({ file: f.file, name: f.name, created_at: ts, finalized: Boolean(led.finalized_at), verdict });
+  }
+  const t = (r) => Date.parse(r.created_at) || 0;
+  return rows.sort((a, b) => t(b) - t(a) || (a.name < b.name ? 1 : -1));
+}
+
+// ---------------------------------------------------------------------------
+// Git-free repository lookup (hooks: no git process on the hot path)
+
+/**
+ * Walk up from `start` to the first directory holding `.git` (a directory, or the file a linked
+ * worktree or submodule has). Returns `{ root, gitDir, commonDir }` (root symlink-resolved) or null.
+ */
+export function locateRepo(start) {
+  if (!start || typeof start !== 'string') return null;
+  let dir = path.resolve(start);
+  try { if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir); } catch { return null; }
+  for (let i = 0; i < 64; i++) {
+    const dotgit = path.join(dir, '.git');
+    let st = null;
+    try { st = fs.statSync(dotgit); } catch {}
+    if (st) {
+      let gitDir = dotgit;
+      if (st.isFile()) {
+        const m = /^gitdir:\s*(.+?)\s*$/m.exec(readText(dotgit, '') || '');
+        if (!m) return null;
+        gitDir = path.resolve(dir, m[1]);
+      }
+      const common = readText(path.join(gitDir, 'commondir'));
+      const commonDir = common && common.trim() ? path.resolve(gitDir, common.trim()) : gitDir;
+      return { root: realPath(dir), gitDir, commonDir };
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Generated files (scaffold, tooling port): create freely, never clobber without --force
+
+/** Lazy `<state>/<sub...>/<stamp>/` backup dir: created on first call, null when the state dir is unusable. */
+export function backupDirFactory(ctx, root, ...sub) {
+  let dir;
+  return () => {
+    if (dir !== undefined) return dir;
+    try {
+      const info = prepareStateDir({ ...(ctx || {}), cwd: root }, { create: true });
+      dir = ensureDir(path.join(info.dir, ...sub, stamp()));
+    } catch {
+      dir = null;
+    }
+    return dir;
+  };
+}
+
+/**
+ * Write (or with `dryRun` plan) generated files. Each output is `{ path, content, merge?, replace?,
+ * absPath?, ...extra }`: `path` is relative to `root` (POSIX) unless `absPath` is given; `merge(current)`
+ * returns the merged text for an existing file; `replace` overwrites without `force`. Existing files
+ * are kept unless merged or forced; with `mergeNeedsForce` merges need `force` too. Paths outside
+ * `root` and directories are skipped; the same path twice is merged into one output. Overwritten
+ * (and forced merged) files are copied to `backupDir()` first. `host` and `kind` are copied to the
+ * rows. Returns `{ written: [{ path, action, bytes }], skipped: [{ path, reason, planned? }], backups[] }`
+ * with actions create | merge | overwrite | unchanged (`would-*` in a dry run).
+ */
+export function writeOutputs(outputs, {
+  root, dryRun = false, force = false, mergeNeedsForce = false, backupDir = null,
+} = {}) {
+  const written = [];
+  const skipped = [];
+  const backups = [];
+  const byPath = new Map();
+  for (const o of outputs) {
+    const abs = o.absPath || path.join(root, ...String(o.path).split('/'));
+    const prev = byPath.get(abs);
+    if (!prev) { byPath.set(abs, { ...o, abs }); continue; }
+    if (o.merge && typeof prev.content === 'string') prev.content = o.merge(prev.content);
+  }
+  for (const o of byPath.values()) {
+    const { path: shown, abs, content, merge, replace, absPath } = o;
+    const extra = Object.fromEntries(['host', 'kind'].filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
+    if (!absPath && (relPosix(root, abs) == null || String(shown).split('/').includes('..'))) {
+      skipped.push({ path: shown, reason: 'outside the repository', ...extra });
+      continue;
+    }
+    if (isDir(abs)) { skipped.push({ path: shown, reason: 'a directory exists at this path', ...extra }); continue; }
+    let current = null;
+    try { current = fs.readFileSync(abs); } catch {}
+    let next = content;
+    let action = 'create';
+    if (current != null) {
+      const text = current.toString('utf8');
+      action = merge && !replace ? 'merge' : 'overwrite';
+      if (action === 'merge') {
+        try { next = merge(text); } catch (err) {
+          if (!force) {
+            const reason = `cannot merge (${err.message}); use --force to replace it`;
+            skipped.push({ path: shown, reason, planned: 'overwrite', ...extra });
+            continue;
+          }
+          next = content;
+          action = 'overwrite';
+        }
+      }
+      const lf = (t) => t.replace(/\r\n/g, '\n');
+      const same = Buffer.isBuffer(next) ? current.equals(next) : lf(String(next)) === lf(text);
+      if (same) { written.push({ path: shown, action: 'unchanged', bytes: current.length, ...extra }); continue; }
+      if (!force && !replace && (action === 'overwrite' || mergeNeedsForce)) {
+        const reason = `exists (use --force to ${action}; a backup is kept)`;
+        skipped.push({ path: shown, reason, planned: action, ...extra });
+        continue;
+      }
+      if (!dryRun && backupDir && (action === 'overwrite' || mergeNeedsForce)) {
+        const dir = backupDir();
+        if (dir) {
+          const b = path.join(dir, ...String(shown).replace(/^(\.\.\/)+/, '').split('/'));
+          ensureDir(path.dirname(b));
+          fs.writeFileSync(b, current);
+          backups.push(toPosix(b));
+        }
+      }
+    }
+    if (!dryRun) writeFileAtomic(abs, next);
+    const done = dryRun ? `would-${action}` : action;
+    written.push({ path: shown, action: done, bytes: Buffer.byteLength(next), ...extra });
+  }
+  return { written, skipped, backups };
+}
+
 // ---------------------------------------------------------------------------
 // Append-only records
 
@@ -287,7 +439,7 @@ export function hookLog(stateDir, entry) {
     try {
       if (fs.statSync(file).size > LOG_ROTATE_BYTES) fs.renameSync(file, `${file}.1`);
     } catch {}
-    const line = JSON.stringify({ ts: nowIso(), ...entry }).replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, 'ADC_LIVE_TOKEN=[REDACTED]');
+    const line = redactLiveToken(JSON.stringify({ ts: nowIso(), ...entry }));
     fs.appendFileSync(file, line + '\n');
   } catch {
     // Logging must never break a hook.
@@ -303,7 +455,6 @@ export function hookLog(stateDir, entry) {
  * Returns { root, state, base: { ref, tip, sha, source }, snapshot: { tree, commit, head } }.
  */
 export async function prepareTarget(ctx, { base = null, snapshot = null, createState = true } = {}) {
-  const { requireRepo, resolveBase, createSnapshot } = await import('./git.mjs');
   const root = requireRepo(ctx.cwd);
   const state = prepareStateDir({ ...ctx, cwd: root }, { create: createState });
   const b = resolveBase(root, base);
