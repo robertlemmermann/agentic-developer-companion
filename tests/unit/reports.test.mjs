@@ -8,11 +8,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import * as core from '../../scripts/lib/core.mjs';
-import * as reports from '../../scripts/lib/reports.mjs';
-import * as cr from '../../scripts/lib/clean-run.mjs';
-import * as probes from '../../scripts/lib/probes.mjs';
-import { prepareTarget } from '../../scripts/lib/state.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as reports from '../../skills/agentic-developer-companion/scripts/lib/reports.mjs';
+import * as cr from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
+import * as probes from '../../skills/agentic-developer-companion/scripts/lib/probes.mjs';
+import { prepareTarget } from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const fixture = (name) => fs.readFileSync(path.join(FIX, 'reports', name), 'utf8');
@@ -45,7 +45,7 @@ function alive(pid) {
   try { return !/^State:\s+Z/m.test(fs.readFileSync(`/proc/${pid}/status`, 'utf8')); } catch { return true; }
 }
 let HAS_MARKERS = false;
-try { HAS_MARKERS = Array.isArray((await import('../../scripts/lib/markers.mjs')).SECRET_PATTERNS); } catch {}
+try { HAS_MARKERS = Array.isArray((await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs')).SECRET_PATTERNS); } catch {}
 
 function makeRepo(files = {}) {
   const dir = tmp('adc-wpd-repo-');

@@ -6,10 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import * as core from '../../scripts/lib/core.mjs';
-import * as state from '../../scripts/lib/state.mjs';
-import * as live from '../../scripts/lib/live.mjs';
-import * as doctor from '../../scripts/lib/doctor.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import * as live from '../../skills/agentic-developer-companion/scripts/lib/live.mjs';
+import * as doctor from '../../skills/agentic-developer-companion/scripts/lib/doctor.mjs';
 
 const ADC = core.ADC_SCRIPT;
 const POSIX = process.platform !== 'win32';
@@ -708,7 +708,7 @@ test('cli: doctor warns about raised budget caps, terminal overrides and a token
 
 test('doctor lists registered hooks (hooks-render) and probes the launchers of their host', { skip: !POSIX && 'POSIX launchers' }, async () => {
   let hr;
-  try { hr = await import('../../scripts/lib/hooks-render.mjs'); } catch { return; }
+  try { hr = await import('../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs'); } catch { return; }
   if (typeof hr.renderHooks !== 'function' || typeof hr.writeHooks !== 'function') return;
   const { dir } = makeRepo({});
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-hooks-home-'));

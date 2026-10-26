@@ -11,17 +11,17 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SKILL = path.resolve(HERE, '..', '..');
+const SKILL = path.resolve(HERE, '..', '..', 'skills', 'agentic-developer-companion');
 const ADC = path.join(SKILL, 'scripts', 'adc.mjs');
-const P = await import('../../scripts/lib/tooling-port.mjs');
-const T = await import('../../scripts/lib/tooling.mjs');
-const { which } = await import('../../scripts/lib/core.mjs');
+const P = await import('../../skills/agentic-developer-companion/scripts/lib/tooling-port.mjs');
+const T = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs');
+const { which } = await import('../../skills/agentic-developer-companion/scripts/lib/core.mjs');
 const LINT_AVAILABLE = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'tooling-lint.mjs'));
 const CLAUDE = which('claude');
 // Real host CLIs run their free load checks when they are on PATH (nothing is installed or spent).
 const COPILOT = which('copilot');
 const CODEX = which('codex');
-const TL = LINT_AVAILABLE ? await import('../../scripts/lib/tooling-lint.mjs') : null;
+const TL = LINT_AVAILABLE ? await import('../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs') : null;
 
 const dirs = [];
 after(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); });

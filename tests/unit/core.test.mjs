@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import * as core from '../../scripts/lib/core.mjs';
-import * as git from '../../scripts/lib/git.mjs';
-import * as state from '../../scripts/lib/state.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as git from '../../skills/agentic-developer-companion/scripts/lib/git.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 
 const ADC = core.ADC_SCRIPT;
 

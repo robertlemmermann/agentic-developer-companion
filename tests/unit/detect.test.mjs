@@ -6,12 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import * as core from '../../scripts/lib/core.mjs';
-import * as state from '../../scripts/lib/state.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import {
   detect, isTestFile, projectForFile, RUNNERS, DEFAULT_TEST_GLOBS, detectCommand, tokenizeShell, parseToml, parseYaml,
   parseIni, parseMakeTargets, normalizeGlob, portableArg,
-} from '../../scripts/lib/detect.mjs';
+} from '../../skills/agentic-developer-companion/scripts/lib/detect.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
@@ -274,7 +274,7 @@ test('malformed inputs never break detection: bad JSON, BOM, CRLF, unparseable Y
 });
 
 test('own source files carry no secret-shaped literals', async (t) => {
-  const markers = await import('../../scripts/lib/markers.mjs').catch(() => null);
+  const markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs').catch(() => null);
   if (!markers || typeof markers.scanSecrets !== 'function') { t.skip('markers.mjs not available in this build'); return; }
   const files = [path.join(core.SKILL_DIR, 'scripts', 'lib', 'detect.mjs'), fileURLToPath(import.meta.url), path.join(FIX, '_parts', 'detect.json')];
   for (const f of files) assert.deepEqual(markers.scanSecrets(fs.readFileSync(f, 'utf8')).map((h) => `${h.id}:${h.line}`), [], f);
@@ -399,7 +399,7 @@ test('real run: the node-test runner with the report flag before its paths write
     assert.equal(run.exit, 0, run.stderr || run.stdout);
     const xml = fs.readFileSync(report, 'utf8');
     assert.match(xml, /<testcase[^>]*name="adds"/);
-    const reports = await import('../../scripts/lib/reports.mjs').catch(() => null);
+    const reports = await import('../../skills/agentic-developer-companion/scripts/lib/reports.mjs').catch(() => null);
     if (reports && typeof reports.parseReport === 'function') {
       const counts = reports.parseReport(r.report.format, xml);
       assert.equal(counts.passed, 1);
@@ -409,7 +409,7 @@ test('real run: the node-test runner with the report flag before its paths write
 });
 
 test('clean-run compatibility: every detected runner builds a command with its report target resolved', async (t) => {
-  const cr = await import('../../scripts/lib/clean-run.mjs').catch(() => null);
+  const cr = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs').catch(() => null);
   if (!cr || typeof cr.resolveRunner !== 'function' || typeof cr.buildRunCommand !== 'function') { t.skip('clean-run.mjs not available in this build'); return; }
   const out = tmpDir();
   try {

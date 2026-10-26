@@ -43,7 +43,6 @@ const COMMANDS = {
   'live': ['live.mjs', 'liveCommand'],
   'budget': ['live.mjs', 'budgetCommand'],
   'scaffold': ['scaffold.mjs', 'scaffoldCommand'],
-  'selftest': ['selftest.mjs', 'selftestCommand'],
   'doctor': ['doctor.mjs', 'doctorCommand'],
 };
 
@@ -72,7 +71,6 @@ const HELP = [
   '  hooks render      render hook config for a host (alias: setup hooks)',
   '  hook-run <event>  hook handler (reads stdin, prints one JSON object)',
   '  doctor            environment and installation diagnostics',
-  '  selftest          the skill\'s own tests',
   '  version | help',
   '',
   'Common options: --json --cwd <dir> --base <ref> --state-dir <dir> --dry-run --yes',

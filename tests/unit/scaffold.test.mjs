@@ -11,8 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import * as core from '../../scripts/lib/core.mjs';
-import * as scaffold from '../../scripts/lib/scaffold.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as scaffold from '../../skills/agentic-developer-companion/scripts/lib/scaffold.mjs';
 
 const ADC = core.ADC_SCRIPT;
 const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-scaffold-')));
@@ -190,7 +190,7 @@ function validateAll(dir, res) {
 let markers;
 async function loadMarkers() {
   if (markers !== undefined) return markers;
-  try { markers = await import('../../scripts/lib/markers.mjs'); } catch { markers = null; }
+  try { markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs'); } catch { markers = null; }
   return markers;
 }
 
@@ -451,7 +451,7 @@ describe('scaffold command', () => {
 
   test('tooling kinds are delegated to tooling.mjs scaffoldTooling', async (t) => {
     let mod = null;
-    try { mod = await import('../../scripts/lib/tooling.mjs'); } catch {}
+    try { mod = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs'); } catch {}
     if (!mod || typeof mod.scaffoldTooling !== 'function') return t.skip('tooling.mjs is not available in this build');
     const dir = repo(nodeProject());
     const res = sc(dir, 'skill', ['--for', 'claude', '--name', 'demo-skill', '--description', 'Use when testing the scaffold delegation of the companion.']);
@@ -612,7 +612,7 @@ describe('regress', () => {
       .replace(/assert\.fail\([^\n]*\);/, 'assert.equal(sum([]), 0);'));
     fs.writeFileSync(path.join(dir, 'src/sum.mjs'), 'export function sum(values) {\n  return values.reduce((a, b) => a + b, 0);\n}\n');
     let cleanRun = null;
-    try { cleanRun = await import('../../scripts/lib/clean-run.mjs'); } catch {}
+    try { cleanRun = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs'); } catch {}
     if (!cleanRun || typeof cleanRun.cleanRunCommand !== 'function') return t.skip('clean-run.mjs is not available in this build');
     const before = git(dir, 'status', '--porcelain');
     const rg = adc(['clean-run', '--red-green', testFile], { cwd: dir });
@@ -928,7 +928,7 @@ describe('live', () => {
 
   test('the generated probe project runs under `adc.mjs live run`; the token never appears in the output', { timeout: 60_000 }, async (t) => {
     let live = null;
-    try { live = await import('../../scripts/lib/live.mjs'); } catch {}
+    try { live = await import('../../skills/agentic-developer-companion/scripts/lib/live.mjs'); } catch {}
     if (!live || typeof live.liveRunCommand !== 'function') return t.skip('live.mjs is not available in this build');
     const token = ['tok', 'scaffold', String(Date.now())].join('-');
     const { server, url } = await startServer((req, res) => {
@@ -1060,7 +1060,7 @@ describe('ci-gate', () => {
     assert.match(fs.readFileSync(path.join(out, 'output'), 'utf8'), /^executed=2$/m);
     assert.match(fs.readFileSync(path.join(out, 'summary.md'), 'utf8'), /\| 2 \| 2 \| 0 \| 0 \| 1 \| 0 \|/);
     let clean = null;
-    try { clean = await import('../../scripts/lib/clean-run.mjs'); } catch {}
+    try { clean = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs'); } catch {}
     if (clean && typeof clean.importBaseCounts === 'function') {
       assert.equal(clean.importBaseCounts(path.join(out, 'counts.json'), '.').executed, 2, 'clean-run --base-counts imports the CI counts');
     }

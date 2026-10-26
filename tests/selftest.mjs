@@ -1,4 +1,8 @@
-// `selftest`: the skill's own tests (§13) behind one command. Areas backed by unit files run
+// `selftest`: the skill's own tests (§13) behind one command, run from the repository:
+//   node tests/selftest.mjs [--only area,...]
+// It is development tooling and is not shipped: the skill folder carries only what a consumer
+// needs, while tests/, evals/, CHANGELOG.md and THIRD_PARTY_NOTICES.md live at the repo root.
+// Areas backed by unit files run
 // `node --test --test-reporter=tap <file>` in a child process and parse the TAP stream (a
 // missing unit file makes it `skipped`, not failed, while the build is in progress); the
 // cross-cutting areas check the skill tree directly. Scenarios run in temp repositories that
@@ -12,11 +16,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   EXIT, SKILL_DIR, SKILL_NAME, IS_WINDOWS, defineCommand, usageError, readText, readJson, run, which,
   toolVersion, versionGte, parseVersion, toPosix, tmpRoot, truncate, nowIso, nonce,
-} from './core.mjs';
-import { createSnapshot, lsTree } from './git.mjs';
-import { materializeTemplates, prepareStateDir } from './state.mjs';
+} from '../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import { createSnapshot, lsTree } from '../skills/agentic-developer-companion/scripts/lib/git.mjs';
+import { materializeTemplates, prepareStateDir } from '../skills/agentic-developer-companion/scripts/lib/state.mjs';
 
-const OWN_LIB = path.dirname(fileURLToPath(import.meta.url));
+const OWN_LIB = path.join(SKILL_DIR, 'scripts', 'lib');
+/** The repository root that holds tests/, evals/, README.md, CHANGELOG.md for a skill at skills/<name>/. */
+const devRootOf = (skillDir) => path.resolve(skillDir, '..', '..');
+/** Development-only material that must never ship inside the skill folder. */
+const DEV_ONLY = ['tests', 'evals', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', '.gitattributes'];
 
 /** Unit files per area (tests/unit/); any other unit file present runs under `scripts`. */
 export const UNIT_FILES = Object.freeze({
@@ -52,7 +60,7 @@ export const AREAS = Object.freeze({
   scaffold: 'scaffold unit tests',
 });
 
-const LIMITS = Object.freeze({ files: 100, folderEntries: 50, fileBytes: 5 * 1024 * 1024, skillLines: 350, refLines: 300, tocOver: 100,
+const LIMITS = Object.freeze({ files: 100, folderEntries: 50, fileBytes: 5 * 1024 * 1024, skillLines: 150, refLines: 300, tocOver: 100,
   prereqLines: 200, evalFiles: 10, descriptionChars: 1024, compatibilityChars: 500 });
 const DEFAULT_TIMEOUT_S = 600;
 const FALLBACK_EVENTS = ['session-start', 'post-edit', 'post-shell', 'stop', 'pre-guard', 'session-end'];
@@ -572,11 +580,13 @@ function makeContext({ skillDir, env, timeoutS, external, keep }) {
   const ownAdc = path.join(SKILL_DIR, 'scripts', 'adc.mjs');
   const targetAdc = path.join(dir, 'scripts', 'adc.mjs');
   const top = run('git', ['rev-parse', '--show-toplevel'], { cwd: dir, env: childEnv(env), timeoutMs: 30_000 });
-  const readme = path.join(dir, '..', '..', 'README.md');
+  const devRoot = devRootOf(dir);
+  const readme = path.join(devRoot, 'README.md');
   let tmpBase = null;
   const modules = new Map();
   const sx = {
     skillDir: dir,
+    devRoot,
     name: path.basename(dir),
     adc: exists(targetAdc) ? targetAdc : ownAdc,
     repoRoot: top.exit === 0 ? path.resolve(top.stdout.trim()) : null,
@@ -656,6 +666,9 @@ async function areaFootprint(sx) {
   sx.texts = texts;
   cases.push(verdict('LF line endings', crlf.map((x) => `CR in ${x}`), `${texts.size} text file(s), no CR`));
   cases.push(verdict('no symlinks', t.symlinks.map((s) => `${s} is a symlink`), 'none'));
+  const devOnly = DEV_ONLY.filter((n) => exists(path.join(S, n))).map((n) => `${n} is development material; keep it at the repository root`);
+  devOnly.push(...t.files.filter((f) => /\.test\.m?js$/.test(f.rel)).map((f) => `${f.rel} is a test file`));
+  cases.push(verdict('skill folder ships only consumer files', devOnly, 'no tests, evals, changelog or notices inside the skill'));
 
   const markers = (await sx.lib('markers.mjs')).mod;
   const credNames = [];
@@ -725,7 +738,7 @@ async function areaFootprint(sx) {
   cases.push(verdict('references within budget', budget, `each <= ${LIMITS.refLines} lines; a table of contents above ${LIMITS.tocOver}`));
 
   const linkProblems = [];
-  const docs = ['SKILL.md', 'PREREQUISITES.md', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', ...refMd.map((n) => `references/${n}`)];
+  const docs = ['SKILL.md', 'PREREQUISITES.md', ...refMd.map((n) => `references/${n}`)];
   for (const rel of docs) {
     const abs = path.join(S, ...rel.split('/'));
     if (!exists(abs)) continue;
@@ -750,7 +763,7 @@ async function areaFootprint(sx) {
       if (m) { ported.push({ rel, source: m[1] }); break; }
     }
   }
-  const notices = readText(path.join(S, 'THIRD_PARTY_NOTICES.md'));
+  const notices = readText(path.join(sx.devRoot, 'THIRD_PARTY_NOTICES.md'));
   const noticeProblems = [];
   for (const p of ported) {
     if (notices == null) { noticeProblems.push(`${p.rel} has a "Ported from" header but THIRD_PARTY_NOTICES.md is missing`); continue; }
@@ -1170,7 +1183,7 @@ async function areaRelease(sx) {
   version = version != null ? String(version) : foundationVersion(skillText);
   if (!version) return [fail('metadata.version', 'SKILL.md has no metadata.version')];
 
-  const changelog = readText(path.join(sx.skillDir, 'CHANGELOG.md'));
+  const changelog = readText(path.join(sx.devRoot, 'CHANGELOG.md'));
   if (changelog == null) cases.push(fail('CHANGELOG.md top entry = metadata.version', 'CHANGELOG.md is missing'));
   else {
     const top = changelogTop(changelog);
@@ -1213,11 +1226,11 @@ async function areaRelease(sx) {
 
 async function areaEvals(sx) {
   const cases = [];
-  const dir = path.join(sx.skillDir, 'evals');
+  const dir = path.join(sx.devRoot, 'evals');
   const S = toPosix(sx.skillDir);
   const adcPath = toPosix(sx.adc);
   const paid = [
-    `claude plugin eval "${S}" --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "<tmp>/adc-evals" --json "<tmp>/adc-evals/result.json"`,
+    `claude plugin eval "${toPosix(sx.devRoot)}" --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "<tmp>/adc-evals" --json "<tmp>/adc-evals/result.json"`,
     `node "${adcPath}" tooling trigger-set "${S}" --host claude --run --runs 3 --max-cost-usd 10`,
     `node "${adcPath}" tooling trigger-set "${S}" --host copilot --run --runs 3`,
   ];
@@ -1226,8 +1239,9 @@ async function areaEvals(sx) {
     cases.push(skip('paid evals (manual)', `never run by selftest; run by hand: ${paid.join(' ; ')}`, { commands: paid }));
     return cases;
   }
-  const t = sx.getTree();
-  const evalFiles = t.files.filter((f) => f.rel.startsWith('evals/'));
+  const evalFiles = [];
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) walk(path.join(d, e.name)); else evalFiles.push(e.name); } };
+  walk(dir);
   cases.push(evalFiles.length <= LIMITS.evalFiles ? pass('evals/ file count', `${evalFiles.length} file(s) (limit ${LIMITS.evalFiles})`)
     : fail('evals/ file count', `${evalFiles.length} files, limit ${LIMITS.evalFiles}`));
   if (exists(path.join(dir, 'results'))) cases.push(fail('no eval results in the tree', 'evals/results/ exists; pass --output-dir outside the skill'));
@@ -1678,7 +1692,7 @@ export function resolveAreas(only) {
 
 /** Unit files per selected area, with every unit file no area claims added to `scripts`. */
 function unitPlan(sx, areas) {
-  const dir = path.join(sx.skillDir, 'tests', 'unit');
+  const dir = path.join(sx.devRoot, 'tests', 'unit');
   const present = exists(dir) ? fs.readdirSync(dir).filter((n) => /\.test\.m?js$/.test(n)).sort() : [];
   const claimed = new Set(Object.values(UNIT_FILES).flat());
   const plan = [];
@@ -1705,7 +1719,7 @@ async function runUnits(sx, plan, { jobs, units, progress }) {
     const worker = async () => {
       while (next < todo.length) {
         const u = todo[next++];
-        const res = await runUnitProcess(u.abs, { cwd: sx.skillDir, env: sx.env, timeoutMs: sx.timeoutS * 1000 });
+        const res = await runUnitProcess(u.abs, { cwd: sx.devRoot, env: sx.env, timeoutMs: sx.timeoutS * 1000 });
         const tap = parseTap(res.stdout);
         const cs = unitCases(u.rel, res, tap, sx.timeoutS);
         results.set(u.rel, cs);
@@ -1790,7 +1804,7 @@ export async function selftest({ skillDir = SKILL_DIR, only = null, timeoutS = D
 /** What a run would do, without running anything (`--list` / `--dry-run`). */
 export function selftestPlan({ skillDir = SKILL_DIR, only = null } = {}) {
   const areas = resolveAreas(only);
-  const sx = { skillDir: path.resolve(skillDir) };
+  const sx = { skillDir: path.resolve(skillDir), devRoot: devRootOf(path.resolve(skillDir)) };
   const plan = unitPlan(sx, areas);
   return {
     skill_dir: toPosix(sx.skillDir),
@@ -1862,3 +1876,9 @@ export const selftestCommand = defineCommand({
     };
   },
 });
+
+// Standalone entry: `node tests/selftest.mjs [options]` (the shipped adc.mjs has no selftest command).
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const { dispatch } = await import('../skills/agentic-developer-companion/scripts/lib/core.mjs');
+  process.exitCode = await dispatch('selftest', process.argv.slice(2), async () => ({ selftestCommand }), 'selftestCommand');
+}

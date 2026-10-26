@@ -5,10 +5,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import * as core from '../../scripts/lib/core.mjs';
-import * as ev from '../../scripts/lib/evidence.mjs';
-import * as tr from '../../scripts/lib/trace.mjs';
-import * as vf from '../../scripts/lib/verify.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as ev from '../../skills/agentic-developer-companion/scripts/lib/evidence.mjs';
+import * as tr from '../../skills/agentic-developer-companion/scripts/lib/trace.mjs';
+import * as vf from '../../skills/agentic-developer-companion/scripts/lib/verify.mjs';
 
 const ADC = core.ADC_SCRIPT;
 delete process.env.ADC_HOME;

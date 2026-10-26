@@ -9,9 +9,9 @@ import { fileURLToPath } from 'node:url';
 import {
   parseFrontmatter, parseYaml, parseYamlDocument, stringifyYaml, stringifyFrontmatter, YamlError, resolvePlain,
   normalizeSkillFrontmatter, INSTALL_METADATA_KEY,
-} from '../../scripts/lib/frontmatter.mjs';
-import * as lint from '../../scripts/lib/tooling-lint.mjs';
-import * as core from '../../scripts/lib/core.mjs';
+} from '../../skills/agentic-developer-companion/scripts/lib/frontmatter.mjs';
+import * as lint from '../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
@@ -411,7 +411,7 @@ describe('tooling-lint: the companion skill and its rendered hooks', () => {
 
   test('every hook config hooks-render produces lints without errors or warnings', async (t) => {
     let hr;
-    try { hr = await import('../../scripts/lib/hooks-render.mjs'); } catch { t.skip('hooks-render.mjs is not available'); return; }
+    try { hr = await import('../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs'); } catch { t.skip('hooks-render.mjs is not available'); return; }
     if (typeof hr.renderHooks !== 'function') { t.skip('renderHooks is not available'); return; }
     const root = tmp();
     const home = path.join(root, 'home');
@@ -628,7 +628,7 @@ function adc(args, { cwd, env = {} } = {}) {
 describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
   let available = true;
   test('tooling lint is reachable through the tooling group', async (t) => {
-    try { const m = await import('../../scripts/lib/tooling.mjs'); available = typeof m.toolingCommand === 'function'; } catch { available = false; }
+    try { const m = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs'); available = typeof m.toolingCommand === 'function'; } catch { available = false; }
     if (!available) t.skip('tooling.mjs (WP-J) is not available; lintCommand is tested directly below');
   });
 

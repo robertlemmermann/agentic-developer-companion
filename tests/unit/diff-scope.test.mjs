@@ -8,12 +8,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import * as core from '../../scripts/lib/core.mjs';
-import * as git from '../../scripts/lib/git.mjs';
-import * as state from '../../scripts/lib/state.mjs';
-import * as M from '../../scripts/lib/markers.mjs';
-import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand, ciBlock, workflowEvents } from '../../scripts/lib/diff-scope.mjs';
-import * as deps from '../../scripts/lib/deps.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as git from '../../skills/agentic-developer-companion/scripts/lib/git.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import * as M from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
+import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand, ciBlock, workflowEvents } from '../../skills/agentic-developer-companion/scripts/lib/diff-scope.mjs';
+import * as deps from '../../skills/agentic-developer-companion/scripts/lib/deps.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {

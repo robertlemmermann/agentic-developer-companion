@@ -10,11 +10,11 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import * as core from '../../scripts/lib/core.mjs';
-import * as state from '../../scripts/lib/state.mjs';
-import * as dialects from '../../scripts/lib/hook-dialects.mjs';
-import * as hookRun from '../../scripts/lib/hook-run.mjs';
-import * as hooksRender from '../../scripts/lib/hooks-render.mjs';
+import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import * as dialects from '../../skills/agentic-developer-companion/scripts/lib/hook-dialects.mjs';
+import * as hookRun from '../../skills/agentic-developer-companion/scripts/lib/hook-run.mjs';
+import * as hooksRender from '../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIX = path.join(HERE, '..', 'fixtures');
@@ -391,7 +391,7 @@ test('scanCatalog reports line numbers, honors patch line maps and multi-line pa
 const HAS_MARKERS = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'markers.mjs'));
 
 test('scanEdit uses markers.mjs scanText: languages, comment masking and multi-line constructs', { skip: HAS_MARKERS ? false : 'markers.mjs not built yet' }, async () => {
-  const markers = await import('../../scripts/lib/markers.mjs');
+  const markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs');
   const m = { scanText: markers.scanText };
   const multiCatch = 'try {\n  run();\n} catch (e) {\n  log(e);\n}\n';
   assert.deepEqual(hookRun.scanEdit(m, multiCatch, markers.SWALLOW_PATTERNS, 'src/a.js'), [], 'a catch block with a body is not swallowing');
