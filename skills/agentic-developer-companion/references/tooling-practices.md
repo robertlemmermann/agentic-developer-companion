@@ -27,9 +27,9 @@ Without Node, each mode's playbook has a manual fallback; write its results into
   deliberately. Marketplace entries pin `ref` and a 40-character `sha`.
 - **Instructions and agents** have no version field: the repository tag and the changelog
   entry are the version.
-- Breaking (bumps the minor before 1.0.0, the major after): a renamed mode or argument, a
-  removed or retyped field, a changed output contract, a hook that must be re-registered, a
-  raised host minimum.
+- Breaking (bumps the minor before 1.0.0, the major after): a renamed or removed mode,
+  command or argument, a removed or retyped field, a changed output contract, a hook that must
+  be re-registered, a raised host minimum.
 - `tooling modify compare ... --accept` writes the changelog entry and the version bump for a
   measured change ([tooling-modify](tooling-modify.md) §4).
 

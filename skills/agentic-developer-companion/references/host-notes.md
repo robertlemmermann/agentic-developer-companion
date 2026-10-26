@@ -37,15 +37,13 @@ Explicit non-interactive switch for scripts on every host: `--yes` (also implied
 
 ## 2. Script commands
 
-Every command is `node "<skill>/scripts/adc.mjs" <command> [options] --json`; locate `<skill>`
-as SKILL.md describes or read it from `doctor`. Output is one ASCII-only JSON document on
-stdout and a one-line summary on stderr. Global options: `--json`, `--cwd <dir>`,
-`--base <ref>`, `--state-dir <dir>`, `--dry-run`, `--yes`, `--help`. Exit codes: `0` ok, `1` findings, `2`
-usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4` could not verify.
+Invocation, `$ADC`, output and exit codes: [SKILL.md](../SKILL.md) Scripts (exit `3` covers a
+missing Git, Node 24, runner or tool and a tracked `.adc/`). Global options: `--json`,
+`--cwd <dir>`, `--base <ref>`, `--state-dir <dir>`, `--dry-run`, `--yes`, `--help`.
 
 | Command | Purpose | Key options | JSON output |
 |---|---|---|---|
-| `verify` | every scripted verify step on one snapshot, into one ledger | `--base` `--spec` `--claims` `--quick\|--deep` `--finalize` `--allow` `--offline` `--runner` `--no-install` | `{ ledger, markdown, verdict, checks[], claims[], next_steps[], trace_matrix, worktree_unchanged }` |
+| `verify` | every scripted verify step on one snapshot, into one ledger | `--base` `--spec` `--claims` `--quick\|--deep` `--finalize` `--allow` `--offline` `--runner` `--no-install` | [verify](verify.md) |
 | `detect` | projects, managers, runners with report and retries-off flags, test globs, CI, default branch | `--refresh` | `{ cache_key, summary, projects[{root, languages[], managers[], runners[], test_globs[]}], ci, lint[], typecheck[], default_branch, base_source }` |
 | `diff-scope` | CK-SCOPE, TEST-DEL, SKIP, ASSERT, TEST-CFG, SUPPRESS, CI, SWALLOW, SECRETS, LOCK (static), RETRY | `--base` `--spec` `--allow <glob>` | `{ base, tree_digest, files[], findings[], counts, checks[] }` |
 | `deps-check` | new dependencies exist, look-alikes, lockfile consistency (CK-DEPS, CK-LOCK) | `--offline\|--online` `--static-only` | `{ new_deps[{name, ecosystem, exists, source, lookalike_of}], lock_status, findings[], checks[] }` |
@@ -56,16 +54,15 @@ usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4
 | `flake-probe` | repeat and shuffle new or changed tests (CK-FLAKE) | `--times <n>` `--tests <file[::name]>` | `{ runs, shuffle, seeds[], failures[], suspect_tests[], checks[] }` |
 | `evidence init\|add\|claims\|waive\|finalize\|render\|status\|score` | the ledger; claim status derived; waivers quote the spec; `score` aggregates yes/no/unknown answers | `--ledger` `--check` `--run` `--repro` `--reason` `--file` `--md` `--short` `--out` `--add` | ledger summary per subcommand ([verify](verify.md) §6) |
 | `trace` | requirement candidates and unmapped hunks (CK-TRACE) | `--spec` `--matrix <completed.json>` `--md` | `{ requirements[], extras[], hunks_total, checks[] }` |
-| `scaffold <kind>` | `e2e-web e2e-api e2e-cli live regress ci-gate flake` and the tooling kinds | `--lang` `--for` `--out` `--write` `--force` `--checklist` | `{ written[], next_steps[] }` |
-| `live run` | live probes under the budget ledger (CK-LIVE) | `--manifest` `--probes` `--session` `--credits` `--credits-override` (terminal only) `--no-ledger` | `{ session_id, identity_source, probes[{id, status, cost, duration_ms}], spent, remaining, stopped_reason }` |
+| `scaffold <kind>` | `e2e-web e2e-api e2e-cli live regress ci-gate flake`; the tooling kinds `instructions skill agent prompt hooks mcp plugin` (= `tooling scaffold <kind>`) | `--lang` `--for` `--name` `--out` `--write` `--force` `--checklist` | `{ written[], next_steps[] }`; per kind in its playbook |
+| `live run` | live probes under the budget ledger (CK-LIVE) | `--manifest` `--probes` `--session` `--credits` `--credits-override` (terminal only) `--no-ledger` | [live](live.md) |
 | `budget show\|reset\|prune` | inspect or maintain `.adc/budget.json` | `--session` | `{ unit, max_per_session, max_per_day, today, sessions[] }` |
-| `tooling lint` | host-rule validation incl. the security group | `--host` `--strict` `--no-external` `--allow-host` | `{ files[{path, kind, host_results[]}], security[], summary }` |
-| `tooling cost` | context cost per file and host | `--host` `--context-tokens` `--max-tokens` `--top` | `{ files[{path, chars, est_tokens, always_on}], totals, biggest_always_on[] }` |
-| `tooling port` | translate tooling between hosts | `--from` `--to` `--out` `--force` | `{ written[], dropped_fields[], manual_steps[] }` |
-| `tooling trigger-set` | trigger-eval set; runs only with `--run` (paid) | `--init` `--set` `--host` `--run` `--runs` `--threshold` `--max-cost-usd` | `{ queries[], results[], per_query_pass_rate, suite_score }` |
-| `tooling modify` | baseline, compare, accept or reject; migrations | `baseline\|compare\|restore <path>` `--accept` `--migrate <kind>` | `{ before, after, deltas, verdict, changelog_entry }` |
-| `tooling plugin` | plugins for the user's own projects | `init\|check\|test\|release` `--for` | `{ files[], validators[], local_test_commands[], release_steps[] }` |
-| `tooling scaffold <kind>` | instructions, skill, agent, prompt, hooks, mcp, plugin | `--for` `--name` `--write` | `{ written[], next_steps[] }` |
+| `tooling lint` | host-rule validation incl. the security group | `--host` `--strict` `--no-external` `--allow-host` | [tooling-lint](tooling-lint.md) |
+| `tooling cost` | context cost per file and host | `--host` `--context-tokens` `--max-tokens` `--top` | [tooling-optimize](tooling-optimize.md) §2 |
+| `tooling port` | translate tooling between hosts | `--from` `--to` `--out` `--force` | [tooling-port](tooling-port.md) |
+| `tooling trigger-set` | trigger-eval set; runs only with `--run` (paid) | `--init` `--set` `--host` `--run` `--runs` `--threshold` `--max-cost-usd` | `{ queries[], results[], per_query_pass_rate, suite_score }` ([tooling-eval](tooling-eval.md)) |
+| `tooling modify` | baseline, compare, accept or reject; migrations | `baseline\|compare\|restore <path>` `--accept` `--migrate <kind>` | [tooling-modify](tooling-modify.md) |
+| `tooling plugin` | plugins for the user's own projects | `init\|check\|test\|release` `--for` | [tooling-plugin](tooling-plugin.md) |
 | `hooks render` (alias `setup hooks`) | render, merge (`--write`) or remove (`--remove`) the hook config | `--host` `--scope` `--level` `--node-path` | `{ host, target_file, config, warnings[], next_steps[], permission_rules }` |
 | `hooks list` | registered hooks of this skill | — | `{ hooks[{host, scope, file, events[], level}] }` |
 | `hook-run <event>` | the hook handler: stdin payload in, one decision object out, always exit 0 | `--dialect` `--level` | host-specific decision (`{}` for none) |
@@ -117,7 +114,7 @@ context): Copilot has none of them and Codex passes them through as text.
 
 **Measured**: `skills-ref validate` (strictyaml) passes this skill and rejects flow-style YAML
 such as `[Bash]`; Codex re-quotes unquoted `: ` in scalars (documented); `gh skill install`
-rewrites the frontmatter on install (§8), so never compare an installed SKILL.md byte for byte.
+rewrites the frontmatter (§8).
 
 ## 6. Hooks
 
@@ -146,16 +143,14 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
 ## 8. Measured on 2026-10-25
 
 - **`gh skill install`** (gh 2.99.0) discovers `skills/agentic-developer-companion/` in a
-  repository whose root holds only `LICENSE` and the README. Destinations: default agent
-  (`github-copilot`) `.agents/skills/` (project) and `~/.copilot/skills/` (user);
-  `--agent claude-code` `.claude/skills/` and `~/.claude/skills/`; `--agent codex`
-  `.agents/skills/` and `~/.agents/skills/`; `--dir .github/skills` →
-  `.github/skills/agentic-developer-companion/`. `--pin` takes a tag or SHA as its value.
+  repository whose root holds only `LICENSE` and the README; destinations per `--agent`,
+  `--scope` and `--dir` as in [install](install.md) §2. `--pin` takes a tag or SHA as its value.
 - **`gh skill install` rewrites SKILL.md frontmatter**: keys sorted, folded `>-` scalars
   turned into single-quoted or plain strings, `metadata.version` unquoted, 4-space
   indentation, the blank line after `---` dropped, provenance added inside `metadata`
   (`local-path` for `--from-local`, `github-*` keys for remote installs). `doctor
-  --verify-vendored` therefore compares SKILL.md semantically and other files byte for byte.
+  --verify-vendored` therefore compares SKILL.md semantically and other files byte for byte;
+  never compare an installed SKILL.md byte for byte.
 - **`gh skill publish --dry-run`** passes on this repository; the only warning is the missing
   tag-protection ruleset. Validation strips `metadata.github-*`.
 - **`copilot skill list --json`** works without authentication; fields `name`, `description`,
@@ -173,8 +168,8 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
   `contents: []` as not applicable, never as a pass.
 - **`claude plugin eval`**: a bare skill folder given as the target resolves as a plugin named
   after the folder (C8); a repository root that only contains `skills/` does not (`plugins: []`,
-  so the "with" arm runs without the skill). It refuses an `--eval-dir` outside the target, so
-  this repository's `tests/run-evals.mjs` copies the skill to a temp dir with `evals/` inside. `claude plugin eval init --bare
+  so the "with" arm runs without the skill). It refuses an `--eval-dir` outside the target:
+  copy the skill to a temp dir with `evals/` inside. `claude plugin eval init --bare
   <case>` writes `evals/<case>/prompt.md` and `evals/<case>/graders/criteria.md`. Results go
   to `<target>/<eval-dir>/results/` unless `--output-dir` and `--report` point elsewhere. In
   the default two-arm mode a `tool_used: Skill` grader only counts with `arm: both` (or under
@@ -188,7 +183,7 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
 ## 9. Open items
 
 Not yet verified; each needs a host session, an entitlement or an OS this container lacks.
-Status as of 2026-10-25 (C numbers refer to the build plan's Appendix C).
+Status as of 2026-10-25 (C numbers are stable ids).
 
 | # | Question | Status |
 |---|---|---|
@@ -208,7 +203,7 @@ Status as of 2026-10-25 (C numbers refer to the build plan's Appendix C).
 | C18 | `COPILOT_CLI=1` in the VS Code harness and the cloud agent | CLI measured; others open (payload-shape fallback covers it) |
 | C19 | `agentStop` transcript format; PascalCase and camelCase entries in one file | partly measured: JSONL with `assistant.message` events |
 | C20 | Hook events the VS Code Copilot harness fires in-editor | open |
-| C21 | How Claude Code exposes the skill directory to the model | Codex measured; Claude open (the "locate the companion" search is the fallback) |
+| C21 | How Claude Code exposes the skill directory to the model | Codex measured; Claude open (the `$ADC` search in SKILL.md is the fallback) |
 | C22 | Writes under `.git/` in the Codex `workspace-write` and Copilot sandboxes (`info/exclude`) | open; fallback `.gitignore` entry or `ADC_HOME` |
 
 Resolved since the plan: C7, C8, C10, C17, C23, C24 (§8).
@@ -234,6 +229,5 @@ codex debug prompt-input "hello" | Select-String agentic-developer-companion
 node .github/skills/agentic-developer-companion/scripts/adc.mjs doctor --json
 ```
 
-Hook payloads are re-measured by `tests/unit/hooks.test.mjs` when the host CLIs are
-installed; the manual OS × host matrix lives in `tests/manual-matrix.md`. Paid checks
-(trigger sets, `claude plugin eval`) are listed in [release](release.md) §4.
+In the source repository `tests/unit/hooks.test.mjs` re-measures hook payloads and
+`tests/manual-matrix.md` holds the OS × host matrix; paid checks: [release](release.md) §4.

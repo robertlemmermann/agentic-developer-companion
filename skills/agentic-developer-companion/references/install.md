@@ -1,8 +1,7 @@
 # Install, verify, update and register hooks
 
-Long-form companion to the README install section. Every step names the script command and
-its **manual fallback** (what to run by hand in guidance-only mode, when Node is missing).
-The skill folder is `skills/agentic-developer-companion` in the public repository
+Every step names the script command and its **manual fallback** (guidance-only mode, when
+Node is missing). The skill folder is `skills/agentic-developer-companion` in the public repository
 `robertlemmermann/agentic-developer-companion`; below, `<skill>` is wherever it ends up.
 
 ## Contents
@@ -20,9 +19,8 @@ The skill folder is `skills/agentic-developer-companion` in the public repositor
 
 ## 1. Before you install
 
-Git 2.31+, a supported host, and Node.js 24 for scripts and hooks; everything else is optional with a fallback, listed
-in [PREREQUISITES.md](../PREREQUISITES.md). Without Node the skill still works in guidance-only mode (the playbooks
-list the manual commands) and no hook can run.
+Git 2.31+, a supported host, and Node.js 24 for scripts and hooks (without it: guidance-only mode,
+no hooks); everything else is optional with a fallback: [PREREQUISITES.md](../PREREQUISITES.md).
 
 ## 2. Install matrix
 
@@ -39,35 +37,17 @@ list the manual commands) and no hook can run.
 Duplicates are harmless (first found wins by name). Copilot code review reads only
 `.github/skills/`, so a Copilot repository should always have that copy.
 
-**Copilot CLI without an installer** (registers a clone as a skill source, no copy):
+**Without an installer**: register a clone with Copilot CLI (no copy), or copy the skill folder
+into the host's skill directory (here Claude Code's user directory):
 
 ```bash
 git clone --depth 1 https://github.com/robertlemmermann/agentic-developer-companion "$HOME/.copilot/adc" && copilot skill add "$HOME/.copilot/adc/skills"
-```
-
-```powershell
-git clone --depth 1 https://github.com/robertlemmermann/agentic-developer-companion "$env:USERPROFILE\.copilot\adc"; copilot skill add "$env:USERPROFILE\.copilot\adc\skills"
-```
-
-**Any host, plain clone plus copy** (replace the target with the host's user skill directory,
-for example `~/.claude/skills`):
-
-```bash
 git clone --depth 1 https://github.com/robertlemmermann/agentic-developer-companion /tmp/adc && cp -R /tmp/adc/skills/agentic-developer-companion "$HOME/.claude/skills/"
 ```
 
-```powershell
-git clone --depth 1 https://github.com/robertlemmermann/agentic-developer-companion "$env:TEMP\adc"; Copy-Item -Recurse "$env:TEMP\adc\skills\agentic-developer-companion" "$env:USERPROFILE\.claude\skills\"
-```
-
-```bat
-git clone --depth 1 https://github.com/robertlemmermann/agentic-developer-companion "%TEMP%\adc" && robocopy "%TEMP%\adc\skills\agentic-developer-companion" "%USERPROFILE%\.claude\skills\agentic-developer-companion" /E
-```
-
-A junction instead of a copy needs no admin rights and no Developer Mode:
+On Windows, link a clone with a junction (§9):
 PowerShell `New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\agentic-developer-companion" -Target "<clone>\skills\agentic-developer-companion"`,
 cmd `mklink /J "%USERPROFILE%\.claude\skills\agentic-developer-companion" "<clone>\skills\agentic-developer-companion"`.
-Do not use symlinks: they need privileges on Windows and become text files in Git.
 
 ## 3. Verify the install
 
@@ -75,7 +55,7 @@ Do not use symlinks: they need privileges on Windows and become text files in Gi
 |---|---|
 | Copilot CLI | `copilot skill list --json` lists `agentic-developer-companion` (works without signing in); `/skills info agentic-developer-companion` |
 | VS Code | type `/` in chat and look for the skill; the Agent Debug panel lists loaded skills |
-| Claude Code | `/agentic-developer-companion help`; frontmatter: `node <skill>/scripts/adc.mjs tooling lint <skill> --strict` (`claude plugin validate` does not check a bare skills folder: it reports `contents: []`) |
+| Claude Code | `/agentic-developer-companion help`; frontmatter: `node <skill>/scripts/adc.mjs tooling lint <skill> --strict` |
 | Codex | the `/skills` picker shows it; `$agentic-developer-companion help`; `codex debug prompt-input "x"` prints the skill list without signing in |
 | Everywhere | `node <skill>/scripts/adc.mjs doctor` |
 
@@ -114,7 +94,6 @@ then copy `assets/templates/adc/budget.json` to `.adc/budget.json` and
   the skill directory under each host path that `doctor` lists; `npx skills remove agentic-developer-companion`
   where installed that way. Codex `$skill-installer` aborts when the target exists, so delete
   `~/.codex/skills/agentic-developer-companion` before reinstalling.
-- The skill `name` never changes; renames would break installs.
 
 ## 5. Register hooks (`setup hooks`)
 
@@ -175,10 +154,9 @@ denies the tool call. Repository hooks (`.github/hooks/`, `.claude/settings*.jso
 names a skill outside the repository carries your machine's path: do not commit it (the render warns). `ask` decisions
 are denials in `-p` ("unable to ask user for confirmation"), in autopilot and in the cloud agent.
 
-**Copilot cloud agent.** Only `.github/hooks/*.json` on the default branch is read, only the `bash` strings run
-(Linux), and `ask` is treated as deny. Vendor the skill first (`.github/skills/agentic-developer-companion/` or
-`.agents/skills/…`) and protect `.github/hooks/**` and the vendored folder with CODEOWNERS and branch protection:
-those files run on every colleague's machine that opens the repository with Copilot.
+**Copilot cloud agent** (limits: [host notes](host-notes.md) §1). Vendor the skill first
+(`.github/skills/agentic-developer-companion/` or `.agents/skills/…`) and protect `.github/hooks/**`
+and the vendored folder with CODEOWNERS and branch protection: they run for everyone who opens the repository with Copilot.
 
 **Claude Code.** User scope uses the exec form (`"command": "node", "args": ["<SKILL>/scripts/adc.mjs", "hook-run", …]`),
 which needs no shell and no Git Bash on Windows. Project scope is written to
@@ -203,8 +181,7 @@ with `codex exec --dangerously-bypass-hook-trust`, meant for automation that vet
 approvals off an `ask` lets the call run; only `deny` stops it.
 
 **Measured payloads** (2026-10-25: Copilot CLI 1.0.103, Claude Code 2.1.310, Codex 0.164.0,
-each driven offline by a scripted model endpoint; the source repository's `tests/unit/hooks.test.mjs`
-repeats this when the CLIs are installed):
+each driven offline by a scripted model endpoint):
 
 | Host | What the hooks receive and how output arrives |
 |---|---|
@@ -260,8 +237,6 @@ Fallback for the two Mermaid diagrams in the README.
   Codex runs `commandWindows` through `%COMSPEC% /C` per its source (a PowerShell session shell
   is also reported); the bare `node "<SKILL>/…"` form is valid in both, so keep Node on the
   plain PATH.
-- Hook output is ASCII-only JSON, so console code pages cannot damage it; the handler always
-  exits 0 (PowerShell `-Command` collapses other exit codes, Codex issue #54072).
 - `node.exe` must be a real executable on the launcher's PATH. Version managers that expose
   `node` as a `.cmd` shim or only through a shell profile need `setup hooks --node-path`.
   A Node path with spaces (`C:\Program Files\nodejs\node.exe`) is rendered for Codex and for
@@ -273,7 +248,8 @@ Fallback for the two Mermaid diagrams in the README.
 - Codex hooks on native Windows were disabled in 0.117 and their re-enablement is
   undocumented: confirm with `/hooks` that they fire.
 - Paths are rendered with forward slashes, which Node, PowerShell and cmd.exe all accept.
-- Junctions, not symlinks: no Developer Mode needed.
+- Junctions, not symlinks: a junction needs no admin rights and no Developer Mode; symlinks need
+  privileges on Windows and become text files in Git.
 - `.adc/.env.live` is restricted to your SID with `icacls`; `doctor` checks it.
 
 ## 10. Troubleshooting

@@ -17,7 +17,7 @@ license: Apache-2.0
 compatibility: >-
   Node.js 24+ and Git on PATH for scripts and hooks (guidance-only mode works
   without Node). Windows: PowerShell 7 for Copilot CLI and Codex hooks; Git for
-  Windows recommended for Claude Code. Host minimums in README.
+  Windows recommended for Claude Code. Host minimums in PREREQUISITES.md.
 metadata:
   version: "0.1.0"
   short-description: QA for agent-made changes and agentic tooling
