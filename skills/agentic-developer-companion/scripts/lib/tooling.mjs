@@ -513,8 +513,8 @@ function skillDirsFor(hosts, name, base = null) {
 }
 
 function triggerSetTemplate(name) {
-  const tpl = readText(path.join(ASSETS_DIR, 'evals', 'trigger-set.template.json'));
-  if (tpl == null) throw envError('TEMPLATE_MISSING', 'assets/evals/trigger-set.template.json is missing');
+  const tpl = readText(path.join(ASSETS_DIR, 'templates', 'evals', 'trigger-set.template.json'));
+  if (tpl == null) throw envError('TEMPLATE_MISSING', 'assets/templates/evals/trigger-set.template.json is missing');
   return json(JSON.parse(renderString(tpl, { skill_name: name })));
 }
 
@@ -523,8 +523,8 @@ function triggerSetTemplate(name) {
  * `evals.json` (a different format; the two are not interchangeable, so both are generated).
  */
 function evalOutputs(evalsDir, name, { all = true } = {}) {
-  const tpl = readText(path.join(ASSETS_DIR, 'evals', 'eval-case.template.md'));
-  if (tpl == null) throw envError('TEMPLATE_MISSING', 'assets/evals/eval-case.template.md is missing');
+  const tpl = readText(path.join(ASSETS_DIR, 'templates', 'evals', 'eval-case.template.md'));
+  if (tpl == null) throw envError('TEMPLATE_MISSING', 'assets/templates/evals/eval-case.template.md is missing');
   const vars = { case: `${name}-basic`, name };
   const outputs = parseBundle(tpl)
     .map((s) => ({ path: `${evalsDir}/${renderString(s.path, vars)}`, content: renderString(s.content, vars) }));

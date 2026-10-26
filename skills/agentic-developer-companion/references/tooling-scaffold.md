@@ -3,7 +3,7 @@
 `tooling scaffold <kind> --for copilot|claude|codex|all` writes known-good starting points for
 the user's own instructions, skills, agents, prompt files, hooks, MCP configs and plugins, in
 each host's real location and shape. Templates come from `assets/templates/tooling.tmpl` and
-`assets/evals/`; frontmatter, hook, MCP and plugin files are rendered in code from the same
+`assets/templates/evals/`; frontmatter, hook, MCP and plugin files are rendered in code from the same
 model `tooling port` uses, so a scaffold and a port always agree.
 
 ## Contents

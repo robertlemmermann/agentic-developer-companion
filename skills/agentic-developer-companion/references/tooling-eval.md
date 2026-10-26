@@ -18,7 +18,7 @@ always shows the command and the cost cap first and runs only after the user agr
 ## 1. Trigger sets
 
 1. Create the set next to the skill (free): `node "$ADC" tooling trigger-set <skill-dir> --init --json`
-   writes `<skill-dir>/evals/trigger-set.json` from `assets/evals/trigger-set.template.json`
+   writes `<skill-dir>/evals/trigger-set.json` from `assets/templates/evals/trigger-set.template.json`
    (`--set <file>` for another location, `--force` to replace an existing one).
 2. Replace every `TODO` query; the runner refuses a set that still contains one. About 20
    queries: 8-10 `should_trigger: true` with varied phrasing (direct and indirect asks, the
