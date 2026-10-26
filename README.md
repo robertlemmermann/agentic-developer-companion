@@ -397,8 +397,8 @@ checklist filled per tag is [tests/manual-matrix.md](tests/manual-matrix.md). Th
 evals live in [`evals/`](evals/trigger-set.json): a 20-query trigger set
 (`node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json`
 checks it for free; add `--host claude --run` to run it, which is billed) and two
-`claude plugin eval` cases, run against the repository root
-(`claude plugin eval . --eval-dir evals`; see [release](skills/agentic-developer-companion/references/release.md#4-evals-paid)).
+`claude plugin eval` cases (`node tests/run-evals.mjs`, billed; see
+[release](skills/agentic-developer-companion/references/release.md#4-evals-paid)).
 
 ## 🏢 Using it at work
 

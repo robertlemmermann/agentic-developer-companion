@@ -171,10 +171,10 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
   for a bare skills directory even when a SKILL.md in it is broken, and "No manifest found"
   for a skill folder: for standalone skills it is **not a validator**. `tooling lint` treats
   `contents: []` as not applicable, never as a pass.
-- **`claude plugin eval`**: a skill folder or a skills directory given as the target
-  resolves as a plugin, and the ablation defaults to `with-without` (C8). It refuses an
-  `--eval-dir` outside the target, so this repository keeps its cases in the root `evals/`
-  and runs `claude plugin eval <repo> --eval-dir evals`. `claude plugin eval init --bare
+- **`claude plugin eval`**: a bare skill folder given as the target resolves as a plugin named
+  after the folder (C8); a repository root that only contains `skills/` does not (`plugins: []`,
+  so the "with" arm runs without the skill). It refuses an `--eval-dir` outside the target, so
+  this repository's `tests/run-evals.mjs` copies the skill to a temp dir with `evals/` inside. `claude plugin eval init --bare
   <case>` writes `evals/<case>/prompt.md` and `evals/<case>/graders/criteria.md`. Results go
   to `<target>/<eval-dir>/results/` unless `--output-dir` and `--report` point elsewhere. In
   the default two-arm mode a `tool_used: Skill` grader only counts with `arm: both` (or under

@@ -115,25 +115,23 @@ Required before v1.0.0 and whenever the description, the mode router or a playbo
 meaning; optional for patch releases. Each run bills your account: set a ceiling.
 
 ```bash
-OUT="${TMPDIR:-/tmp}/adc-evals"; mkdir -p "$OUT"
-claude plugin eval . --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "$OUT" --report "$OUT/report.html" --json "$OUT/result.json"
+node tests/run-evals.mjs --json "${TMPDIR:-/tmp}/adc-evals.json"
 node "$S/scripts/adc.mjs" tooling trigger-set "$S" --set evals/trigger-set.json --host claude --run --runs 3 --max-cost-usd 10
 node "$S/scripts/adc.mjs" tooling trigger-set "$S" --set evals/trigger-set.json --host copilot --run --runs 3
 ```
 
 ```powershell
-$OUT = Join-Path $env:TEMP "adc-evals"; New-Item -ItemType Directory -Force $OUT | Out-Null
-claude plugin eval . --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir $OUT --report "$OUT/report.html" --json "$OUT/result.json"
+node tests/run-evals.mjs --json (Join-Path $env:TEMP "adc-evals.json")
 node "$S/scripts/adc.mjs" tooling trigger-set $S --set evals/trigger-set.json --host claude --run --runs 3 --max-cost-usd 10
 ```
 
-- The repository root is the target, because `claude plugin eval` refuses an eval
-  directory outside the plugin root and the evals live in the root `evals/`. It resolves the
-  `skills/` directory as a skills-dir plugin and runs each case with and without the skill
-  (Claude Code 2.1.269+). `--output-dir` and `--report` keep results out of the checkout (the
-  default is `evals/results/`).
+- `tests/run-evals.mjs` copies the skill to the temp dir with `evals/` inside it and runs
+  `claude plugin eval` on that copy (Claude Code 2.1.269+): the command reads cases only inside
+  its target, and the repository root does not resolve as a plugin. It defaults to
+  `--ablation none --threshold 0.8 --max-cost-usd 10 --no-publish` and a temp `--output-dir`;
+  any `claude plugin eval` option passes through.
 - Cases: `evals/verify-false-pass-claim` (the skill is selected for a distrusted "tests
-  pass" claim; its `tool_used: Skill` grader has `arm: both`, so it scores in both arms) and
+  pass" claim; its `tool_used: Skill` grader has `arm: both`) and
   `evals/lint-broken-skill` (an `llm` grader checks the defects named in a broken SKILL.md).
   Neither grants a shell tool, so both also run on native Windows without WSL2.
 - Pin `--model` and `--judge-model` to the models you release against and write them into

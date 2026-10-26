@@ -1257,9 +1257,10 @@ async function areaEvals(sx) {
   const adcPath = toPosix(sx.adc);
   const repo = sx.devLayout ? toPosix(sx.devRoot) : '<repo>';
   const set = `${repo}/evals/trigger-set.json`;
-  // `claude plugin eval` refuses an eval dir outside the plugin root, so it targets the repository root.
+  // `claude plugin eval` reads cases only inside its target and the repository root is not a
+  // plugin, so tests/run-evals.mjs evaluates a temp copy of the skill with evals/ inside it.
   const paid = [
-    `claude plugin eval "${repo}" --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "<tmp>/adc-evals" --json "<tmp>/adc-evals/result.json"`,
+    `node "${repo}/tests/run-evals.mjs"`,
     `node "${adcPath}" tooling trigger-set "${S}" --set "${set}" --host claude --run --runs 3 --max-cost-usd 10`,
     `node "${adcPath}" tooling trigger-set "${S}" --set "${set}" --host copilot --run --runs 3`,
   ];
