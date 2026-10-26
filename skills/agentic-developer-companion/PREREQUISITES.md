@@ -4,7 +4,7 @@ What `agentic-developer-companion` needs, what it can use when present, and what
 when something is missing. Written for someone who has never used the skill. The
 machine-readable twin is [`assets/prerequisites.json`](assets/prerequisites.json); `doctor`
 reads it and prints each item as present, missing or old together with the fallback in
-effect, and `selftest --only prereqs` fails when the two files disagree.
+effect. The repository's own `node tests/selftest.mjs --only prereqs` fails when the two disagree.
 
 **In short:** Git, a supported host, and Node.js 24 for scripts and hooks. Everything else
 is optional and has a fallback. Run `node <skill-dir>/scripts/adc.mjs doctor` to check.
@@ -26,7 +26,7 @@ The skill cannot do its job without these; there is no fallback.
 | Prerequisite | Minimum | Needed for | Without it |
 |---|---|---|---|
 | Git on PATH | 2.31 | working-tree snapshots, temp worktrees, base resolution, every diff-scoped check, hook identity | `adc.mjs` exits 3; QA modes cannot run; hooks emit `{}` |
-| Node.js on PATH | 24 | every script, every hook, the evidence ledger, `doctor`, `selftest` | guidance-only mode: the model follows the manual steps in `references/*.md` and says so in the ledger it writes by hand; hooks print `{}` (Copilot) or fail non-blocking (Claude, Codex) |
+| Node.js on PATH | 24 | every script, every hook, the evidence ledger, `doctor` | guidance-only mode: the model follows the manual steps in `references/*.md` and says so in the ledger it writes by hand; hooks print `{}` (Copilot) or fail non-blocking (Claude, Codex) |
 | A supported host with the skill installed in a directory it scans | see Host minimums | invocation, discovery, hooks | nothing loads; pasting `SKILL.md` into the conversation (guidance-only) is the last resort |
 | Permission to run `node` and `git` through the host's shell tool | — | every script invocation (no `allowed-tools` is shipped) | a denied call leaves the step `UNVERIFIED`; headless runs need explicit grants |
 | A writable, git-excluded state directory (`.adc/`) | — | state, evidence, hook records, live credentials and the budget ledger | CLI commands exit 3 while `.adc/` is tracked by git; hooks keep emitting `{}`; relocate with `ADC_HOME` or `--state-dir` |
@@ -90,7 +90,7 @@ skill still works in **guidance-only mode** and says so in every ledger it write
 
 | Prerequisite | Minimum | Used for | Fallback |
 |---|---|---|---|
-| External validators (`skills-ref validate`, `claude plugin validate`, `gh skill publish --dry-run`, `copilot skill list --json`, `codex exec --strict-config`, `waza`) | — | merged into `tooling lint` and `selftest` | the built-in Node validator always runs; external results are merged only when the tool is installed |
+| External validators (`skills-ref validate`, `claude plugin validate`, `gh skill publish --dry-run`, `copilot skill list --json`, `codex exec --strict-config`, `waza`) | — | merged into `tooling lint` | the built-in Node validator always runs; external results are merged only when the tool is installed |
 | `claude plugin eval`, promptfoo, Waza, a headless host CLI on PATH | — | `tooling eval`, `tooling trigger-set`, the skill's own evals | the trigger set is generated without a runner; evals are marked manual and paid |
 | Claude `/skill-doctor`, `/doctor prompt-audit`, `claude --debug`; Copilot `/env`, `/skills info` | — | diagnostics referenced by `tooling optimize` and host notes | `doctor` and `tooling cost` are the skill's own equivalents |
 

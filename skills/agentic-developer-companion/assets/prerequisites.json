@@ -11,7 +11,7 @@
     {
       "id": "node", "category": "required", "group": "Core", "name": "Node.js on PATH", "minimum": "24",
       "tools": ["node"], "check": { "cmd": "node", "args": ["--version"] },
-      "needed_for": "every script, every hook, the evidence ledger, `doctor`, `selftest`",
+      "needed_for": "every script, every hook, the evidence ledger, `doctor`",
       "without": "guidance-only mode: the model follows the manual steps in `references/*.md` and says so in the ledger it writes by hand; hooks print `{}` (Copilot) or fail non-blocking (Claude, Codex)"
     },
     {
@@ -186,7 +186,7 @@
     {
       "id": "external-validators", "category": "optional", "group": "Tooling development", "name": "External validators (`skills-ref validate`, `claude plugin validate`, `gh skill publish --dry-run`, `copilot skill list --json`, `codex exec --strict-config`, `waza`)", "minimum": null,
       "tools": ["skills-ref", "waza"],
-      "needed_for": "merged into `tooling lint` and `selftest`",
+      "needed_for": "merged into `tooling lint`",
       "fallback": "the built-in Node validator always runs; external results are merged only when the tool is installed"
     },
     {
