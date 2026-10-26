@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as git from '../../skills/agentic-developer-companion/scripts/lib/git.mjs';
+import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import * as ev from '../../skills/agentic-developer-companion/scripts/lib/evidence.mjs';
 import * as tr from '../../skills/agentic-developer-companion/scripts/lib/trace.mjs';
 import * as vf from '../../skills/agentic-developer-companion/scripts/lib/verify.mjs';
@@ -63,7 +65,7 @@ function mem(checks, { waivers = [], claims = [] } = {}) {
 
 async function ledgerWith(dir, checks = [], { specText = null } = {}) {
   const ctx = core.makeContext({ cwd: dir });
-  const target = await ev.prepareQaTarget(ctx);
+  const target = await state.prepareTarget(ctx);
   const { path: file } = await ev.initLedger({ target, tool: 'unknown', mode: 'verify', spec: specText ? 'SPEC.md' : null, specText });
   if (checks.length) await ev.addChecks(file, checks, { source: 'verify', root: target.root });
   return { file, target, ctx };
@@ -89,8 +91,8 @@ test('detectTool maps host environment markers', () => {
 test('canonicalJson is key-order independent and stable across a JSON round trip', () => {
   const a = { b: [1, { y: 2, x: 'é' }], a: null, c: undefined };
   const b = { a: null, b: [1, { x: 'é', y: 2 }] };
-  assert.equal(ev.canonicalJson(a), ev.canonicalJson(b));
-  assert.equal(ev.canonicalJson(JSON.parse(core.asciiJson(a))), ev.canonicalJson(a));
+  assert.equal(core.canonicalJson(a), core.canonicalJson(b));
+  assert.equal(core.canonicalJson(JSON.parse(core.asciiJson(a))), core.canonicalJson(a));
 });
 
 test('normalizeCheck validates input strictly and degrades script output', () => {
@@ -109,7 +111,7 @@ test('normalizeCheck validates input strictly and degrades script output', () =>
   assert.equal(big.data.truncated, true);
 });
 
-test('createQaSnapshot sees same-tick edits (racy git) and works with an ignored .adc/', () => {
+test('createSnapshot sees same-tick edits (racy git) and works with an ignored .adc/', () => {
   for (let i = 0; i < 8; i++) {
     const { dir, g } = makeRepo({ 'a.js': 'x\n' });
     fs.writeFileSync(path.join(dir, 'a.js'), 'y\n');
@@ -117,7 +119,7 @@ test('createQaSnapshot sees same-tick edits (racy git) and works with an ignored
     fs.appendFileSync(path.join(dir, '.git', 'info', 'exclude'), '/.adc/\n');
     core.sleepSync(40);
     const before = g('status', '--porcelain');
-    const snap = ev.createQaSnapshot(dir, { exclude: ['.adc'] });
+    const snap = git.createSnapshot(dir, { exclude: ['.adc'] });
     assert.equal(g('cat-file', 'blob', `${snap.tree}:a.js`), 'y\n', 'a same-size edit right after the commit is in the snapshot');
     assert.deepEqual(g('ls-tree', '-r', '--name-only', snap.tree).trim().split('\n'), ['a.js', 'u.txt']);
     assert.equal(g('status', '--porcelain'), before);
@@ -250,11 +252,11 @@ test('ledger: finalize refuses a stale snapshot, seals, and freezes the ledger',
   const { file, ctx } = await ledgerWith(dir, [ck('CK-CLEANRUN', 'pass'), ck('CK-SCOPE', 'pass')]);
   await ev.setClaims(file, 'All tests pass.\n');
   write(dir, { 'new.txt': 'edited after verify\n' });
-  const staleTarget = await ev.prepareQaTarget(ctx);
+  const staleTarget = await state.prepareTarget(ctx);
   assert.equal(ev.ledgerStatus({ target: staleTarget }).stale, true);
   await assert.rejects(ev.finalizeLedger(file, { target: staleTarget }), (e) => e.exit === 4 && e.code === 'LEDGER_STALE');
   write(dir, { 'new.txt': 'untracked\n' });
-  const target = await ev.prepareQaTarget(ctx);
+  const target = await state.prepareTarget(ctx);
   const st = ev.ledgerStatus({ target });
   assert.equal(st.stale, false);
   assert.equal(st.integrity.ok, true);
@@ -306,6 +308,30 @@ test('ledger: secrets and the live token never reach the ledger or its Markdown'
   }
 });
 
+test('ledger: the newest live run summary refreshes the budget; CLI input cannot set it', async () => {
+  const { dir } = makeRepo({ 'a.txt': 'a\n' });
+  const { file } = await ledgerWith(dir);
+  const view = (spent) => ({ unit: 'credits', session_id: 's1', identity_source: 'flag', max_per_session: 2500,
+    max_per_day: 2500, spent, spent_today: spent, remaining: 2500 - spent });
+  await ev.addChecks(file, [ck('CK-LIVE', 'pass', { cost: 3, data: { budget: view(3) } }), ck('CK-LIVE', 'pass', { cost: 3 })], { source: 'script', root: dir });
+  assert.equal(readLedger(file).budget.spent, 3);
+  await ev.addChecks(file, [ck('CK-LIVE', 'pass', { data: { budget: view(7) } })], { source: 'script', root: dir });
+  assert.equal(readLedger(file).budget.spent, 7);
+  await ev.addChecks(file, [ck('CK-LIVE', 'pass', { data: { budget: view(0) } })], { source: 'input', root: dir });
+  assert.equal(readLedger(file).budget.spent, 7, 'evidence add cannot rewrite the budget');
+  assert.equal(ev.verifyIntegrity(readLedger(file), { root: dir }).ok, true);
+  assert.match(fs.readFileSync(ev.markdownPath(file), 'utf8'), /spent 7 of 2500 credits/);
+});
+
+test('ledger: an artifact that is not a regular file is recorded unhashed and never read', { skip: process.platform === 'win32' && 'no FIFOs' }, async (t) => {
+  const { dir } = makeRepo({ 'a.txt': 'a\n' });
+  const { file } = await ledgerWith(dir);
+  if (spawnSync('mkfifo', [path.join(dir, '.adc', 'pipe')]).status !== 0) return t.skip('mkfifo is not available');
+  const { added } = await ev.addChecks(file, [ck('CK-X', 'pass', { artifacts: ['.adc/pipe', '.adc'] })], { source: 'input', root: dir });
+  assert.deepEqual(added[0].artifact_sha256, { '.adc/pipe': null, '.adc': null });
+  assert.equal(ev.verifyIntegrity(readLedger(file), { root: dir }).ok, true);
+});
+
 test('waivers must quote the captured spec; without a spec only a terminal may waive', async () => {
   const spec = '# Spec\n\n3. Remove the legacy endpoint and its tests.\n';
   const { dir } = makeRepo({ 'a.txt': 'a\n' });
@@ -350,7 +376,7 @@ test('renderMarkdown: verdict, check table, findings, claims, reproduce commands
 test('scoreAnswers rejects uncited answers, honors polarity and validates citations in the snapshot', async () => {
   const { dir } = makeRepo({ 'src/a.js': 'one\ntwo\nthree\n', 'tests/a.test.js': 't\n' });
   const ctx = core.makeContext({ cwd: dir });
-  const target = await ev.prepareQaTarget(ctx);
+  const target = await state.prepareTarget(ctx);
   const r = ev.scoreAnswers({ answers: [
     { id: 'AT-NO-ASSERT', answer: 'no', citation: 'tests/a.test.js:1' },
     { id: 'AT-MOCK-DOMINATED', answer: 'yes', citations: ['tests/a.test.js:1'] },
@@ -455,7 +481,7 @@ async function traceRepo() {
     'tests/limiter.test.js': "test('x', () => {});\ntest('429 over limit', () => { expect(limit(101)).toBe(429); });\n",
     'src/blank.js': 'x\n\n}\n',
   });
-  return { dir, g, target: await ev.prepareQaTarget(core.makeContext({ cwd: dir })) };
+  return { dir, g, target: await state.prepareTarget(core.makeContext({ cwd: dir })) };
 }
 
 test('diffHunks: changes, additions, pure deletions and binaries with stable keys', async () => {
@@ -531,7 +557,6 @@ test('verify degrades a missing module, a missing export, a thrown step and a ba
     { name: 'missing-export', step: 'x', module: './core.mjs', export: 'noSuchExport', ids: ['CK-SCOPE', 'CK-SKIP'], call: (fn) => fn() },
     { name: 'thrower', step: 'y', module: './git.mjs', export: 'git', ids: ['CK-DEPS'], call: (fn, s) => fn(s.target.root, ['definitely-not-a-git-command']) },
     { name: 'bad-result', step: 'z', module: './core.mjs', export: 'nowIso', ids: ['CK-LOCK'], call: (fn) => fn() },
-    { name: 'needs-detect', step: 'w', module: './core.mjs', export: 'nowIso', ids: ['CK-CLEANRUN'], needsDetect: true, call: (fn) => fn() },
     { name: 'scorer', step: 'v', module: './evidence.mjs', export: 'scoreAnswers', ids: ['CK-MOCK', 'CK-TYPES'],
       call: (fn) => ({ checks: [fn([{ id: 'AT-NO-ASSERT', answer: 'no', citation: 'a.txt:1' }]).check] }) },
     { ...vf.DEFAULT_STEPS.find((s) => s.name === 'mutation-scope') },
@@ -542,13 +567,13 @@ test('verify degrades a missing module, a missing export, a thrown step and a ba
   assert.equal(by['CK-SKIP'], 'unverified:MODULE_UNAVAILABLE');
   assert.equal(by['CK-DEPS'], 'unverified:GIT_FAILED');
   assert.equal(by['CK-LOCK'], 'unverified:NO_CHECKS_RETURNED');
-  assert.equal(by['CK-CLEANRUN'], 'unverified:DETECT_UNAVAILABLE');
   assert.equal(by['CK-MOCK'], 'pass:');
   assert.equal(by['CK-TYPES'], 'unverified:NOT_REPORTED');
   assert.equal(by['CK-MUTATION'], 'skipped:NOT_REQUESTED');
   assert.equal(by['CK-REVIEW'], 'skipped:AWAITING_REVIEW');
   assert.match(res.result.checks.find((c) => c.id === 'CK-SCOPE').summary, /no export "noSuchExport"/);
-  assert.match(res.result.checks.find((c) => c.id === 'CK-CLEANRUN').summary, /detect-does-not-exist\.mjs/);
+  assert.equal(res.result.steps.find((s) => s.name === 'detect').reason, 'MODULE_UNAVAILABLE');
+  assert.ok(fs.statSync(ev.artifactsDir(path.join(dir, res.result.ledger))).isDirectory(), 'the scratch folder next_steps names exists');
   assert.equal(res.result.verdict, 'UNVERIFIED');
   assert.equal(res.exit, 4);
   assert.equal(res.result.worktree_unchanged, true);
@@ -595,6 +620,7 @@ test('verify --dry-run writes nothing; --finalize seals; bad options are usage e
   assert.ok(!fs.existsSync(path.join(dir, '.adc')), 'no state dir created by a dry run');
   await assert.rejects(vf.runVerify(core.makeContext({ cwd: dir }), { quick: true, deep: true }), (e) => e.exit === 2);
   await assert.rejects(vf.runVerify(core.makeContext({ cwd: dir }), { times: '-1' }), (e) => e.exit === 2);
+  await assert.rejects(vf.runVerify(core.makeContext({ cwd: dir }), { session: 'spaces are not allowed' }), (e) => e.exit === 2);
   const steps = [{ name: 'detect', module: './missing.mjs', export: 'detect', ids: [], kind: 'detect', call: (fn) => fn() }];
   const claims = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-cl-')), 'claims.txt');
   fs.writeFileSync(claims, 'All tests pass.\n');
@@ -604,6 +630,19 @@ test('verify --dry-run writes nothing; --finalize seals; bad options are usage e
   const ledger = readLedger(path.join(dir, res.result.ledger));
   assert.ok(ledger.finalized_at);
   assert.equal(ledger.checks.at(-1).id, 'CK-CLAIMS');
+});
+
+test('verify hands --no-install, --keep and --runner to the worktree steps; deps-check keeps its offline default', () => {
+  const s = { target: 'T', detectResult: 'D', spec: { text: 'x', ref: 'r' }, specPaths: null, fired: () => [],
+    opts: { noInstall: true, keep: true, runner: 'npm test', offline: false } };
+  const args = Object.fromEntries(vf.DEFAULT_STEPS.map((st) => [st.name, st.call((a) => a, s)]));
+  for (const name of ['typecheck', 'clean-run', 'coverage-delta', 'mutation-scope', 'flake-probe']) {
+    assert.deepEqual([args[name].noInstall, args[name].keep, args[name].target], [true, true, 'T'], name);
+  }
+  for (const name of ['typecheck', 'clean-run', 'coverage-delta', 'flake-probe']) assert.equal(args[name].runner, 'npm test', name);
+  assert.equal(args['flake-probe'].times, undefined, 'an absent --times leaves the step default');
+  assert.equal(args['deps-check'].offline, null, 'ADC_OFFLINE and the Codex sandbox are decided by deps-check');
+  assert.equal(vf.DEFAULT_STEPS.find((st) => st.name === 'deps-check').call((a) => a, { ...s, opts: { offline: true } }).offline, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -761,4 +800,22 @@ test('e2e: evidence init + add command output; tampered ledger is refused; trace
   assert.equal(st.status, 0);
   assert.equal(st.json.stale, true);
   assert.equal(st.json.integrity.ok, false);
+});
+
+test('e2e: evidence add --run never passes live credentials and kills a timed-out process tree', () => {
+  const { dir } = makeRepo({ 'a.js': 'x\n' });
+  assert.equal(adc(['evidence', 'init', '--session', 'bad id!'], { cwd: dir }).status, 2);
+  assert.equal(adc(['evidence', 'init'], { cwd: dir }).status, 0);
+  const env = { ADC_LIVE_TOKEN: ['hunter2', 'xyz'].join(''), ADC_LIVE_API_KEY: ['k3y', 'value'].join('-') };
+  const probe = 'node -e "process.exit(Object.keys(process.env).some((k) => k.startsWith(\'ADC_LIVE_\')) ? 7 : 0)"';
+  const r = adc(['evidence', 'add', '--check', 'CK-E2E', '--run', probe], { cwd: dir, env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.json.added[0].status, 'pass', 'the recorded command saw no ADC_LIVE_* variable');
+  assert.equal(adc(['evidence', 'add', '--check', 'CK-E2E', '--run', 'node -e 0', '--timeout', '0'], { cwd: dir }).status, 2);
+  const hang = 'node -e "const c=require(\'child_process\');c.spawn(process.execPath,[\'-e\',\'setTimeout(()=>{},30000)\'],{stdio:\'inherit\'});setTimeout(()=>{},30000)"';
+  const started = Date.now();
+  const slow = adc(['evidence', 'add', '--check', 'CK-E2E', '--run', hang, '--timeout', '1'], { cwd: dir });
+  assert.equal(slow.status, 0, slow.stderr);
+  assert.deepEqual([slow.json.added[0].status, slow.json.added[0].reason], ['unverified', 'TIMEOUT']);
+  assert.ok(Date.now() - started < 20_000, 'a grandchild holding the output pipe does not keep the command alive');
 });

@@ -105,7 +105,7 @@ const CATALOG = {
   ['**/*Tests*/**', 'tests/**', 'test/**']],
   maven: ['jvm', 'mvn -B test', junit(null, { dir: 'target/surefire-reports', glob: 'TEST-*.xml' }),
     '-Dsurefire.rerunFailingTestsCount=0', 'full', ['src/test/**']],
-  gradle: ['jvm', './gradlew test --no-build-cache', 
+  gradle: ['jvm', './gradlew test --no-build-cache',
     junit(null, { dir: 'build/test-results/test', glob: 'TEST-*.xml' }),
     'Gradle has no retry switch; framework-level retries are not visible', 'unknown', ['src/test/**']],
   rspec: ['ruby', 'bundle exec rspec', { flag: '--format json --out <f> --format progress', format: 'rspec-json' },
@@ -153,7 +153,8 @@ function normRel(file) {
 export function portableArg(arg) {
   const s = String(arg);
   if (s && /^[A-Za-z0-9_\-+=.,/:@]+$/.test(s)) return { text: s, portable: true };
-  return { text: `"${s.replace(/"/g, '\\"')}"`, portable: !/["$`%!^\n]/.test(s) };
+  // sh unescapes `\\` inside double quotes and a trailing `\` escapes the closing quote in both shells.
+  return { text: `"${s.replace(/"/g, '\\"')}"`, portable: !/["$`%!^\n]|\\(?:\\|$)/.test(s) };
 }
 
 function joinArgs(args) {
@@ -311,6 +312,8 @@ function inputDigest(g, platform) {
 
 function makeCtx(g, { platform, tools }) {
   const byDir = Map.groupBy([...g.relevant.keys()].sort(), dirOf);
+  const buildInputs = [...g.relevant.keys()].filter((r) => !inFixtureDir(r));
+  const byBase = Map.groupBy(buildInputs, (r) => baseOf(r));
   const memo = new Map();
   const parsed = (kind, rel, parse) => {
     const key = `${kind}:${rel}`;
@@ -324,8 +327,8 @@ function makeCtx(g, { platform, tools }) {
     read: (rel) => g.relevant.get(rel) ?? null,
     facts: (dir) => g.facts.get(dir) || new Set(),
     /** Inputs outside fixture folders whose base name is `name` (or matches it). */
-    inputs: (name) => [...g.relevant.keys()].filter((r) => !inFixtureDir(r)
-      && (typeof name === 'string' ? baseOf(r) === name : name.test(baseOf(r)))),
+    inputs: (name) => (typeof name === 'string' ? byBase.get(name) || []
+      : buildInputs.filter((r) => name.test(baseOf(r)))),
     json: (rel) => parsed('json', rel, (t) => {
       try { return JSON.parse(t); } catch { ctx.warn(`${rel}: invalid JSON; ignored`); return null; }
     }),
@@ -1004,11 +1007,12 @@ function detectDotnet(ctx) {
   const slnDirs = uniq(slns.map(dirOf)).sort((a, b) => b.length - a.length);
   const slnIn = (d) => slns.filter((s) => dirOf(s) === d).sort()[0];
   const groups = new Map(slnDirs.map((d) => [d, { dir: d, target: slnIn(d), projs: [] }]));
+  const perDir = Map.groupBy(projs, (p) => dirOf(p.file));
   // Projects belong to the nearest solution; a test project without one is a group of its own.
   for (const p of projs) {
     const d = slnDirs.find((s) => under(p.file, s)) ?? (p.isTest ? dirOf(p.file) : null);
     if (d == null) continue;
-    const several = projs.filter((x) => dirOf(x.file) === d).length > 1;
+    const several = perDir.get(d)?.length > 1;
     if (!groups.has(d)) groups.set(d, { dir: d, target: several ? p.file : null, projs: [] });
     groups.get(d).projs.push(p);
   }
@@ -1214,7 +1218,9 @@ const CI_DROP = {
 };
 const CI_VALUED = /^-[nlfo]$|^--(?:logger|numprocesses|format|out|results-directory|junit-?xml|cov|cov-report)$/;
 
-const firstString = (...vals) => vals.find((v) => typeof v === 'string' && v.trim())?.trim() ?? null;
+// YAML 1.2 types scalars: `working-directory: 2024` is a number but names a folder.
+const firstString = (...vals) => vals.map((v) => (typeof v === 'number' ? String(v) : v))
+  .find((v) => typeof v === 'string' && v.trim())?.trim() ?? null;
 
 /**
  * A CI directory relative to the checkout, from `base` (the step's current directory). Absolute and
@@ -1266,9 +1272,9 @@ const ciCommandLines = (script) => String(script).replace(/\r\n?/g, '\n').replac
 const isTestCommand = (line) => !INSTALL_LINE.test(line) && !/--version\b|--help\b/.test(line)
   && TEST_LINE_RES.some((re) => re.test(line));
 
-function lineNo(text, needle) {
+function lineNo(lines, needle) {
   const first = String(needle).split('\n')[0].trim().slice(0, 60);
-  const idx = String(text).split(/\r?\n/).findIndex((l) => l.includes(first));
+  const idx = lines.findIndex((l) => l.includes(first));
   return idx === -1 ? null : idx + 1;
 }
 
@@ -1276,12 +1282,14 @@ function detectCi(ctx) {
   const systems = [];
   const files = [];
   const steps = [];
+  const seen = new Set();
   for (const rel of [...ctx.g.relevant.keys()].sort()) {
     const sys = CI_SYSTEMS.find(([, re]) => re.test(rel))?.[0];
     if (!sys) continue;
     if (!systems.includes(sys)) systems.push(sys);
     files.push(rel);
     const text = ctx.read(rel) || '';
+    const lines = text.split(/\r?\n/);
     let scripts = parseYamlAll(text).flatMap(ciScripts);
     // Unparseable YAML: fall back to single-line `run:`/`script:` values.
     if (!scripts.length) {
@@ -1297,14 +1305,17 @@ function detectCi(ctx) {
         if (cd) cwd = ciDir(cd[1].replace(/^['"]|['"]$/g, ''), cwd);
         const cmd = cd ? line.slice(cd[0].length) : line;
         if (!cmd || !isTestCommand(cmd)) continue;
-        const at = lineNo(text, line) ?? (hint ? lineNo(text, hint) : null);
-        steps.push({ file: rel, line: at, cmd: truncate(cmd, 400), cwd });
+        const step = { file: rel, line: null, cmd: truncate(cmd, 400), cwd };
+        const key = `${step.cmd}\0${cwd}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        step.line = lineNo(lines, line) ?? (hint ? lineNo(lines, hint) : null);
+        steps.push(step);
       }
     }
   }
-  const dedup = steps.filter((s, i) => steps.findIndex((d) => d.cmd === s.cmd && d.cwd === s.cwd) === i);
   return { system: systems[0] || null, ...(systems.length > 1 ? { systems } : {}), files,
-    test_commands: uniq(dedup.map((s) => s.cmd)), steps: dedup };
+    test_commands: uniq(steps.map((s) => s.cmd)), steps };
 }
 
 /** Recognize a runner in one command segment (CI lines, make recipes). */
@@ -1403,9 +1414,9 @@ function summarize(projects) {
   return parts.length ? parts.join(' · ') : 'no projects detected';
 }
 
-/** Default branch and how it was found (§7.4 base chain). */
-function gitInfo(root) {
-  if (!repoRoot(root)) return { default_branch: null, base_source: null };
+/** Default branch and how it was found (§7.4 base chain); `inRepo`: git already listed the files. */
+function gitInfo(root, inRepo) {
+  if (!inRepo) return { default_branch: null, base_source: null };
   const current = () => gitTry(root, ['symbolic-ref', '-q', '--short', 'HEAD']);
   try {
     const b = resolveBase(root, null);
@@ -1506,7 +1517,7 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
   const cacheFile = stateInfo ? stateInfo.paths?.detect || statePaths(stateInfo.dir).detect : null;
   const seen = {};
   const tools = { has: (n) => (n in seen ? seen[n] : (seen[n] = Boolean(whichFn ? whichFn(n) : which(n, env)))) };
-  const live = { ...gitInfo(abs), repo_root: toPosix(abs) };
+  const live = { ...gitInfo(abs, g.listing === 'git'), repo_root: toPosix(abs) };
   const done = (res, cache) => ({ ...res, duration_ms: Date.now() - started,
     cache: { path: cacheFile && toPosix(cacheFile), ...cache } });
   const c = cacheFile && !refresh ? readJson(cacheFile, null) : null;
@@ -1520,7 +1531,7 @@ export async function detect({ root, stateInfo = null, refresh = false, write = 
   const sorted = (o) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => cmp(a, b)));
   const derived = derive(g, { platform, tools });
   const result = redactResult({ schema: DETECT_SCHEMA, cache_key: key, generated_at: nowIso(),
-    generated_by: generatedBy(), detect_source: 'detect', platform, file_listing: g.listing, files_scanned: g.fileCount,
+    generated_by: generatedBy(), platform, file_listing: g.listing, files_scanned: g.fileCount,
     inputs: g.relevant.size, ...derived, ...live, tools: sorted(seen), probes: sorted(g.probes) }, env);
   let written = false;
   let error = null;

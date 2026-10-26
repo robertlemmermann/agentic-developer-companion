@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   defineCommand, usageError, envError, EXIT, readText, toPosix, globToRegExp, which, runTool, toolVersion,
-  versionGte, truncate, isObj, lineOf, statOrNull, findUp, hostHomes, samePath, listFiles, firstLine, SKILL_DIR,
+  versionGte, truncate, isObj, isDir, statOrNull, findUp, hostHomes, samePath, listFiles, firstLine, SKILL_DIR,
 } from './core.mjs';
 import { repoRoot } from './git.mjs';
 import { resolveStateDir, assertStateUntracked } from './state.mjs';
@@ -17,6 +17,7 @@ import { parseJson, parseToml } from './formats.mjs';
 import { scanSecrets, redactSecrets } from './markers.mjs';
 import {
   parseFrontmatter, parseYamlDocument, INSTALL_METADATA_KEY, markdownLines, markdownLinks, isExternalLink, linkPath,
+  lineLocator,
 } from './frontmatter.mjs';
 
 export const HOSTS = Object.freeze(['spec', 'copilot', 'claude', 'codex']);
@@ -138,8 +139,23 @@ const WIN_ABS = /^[a-zA-Z]:[\\/]/;
 // ---------------------------------------------------------------------------
 // Small helpers
 
-const readNorm = (p) => readText(p)?.replace(/\r\n/g, '\n') ?? null;
-const keyLine = (text, key) => { const i = text.indexOf(`"${key}"`); return i < 0 ? null : lineOf(text, i); };
+/** A per-run reader: rules and validators look at the same files several times, so each is read once. */
+function fileReader() {
+  const cache = new Map();
+  return (abs) => {
+    if (!cache.has(abs)) {
+      let text = null;
+      try { text = fs.readFileSync(abs, 'utf8').replace(/\r\n/g, '\n'); } catch {}
+      cache.set(abs, text);
+    }
+    return cache.get(abs);
+  };
+}
+// Line numbers of the text being linted: its line breaks are indexed once (a marketplace lists hundreds of plugins).
+let located = { text: null, line: null };
+const lineIn = (text, i) => (located.text === text ? located : (located = { text, line: lineLocator(text) })).line(i);
+/** Line of the first `"key"` in a JSON text, or null. */
+const keyLine = (text, key) => { const i = text.indexOf(`"${key}"`); return i < 0 ? null : lineIn(text, i); };
 const badRegex = (re) => { try { new RegExp(re); return null; } catch (err) { return err; } };
 const strs = (...xs) => xs.flat().filter((x) => typeof x === 'string');
 const own = (o, k) => isObj(o) && Object.hasOwn(o, k);
@@ -201,20 +217,21 @@ const SKILL_READERS = { claude: 'spec claude copilot', github: 'spec copilot', a
  * Copilot, .agents/skills by Copilot and Codex; one anywhere else (a source tree, a plugin) by every host.
  * `sniff` classifies an explicitly named file outside the conventional locations by its content.
  */
-function classify(absPath, { root = null, env = process.env, home, sniff = false } = {}) {
+function classify(absPath, { root = null, H, read, sniff = false }) {
   const abs = toPosix(path.resolve(absPath));
   const b = path.posix.basename(abs);
   const parent = path.posix.basename(path.posix.dirname(abs));
-  const H = homes(env, home);
   const user = under(abs, H.home) && [H.copilot, H.claude, H.codex, `${H.home}/.agents`].some((d) => under(abs, d));
   const res = (kind, sub, reads, extra) => ({ kind, sub, scope: user ? 'user' : 'project', reads: W(reads), ...extra });
   const has = (re) => re.test(abs);
   const up = (marker) => findUp(path.dirname(absPath), marker, { stopAt: root, maxDepth: 12 });
-  const clPlugin = () => up(path.join('.claude-plugin', 'plugin.json'));
+  let cl;
+  const clPlugin = () => (cl === undefined ? (cl = up(path.join('.claude-plugin', 'plugin.json'))) : cl);
   const near = (n) => fs.existsSync(path.join(path.dirname(absPath), n));
   if (b.toLowerCase() === 'skill.md') {
     const d = path.posix.dirname(path.posix.dirname(abs));
-    const at = { [`${H.claude}/skills`]: 'claude', [`${H.copilot}/skills`]: 'github', [`${H.codex}/skills`]: 'codex' }[d]
+    const at = { [`${H.claude}/skills`]: 'claude', [`${H.copilot}/skills`]: 'github',
+      [`${H.codex}/skills`]: 'codex' }[d]
       || /(?:^|\/)\.(claude|github|agents|codex)\/skills$/.exec(d)?.[1];
     return res('skill', 'skill', SKILL_READERS[at] || 'spec copilot claude codex');
   }
@@ -255,7 +272,7 @@ function classify(absPath, { root = null, env = process.env, home, sniff = false
   }
   if (has(/(?:^|\/)\.claude-plugin\/plugin\.json$/)) return res('plugin', 'claude', 'claude copilot');
   if (has(/(?:^|\/)\.codex-plugin\/plugin\.json$/)) return res('plugin', 'codex', 'codex');
-  if (b === 'plugin.json' && /agent-plugins\.org/.test(String(parseJson(readNorm(absPath) || '').value?.$schema))) {
+  if (b === 'plugin.json' && /agent-plugins\.org/.test(String(parseJson(read(absPath) || '').value?.$schema))) {
     return res('plugin', 'agent-plugins', 'copilot codex');
   }
   if (b === 'plugin.json' && (parent === '.plugin' || has(/(?:^|\/)\.github\/plugin\/plugin\.json$/) || sniff
@@ -271,7 +288,7 @@ function classify(absPath, { root = null, env = process.env, home, sniff = false
   if (has(/(?:^|\/)\.codex\/config\.toml$/) || abs === `${H.codex}/config.toml`) {
     return res('codex-config', 'config', 'codex');
   }
-  const text = sniff ? readNorm(absPath) : null;
+  const text = sniff ? read(absPath) : null;
   if (text == null) return null;
   const v = b.endsWith('.json') ? parseJson(text, { jsonc: true }).value : null;
   if (isObj(v?.hooks) && (own(v, 'version') || Object.keys(v.hooks).some((e) => CP_EVENTS.includes(e)))) {
@@ -306,7 +323,15 @@ class FileLint {
       .map((h) => [h, { host: h, errors: [], warnings: [], notes: [] }]));
   }
 
-  get text() { return (this.cached ??= readNorm(this.abs) || ''); }
+  /** The file's text (LF line endings, no BOM; `bom` tells whether it had one). */
+  get text() {
+    if (this.cached === undefined) {
+      const raw = this.run.read(this.abs) || '';
+      this.bom = raw.charCodeAt(0) === 0xfeff;
+      this.cached = this.bom ? raw.slice(1) : raw;
+    }
+    return this.cached;
+  }
 
   /** A finding for each selected host of the rule (`only` narrows them); the message defaults to the title. */
   emit(id, line, message, { field, evidence, only, severity, strictSeverity } = {}) {
@@ -319,7 +344,8 @@ class FileLint {
       const key = `${host}|${id}|${line}|${msg}`;
       if (!r || (only && !only.includes(host)) || this.seen.has(key)) continue;
       this.seen.add(key);
-      const sev = (this.run.strict && (pick(strictSeverity, host) || rule.strict?.[host])) || pick(severity, host) || def;
+      const sev = (this.run.strict && (pick(strictSeverity, host) || rule.strict?.[host]))
+        || pick(severity, host) || def;
       r[{ error: 'errors', warning: 'warnings' }[sev] || 'notes'].push({ rule: id, line: line ?? null, message: msg,
         ...(field && { field }), ...(evidence && { evidence: clip(evidence) }) });
     }
@@ -336,7 +362,8 @@ class FileLint {
 
   secrets(text, offset = 0, where = '') {
     for (const s of scanSecrets(text)) {
-      this.sec('SEC-SECRET', s.line + offset, `secret-shaped value (${s.id})${where}; remove and rotate it`, s.redacted);
+      this.sec('SEC-SECRET', s.line + offset, `secret-shaped value (${s.id})${where}; remove and rotate it`,
+        s.redacted);
     }
   }
 
@@ -361,9 +388,11 @@ class FileLint {
 // ---------------------------------------------------------------------------
 // Markdown kinds: security text, skills, Codex sidecar, instructions, agents, commands, prompt files
 
-const PIPE_SHELL = [/\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b/i, /\b(?:ba)?sh\s+<\(\s*(?:curl|wget)\b/i,
+const PIPE_SHELL = [/\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b/i,
+  /\b(?:ba)?sh\s+<\(\s*(?:curl|wget)\b/i,
   /\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n|]*\|\s*(?:iex|Invoke-Expression)\b/i,
-  /\b(?:iex|Invoke-Expression)\s*\(?\s*\(?\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|New-Object\s+Net\.WebClient)/i];
+  new RegExp('\\b(?:iex|Invoke-Expression)\\s*\\(?\\s*\\(?\\s*'
+    + '(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|New-Object\\s+Net\\.WebClient)', 'i')];
 const DISABLE_GUARDS = [/--dangerously-skip-permissions\b/, /--dangerously-bypass-approvals-and-sandbox\b/,
   /--(?:dangerously-)?bypass-hook-trust\b/, /(?:^|\s)--yolo\b/, /--allow-all-tools\b/, /(?:^|\s)--allow-all\b/,
   /\bCOPILOT_ALLOW_ALL\s*=\s*["']?true/i, /"?disableAllHooks"?\s*[:=]\s*true/, /\bbypassPermissions\b/,
@@ -394,27 +423,31 @@ const NOT_THIRD = new RegExp(`^\\s*(?:${['i', "i'm", 'i am', 'i can', 'i will', 
 const SHELL_TOOL = /^(?:shell|bash|powershell|execute|\*)$|^(?:shell|bash|powershell)\(\s*(?:\*|\*:\*|:\*)?\s*\)$/i;
 const STRICT_WHAT = { flow: 'a flow-style collection', anchor: 'the anchor', alias: 'the alias', tag: 'the tag' };
 const SUBST = [[/\$ARGUMENTS\b/, () => '$ARGUMENTS works only in Claude Code; say "the text after the skill name"'],
-  [/\$\{CLAUDE_(?:SKILL_DIR|PROJECT_DIR|SESSION_ID|EFFORT|PLUGIN_ROOT|PLUGIN_DATA)\}/, (m) => `${m[0]} works only in Claude`],
+  [/\$\{CLAUDE_(?:SKILL_DIR|PROJECT_DIR|SESSION_ID|EFFORT|PLUGIN_ROOT|PLUGIN_DATA)\}/,
+    (m) => `${m[0]} works only in Claude`],
   [/(?:^|\s)!`[^`]+`|^\s*(?:`{3,}|~{3,})!/, () => 'dynamic context (!`cmd`) runs only in Claude Code']];
 
 function lintSkill(fl) {
-  const raw = fs.readFileSync(fl.abs, 'utf8').replace(/\r\n/g, '\n');
+  const raw = fl.text;
   const [dir, base] = [path.dirname(fl.abs), path.basename(fl.abs)];
   const dirName = path.basename(dir);
   const fm = parseFrontmatter(raw);
   const E = (id, line, msg, o) => fl.emit(id, line, msg, o);
+  fl.skillName = fm.data?.name;
   if (base !== 'SKILL.md') E('SK-FILENAME', null, `the file is named ${base}; hosts look for SKILL.md`);
-  if (fm.bom) E('SK-FM-BOM', 1);
+  if (fl.bom) E('SK-FM-BOM', 1);
   if (!fm.hasFrontmatter) {
     E('SK-FM-LINE1', fm.lateOpenLine || 1, fm.lateOpenLine && `frontmatter starts on line ${fm.lateOpenLine}, not 1`);
   }
   for (const e of fm.errors) E('SK-FM-YAML', e.line, `frontmatter YAML: ${e.message}`);
   for (const w of fm.warnings) {
     if (w.code === 'UNQUOTED_COLON') E('SK-FM-COLON', w.line, w.message);
-    else E('SK-FM-YAML', w.line, `frontmatter YAML: ${w.message}`, { severity: w.code !== 'RESERVED_INDICATOR' && 'warning' });
+    else E('SK-FM-YAML', w.line, `frontmatter YAML: ${w.message}`,
+      { severity: w.code !== 'RESERVED_INDICATOR' && 'warning' });
   }
   for (const c of fm.errors.length ? [] : fm.constructs) {
-    const fix = c.kind === 'flow' ? 'write one "key: value" or "- item" per line' : 'write the value out in block style';
+    const fix = c.kind === 'flow' ? 'write one "key: value" or "- item" per line'
+      : 'write the value out in block style';
     E('SK-FM-STRICTYAML', c.line, `${STRICT_WHAT[c.kind]} ${c.text}${c.path ? ` in \`${c.path}\`` : ''}: skills-ref `
       + `(strictyaml) rejects it; ${fix}`, { field: c.path || undefined });
   }
@@ -425,13 +458,15 @@ function lintSkill(fl) {
   const count = body.trim() ? body.replace(/\n+$/, '').split('\n').length : 0;
   const tokens = Math.ceil(body.length / 4);
   if (!count) E('SK-BODY-EMPTY', null);
-  if (count > 500) E('SK-BODY-LINES', null, `the body has ${count} lines (keep it under 500; move detail to references/)`);
+  if (count > 500) E('SK-BODY-LINES', null,
+    `the body has ${count} lines (keep it under 500; move detail to references/)`);
   if (tokens > 5000) E('SK-BODY-TOKENS', null, `the body is about ${tokens} tokens (keep it under 5,000)`);
   body.split('\n').forEach((l, i) => {
     for (const [re, msg] of SUBST) { const m = re.exec(l); if (m) E('SK-SUBST', i + 1 + offset, msg(m)); }
     // $N outside currency-like text ($1,845.00, $1k, $12.3M).
     const pos = /(?<![\\\w$])\$[0-9](?![0-9]|[.,]\d|[kKmMbB]\b)/.exec(l);
-    if (pos) E('SK-SUBST-POSITIONAL', i + 1 + offset, `${pos[0]} becomes an argument in Claude Code; write \\${pos[0]}`);
+    if (pos) E('SK-SUBST-POSITIONAL', i + 1 + offset,
+      `${pos[0]} becomes an argument in Claude Code; write \\${pos[0]}`);
   });
   skillStructure(fl, dir, body, offset);
   securityText(fl, body, offset);
@@ -449,10 +484,12 @@ function skillFields(fl, data, L, dirName) {
     if (typeof name !== 'string') E('SK-NAME-FORMAT', 'name', '`name` must be a string');
     if (n.length > 64) E('SK-NAME-LENGTH', 'name', `\`name\` has ${n.length} characters (max 64)`);
     if (why) E('SK-NAME-FORMAT', 'name', `\`name\` "${n}" has ${why}`);
-    if (n.normalize('NFKC') !== dirName.normalize('NFKC')) E('SK-NAME-DIR', 'name', `"${n}" is not the folder "${dirName}"`);
+    if (n.normalize('NFKC') !== dirName.normalize('NFKC')) E('SK-NAME-DIR', 'name',
+      `"${n}" is not the folder "${dirName}"`);
     if (/claude|anthropic/i.test(n)) E('SK-NAME-RESERVED', 'name', `\`name\` "${n}" contains a reserved word`);
   }
-  if (d === undefined || d === null || (typeof d === 'string' && !d.trim())) fl.emit('SK-DESC-REQUIRED', L('description') || 1);
+  if (d === undefined || d === null || (typeof d === 'string' && !d.trim())) fl.emit('SK-DESC-REQUIRED',
+    L('description') || 1);
   else if (typeof d !== 'string') E('SK-DESC-TYPE', 'description');
   else {
     const listing = d.length + (typeof data.when_to_use === 'string' ? data.when_to_use.length : 0);
@@ -462,7 +499,8 @@ function skillFields(fl, data, L, dirName) {
     if (NOT_THIRD.test(d)) E('SK-DESC-PERSON', 'description');
   }
   for (const key of Object.keys(data)) {
-    if (!W(SPEC_FIELDS).includes(key)) E('SK-FIELD-NONSPEC', key, `"${key}" is not one of the six spec fields`, { field: key });
+    if (!W(SPEC_FIELDS).includes(key)) E('SK-FIELD-NONSPEC', key, `"${key}" is not one of the six spec fields`,
+      { field: key });
     for (const host of ['copilot', 'claude', 'codex'].filter((h) => !SKILL_FIELDS[h].has(key))) {
       E('SK-FIELD-IGNORED', key, `${LABEL[host]} does not read "${key}"`, { only: [host], field: key });
     }
@@ -476,10 +514,12 @@ function skillFields(fl, data, L, dirName) {
   }
   const sd = String(m?.['short-description'] ?? '');
   if (own(m, 'short-description') && (sd.length < 25 || sd.length > 64)) {
-    E('SK-SHORTDESC', 'metadata.short-description', `\`metadata.short-description\` has ${sd.length} characters (25-64)`);
+    E('SK-SHORTDESC', 'metadata.short-description',
+      `\`metadata.short-description\` has ${sd.length} characters (25-64)`);
   }
   if (own(data, 'compatibility') && (typeof c !== 'string' || c.length < 1 || c.length > 500)) {
-    E('SK-COMPAT-LENGTH', 'compatibility', typeof c === 'string' ? `\`compatibility\` has ${c.length} characters` : null);
+    E('SK-COMPAT-LENGTH', 'compatibility',
+      typeof c === 'string' ? `\`compatibility\` has ${c.length} characters` : null);
   }
   if (!own(data, 'allowed-tools')) return;
   const at = data['allowed-tools'];
@@ -488,7 +528,8 @@ function skillFields(fl, data, L, dirName) {
   const wide = tokens.filter((t) => SHELL_TOOL.test(t));
   if (Array.isArray(at)) E('SK-ALLOWED-TOOLS-TYPE', 'allowed-tools');
   if (wide.length) {
-    fl.sec('SEC-ALLOWED-TOOLS', L('allowed-tools'), `allowed-tools pre-approves ${wide.join(', ')} for every user of this `
+    fl.sec('SEC-ALLOWED-TOOLS', L('allowed-tools'),
+      `allowed-tools pre-approves ${wide.join(', ')} for every user of this `
       + 'skill; keep it only for trusted, first-party skills', tokens.join(' '));
   }
 }
@@ -512,14 +553,18 @@ function skillStructure(fl, dir, body, offset) {
     if (/^references\/.+\//.test(r)) fl.emit('SK-REF-DEPTH', line, `${r} is nested below references/`);
   }
   const refDir = path.join(dir, 'references');
-  const others = statOrNull(refDir)?.isDirectory() ? fs.readdirSync(refDir).map((n) => path.join(refDir, n)) : [];
-  const mentions = (o, name) => ((t) => t.includes(`references/${name}`)
-    || new RegExp(`(?:^|[\\s(\\[\`'"/])${RegExp.escape(name)}\\b`).test(t))(readNorm(o) || '');
+  const refFiles = (isDir(refDir) ? fs.readdirSync(refDir) : []).map((n) => path.join(refDir, n))
+    .filter((f) => statOrNull(f)?.isFile());
+  // A file named only in another reference: hosts follow links one level deep from SKILL.md.
+  const linkedVia = (full, name) => {
+    const re = new RegExp(`(?:^|[\\s(\\[\`'"/])${RegExp.escape(name)}\\b`);
+    const mentions = (t) => t.includes(`references/${name}`) || re.test(t);
+    return refFiles.find((o) => o !== full && mentions(fl.run.read(o) || ''));
+  };
   const walkRefs = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const full = path.join(d, e.name);
-      const via = !e.isDirectory() && !linked.has(full)
-        && others.find((o) => o !== full && statOrNull(o)?.isFile() && mentions(o, e.name));
+      const via = !e.isDirectory() && !linked.has(full) && linkedVia(full, e.name);
       if (e.isDirectory()) fl.emit('SK-REF-DEPTH', null, `${rel(full)}/ nests references more than one level deep`);
       if (e.isDirectory()) walkRefs(full);
       else if (!linked.has(full)) {
@@ -528,7 +573,7 @@ function skillStructure(fl, dir, body, offset) {
       }
     }
   };
-  if (others.length) walkRefs(refDir);
+  if (isDir(refDir)) walkRefs(refDir);
   let files = 0;
   const HIDDEN = S('.git node_modules bin obj dist');
   const walk = (d) => {
@@ -557,7 +602,7 @@ function lintOpenaiYaml(fl) {
   if (!isObj(v)) return fl.emit('CX-YAML-PARSE', 1, 'agents/openai.yaml must be a mapping');
   fl.unknown(v, S('interface dependencies policy'), 'CX-YAML-FIELD', L, 'key');
   const skillDir = path.dirname(path.dirname(fl.abs));
-  const fmName = parseFrontmatter(readNorm(path.join(skillDir, 'SKILL.md')) || '').data?.name;
+  const fmName = parseFrontmatter(fl.run.read(path.join(skillDir, 'SKILL.md')) || '').data?.name;
   const name = typeof fmName === 'string' ? fmName : path.basename(skillDir);
   const { interface: ui, policy, dependencies } = v;
   const sd = ui?.short_description === undefined ? null : String(ui.short_description);
@@ -608,10 +653,11 @@ const NOT_USER = `(?!(?:<|\\{|\\$|%|${W('USER user username you your YOUR me nam
   .join('\\b|')}\\b|\\.\\.\\.))`;
 const USER_PATH = [new RegExp(`(?:^|[\\s"'(=:])(\\/(?:Users|home)\\/${NOT_USER}[A-Za-z0-9._-]+)`),
   new RegExp(`(?:^|[\\s"'(=])([A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\${NOT_USER}[A-Za-z0-9._ -]+)`, 'i')];
-const INTERNAL_HOST = new RegExp('(?:^|[\\s"\'(@/=])((?:[a-z0-9-]+\\.)+(?:internal|corp|intranet|intra|lan|local|private'
-  + '|home\\.arpa))(?![\\w.-])', 'i');
+const INTERNAL_HOST = new RegExp('(?:^|[\\s"\'(@/=])((?:[a-z0-9-]+\\.)+'
+  + '(?:internal|corp|intranet|intra|lan|local|private|home\\.arpa))(?![\\w.-])', 'i');
 const PRIVATE_IP = /(?:^|[^\d.])((?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3})(?![\d.])/;
-const IMPORT_RE = /(?:^|\s)@((?:\.{1,2}\/|~\/|\/)?[\w.-]+(?:\/[\w.-]+)*\.(?:md|mdc|txt|json|ya?ml|toml))(?=$|[\s,;:)\]])/g;
+const IMPORT_RE = new RegExp('(?:^|\\s)@((?:\\.{1,2}\\/|~\\/|\\/)?[\\w.-]+(?:\\/[\\w.-]+)*'
+  + '\\.(?:md|mdc|txt|json|ya?ml|toml))(?=$|[\\s,;:)\\]])', 'g');
 const POSIX_ONLY = new RegExp(`(?:^|[\\s;|&(])(?:${['export\\s+\\w+=', 'rm\\s+-[a-z]*r[a-z]*f', 'chmod\\s', 'chown\\s',
   'ln\\s+-s', 'source\\s', 'sudo\\s', 'grep\\s', 'sed\\s', 'awk\\s', 'xargs\\s', 'cp\\s+-[a-zA-Z]*R', 'ls\\s+-l',
   'cat\\s+<<', '\\$\\(', '\\/dev\\/null', 'mkdir\\s+-p\\s'].join('|')})`);
@@ -633,13 +679,15 @@ function lintInstructions(fl) {
     const v = data[key];
     for (const g of Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : [v]) {
       const p = globProblem(typeof g === 'string' ? g.trim() : g);
-      if (p) fl.emit('IN-APPLYTO-GLOB', L(key), `${key} pattern "${g}" has ${p}`, { only: host === 'copilot' && [host] });
+      if (p) fl.emit('IN-APPLYTO-GLOB', L(key), `${key} pattern "${g}" has ${p}`,
+        { only: host === 'copilot' && [host] });
     }
   }
   if (host) fl.unknown(data, known, 'IN-FIELD', L, 'frontmatter key', { only: [host] });
   if (sub === 'path-specific' && !own(data, 'applyTo')) fl.emit('IN-APPLYTO-MISSING', 1);
   for (const v of sub === 'path-specific' && own(data, 'excludeAgent') ? [data.excludeAgent].flat() : []) {
-    if (!['code-review', 'cloud-agent'].includes(v)) fl.emit('IN-EXCLUDEAGENT', L('excludeAgent'), `excludeAgent "${v}"`);
+    if (!['code-review', 'cloud-agent'].includes(v)) fl.emit('IN-EXCLUDEAGENT', L('excludeAgent'),
+      `excludeAgent "${v}"`);
   }
   const lines = body.replace(/\n+$/, '').split('\n').length;
   if (lines > 1000) fl.emit('IN-LENGTH', null, `${lines} lines; Copilot guidance is under about 1,000`);
@@ -650,8 +698,10 @@ function lintInstructions(fl) {
     const line = l.n + offset;
     const p = USER_PATH.map((re) => re.exec(l.raw)).find(Boolean);
     const [h, ip] = [INTERNAL_HOST.exec(l.raw), PRIVATE_IP.exec(l.raw)];
-    if (p) fl.emit('IN-ABS-PATH', line, `user-specific path ${p[1]}; use a relative path or a placeholder`, { evidence: p[1] });
-    if (h && !/\.(?:md|mdc|json|ya?ml)$/i.test(h[1])) fl.emit('IN-HOSTNAME', line, `internal hostname ${h[1]}`, { evidence: h[1] });
+    if (p) fl.emit('IN-ABS-PATH', line, `user-specific path ${p[1]}; use a relative path or a placeholder`,
+      { evidence: p[1] });
+    if (h && !/\.(?:md|mdc|json|ya?ml)$/i.test(h[1])) fl.emit('IN-HOSTNAME', line, `internal hostname ${h[1]}`,
+      { evidence: h[1] });
     if (ip) fl.emit('IN-HOSTNAME', line, `private IP address ${ip[1]}`, { evidence: ip[1] });
     windows ||= Boolean(l.fenceStart && WIN_LANGS.has(l.lang.toLowerCase()));
     const shell = l.code && !l.fenceStart && !l.fenceEnd && SHELL_LANGS.has(l.lang.toLowerCase());
@@ -672,12 +722,15 @@ function importCheck(fl, target, line) {
   const home = target.startsWith('~/');
   const resolved = home ? path.join(fl.run.home, target.slice(2)) : path.resolve(path.dirname(fl.abs), target);
   const file = { 'gemini-md': 'GEMINI.md', 'path-specific': '*.instructions.md' }[sub];
-  if (file) fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Copilot does not expand imports in ${file}`, { only: ['copilot'] });
+  if (file) fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Copilot does not expand imports in ${file}`,
+    { only: ['copilot'] });
   if (sub === 'agents-md' || sub === 'agents-override') {
-    fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Codex has no @import; the model sees the text`, { only: ['codex'] });
+    fl.emit('IN-IMPORT-UNSUPPORTED', line, `@${target}: Codex has no @import; the model sees the text`,
+      { only: ['codex'] });
   }
   if (/^~?\//.test(target)) fl.emit('IN-IMPORT-ABSOLUTE', line, `@${target} is absolute or home-relative`);
-  if (EXPANDS[sub] && !fs.existsSync(resolved)) fl.emit('IN-IMPORT-MISSING', line, `@${target} does not exist`, { only: EXPANDS[sub] });
+  if (EXPANDS[sub] && !fs.existsSync(resolved)) fl.emit('IN-IMPORT-MISSING', line, `@${target} does not exist`,
+    { only: EXPANDS[sub] });
 }
 
 /** Normalized directive sentences of a Markdown body (for the duplicate and contradiction checks). */
@@ -720,25 +773,44 @@ const conflict = (f, d, p, at) => ((f.neg && f.neg === p.f.pos) || (f.pos && f.p
     ? `indentation ${f.indent} here, ${p.f.indent} at ${at}` : f.pm && p.f.pm && f.pm !== p.f.pm
       ? `package manager ${f.pm} here, ${p.f.pm} at ${at}` : null);
 
+/**
+ * The earliest earlier directive that `f` conflicts with, from indexes of the first directive per facet value
+ * (one lookup per directive instead of a scan of every earlier one).
+ */
+function firstConflict(f, ix) {
+  const cands = [f.neg && ix.pos.get(f.neg), f.pos && ix.neg.get(f.pos)];
+  for (const [k, m] of [['indent', ix.indent], ['pm', ix.pm]]) {
+    for (const [v, i] of f[k] ? m : []) if (v !== f[k]) cands.push(i);
+  }
+  const i = Math.min(...cands.filter((x) => typeof x === 'number'));
+  return Number.isFinite(i) ? ix.prior[i] : null;
+}
+
 /** Duplicates and contradictions across always-on instruction files that load together. */
 function crossInstructionChecks(run) {
   // Nested AGENTS.md files refine their parent on purpose: compare the files that load together at the root.
   const groups = Map.groupBy(run.directives, (e) => (toPosix(path.relative(run.root, e.dir)).split('/')[0] === '.github'
     || path.resolve(e.dir) === run.root ? 'root' : e.dir));
   for (const entries of groups.values()) {
-    const [seen, prior] = [new Map(), []];
+    const seen = new Map();
+    const ix = { prior: [], pos: new Map(), neg: new Map(), indent: new Map(), pm: new Map() };
     for (const { fl, items } of entries) {
       const both = (other) => fl.cls.reads.filter((h) => other.cls.reads.includes(h));
       for (const d of items) {
         const f = facets(d.norm);
         const long = d.norm.split(' ').length >= 5;
         const prev = long && seen.get(d.norm);
-        const hit = prior.map((p) => [p, `${p.fl.path}:${p.d.line}`]).find(([p, at]) => conflict(f, d, p, at));
+        const hit = firstConflict(f, ix);
         if (prev && prev.fl !== fl) {
-          fl.emit('IN-DUPLICATE', d.line, `same directive as ${prev.fl.path}:${prev.line}`, { only: both(prev.fl), evidence: d.raw });
+          fl.emit('IN-DUPLICATE', d.line, `same directive as ${prev.fl.path}:${prev.line}`,
+            { only: both(prev.fl), evidence: d.raw });
         } else if (long && !prev) seen.set(d.norm, { fl, line: d.line });
-        if (hit) fl.emit('IN-CONFLICT', d.line, `${conflict(f, d, ...hit)} (${hit[1]})`, { only: both(hit[0].fl) });
-        prior.push({ fl, d, f });
+        if (hit) {
+          const at = `${hit.fl.path}:${hit.d.line}`;
+          fl.emit('IN-CONFLICT', d.line, `${conflict(f, d, hit, at)} (${at})`, { only: both(hit.fl) });
+        }
+        for (const k of ['pos', 'neg', 'indent', 'pm']) if (f[k] && !ix[k].has(f[k])) ix[k].set(f[k], ix.prior.length);
+        ix.prior.push({ fl, d, f });
       }
     }
   }
@@ -779,7 +851,8 @@ function lintAgent(fl) {
     if (String(data.description ?? '').trim() === '') fl.emit('AG-DESC-REQUIRED', 1);
     fl.unknown(data, AGENT_FIELDS[host], 'AG-FIELD', L, 'agent field', { only: [host] });
     for (const [k, vals] of Object.entries(AGENT_ENUMS[host])) {
-      if (own(data, k) && !vals.includes(data[k])) E('AG-ENUM', k, `${k} "${data[k]}" is not one of ${vals.join(', ')}`, { only: [host] });
+      if (own(data, k) && !vals.includes(data[k])) E('AG-ENUM', k, `${k} "${data[k]}" is not one of ${vals.join(', ')}`,
+        { only: [host] });
     }
     if (host === 'copilot') copilotAgent(fl, data, L, body, base);
     else if (name === undefined || name === null || name === '') fl.emit('AG-NAME-REQUIRED', 1);
@@ -793,14 +866,16 @@ function lintAgent(fl) {
 
 function copilotAgent(fl, data, L, body, base) {
   if (!/^[.\-_a-zA-Z0-9]+$/.test(base)) fl.emit('AG-FILENAME', null, `file name "${base}" has other characters`);
-  if (body.length > 30000) fl.emit('AG-BODY-LENGTH', null, `the agent prompt has ${body.length} characters (max 30,000)`);
+  if (body.length > 30000) fl.emit('AG-BODY-LENGTH', null,
+    `the agent prompt has ${body.length} characters (max 30,000)`);
   for (const k of Object.keys(data).filter((x) => x in SURFACE)) {
     fl.emit('AG-FIELD-SURFACE', L(k), `"${k}" is ${SURFACE[k] || 'read by Copilot CLI and the cloud agent; VS Code and '
       + 'IDE agents ignore it'}`, { field: k, severity: !SURFACE[k] && 'note' });
   }
   const tools = data.tools == null ? [] : Array.isArray(data.tools) ? data.tools : String(data.tools).split(',');
   for (const t of tools.map((x) => String(x).trim())) {
-    if (t && !CP_TOOL_ALIASES.has(t) && !/^[\w.-]+\/(?:\*|[\w.-]+)$/.test(t)) fl.emit('AG-TOOLS', L('tools'), `tool "${t}"`);
+    if (t && !CP_TOOL_ALIASES.has(t) && !/^[\w.-]+\/(?:\*|[\w.-]+)$/.test(t)) fl.emit('AG-TOOLS', L('tools'),
+      `tool "${t}"`);
   }
 }
 
@@ -824,17 +899,19 @@ function lintCommandOrPrompt(fl) {
 
 const EXT = '\\.(?:mjs|cjs|js|ts|py|sh|ps1|rb|pl)\\b';
 const ROOT_VAR = '(?:PLUGIN_ROOT|COPILOT_PLUGIN_ROOT|CLAUDE_PLUGIN_ROOT)';
-const SCRIPT = new RegExp(`(?:\\$\\{?(?:${ROOT_VAR.slice(3, -1)}|CLAUDE_PROJECT_DIR)\\}?[\\\\/])?[\\w.@~\${}\\\\/-]*[\\w-]${EXT}`, 'g');
+const SCRIPT = new RegExp(`(?:\\$\\{?(?:${ROOT_VAR.slice(3, -1)}|CLAUDE_PROJECT_DIR)\\}?[\\\\/])?`
+  + `[\\w.@~\${}\\\\/-]*[\\w-]${EXT}`, 'g');
 const CP_SCRIPT = new RegExp(`(\\$\\{?${ROOT_VAR}\\}?|\\$env:${ROOT_VAR}|\\$\\{?PLUGIN_DATA\\}?)?`
   + `([\\\\/]?[\\w.@~-][\\w.@~\\\\/-]*${EXT})`, 'g');
 const WRITES = '(?:>>?|\\btee\\s+(?:-a\\s+)?)\\s*["\']?';
 const WRITE_CALL = '(?:writeFile|appendFile|createWriteStream|mkdir)\\w*\\([^\\n]*';
-const CP_WRITES_ROOT = new RegExp(`(?:${WRITES}|\\b(?:Out-File|Set-Content)\\b[^\\n]*\\s*["']?)(?:\\$\\{?|\\$env:)`
+const CP_WRITES_ROOT = new RegExp(`(?:${WRITES}|\\b(?:Out-File|Set-Content)\\b[^\\n]*)(?:\\$\\{?|\\$env:)`
   + `${ROOT_VAR}|${WRITE_CALL}${ROOT_VAR}`);
 const CL_WRITES_ROOT = new RegExp(`${WRITES}\\$\\{?CLAUDE_PLUGIN_ROOT|${WRITE_CALL}CLAUDE_PLUGIN_ROOT`
   + '|open\\([^\\n]*CLAUDE_PLUGIN_ROOT[^\\n]*["\'][wa]');
 const ASK = /permissionDecision["']?\s*[:=]\s*["']ask["']/;
-const EXIT2 = new RegExp(['process\\.exit\\(\\s*2\\s*\\)', 'process\\.exitCode\\s*=\\s*2\\b', '(?:^|[\\s;&|])exit\\s+2\\b',
+const EXIT2 = new RegExp(['process\\.exit\\(\\s*2\\s*\\)', 'process\\.exitCode\\s*=\\s*2\\b',
+  '(?:^|[\\s;&|])exit\\s+2\\b',
   'sys\\.exit\\(\\s*2\\s*\\)', '\\[Environment\\]::Exit\\(\\s*2\\s*\\)'].join('|'));
 const ROOTED = new RegExp(`^\\$\\{?${ROOT_VAR}\\}?`);
 const tail = (p) => p.replace(/^\$\{?[A-Z_]+\}?[\\/]/, '');
@@ -844,16 +921,16 @@ function scriptsOf(fl, list, baseDir, pluginRoot = null) {
   return list.flatMap((s) => [...s.matchAll(SCRIPT)].map((m) => m[0].replace(/^["']|["']$/g, '')))
     .map((p) => (ROOTED.test(p) ? pluginRoot && path.join(pluginRoot, tail(p)) : /^\$\{?CLAUDE_PROJECT_DIR\}?/.test(p)
       ? path.join(fl.run.root, tail(p)) : /[<$]/.test(p) ? null : path.resolve(baseDir, p)))
-    .filter((p) => p && statOrNull(p)?.isFile() && statOrNull(p).size < 512 * 1024)
-    .map((file) => ({ file, text: readNorm(file) || '' }));
+    .filter((p) => { const st = p && statOrNull(p); return st?.isFile() && st.size < 512 * 1024; })
+    .map((file) => ({ file, text: fl.run.read(file) || '' }));
 }
 const anyText = (list, scripts, re) => list.some((s) => re.test(s)) || scripts.some((s) => re.test(s.text));
 
 function httpSecurity(fl, line, url) {
-  let u = null;
-  try { u = new URL(String(url)); } catch {}
+  const u = URL.parse(String(url));
   if (u && !fl.run.allowHosts.has(u.hostname)) {
-    fl.sec('SEC-HTTP-HOOK', line, `HTTP hook sends payloads to ${u.hostname}, which is not on the allowlist (--allow-host)`,
+    fl.sec('SEC-HTTP-HOOK', line,
+      `HTTP hook sends payloads to ${u.hostname}, which is not on the allowlist (--allow-host)`,
       u.origin);
   }
 }
@@ -862,7 +939,8 @@ function lintCopilotHooks(fl, v, text, inline = false) {
   if (!isObj(v)) return fl.emit('HK-CP-SHAPE', 1, 'the hooks file must be a JSON object');
   const L = (k) => keyLine(text, k);
   if (!inline && !own(v, 'version')) fl.emit('HK-CP-VERSION-MISSING', 1);
-  else if (!inline && v.version !== 1) fl.emit('HK-CP-VERSION', L('version'), `"version" is ${JSON.stringify(v.version)}`);
+  else if (!inline && v.version !== 1) fl.emit('HK-CP-VERSION', L('version'),
+    `"version" is ${JSON.stringify(v.version)}`);
   if (!inline) fl.unknown(v, S('version disableAllHooks hooks description $schema'), 'HK-CP-FIELD', L, 'top-level key');
   if (!inline && v.disableAllHooks === true) fl.emit('HK-CP-DISABLED', L('disableAllHooks'));
   if (!isObj(v.hooks)) return fl.emit('HK-CP-SHAPE', L('hooks') || 1, '"hooks" must map event names to arrays');
@@ -871,12 +949,18 @@ function lintCopilotHooks(fl, v, text, inline = false) {
   for (const [event, entries] of Object.entries(v.hooks)) {
     const line = L(event);
     const E = (id, msg) => fl.emit(id, line, msg);
-    const kind = CP_EVENTS.includes(event) ? 'camel' : [...CP_EVENTS_PASCAL, ...CP_EVENTS_UNDOC].includes(event) && 'pascal';
-    if (!kind) { E('HK-CP-EVENT', `"${event}" is not a Copilot event${guess([...CP_EVENTS, ...CP_EVENTS_PASCAL], event)}`); continue; }
+    const kind = CP_EVENTS.includes(event) ? 'camel'
+      : [...CP_EVENTS_PASCAL, ...CP_EVENTS_UNDOC].includes(event) && 'pascal';
+    if (!kind) {
+      E('HK-CP-EVENT', `"${event}" is not a Copilot event${guess([...CP_EVENTS, ...CP_EVENTS_PASCAL], event)}`);
+      continue;
+    }
     cases[kind].push(event);
-    if (CP_EVENTS_UNDOC.includes(event)) E('HK-CP-EVENT-UNDOC', `"${event}": use ${event[0].toLowerCase()}${event.slice(1)}`);
+    if (CP_EVENTS_UNDOC.includes(event)) E('HK-CP-EVENT-UNDOC',
+      `"${event}": use ${event[0].toLowerCase()}${event.slice(1)}`);
     if (!Array.isArray(entries)) { E('HK-CP-SHAPE', `"${event}" must be an array of hook entries`); continue; }
-    if (cloud && /^(?:notification|[pP]ermissionRequest)$/.test(event)) E('HK-CP-CLOUD-EVENT', `${event}: ${title('HK-CP-CLOUD-EVENT')}`);
+    if (cloud && /^(?:notification|[pP]ermissionRequest)$/.test(event)) E('HK-CP-CLOUD-EVENT',
+      `${event}: ${title('HK-CP-CLOUD-EVENT')}`);
     if (CP_OUTPUT_IGNORED.has(event)) E('HK-CP-OUTPUT-IGNORED', `Copilot ignores the output of ${event} command hooks`);
     for (const entry of entries) {
       if (!isObj(entry)) E('HK-CP-SHAPE', `${event}: every entry must be an object`);
@@ -888,13 +972,15 @@ function lintCopilotHooks(fl, v, text, inline = false) {
     }
   }
   if (cases.camel.length && cases.pascal.length) {
-    fl.emit('HK-CP-MIXED-CASE', null, `camelCase (${cases.camel.join(', ')}) and PascalCase (${cases.pascal.join(', ')})`);
+    fl.emit('HK-CP-MIXED-CASE', null,
+      `camelCase (${cases.camel.join(', ')}) and PascalCase (${cases.pascal.join(', ')})`);
   }
 }
 
 function copilotMatcher(fl, matcher, line) {
   const err = matcher === undefined ? null : badRegex(`^(?:${matcher})$`);
-  if (err) fl.emit('HK-CP-MATCHER', line, `matcher "${matcher}" does not compile (${err.message.split(':').pop().trim()})`);
+  if (err) fl.emit('HK-CP-MATCHER', line,
+    `matcher "${matcher}" does not compile (${err.message.split(':').pop().trim()})`);
 }
 
 function copilotEntry(fl, event, e, line, cloud, nested) {
@@ -904,7 +990,8 @@ function copilotEntry(fl, event, e, line, cloud, nested) {
   if (!['command', 'http', 'prompt'].includes(type)) return E('HK-CP-TYPE', `type "${type}"`);
   for (const k of Object.keys(e).filter((x) => !CP_ENTRY_FIELDS.has(x) || (nested && x === 'hooks'))) {
     const local = ['windows', 'linux', 'osx', 'hookSpecificOutput'].includes(k);
-    E(local && cloud ? 'HK-CP-LOCAL-KEYS' : 'HK-CP-FIELD', local ? `"${k}" is a VS Code Local-harness key; Copilot ignores it`
+    E(local && cloud ? 'HK-CP-LOCAL-KEYS' : 'HK-CP-FIELD',
+      local ? `"${k}" is a VS Code Local-harness key; Copilot ignores it`
       : `unknown key "${k}"`, { field: k });
   }
   copilotMatcher(fl, e.matcher, line);
@@ -912,7 +999,8 @@ function copilotEntry(fl, event, e, line, cloud, nested) {
   const eff = [e.timeoutSec, e.timeout].find((x) => typeof x === 'number');
   const [hasSec, hasTimeout] = [e.timeoutSec !== undefined, e.timeout !== undefined];
   if (hasSec && !(typeof e.timeoutSec === 'number' && e.timeoutSec > 0)) E('HK-CP-TIMEOUT-TYPE');
-  if (!hasSec && !hasTimeout) E('HK-CP-TIMEOUT', 'no timeoutSec (Copilot waits up to 30 s)', { severity: 'note', strictSeverity: 'warning' });
+  if (!hasSec && !hasTimeout) E('HK-CP-TIMEOUT', 'no timeoutSec (Copilot waits up to 30 s)',
+    { severity: 'note', strictSeverity: 'warning' });
   if (hasSec && hasTimeout) E('HK-CP-TIMEOUT', 'both timeoutSec and timeout (VS Code reads timeout first)');
   if (eff > 30) E('HK-CP-TIMEOUT', `timeout ${eff} s is above 30 s`);
   if (type === 'http') return copilotHttp(fl, E, event, e.url, line);
@@ -924,7 +1012,8 @@ function copilotEntry(fl, event, e, line, cloud, nested) {
   if (!bash && !ps && !cmd && !exec) E('HK-CP-COMMAND');
   if (bash && !ps && !cmd) E('HK-CP-NO-WINDOWS', 'bash only; add a powershell entry for Windows');
   if (ps && !bash && !cmd) E('HK-CP-PS-ONLY', 'powershell only; the cloud agent (Linux) ignores it');
-  if (xs.length) E('HK-XS-COMMAND', `"command" runs in bash and PowerShell but uses ${xs.join('; ')}`, { evidence: e.command });
+  if (xs.length) E('HK-XS-COMMAND', `"command" runs in bash and PowerShell but uses ${xs.join('; ')}`,
+    { evidence: e.command });
   if (ps && /&&|\|\|/.test(e.powershell)) E('HK-CP-PS-COMPAT', 'the powershell string uses && or ||');
   const list = strs(e.bash, e.powershell, e.command, e.exec, Array.isArray(e.args) ? e.args : []);
   const plugin = fl.cls.plugin || null;
@@ -933,21 +1022,25 @@ function copilotEntry(fl, event, e, line, cloud, nested) {
   const rootCwd = typeof e.cwd === 'string' && ROOTED.test(e.cwd);
   const [m, s] = (plugin && !rootCwd && list.flatMap((x) => [...x.matchAll(CP_SCRIPT)].map((y) => [y, x]))
     .find(([y]) => !y[1] && !/^[/\\~]/.test(y[2]) && !WIN_ABS.test(y[2]))) || [];
-  if (anyText(list, scripts, ASK)) E('HK-CP-ASK', 'the hook can answer permissionDecision "ask" (deny in the cloud agent)');
+  if (anyText(list, scripts, ASK)) E('HK-CP-ASK',
+    'the hook can answer permissionDecision "ask" (deny in the cloud agent)');
   if (plugin && /^[pP]reToolUse$/.test(event) && e.cwd !== '${PLUGIN_ROOT}') E('HK-CP-PLUGIN-CWD');
-  if (m) E('HK-CP-PLUGIN-PATHS', `"${m[2]}" resolves against the project; write "\${PLUGIN_ROOT}/${m[2].replace(/^\.[\\/]/, '')}"`, { evidence: s });
-  if (plugin && anyText(list, scripts, CP_WRITES_ROOT)) E('HK-CP-PLUGIN-PATHS', 'writes under ${PLUGIN_ROOT}; use ${PLUGIN_DATA}');
+  if (m) E('HK-CP-PLUGIN-PATHS',
+    `"${m[2]}" resolves against the project; write "\${PLUGIN_ROOT}/${m[2].replace(/^\.[\\/]/, '')}"`, { evidence: s });
+  if (plugin && anyText(list, scripts, CP_WRITES_ROOT)) E('HK-CP-PLUGIN-PATHS',
+    'writes under ${PLUGIN_ROOT}; use ${PLUGIN_DATA}');
   fl.unpinned(list, line, `${event}: `);
 }
 
 function copilotHttp(fl, E, event, url, line) {
-  let u = null;
-  try { u = new URL(String(url)); } catch {}
+  const u = URL.parse(String(url));
   if (typeof url !== 'string') return E('HK-CP-HTTP', 'http hooks need a url');
   if (!u) return E('HK-CP-HTTP', `invalid URL "${url}"`);
   if (u.protocol === 'http:' && !LOOPBACK.has(u.hostname)) E('HK-CP-HTTP', `${u.origin} must use https`);
-  else if (u.protocol === 'http:' && /^(?:[pP]reToolUse|[pP]ermissionRequest)$/.test(event)) E('HK-CP-HTTP', 'https even on localhost');
-  else if (u.protocol === 'http:') E('HK-CP-HTTP', 'localhost needs COPILOT_HOOK_ALLOW_LOCALHOST=1', { severity: 'warning' });
+  else if (u.protocol === 'http:' && /^(?:[pP]reToolUse|[pP]ermissionRequest)$/.test(event)) E('HK-CP-HTTP',
+    'https even on localhost');
+  else if (u.protocol === 'http:') E('HK-CP-HTTP', 'localhost needs COPILOT_HOOK_ALLOW_LOCALHOST=1',
+    { severity: 'warning' });
   else if (u.protocol !== 'https:') E('HK-CP-HTTP', `unsupported URL scheme ${u.protocol}`);
   httpSecurity(fl, line, url);
 }
@@ -958,7 +1051,7 @@ function lintGroups(fl, hooks, text, dialect, handler, fromToml = false) {
     : [CX_EVENTS, CX_NO_MATCHER, /^[A-Za-z0-9_|]+$/];
   for (const [event, groups] of Object.entries(hooks).filter(([e]) => !fromToml || e !== 'state')) {
     const at = fromToml ? text.indexOf(`hooks.${event}`) : -1;
-    const line = fromToml ? (at < 0 ? null : lineOf(text, at)) : keyLine(text, event);
+    const line = fromToml ? (at < 0 ? null : lineIn(text, at)) : keyLine(text, event);
     const E = (id, msg) => fl.emit(`HK-${dialect}-${id}`, line, msg);
     if (!EVENTS.includes(event)) {
       E('EVENT', `"${event}" is not a ${dialect === 'CL' ? 'Claude Code' : 'Codex'} hook event`
@@ -968,26 +1061,30 @@ function lintGroups(fl, hooks, text, dialect, handler, fromToml = false) {
     for (const g of groups) {
       const shape = !isObj(g) || (dialect === 'CX' && !Array.isArray(g.hooks));
       if (shape) { E('SHAPE', `${event}: every matcher group must be an object with "hooks"`); continue; }
-      if (dialect === 'CL' && Array.isArray(g.matcher)) E('SHAPE', `${event}: a matcher array invalidates the file; use "A|B"`);
+      if (dialect === 'CL' && Array.isArray(g.matcher)) E('SHAPE',
+        `${event}: a matcher array invalidates the file; use "A|B"`);
       else if (g.matcher !== undefined && g.matcher !== '' && g.matcher !== '*') {
         if (NO_MATCHER.has(event)) E('MATCHER-IGNORED', `${event} ignores matchers; "${g.matcher}" is dropped`);
         else if (typeof g.matcher === 'string' && !plain.test(g.matcher) && badRegex(g.matcher)) {
           E('MATCHER', `matcher "${g.matcher}" does not compile`);
         }
       }
-      fl.unknown(g, S('matcher hooks'), `HK-${dialect}-FIELD`, () => line, 'matcher-group key', { prefix: `${event}: ` });
+      fl.unknown(g, S('matcher hooks'), `HK-${dialect}-FIELD`, () => line, 'matcher-group key',
+        { prefix: `${event}: ` });
       if (!Array.isArray(g.hooks)) { E('SHAPE', `${event}: every matcher group needs a "hooks" array`); continue; }
       for (const h of g.hooks) handler(event, h, line);
     }
   }
 }
 
+const CLAUDE_VAR = /^\$\{?(?:CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA)\}?/;
+
 function unquotedVar(cmd) {
   let q = null;
   for (let i = 0; i < cmd.length; i++) {
     if (q) { if (cmd[i] === q) q = null; continue; }
     if (cmd[i] === '"' || cmd[i] === "'") q = cmd[i];
-    const m = cmd[i] === '$' && /^\$\{?(?:CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA)\}?/.exec(cmd.slice(i));
+    const m = cmd[i] === '$' && CLAUDE_VAR.exec(cmd.slice(i));
     if (m) return m[0];
   }
   return null;
@@ -999,15 +1096,18 @@ function claudeHandler(fl, event, h, line, { project, plugin }) {
   const { type, onFailure } = h;
   const types = claudeTypes(event);
   if (!W('command http mcp_tool prompt agent').includes(type)) return E('HK-CL-TYPE', `type ${JSON.stringify(type)}`);
-  if (CL_EVENTS.includes(event) && !types.includes(type)) E('HK-CL-TYPE', `${type} hooks are not supported (only ${types.join(', ')})`);
+  if (CL_EVENTS.includes(event) && !types.includes(type)) E('HK-CL-TYPE',
+    `${type} hooks are not supported (only ${types.join(', ')})`);
   fl.unknown(h, CL_HANDLER_FIELDS, 'HK-CL-FIELD', () => line, 'handler field', { prefix: `${event}: ` });
   if (h.if !== undefined && !CL_IF_EVENTS.has(event)) E('HK-CL-IF');
   if (h.once !== undefined) E('HK-CL-ONCE');
   if (h.shell !== undefined && !['bash', 'powershell'].includes(h.shell)) E('HK-CL-SHELL', `shell "${h.shell}"`);
-  if (onFailure !== undefined && !['continue', 'block'].includes(onFailure)) E('HK-CL-ONFAILURE', `onFailure "${onFailure}"`);
+  if (onFailure !== undefined && !['continue', 'block'].includes(onFailure)) E('HK-CL-ONFAILURE',
+    `onFailure "${onFailure}"`);
   else if (onFailure !== undefined && (S('Stop SubagentStop TaskCompleted TeammateIdle').has(event) || h.async)) {
     E('HK-CL-ONFAILURE', `onFailure has no effect on ${h.async ? 'async hooks' : event}`, { severity: 'warning' });
-  } else if (onFailure !== undefined) E('HK-CL-ONFAILURE', 'onFailure needs Claude Code 2.1.295+', { severity: 'note' });
+  } else if (onFailure !== undefined) E('HK-CL-ONFAILURE', 'onFailure needs Claude Code 2.1.295+',
+    { severity: 'note' });
   if (type === 'http') return typeof h.url === 'string' ? httpSecurity(fl, line, h.url) : E('HK-CL-SHAPE', 'no url');
   if (type !== 'command') return;
   if (typeof h.command !== 'string' || !h.command.trim()) return E('HK-CL-SHAPE', 'a command hook needs "command"');
@@ -1015,21 +1115,25 @@ function claudeHandler(fl, event, h, line, { project, plugin }) {
   const shim = path.basename(h.command.replace(/\\/g, '/')).toLowerCase();
   const [unquoted, xs] = exec ? [null, []] : [unquotedVar(h.command), project ? crossShellProblems(h.command) : []];
   const list = strs(h.command, exec ? h.args : []);
-  if (exec && (/\.(?:cmd|bat)$/.test(shim) || NPM_SHIMS.has(shim))) E('HK-CL-EXEC-SHIM', `exec form cannot start "${h.command}"`);
+  if (exec && (/\.(?:cmd|bat)$/.test(shim) || NPM_SHIMS.has(shim))) E('HK-CL-EXEC-SHIM',
+    `exec form cannot start "${h.command}"`);
   if (exec && project) E('HK-CL-REPO-EXEC');
   if (unquoted) E('HK-CL-UNQUOTED-VAR', `${unquoted} is not double-quoted`, { evidence: h.command });
-  if (xs.length) E('HK-XS-COMMAND', `Copilot runs it in bash and PowerShell, but it uses ${xs.join('; ')}`, { only: ['copilot'], evidence: h.command });
+  if (xs.length) E('HK-XS-COMMAND', `Copilot runs it in bash and PowerShell, but it uses ${xs.join('; ')}`,
+    { only: ['copilot'], evidence: h.command });
   for (const s of plugin ? list : []) {
     const tok = [...s.matchAll(SCRIPT)].map((m) => m[0])
       .find((t) => !ROOTED.test(t) && !/^\$\{?CLAUDE_PROJECT_DIR/.test(t) && !/^(?:https?:|<)/.test(t));
-    if (tok) E('HK-CL-PLUGIN-ROOT', `"${tok}" resolves against the project; write "\${CLAUDE_PLUGIN_ROOT}/${tok.replace(/^\.\//, '')}"`);
+    if (tok) E('HK-CL-PLUGIN-ROOT',
+      `"${tok}" resolves against the project; write "\${CLAUDE_PLUGIN_ROOT}/${tok.replace(/^\.\//, '')}"`);
   }
   if (plugin && anyText(list, scriptsOf(fl, list, plugin, plugin), CL_WRITES_ROOT)) E('HK-CL-PLUGIN-DATA');
   fl.unpinned(list, line, `${event}: `);
 }
 
 /** Why a Codex `command` fails under cmd.exe /C on Windows (checked when no commandWindows is given). */
-const CMD_EXE = [[/(?:^|\s)\.{1,2}\/[^\s]*|\.sh\b/, 'a ./script or .sh path'], [/\$\{?[A-Za-z_]/, '$VAR (cmd uses %VAR%)'],
+const CMD_EXE = [[/(?:^|\s)\.{1,2}\/[^\s]*|\.sh\b/, 'a ./script or .sh path'],
+  [/\$\{?[A-Za-z_]/, '$VAR (cmd uses %VAR%)'],
   [/'/, 'single quotes (not quotes in cmd.exe)'], [/(?:^|\s)~\//, '~/'], [/\/dev\/null/, '/dev/null'],
   [/\bcommand\s+-v\b|\bexport\s|;\s*then\b/, 'POSIX shell syntax']];
 const COPILOT_OUTPUT = /\b(?:modifiedArgs|modifiedResult|textResultForLlm)\b/;
@@ -1037,10 +1141,13 @@ const COPILOT_OUTPUT = /\b(?:modifiedArgs|modifiedResult|textResultForLlm)\b/;
 function codexHandler(fl, event, h, line) {
   const E = (id, msg, o) => fl.emit(id, line, `${event}: ${msg ?? title(id)}`, o);
   if (!isObj(h)) return E('HK-CX-SHAPE', 'every handler must be an object');
-  if (!W('command mcp_tool prompt agent').includes(h.type)) return E('HK-CX-TYPE', `handler type ${JSON.stringify(h.type)}`);
-  if (h.type === 'prompt' || h.type === 'agent') return E('HK-CX-TYPE', `${h.type} handlers never run`, { severity: 'warning' });
+  if (!W('command mcp_tool prompt agent').includes(h.type)) return E('HK-CX-TYPE',
+    `handler type ${JSON.stringify(h.type)}`);
+  if (h.type === 'prompt' || h.type === 'agent') return E('HK-CX-TYPE', `${h.type} handlers never run`,
+    { severity: 'warning' });
   for (const k of Object.keys(h).filter((x) => !CX_HANDLER_FIELDS[h.type].has(x))) {
-    E('HK-CX-FIELD', `"${k}" is not a ${h.type} handler field${/^(?:args|cwd|env)$/.test(k) ? ' (no args, cwd or env)' : ''}`, { field: k });
+    const why = /^(?:args|cwd|env)$/.test(k) ? ' (no args, cwd or env)' : '';
+    E('HK-CX-FIELD', `"${k}" is not a ${h.type} handler field${why}`, { field: k });
   }
   if (h.type !== 'command') return codexSessionEnd(E, event, h);
   if (typeof h.command !== 'string' || !h.command.trim()) return E('HK-CX-SHAPE', 'a command handler needs "command"');
@@ -1082,11 +1189,14 @@ function lintHooksOrSettings(fl) {
     if (kind === 'settings' && sub === 'claude') fl.emit('HK-CP-JSON', parsed.line, `invalid JSON: ${parsed.error}`);
     return;
   }
-  if (kind === 'settings' && !isObj(v)) return fl.emit(`HK-${dialect}-SHAPE`, 1, 'a settings file must be a JSON object');
-  if (kind === 'settings' && own(v, 'hooks') && sub === 'claude') claude(v.hooks, { project: fl.cls.scope === 'project' });
+  if (kind === 'settings' && !isObj(v)) return fl.emit(`HK-${dialect}-SHAPE`, 1,
+    'a settings file must be a JSON object');
+  if (kind === 'settings' && own(v, 'hooks') && sub === 'claude') claude(v.hooks,
+    { project: fl.cls.scope === 'project' });
   if (kind === 'settings' && own(v, 'hooks') && sub === 'copilot') lintCopilotHooks(fl, { hooks: v.hooks }, text, true);
   if (kind === 'settings' && sub === 'copilot' && v.disableAllHooks === true) {
-    fl.emit('HK-CP-DISABLED', keyLine(text, 'disableAllHooks'), '"disableAllHooks": true turns off every non-policy hook');
+    fl.emit('HK-CP-DISABLED', keyLine(text, 'disableAllHooks'),
+      '"disableAllHooks": true turns off every non-policy hook');
   }
   if (kind === 'hooks' && sub === 'copilot') lintCopilotHooks(fl, v, text);
   if (kind === 'hooks' && sub === 'claude-plugin' && !own(v, 'hooks')) {
@@ -1095,8 +1205,9 @@ function lintHooksOrSettings(fl) {
     claude(v.hooks, { plugin: fl.cls.plugin || path.dirname(path.dirname(fl.abs)) });
   }
   if (kind === 'hooks' && sub === 'codex') lintCodexHooks(fl, v, text);
-  const toml = kind === 'hooks' && sub === 'codex' && readNorm(path.join(path.dirname(fl.abs), 'config.toml'));
-  if (toml && /^\s*\[\[?hooks[.\]]/m.test(toml)) fl.emit('HK-CX-BOTH', null, 'hooks in both hooks.json and config.toml');
+  const toml = kind === 'hooks' && sub === 'codex' && fl.run.read(path.join(path.dirname(fl.abs), 'config.toml'));
+  if (toml && /^\s*\[\[?hooks[.\]]/m.test(toml)) fl.emit('HK-CX-BOTH', null,
+    'hooks in both hooks.json and config.toml');
   fl.secrets(text);
 }
 
@@ -1114,16 +1225,23 @@ const AP_NAME = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
 const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const hasSkill = (...p) => fs.existsSync(path.join(...p, 'SKILL.md'));
 
-function pluginSkillCollisions(fl, pluginRoot) {
-  const project = new Map();
+/** Project skill folders by name (first found wins), listed once per run. */
+function projectSkills(run) {
+  if (run.projectSkills) return run.projectSkills;
+  const project = (run.projectSkills = new Map());
   for (const rel of ['.github/skills', '.agents/skills', '.claude/skills']) {
-    for (const e of subdirs(path.join(fl.run.root, rel))) {
-      if (!project.has(e.name) && hasSkill(fl.run.root, rel, e.name)) project.set(e.name, `${rel}/${e.name}`);
+    for (const e of subdirs(path.join(run.root, rel))) {
+      if (!project.has(e.name) && hasSkill(run.root, rel, e.name)) project.set(e.name, `${rel}/${e.name}`);
     }
   }
+  return project;
+}
+
+function pluginSkillCollisions(fl, pluginRoot) {
+  const project = projectSkills(fl.run);
   const skillsDir = path.join(pluginRoot, 'skills');
   for (const e of project.size ? subdirs(skillsDir) : []) {
-    const fmName = parseFrontmatter(readNorm(path.join(skillsDir, e.name, 'SKILL.md')) || '').data?.name;
+    const fmName = parseFrontmatter(fl.run.read(path.join(skillsDir, e.name, 'SKILL.md')) || '').data?.name;
     const n = typeof fmName === 'string' ? fmName : e.name;
     if (project.has(n) && path.resolve(fl.run.root, project.get(n)) !== path.resolve(skillsDir, e.name)) {
       fl.emit('PL-SKILL-COLLISION', null, `plugin skill "${n}" is shadowed by the project skill ${project.get(n)}`);
@@ -1139,20 +1257,24 @@ function lintPlugin(fl) {
   if (!isObj(v)) return fl.emit('PL-JSON', 1, 'the manifest must be a JSON object');
   const [name, skillsDir] = [v.name, path.join(root, 'skills')];
   if (sub === 'agent-plugins') {
-    if (!AP_SCHEMA('plugin').includes(v.$schema)) fl.emit('PL-AP-SCHEMA', L('$schema'), `$schema ${JSON.stringify(v.$schema)}`);
+    if (!AP_SCHEMA('plugin').includes(v.$schema)) fl.emit('PL-AP-SCHEMA', L('$schema'),
+      `$schema ${JSON.stringify(v.$schema)}`);
     for (const k of Object.keys(v).filter((x) => !PLUGIN_FIELDS[sub].has(x))) {
       fl.emit('PL-AP-FIELD', L(k), `"${k}" is outside the Agent Plugins field set (use "extensions")`, { field: k });
     }
-    if (typeof name !== 'string' || !AP_NAME.test(name) || /--|\.\./.test(name)) fl.emit('PL-AP-NAME', L('name'), `name ${JSON.stringify(name)}`);
+    if (typeof name !== 'string' || !AP_NAME.test(name) || /--|\.\./.test(name)) fl.emit('PL-AP-NAME', L('name'),
+      `name ${JSON.stringify(name)}`);
     if (hasSkill(root) && !fs.existsSync(skillsDir)) fl.emit('PL-AP-SKILLS', null, 'a root SKILL.md is not loaded');
     for (const e of subdirs(skillsDir).filter((x) => !hasSkill(skillsDir, x.name))) {
       if (subdirs(path.join(skillsDir, e.name)).some((y) => hasSkill(skillsDir, e.name, y.name))) {
         fl.emit('PL-AP-SKILLS', null, `skills/${e.name}/ nests skills one level too deep`);
       }
     }
-    if (v.extensions !== undefined && !isObj(v.extensions)) fl.emit('PL-AP-FIELD', L('extensions'), '"extensions" is not an object');
+    if (v.extensions !== undefined && !isObj(v.extensions)) fl.emit('PL-AP-FIELD', L('extensions'),
+      '"extensions" is not an object');
   } else if (sub === 'copilot') {
-    if (typeof name !== 'string' || !KEBAB.test(name) || name.length > 64) fl.emit('PL-CP-MANIFEST', L('name'), `name ${JSON.stringify(name)}`);
+    if (typeof name !== 'string' || !KEBAB.test(name) || name.length > 64) fl.emit('PL-CP-MANIFEST', L('name'),
+      `name ${JSON.stringify(name)}`);
     if (typeof v.description === 'string' && v.description.length > 1024) {
       fl.emit('PL-CP-MANIFEST', L('description'), `description has ${v.description.length} characters (max 1,024)`);
     }
@@ -1166,11 +1288,12 @@ function lintPlugin(fl) {
   else if (sub === 'codex') {
     for (const [obj, pre] of [[v, ''], [isObj(v.interface) ? v.interface : {}, 'interface.']]) {
       for (const k of Object.keys(obj).filter((x) => CX_SNAKE[x])) {
-        fl.emit('PL-CX-FIELD', L(k), `"${pre}${k}" is snake_case; use "${CX_SNAKE[k]}"`, { field: pre + k, severity: 'error' });
+        fl.emit('PL-CX-FIELD', L(k), `"${pre}${k}" is snake_case; use "${CX_SNAKE[k]}"`,
+          { field: pre + k, severity: 'error' });
       }
     }
-    fl.unknown(Object.fromEntries(Object.entries(v).filter(([k]) => !CX_SNAKE[k])), PLUGIN_FIELDS.codex, 'PL-CX-FIELD', L,
-      'plugin field');
+    const camel = Object.fromEntries(Object.entries(v).filter(([k]) => !CX_SNAKE[k]));
+    fl.unknown(camel, PLUGIN_FIELDS.codex, 'PL-CX-FIELD', L, 'plugin field');
   }
   pluginSkillCollisions(fl, root);
   fl.secrets(fl.text);
@@ -1184,16 +1307,19 @@ function claudePlugin(fl, v, root, L) {
   if (typeof name !== 'string' || !name) fl.emit('PL-CL-NAME', L('name') || 1, '"name" is required');
   else if (!KEBAB.test(name)) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is not kebab-case`);
   if (reserved) fl.emit('PL-CL-NAME', L('name'), `plugin name "${name}" is reserved`);
-  else if (/(?:^|-)(?:claude|anthropic)(?:-|$)/.test(name)) fl.emit('PL-CL-NAME-WORD', L('name'), `plugin name "${name}"`);
+  else if (/(?:^|-)(?:claude|anthropic)(?:-|$)/.test(name)) fl.emit('PL-CL-NAME-WORD', L('name'),
+    `plugin name "${name}"`);
   fl.unknown(v, PLUGIN_FIELDS.claude, 'PL-CL-FIELD', L, 'plugin field');
   if (missing.length) fl.emit('PL-CL-META', null, `no ${missing.join(', ')} (claude plugin validate warns)`);
-  if (v.author !== undefined && typeof v.author?.name !== 'string') fl.emit('PL-CL-FIELD', L('author'), '"author" needs a "name"');
+  if (v.author !== undefined && typeof v.author?.name !== 'string') fl.emit('PL-CL-FIELD', L('author'),
+    '"author" needs a "name"');
   for (const f of W(CL_PATH_FIELDS).filter((x) => v[x] !== undefined && !isObj(v[x]))) {
     for (const p of strs(v[f])) {
       const [abs, rel] = [path.resolve(root, p), path.relative(root, path.resolve(root, p))];
       const why = !(p.startsWith('./') || (f === 'skills' && (p === '.' || p === './'))) ? 'must start with ./'
-        : p.includes('\\') ? 'uses backslashes' : rel.startsWith('..') || path.isAbsolute(rel) ? 'leaves the plugin root'
-          : !fs.existsSync(abs) ? 'does not exist' : null;
+        : p.includes('\\') ? 'uses backslashes'
+          : rel.startsWith('..') || path.isAbsolute(rel) ? 'leaves the plugin root'
+            : !fs.existsSync(abs) ? 'does not exist' : null;
       if (why) fl.emit('PL-CL-PATH', null, `"${f}" path "${p}" ${why}`, { field: f });
     }
   }
@@ -1203,7 +1329,9 @@ function claudePlugin(fl, v, root, L) {
 function sourcePinned(src) {
   if (!isObj(src)) return true;
   if (['github', 'url', 'git-subdir', 'git'].includes(src.source)) return /^[0-9a-f]{40}$/i.test(String(src.sha ?? ''));
-  if (src.source === 'npm') return typeof src.version === 'string' && /\d/.test(src.version) && src.version !== 'latest';
+  if (src.source === 'npm') {
+    return typeof src.version === 'string' && /\d/.test(src.version) && src.version !== 'latest';
+  }
   return src.source !== 'archive' || /^[0-9a-f]{64}$/i.test(String(src.sha256 ?? ''));
 }
 
@@ -1217,11 +1345,17 @@ function lintMarketplace(fl) {
   else if (sub === 'claude' && (CL_RESERVED_MKT.has(v.name.toLowerCase()) || /^claudeai-/i.test(v.name))) {
     fl.emit('MK-NAME-RESERVED', L('name'), `marketplace name "${v.name}" is reserved`);
   }
-  if (sub !== 'codex' && typeof v.owner?.name !== 'string') fl.emit('MK-SHAPE', L('owner') || 1, '"owner.name" is required');
+  if (sub !== 'codex' && typeof v.owner?.name !== 'string') fl.emit('MK-SHAPE', L('owner') || 1,
+    '"owner.name" is required');
   if (!Array.isArray(v.plugins)) return fl.emit('MK-SHAPE', L('plugins') || 1, '"plugins" must be an array');
   if (sub !== 'codex') fl.unknown(v, MKT_FIELDS[sub], 'MK-FIELD', L, 'top-level key', { only: [sub] });
+  let from = 0;
   v.plugins.forEach((entry, i) => {
-    const line = (isObj(entry) && entry.name && keyLine(fl.text, entry.name)) || L('plugins');
+    // Entries appear in file order: look for each name after the previous one (one pass over the file).
+    const at = isObj(entry) && entry.name ? fl.text.indexOf(`"${entry.name}"`, from) : -1;
+    if (at >= 0) from = at + 1;
+    const line = (at >= 0 ? lineIn(fl.text, at) : isObj(entry) && entry.name && keyLine(fl.text, entry.name))
+      || L('plugins');
     const src = entry?.source;
     const E = (id, msg, o) => fl.emit(id, line, `${entry.name}: ${msg}`, o);
     if (!isObj(entry) || typeof entry.name !== 'string' || src === undefined) {
@@ -1235,14 +1369,17 @@ function lintMarketplace(fl) {
     if (relSrc.split('/').includes('..')) E('MK-ENTRY', `source "${relSrc}" must not use ..`);
     if (!sourcePinned(src)) E('MK-UNPINNED', `${src.source} source without a pinned ${pin}`);
     if (typeof src !== 'string' && !isObj(src)) E('MK-ENTRY', '"source" must be a path string or an object');
-    if (sub === 'claude' && entry.hooks !== undefined && !isObj(entry.hooks)) E('MK-HOOKS-PATH', 'hooks must be an object');
+    if (sub === 'claude' && entry.hooks !== undefined && !isObj(entry.hooks)) E('MK-HOOKS-PATH',
+      'hooks must be an object');
   });
 }
 
 const SECRET_KEY = /(?:token|secret|password|passwd|api[_-]?key|apikey|auth|credential|bearer|cookie|private[_-]?key)/i;
-const literalCredential = (key, v) => typeof v === 'string' && v.length >= 8
-  && !/\$\{|\$[A-Z_]|\{\{|^\$|^<[^>]+>$|^[A-Z][A-Z0-9_]+$/.test(v) && (/^(?:Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{12,}$/i
-    .test(v) || (SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(v) && /\d/.test(v) && /[A-Za-z]/.test(v)));
+// A literal value, not a reference: ${VAR}, $VAR, {{template}}, <placeholder> or an env var NAME.
+const REFERENCE = /\$\{|\$[A-Z_]|\{\{|^\$|^<[^>]+>$|^[A-Z][A-Z0-9_]+$/;
+const literalCredential = (key, v) => typeof v === 'string' && v.length >= 8 && !REFERENCE.test(v)
+  && (/^(?:Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{12,}$/i.test(v)
+    || (SECRET_KEY.test(key) && /^[A-Za-z0-9._~+/=:-]{16,}$/.test(v) && /\d/.test(v) && /[A-Za-z]/.test(v)));
 const credentialKeys = (bag) => Object.entries(isObj(bag) ? bag : {}).filter(([k, v]) => literalCredential(k, v));
 
 const MCP_TYPES = { vscode: { copilot: W('stdio http sse') },
@@ -1259,8 +1396,8 @@ function mcpServer(fl, name, s, sub) {
       { only: [host], severity: host === 'claude' && s.type === 'local' && 'warning' });
   }
   if (typeof s.command !== 'string' && typeof s.url !== 'string') E('MC-SERVER', 'needs a "command" or a "url"');
-  let u = null;
-  try { u = typeof s.url === 'string' ? new URL(s.url) : null; } catch { E('MC-SERVER', `invalid url "${s.url}"`); }
+  const u = typeof s.url === 'string' ? URL.parse(s.url) : null;
+  if (typeof s.url === 'string' && !u) E('MC-SERVER', `invalid url "${s.url}"`);
   if (u?.protocol === 'http:' && !LOOPBACK.has(u.hostname)) E('MC-HTTP', `uses plain http to ${u.hostname}`);
   if (JSON.stringify(s).includes('${input:')) {
     E('MC-INPUT', sub === 'vscode' ? 'uses ${input:...}, which VS Code does not forward to the Copilot harness'
@@ -1270,7 +1407,8 @@ function mcpServer(fl, name, s, sub) {
   if (missing.length) E('MC-CLOUD', `no ${missing.map((k) => `"${k}"`).join(' or ')}`);
   for (const bag of ['env', 'headers']) {
     for (const [k] of credentialKeys(s[bag])) {
-      fl.sec('SEC-MCP-SECRET', keyLine(fl.text, k) || line, `server "${name}" ${bag}.${k} holds a literal credential; use \${VAR}`);
+      fl.sec('SEC-MCP-SECRET', keyLine(fl.text, k) || line,
+        `server "${name}" ${bag}.${k} holds a literal credential; use \${VAR}`);
     }
   }
   fl.unpinned([strs(s.command, Array.isArray(s.args) ? s.args : []).join(' ')], line, `server "${name}" `);
@@ -1285,10 +1423,13 @@ function lintMcp(fl) {
   if (!isObj(v)) return fl.emit('MC-JSON', 1, 'the MCP config must be a JSON object');
   let servers = sub === 'vscode' ? v.servers ?? v.mcpServers : v.mcpServers;
   if (sub === 'vscode') fl.emit('MC-VSCODE-CLI', null);
-  if (sub === 'vscode' && own(v, 'mcpServers') && !own(v, 'servers')) fl.emit('MC-TOPKEY', L('mcpServers'), 'VS Code reads "servers"');
+  if (sub === 'vscode' && own(v, 'mcpServers') && !own(v, 'servers')) fl.emit('MC-TOPKEY', L('mcpServers'),
+    'VS Code reads "servers"');
   if (sub === 'agent-plugins') agentPluginsMcp(fl, v, L);
-  if (other && own(v, 'servers') && !own(v, 'mcpServers')) fl.emit('MC-TOPKEY', L('servers'), '"servers" is the VS Code format');
-  if (other && servers === undefined && !own(v, 'servers') && Object.values(v).some((x) => isObj(x) && (x.command || x.url))) {
+  if (other && own(v, 'servers') && !own(v, 'mcpServers')) fl.emit('MC-TOPKEY', L('servers'),
+    '"servers" is the VS Code format');
+  if (other && servers === undefined && !own(v, 'servers')
+    && Object.values(v).some((x) => isObj(x) && (x.command || x.url))) {
     servers = v;
     fl.emit('MC-TOPKEY', 1, 'Claude Code expects servers under "mcpServers"', { only: ['claude'] });
   }
@@ -1299,7 +1440,8 @@ function lintMcp(fl) {
 
 function agentPluginsMcp(fl, v, L) {
   const VAR = /\$\{PLUGIN_(?:ROOT|DATA)\}/;
-  if (!AP_SCHEMA('mcp').includes(v.$schema)) fl.emit('PL-AP-MCP', L('$schema') || 1, `"$schema" must be ${AP_SCHEMA('mcp')[0]}`);
+  if (!AP_SCHEMA('mcp').includes(v.$schema)) fl.emit('PL-AP-MCP', L('$schema') || 1,
+    `"$schema" must be ${AP_SCHEMA('mcp')[0]}`);
   for (const k of Object.keys(v).filter((x) => x !== '$schema' && x !== 'mcpServers')) {
     fl.emit('PL-AP-MCP', L(k), `mcp.json may contain only $schema and mcpServers ("${k}")`);
   }
@@ -1308,7 +1450,9 @@ function agentPluginsMcp(fl, v, L) {
     const cmd = typeof s.command === 'string' ? s.command : null;
     if (cmd && (/\s/.test(cmd.trim()) || path.isAbsolute(cmd) || WIN_ABS.test(cmd))) E('command must be one token');
     if (cmd && VAR.test(cmd)) E('${PLUGIN_ROOT} expands only in args, env and cwd');
-    if (s.cwd !== undefined && !/^(?:\.\/|\$\{PLUGIN_(?:ROOT|DATA)\})/.test(String(s.cwd))) E('cwd must start with ./ or ${PLUGIN_ROOT}');
+    if (s.cwd !== undefined && !/^(?:\.\/|\$\{PLUGIN_(?:ROOT|DATA)\})/.test(String(s.cwd))) {
+      E('cwd must start with ./ or ${PLUGIN_ROOT}');
+    }
     if (VAR.test(JSON.stringify([s.url ?? '', s.headers ?? {}]))) E('url and headers are not expanded');
   }
 }
@@ -1322,17 +1466,21 @@ function lintCodexConfig(fl) {
   if (isObj(v.hooks) && fs.existsSync(path.join(path.dirname(fl.abs), 'hooks.json'))) {
     fl.emit('HK-CX-BOTH', null, 'hooks in both config.toml and hooks.json');
   }
-  if (sc !== undefined && !Array.isArray(sc)) fl.emit('CX-SKILLS-CONFIG', K('skills.config'), 'skills.config is not an array');
+  if (sc !== undefined && !Array.isArray(sc)) fl.emit('CX-SKILLS-CONFIG', K('skills.config'),
+    'skills.config is not an array');
   for (const [i, e] of (Array.isArray(sc) ? sc : []).entries()) {
-    const ok = ['path', 'name'].filter((k) => isObj(e) && e[k] !== undefined).length === 1 && typeof e.enabled === 'boolean';
+    const ok = ['path', 'name'].filter((k) => isObj(e) && e[k] !== undefined).length === 1
+      && typeof e.enabled === 'boolean';
     if (!ok) fl.emit('CX-SKILLS-CONFIG', K('skills.config'), `[[skills.config]] #${i + 1}`);
   }
   if (own(v, 'mcpServers')) fl.emit('CX-MCP', null, 'Codex reads [mcp_servers.<name>], not mcpServers');
   for (const [name, s] of Object.entries(isObj(v.mcp_servers) ? v.mcp_servers : {})) {
     const at = `[mcp_servers.${name}]`;
-    if (!isObj(s) || (typeof s.command !== 'string' && typeof s.url !== 'string')) fl.emit('CX-MCP', K(`mcp_servers.${name}`), at);
+    if (!isObj(s) || (typeof s.command !== 'string' && typeof s.url !== 'string')) fl.emit('CX-MCP',
+      K(`mcp_servers.${name}`), at);
     for (const [k] of credentialKeys(s?.env)) {
-      fl.sec('SEC-MCP-SECRET', K(`mcp_servers.${name}.env.${k}`) || K(`mcp_servers.${name}.env`), `${at} env.${k} holds a credential`);
+      fl.sec('SEC-MCP-SECRET', K(`mcp_servers.${name}.env.${k}`) || K(`mcp_servers.${name}.env`),
+        `${at} env.${k} holds a credential`);
     }
     fl.unpinned([strs(s?.command, Array.isArray(s?.args) ? s.args : []).join(' ')], null, `${at} `);
   }
@@ -1351,10 +1499,12 @@ function hostSkillRoots(host, root, env, home) {
   // Codex reads .agents/skills from the project root down to the cwd (the root here) and ~/.agents/skills.
   if (host === 'codex') return [path.join(root, '.agents', 'skills'), `${H.home}/.agents/skills`];
   return [...['.github', '.agents', '.claude'].map((d) => path.join(root, d, 'skills')), `${H.copilot}/skills`,
-    `${H.home}/.agents/skills`, ...String(env.COPILOT_SKILLS_DIRS || '').split(',').map((d) => d.trim()).filter(Boolean)];
+    `${H.home}/.agents/skills`,
+      ...String(env.COPILOT_SKILLS_DIRS || '').split(',').map((d) => d.trim()).filter(Boolean)];
 }
 const listedFrom = (s, roots) => roots.some((r) => samePath(path.dirname(s.dir), r));
-// gh skill publish discovers skills/<name>, skills/<scope>/<name>, <name> at the root and plugins/<scope>/skills/<name>.
+// gh skill publish discovers skills/<name>, skills/<scope>/<name>, <name> at the root and
+// plugins/<scope>/skills/<name>.
 const GH_DISCOVERS = /^(?:skills\/[^/]+(?:\/[^/]+)?|[^/.][^/]*|plugins\/[^/]+\/skills\/[^/]+)$/;
 // Instruction files `copilot instruction list` reports for the repository root (nested AGENTS.md files load per cwd).
 const CP_LISTED = new RegExp('^(?:(?:AGENTS|CLAUDE|GEMINI)\\.md|\\.github\\/copilot-instructions\\.md'
@@ -1402,17 +1552,21 @@ function claudeReport(report, dir) {
   const bare = !fs.existsSync(path.join(dir, '.claude-plugin')) && !contents.length;
   if (bare && (!report.manifest || mErrors.every((e) => e.path === 'directory'))) return null;
   const findings = [];
-  const F = (abs, severity, message) => findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity, message });
+  const F = (abs, severity, message) => findings.push({ abs, host: 'claude', rule: 'EXT-CLAUDE-VALIDATE', severity,
+    message });
   for (const entry of [report.manifest, ...contents].filter((e) => isObj(e) && e.file)) {
     const abs = path.resolve(dir, entry.file);
-    for (const [list, sev] of statOrNull(abs)?.isDirectory() ? [] : [[entry.errors, 'error'], [entry.warnings, 'warning']]) {
+    const lists = statOrNull(abs)?.isDirectory() ? [] : [[entry.errors, 'error'], [entry.warnings, 'warning']];
+    for (const [list, sev] of lists) {
       for (const e of list || []) F(abs, sev, `claude plugin validate: ${e.path ? `${e.path}: ` : ''}${e.message}`);
     }
   }
   // Plugin-directory listing findings (README, LICENSE, icon) concern publishing, not loading.
-  const manifest = ['plugin.json', 'marketplace.json'].map((f) => path.join(dir, '.claude-plugin', f)).find((f) => fs.existsSync(f));
+  const manifest = ['plugin.json', 'marketplace.json'].map((f) => path.join(dir, '.claude-plugin', f))
+    .find((f) => fs.existsSync(f));
   for (const d of manifest && Array.isArray(report.directory?.findings) ? report.directory.findings : []) {
-    F(manifest, 'note', `claude plugin validate (plugin listing): ${d.title || d.code}${d.message ? `: ${truncate(d.message, 160)}` : ''}`);
+    const detail = d.message ? `: ${truncate(d.message, 160)}` : '';
+    F(manifest, 'note', `claude plugin validate (plugin listing): ${d.title || d.code}${detail}`);
   }
   const dirErrors = statOrNull(path.resolve(dir, report.manifest?.file || '.'))?.isDirectory() ? mErrors : [];
   const failed = report.success === false || findings.some((f) => f.severity === 'error');
@@ -1435,13 +1589,15 @@ function listingFindings(skills, listed, { host, rule, tool, here, other, missin
 
 /**
  * Run the hosts' own validators that are installed. `targets`: { root, skills: [{dir, file, name}], plugins: [dir],
- * instructions: [abs], codexConfigs: [abs], hosts, env, home }. Returns [{ tool, target, status: 'pass'|'fail'|'error'|
- * 'skipped'|'not-applicable', exit, command, summary, findings: [{ abs, host, rule, severity, message }] }]; only `pass`
- * is a pass. `exec`, `which` and `version` are injectable.
+ * instructions: [abs], codexConfigs: [abs], hosts, env, home }. Returns [{ tool, target, status: 'pass'|'fail'|
+ * 'error'|'skipped'|'not-applicable', exit, command, summary, findings: [{ abs, host, rule, severity, message }] }];
+ * only `pass` is a pass. `exec`, `which` and `version` are injectable.
  */
-export function runExternalValidators(targets, { exec = execTool, which: whichFn = which, version = toolVersion } = {}) {
+export function runExternalValidators(targets, { exec = execTool, which: whichFn = which,
+  version = toolVersion } = {}) {
   const out = [];
-  const { root, skills = [], plugins = [], instructions = [], codexConfigs = [], hosts = HOSTS, env = process.env } = targets;
+  const { root, skills = [], plugins = [], instructions = [], codexConfigs = [], hosts = HOSTS,
+    env = process.env } = targets;
   const want = (h) => hosts.includes(h);
   // Paths inside the root are shown relative to it, others (user-scope files) in full.
   const rel = (p) => {
@@ -1452,18 +1608,23 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
   const push = (tool, target, status, command, summary, findings = [], exit = null) =>
     out.push({ tool, target, status, exit, command, summary: redactSecrets(summary), findings });
   const ctx = { exec, whichFn, version, push, rel, root, env, home: targets.home || os.homedir(),
-    first: (r) => firstLine(r.stderr || r.stdout), failOf: (f) => (f.some((x) => x.severity !== 'note') ? 'fail' : 'pass') };
+    first: (r) => firstLine(r.stderr || r.stdout),
+      failOf: (f) => (f.some((x) => x.severity !== 'note') ? 'fail' : 'pass') };
   const refExe = want('spec') && skills.length ? whichFn('skills-ref') : null;
   for (const s of want('spec') ? skills : []) {
     const command = `skills-ref validate ${rel(s.dir)}`;
     const r = refExe && exec(refExe, ['validate', s.dir], { cwd: root });
-    const status = r ? statusOf(r) : 'skipped';
-    const problems = status !== 'fail' ? [] : skillsRefProblems(`${r.stdout}\n${r.stderr}`);
+    // Only a "Validation failed" report is a verdict; a usage error or a crash (exit 2, traceback) verified nothing.
+    const out = r ? `${r.stdout}\n${r.stderr}` : '';
+    const status = !r ? 'skipped'
+      : statusOf(r) === 'fail' && !/^Validation failed for\b/m.test(out) ? 'error' : statusOf(r);
+    const problems = status !== 'fail' ? [] : skillsRefProblems(out);
     if (status === 'fail' && !problems.length) problems.push('validation failed');
     push('skills-ref', rel(s.dir), status, command, !r ? 'skills-ref is not on PATH (uv tool install '
       + '"git+https://github.com/agentskills/agentskills#subdirectory=skills-ref")' : status === 'fail'
-      ? `${problems.length} problem(s): ${problems[0]}` : firstLine(`${r.stdout}\n${r.stderr}`) || status,
-    problems.map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error', message: `skills-ref: ${m}` })),
+      ? `${problems.length} problem(s): ${problems[0]}` : firstLine(out) || status,
+    problems.map((m) => ({ abs: s.file, host: 'spec', rule: 'EXT-SKILLS-REF', severity: 'error',
+      message: `skills-ref: ${m}` })),
     r ? r.exit : null);
   }
   const skillParents = skills.map((s) => path.dirname(s.dir)).filter((d) => path.basename(d) === 'skills');
@@ -1475,7 +1636,8 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
   const wazaExe = want('copilot') && skills.length ? whichFn('waza') : null;
   for (const s of want('copilot') ? skills : []) {
     const name = s.name || path.basename(s.dir);
-    const evalFile = [path.join(root, 'evals', name, 'eval.yaml'), path.join(s.dir, 'evals', 'eval.yaml')].find((f) => fs.existsSync(f));
+    const evalFile = [path.join(root, 'evals', name, 'eval.yaml'),
+      path.join(s.dir, 'evals', 'eval.yaml')].find((f) => fs.existsSync(f));
     const command = `waza spec verify ${rel(s.dir)} ${evalFile ? rel(evalFile) : `evals/${name}/eval.yaml`} --fail`;
     if (!wazaExe || !evalFile) {
       push('waza', rel(s.dir), 'skipped', command, !wazaExe ? 'waza is not on PATH' : 'no eval.yaml for this skill');
@@ -1484,7 +1646,8 @@ export function runExternalValidators(targets, { exec = execTool, which: whichFn
     const r = exec(wazaExe, ['spec', 'verify', s.dir, evalFile, '--fail'], { cwd: root });
     const [status, line] = [statusOf(r), firstLine(`${r.stdout}\n${r.stderr}`)];
     push('waza', rel(s.dir), status, command, line || status, status !== 'fail' ? []
-      : [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning', message: `waza spec verify: ${line || 'failed'}` }], r.exit);
+      : [{ abs: s.file, host: 'copilot', rule: 'EXT-WAZA', severity: 'warning',
+        message: `waza spec verify: ${line || 'failed'}` }], r.exit);
   }
   return out;
 }
@@ -1502,7 +1665,8 @@ function claudeValidate(dirs, { exec, whichFn, version, push, rel, first, root }
     try { report = JSON.parse(r.stdout); } catch {}
     const res = isObj(report) && r.exit !== 2 && r.exit !== null ? claudeReport(report, dir) : undefined;
     if (res === undefined) push(tool, rel(dir), 'error', command, first(r) || 'no JSON report', [], r.exit);
-    else if (res === null) push(tool, rel(dir), 'not-applicable', command, 'a bare skills directory is not validated', [], r.exit);
+    else if (res === null) push(tool, rel(dir), 'not-applicable', command, 'a bare skills directory is not validated',
+      [], r.exit);
     else push(tool, rel(dir), res.status, command, res.summary, res.findings, r.exit);
   }
 }
@@ -1512,18 +1676,23 @@ function ghSkillPublish(skills, { exec, whichFn, version, push, rel, first, root
   const ghSkills = skills.filter((s) => GH_DISCOVERS.test(toPosix(path.relative(root, s.dir))));
   const exe = ghSkills.length ? whichFn('gh') : null;
   const v = exe ? version('gh') : null;
-  if (!ghSkills.length) return push(tool, '.', 'not-applicable', command, 'no linted skill is where gh skill publish looks');
+  if (!ghSkills.length) return push(tool, '.', 'not-applicable', command,
+    'no linted skill is where gh skill publish looks');
   if (!exe) return push(tool, '.', 'skipped', command, 'gh is not on PATH');
-  if (!v?.version || !versionGte(v.version, '2.90.0')) return push(tool, '.', 'skipped', command, `gh ${v?.version || '?'} < 2.90.0`);
+  if (!v?.version || !versionGte(v.version, '2.90.0')) return push(tool, '.', 'skipped', command,
+    `gh ${v?.version || '?'} < 2.90.0`);
   const r = exec(exe, ['skill', 'publish', '--dry-run', root], { cwd: root });
   // Output lines are "<error|warning>\t<skill>\t<message>"; repository-level lines have no skill.
-  const lines = [...`${r.stdout}\n${r.stderr}`.matchAll(/^(error|warning)\t([^\t\n]*)\t(.+)$/gm)].map(([, sev, name, msg]) =>
-    ({ sev, name, msg: msg.trim(), s: name ? ghSkills.find((x) => x.name === name || path.basename(x.dir) === name) : null }));
+  const lines = [...`${r.stdout}\n${r.stderr}`.matchAll(/^(error|warning)\t([^\t\n]*)\t(.+)$/gm)].map(([, sev, name,
+    msg]) =>
+    ({ sev, name, msg: msg.trim(),
+      s: name ? ghSkills.find((x) => x.name === name || path.basename(x.dir) === name) : null }));
   const findings = lines.filter((l) => l.s).map((l) => ({ abs: l.s.file, host: 'spec', rule: 'EXT-GH-SKILL',
     severity: l.sev === 'error' ? 'error' : 'note', message: `gh skill publish --dry-run: ${l.msg}` }));
   const errors = findings.filter((f) => f.severity === 'error').length;
   const status = r.exit === 0 ? 'pass' : errors ? 'fail' : 'error';
-  const head = status === 'pass' ? 'dry run passed' : errors ? `${errors} validation error(s)` : first(r) || 'gh failed';
+  const head = status === 'pass' ? 'dry run passed'
+    : errors ? `${errors} validation error(s)` : first(r) || 'gh failed';
   push(tool, '.', status, command, [head, ...lines.filter((l) => !l.name).map((l) => `${l.sev}: ${l.msg}`)].join('; '),
     findings, r.exit);
 }
@@ -1533,20 +1702,25 @@ function copilotLists(skills, instructions, { exec, whichFn, push, rel, root, en
   const cpInstructions = instructions.filter((f) => CP_LISTED.test(toPosix(path.relative(root, f))));
   const exe = cpSkills.length || cpInstructions.length ? whichFn('copilot') : null;
   const both = 'copilot skill list --json; copilot instruction list --json';
-  if (!cpSkills.length && !cpInstructions.length) return push('copilot', '.', 'not-applicable', both, 'no file in a listed location');
+  if (!cpSkills.length && !cpInstructions.length) return push('copilot', '.', 'not-applicable', both,
+    'no file in a listed location');
   if (!exe) return push('copilot', '.', 'skipped', both, 'copilot is not on PATH');
   for (const [kind, list] of [['skill', cpSkills], ['instruction', cpInstructions]].filter(([, l]) => l.length)) {
     const r = exec(exe, [kind, 'list', '--json'], { cwd: root, timeoutMs: 60_000 });
     let rows = null;
     try { const j = JSON.parse(r.stdout); rows = [j, j?.skills, j?.instructions].find(Array.isArray) || null; } catch {}
     const listed = (rows || []).filter((x) => x.sourcePath).map((x) => path.resolve(root, String(x.sourcePath)));
-    const findings = !rows ? [] : kind === 'skill' ? listingFindings(list, rows, { host: 'copilot', rule: 'EXT-COPILOT-SKILL',
-      tool: 'copilot skill list', here: (x, s) => x.path && samePath(String(x.path), s.dir), missing: ' in its skill folder',
-      other: (n, o) => `Copilot loads "${n}" from ${o.path ? rel(o.path) : o.source || '?'} (first found wins); not this copy` })
+    const findings = !rows ? [] : kind === 'skill' ? listingFindings(list, rows, {
+      host: 'copilot', rule: 'EXT-COPILOT-SKILL', tool: 'copilot skill list', missing: ' in its skill folder',
+      here: (x, s) => x.path && samePath(String(x.path), s.dir),
+      other: (n, o) => `Copilot loads "${n}" from ${o.path ? rel(o.path) : o.source || '?'} (first found wins); `
+        + 'not this copy' })
       : list.filter((f) => !listed.some((l) => samePath(l, f))).map((f) => ({ abs: f, host: 'copilot',
-        rule: 'EXT-COPILOT-INSTRUCTION', severity: 'warning', message: 'copilot instruction list does not show this file' }));
+        rule: 'EXT-COPILOT-INSTRUCTION', severity: 'warning',
+        message: 'copilot instruction list does not show this file' }));
     const summary = rows ? `${rows.length} listed` : firstLine(r.stderr) || 'no JSON output';
-    push(`copilot ${kind} list`, '.', rows ? failOf(findings) : 'error', `copilot ${kind} list --json`, summary, findings, r.exit);
+    push(`copilot ${kind} list`, '.', rows ? failOf(findings) : 'error', `copilot ${kind} list --json`, summary,
+      findings, r.exit);
   }
 }
 
@@ -1554,17 +1728,22 @@ function codexSkills(skills, { exec, whichFn, push, rel, first, root, env, home,
   const command = 'codex debug prompt-input "x"';
   const cxSkills = skills.filter((s) => listedFrom(s, hostSkillRoots('codex', root, env, home)));
   const exe = cxSkills.length ? whichFn('codex') : null;
-  if (!cxSkills.length) return push('codex', '.', 'not-applicable', command, 'no linted skill in a Codex-listed .agents/skills');
+  if (!cxSkills.length) return push('codex', '.', 'not-applicable', command,
+    'no linted skill in a Codex-listed .agents/skills');
   if (!exe) return push('codex', '.', 'skipped', command, 'codex is not on PATH');
   // Renders the model input locally (no model call, no sign-in needed) and lists the discovered skills.
   const r = exec(exe, ['debug', 'prompt-input', 'x'], { cwd: root, timeoutMs: 60_000 });
   const listed = r.exit === 0 ? codexListedSkills(r.stdout) : null;
   const findings = listed ? listingFindings(cxSkills, listed, { host: 'codex', rule: 'EXT-CODEX-SKILL',
-    tool: 'codex debug prompt-input', here: (x, s) => samePath(x.file, s.file), missing: ' (disabled, invalid or not found)',
+    tool: 'codex debug prompt-input', here: (x, s) => samePath(x.file, s.file),
+      missing: ' (disabled, invalid or not found)',
     other: (n, o) => `Codex lists "${n}" from ${rel(o.file)}; this copy is not the one it uses` }) : [];
   push('codex', '.', listed ? failOf(findings) : 'error', command, listed ? `${listed.length} skill(s) listed`
     : first(r) || 'no <skills_instructions> block in the output', findings, r.exit);
 }
+
+// codex doctor's "startup warning": "  <layer> (<file>): `<key>` is ignored".
+const IGNORED_KEY = /^[ \t]*(\S+) \((.+)\): `([^`]+)` is ignored/gm;
 
 /** `codex exec --strict-config` would bill a model turn; `codex doctor --json` lists ignored settings for free. */
 function codexDoctor(configs, { exec, whichFn, push, rel, first, root }) {
@@ -1575,16 +1754,20 @@ function codexDoctor(configs, { exec, whichFn, push, rel, first, root }) {
   try { report = JSON.parse(r.stdout); } catch {}
   const load = isObj(report?.checks?.['config.load']) ? report.checks['config.load'] : null;
   const details = isObj(load?.details) ? load.details : {};
-  const ignored = [...String(details['startup warning'] || '').matchAll(/^[ \t]*(\S+) \((.+)\): `([^`]+)` is ignored/gm)]
+  const ignored = [...String(details['startup warning'] || '').matchAll(IGNORED_KEY)]
     .map(([, layer, file, key]) => ({ layer, file, key }));
   const loaded = strs(details['config.toml'], ignored.map((x) => x.file));
   for (const f of configs) {
-    const findings = ignored.filter((x) => samePath(x.file, f)).map((x) => ({ abs: f, host: 'codex', rule: 'EXT-CODEX-CONFIG',
+    const findings = ignored.filter((x) => samePath(x.file,
+      f)).map((x) => ({ abs: f, host: 'codex', rule: 'EXT-CODEX-CONFIG',
       severity: 'warning', message: `codex doctor: Codex ignores \`${x.key}\` (unrecognized ${x.layer} setting)` }));
     if (!load) push(tool, rel(f), 'error', command, first(r) || 'no config.load check in the report', [], r.exit);
-    else if (findings.length) push(tool, rel(f), 'fail', command, `${findings.length} unrecognized setting(s)`, findings, r.exit);
-    else if (loaded.some((x) => samePath(x, f))) push(tool, rel(f), 'pass', command, 'no unrecognized settings', [], r.exit);
-    else push(tool, rel(f), 'not-applicable', command, 'not loaded by Codex here (a project layer needs trust)', [], r.exit);
+    else if (findings.length) push(tool, rel(f), 'fail', command, `${findings.length} unrecognized setting(s)`,
+      findings, r.exit);
+    else if (loaded.some((x) => samePath(x, f))) push(tool, rel(f), 'pass', command, 'no unrecognized settings', [],
+      r.exit);
+    else push(tool, rel(f), 'not-applicable', command, 'not loaded by Codex here (a project layer needs trust)', [],
+      r.exit);
   }
 }
 
@@ -1596,16 +1779,21 @@ const LINTERS = { 'skill': lintSkill, 'codex-skill-meta': lintOpenaiYaml, 'instr
   'settings': lintHooksOrSettings, 'plugin': lintPlugin, 'marketplace': lintMarketplace, 'mcp': lintMcp,
   'codex-config': lintCodexConfig };
 
-function summarize(run, files, external) {
+/** Findings that fail the run: errors, security errors and, with --strict, warnings and every security finding. */
+const failing = (s) => s.errors > 0 || s.security_errors > 0 || (s.strict && (s.warnings > 0 || s.security > 0));
+
+/** `clean` only when nothing fails and every file was checked (`unchecked`: files a linter crashed on). */
+function summarize(run, files, external, unchecked) {
   const results = files.flatMap((f) => f.host_results);
   const count = (st) => external.filter((e) => e.status === st).length;
-  const [errors, warnings, notes] = ['errors', 'warnings', 'notes'].map((k) => results.reduce((n, r) => n + r[k].length, 0));
-  const security = run.security.length;
-  const securityErrors = run.security.filter((x) => x.severity === 'error').length;
-  return { files: files.length, errors, warnings, notes, security, security_errors: securityErrors, hosts: run.selected,
+  const [errors, warnings, notes] = ['errors', 'warnings', 'notes']
+    .map((k) => results.reduce((n, r) => n + r[k].length, 0));
+  const s = { files: files.length, errors, warnings, notes, security: run.security.length,
+    security_errors: run.security.filter((x) => x.severity === 'error').length, unchecked, hosts: run.selected,
     strict: run.strict, external: { ran: count('pass') + count('fail') + count('error'), passed: count('pass'),
-      failed: count('fail'), errors: count('error'), skipped: count('skipped'), not_applicable: count('not-applicable') },
-    clean: errors === 0 && securityErrors === 0 && (!run.strict || (warnings === 0 && security === 0)) };
+      failed: count('fail'), errors: count('error'), skipped: count('skipped'),
+        not_applicable: count('not-applicable') } };
+  return { ...s, clean: !failing(s) && !unchecked };
 }
 
 /**
@@ -1615,9 +1803,13 @@ function summarize(run, files, external) {
  * kind, sub, scope, reads[], host_results[{host, errors[], warnings[], notes[]}]}], security[], external[], summary }.
  */
 export async function lintPaths(paths = [], opts = {}) {
-  const { host = 'all', strict = false, env = process.env, home = os.homedir(), allowHosts = [], external = false } = opts;
-  if (!['all', ...HOSTS].includes(host)) throw usageError(`--host must be all, copilot, claude or codex (got "${host}")`);
-  if (!RULES.length) throw envError('LINT_CATALOG', 'references/tooling-lint.md has no rule table; reinstall the skill');
+  const { host = 'all', strict = false, env = process.env, home = os.homedir(), allowHosts = [],
+    external = false } = opts;
+  if (!['all', ...HOSTS].includes(host)) {
+    throw usageError(`--host must be all, spec, copilot, claude or codex (got "${host}")`);
+  }
+  if (!RULES.length) throw envError('LINT_CATALOG',
+    'references/tooling-lint.md has no rule table; reinstall the skill');
   const list = [paths].flat().filter(Boolean);
   const first = list[0] ? path.resolve(list[0]) : process.cwd();
   const root = path.resolve(opts.root || repoRoot(statOrNull(first)?.isDirectory() ? first : path.dirname(first))
@@ -1628,35 +1820,35 @@ export async function lintPaths(paths = [], opts = {}) {
   };
   const run = { selected: host === 'all' ? [...HOSTS] : strict && host !== 'spec' ? [host, 'spec'] : [host], root, home,
     strict: Boolean(strict), allowHosts: new Set([...LOOPBACK, ...allowHosts.map((h) => String(h).toLowerCase())]),
-    files: [], security: [], secSeen: new Set(), directives: [], display };
+    files: [], security: [], secSeen: new Set(), directives: [], display, read: fileReader() };
+  const ctx = { root, H: homes(env, home), read: run.read };
   const targets = new Map();
   for (const p of list.length ? list : [root]) {
     const abs = path.resolve(root, p);
     const st = statOrNull(abs);
     if (!st) throw usageError(`path not found: ${toPosix(p)}`);
     const unknown = { kind: 'unknown', sub: null, scope: 'project', reads: [] };
-    const found = st.isDirectory() ? discover(abs, { root, env, home })
-      : [{ abs, ...(classify(abs, { root, env, home, sniff: true }) || unknown) }];
+    const found = st.isDirectory() ? discover(abs, ctx)
+      : [{ abs, ...(classify(abs, { ...ctx, sniff: true }) || unknown) }];
     for (const f of found) if (!targets.has(path.resolve(f.abs))) targets.set(path.resolve(f.abs), f);
   }
   const internal = [];
   for (const t of targets.values()) {
     const fl = new FileLint(run, t.abs, t);
     run.files.push(fl);
-    try { LINTERS[t.kind]?.(fl); } catch (err) { internal.push({ file: fl.path, message: String(err?.message || err) }); }
+    try { LINTERS[t.kind]?.(fl); } catch (err) { internal.push({ file: fl.path, message: clip(err?.message || err) }); }
   }
   crossInstructionChecks(run);
   const ext = external ? mergeExternal(run, opts) : [];
   const files = run.files.map((f) => f.toJSON());
-  return { root: toPosix(root), files, security: run.security, external: ext, summary: summarize(run, files, ext),
-    ...(internal.length && { internal_errors: internal }) };
+  return { root: toPosix(root), files, security: run.security, external: ext,
+    summary: summarize(run, files, ext, internal.length), ...(internal.length && { internal_errors: internal }) };
 }
 
 function mergeExternal(run, opts) {
   const of = (pred) => run.files.filter((f) => pred(f.cls));
   const ext = runExternalValidators({ root: run.root, hosts: run.selected, env: opts.env || process.env, home: run.home,
-    skills: of((c) => c.kind === 'skill').map((f) => ({ dir: path.dirname(f.abs), file: f.abs,
-      name: parseFrontmatter(f.text).data?.name })),
+    skills: of((c) => c.kind === 'skill').map((f) => ({ dir: path.dirname(f.abs), file: f.abs, name: f.skillName })),
     plugins: [...new Set(of((c) => /^(?:plugin|marketplace)$/.test(c.kind) && c.sub === 'claude')
       .map((f) => pluginRootOf(f.abs)))],
     instructions: of((c) => c.kind === 'instructions' && c.reads.includes('copilot')).map((f) => f.abs),
@@ -1666,7 +1858,8 @@ function mergeExternal(run, opts) {
     for (const f of e.findings) {
       byAbs.get(path.resolve(f.abs))?.emit(f.rule, null, f.message, { only: [f.host], severity: f.severity });
     }
-    e.findings = e.findings.map(({ abs, ...f }) => ({ ...f, message: redactSecrets(f.message), file: run.display(abs) }));
+    e.findings = e.findings.map(({ abs, ...f }) => ({ ...f, message: redactSecrets(f.message),
+      file: run.display(abs) }));
   }
   return ext;
 }
@@ -1682,18 +1875,25 @@ export async function lintSkillDir(dir, { strict = false, host = 'all', external
 }
 
 const summaryLine = (s) => `${s.files} file(s), ${s.errors} error(s), ${s.warnings} warning(s), ${s.notes} note(s), `
-  + `${s.security} security finding(s) for ${s.hosts.join(', ')}${s.strict ? ' (strict)' : ''}`;
+  + `${s.security} security finding(s) for ${s.hosts.join(', ')}${s.strict ? ' (strict)' : ''}`
+  + `${s.unchecked ? `; ${s.unchecked} file(s) could not be checked (internal_errors)` : ''}`;
 
 function renderHuman(res) {
-  const item = (sev, host, x) => `  ${sev.padEnd(7)} ${host.padEnd(7)} ${x.rule}${x.line ? ` (line ${x.line})` : ''}: ${x.message}`;
+  const item = (sev, host, x) => `  ${sev.padEnd(7)} ${host.padEnd(7)} ${x.rule}`
+    + `${x.line ? ` (line ${x.line})` : ''}: ${x.message}`;
   const lines = res.files.flatMap((f) => {
     const items = f.host_results.flatMap((r) => [['error', r.errors], ['warning', r.warnings], ['note', r.notes]]
       .flatMap(([sev, list]) => list.map((x) => item(sev, r.host, x))));
     return items.length ? [`${f.path} [${f.kind}]`, ...items] : [];
   });
   if (res.security.length) lines.push('security:');
-  for (const s of res.security) lines.push(`  ${s.severity.padEnd(7)} ${s.rule} ${s.file}${s.line ? `:${s.line}` : ''}: ${s.message}`);
-  for (const e of res.external) lines.push(`external ${e.tool} ${e.target}: ${e.status}${e.summary ? ` - ${e.summary}` : ''}`);
+  for (const s of res.security) {
+    lines.push(`  ${s.severity.padEnd(7)} ${s.rule} ${s.file}${s.line ? `:${s.line}` : ''}: ${s.message}`);
+  }
+  for (const e of res.external) {
+    lines.push(`external ${e.tool} ${e.target}: ${e.status}${e.summary ? ` - ${e.summary}` : ''}`);
+  }
+  for (const e of res.internal_errors || []) lines.push(`not checked ${e.file}: ${e.message}`);
   return [...lines, summaryLine(res.summary)].join('\n');
 }
 
@@ -1706,7 +1906,8 @@ export const lintCommand = defineCommand({
     '  --no-external (or ADC_LINT_NO_EXTERNAL=1): skip skills-ref, claude plugin validate, gh skill publish,',
     '  copilot skill/instruction list, codex debug prompt-input and doctor, waza (none runs a model turn).',
     '  --allow-host <host> (repeatable): HTTP hooks to this host are not a security finding.',
-    '  Exit: 0 clean, 1 findings, 2 usage, 3 tracked .adc/ or missing rule catalog.'].join('\n'),
+    '  Exit: 0 clean, 1 findings, 2 usage, 3 tracked .adc/ or missing rule catalog,',
+    '  4 a file could not be checked (internal_errors).'].join('\n'),
   options: { host: { type: 'string' }, strict: { type: 'boolean' }, 'no-external': { type: 'boolean' },
     'allow-host': { type: 'string', multiple: true } },
   async run(ctx, values, positionals) {
@@ -1718,8 +1919,9 @@ export const lintCommand = defineCommand({
     if (gitRoot) assertStateUntracked(resolveStateDir({ cwd: ctx.cwd, stateDirOption: ctx.stateDirOption }));
     const external = !values['no-external'] && !/^(?:1|true|yes)$/i.test(process.env.ADC_LINT_NO_EXTERNAL || '');
     const res = await lintPaths(positionals.map((p) => path.resolve(ctx.cwd, p)),
-      { host, strict: Boolean(values.strict), root: gitRoot || ctx.cwd, external, allowHosts: values['allow-host'] || [] });
-    const exit = res.summary.clean ? EXIT.OK : EXIT.FINDINGS;
+      { host, strict: Boolean(values.strict), root: gitRoot || ctx.cwd, external,
+        allowHosts: values['allow-host'] || [] });
+    const exit = res.summary.clean ? EXIT.OK : failing(res.summary) ? EXIT.FINDINGS : EXIT.UNVERIFIABLE;
     return { result: res, exit, human: renderHuman(res), summary: summaryLine(res.summary) };
   },
 });

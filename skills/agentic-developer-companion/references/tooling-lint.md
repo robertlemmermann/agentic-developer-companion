@@ -22,29 +22,29 @@ MCP configs against each host's documented rules: `spec` (the Agent Skills speci
 
 | Option | Effect |
 |---|---|
-| `paths...` | Files or folders. Folders are searched for known tooling locations (dependency and build folders are skipped); a file named explicitly outside them is classified by its content. |
+| `paths...` | Files or folders. Folders are searched for known tooling locations (dependency and build folders are skipped; linked folders are followed); a file named explicitly outside them is classified by its content. |
 | `--host` | Report only that host. With `--strict` the `spec` results stay included. |
 | `--strict` | For anything shipped or shared: only the six spec fields and block-style YAML in `SKILL.md`, pinned marketplace sources, `timeoutSec` on Copilot hooks, and **every warning and security finding fails**. |
 | `--no-external` | Skip the hosts' own validators (same as `ADC_LINT_NO_EXTERNAL=1`). |
 | `--allow-host <h>` | Repeatable. HTTP hooks to `h` are not reported as `SEC-HTTP-HOOK`. |
 
-Exit `0` clean, `1` findings (errors; with `--strict` also warnings and security findings), `2` usage, `3` tracked `.adc/`.
+Exit `0` clean, `1` findings (errors; with `--strict` also warnings and security findings), `2` usage, `3` tracked `.adc/` or a damaged rule catalog (reinstall the skill), `4` a file could not be checked (listed in `internal_errors[]`; never call it clean).
 
 External validators run when installed and are merged as `EXT-*` findings:
 
 | Validator | Runs for | Notes |
 |---|---|---|
-| `skills-ref validate <skill>` | every skill | Install: `uv tool install "git+https://github.com/agentskills/agentskills#subdirectory=skills-ref"`. Parses with strictyaml. |
+| `skills-ref validate <skill>` | every skill | Install: `uv tool install "git+https://github.com/agentskills/agentskills#subdirectory=skills-ref"`. Parses with strictyaml. Only a "Validation failed" report is `fail`; a usage error or crash is `error`. |
 | `claude plugin validate <dir> --strict --json` | Claude plugins and marketplaces, `skills/` folders | Claude Code 2.1.259+. A bare skills folder returns `contents: []`: reported `not-applicable`, never a pass. Plugin-directory listing findings (README, LICENSE, icon) become notes. |
 | `gh skill publish --dry-run <root>` | skills under `skills/*/`, `skills/<scope>/*/`, `<dir>/` at the root, `plugins/<scope>/skills/*/` | gh 2.90.0+. Its errors are errors, its warnings notes; repository lines (tag protection, remote) go to the summary. |
 | `copilot skill list --json`, `copilot instruction list --json` | skills in a Copilot skill folder; root-level instruction files | No sign-in needed. A same-named copy that Copilot loads from elsewhere is a note (first found wins). |
 | `codex debug prompt-input "x"` | skills in `<root>/.agents/skills`, `~/.agents/skills` | Renders the prompt locally; no model call, no sign-in. The skill must appear in `<skills_instructions>`. |
-| `waza spec verify <skill> <eval.yaml> --fail` | skills with `evals/<name>/eval.yaml` | Copilot skill evals. |
+| `waza spec verify <skill> <eval.yaml> --fail` | skills with `evals/<name>/eval.yaml` | Copilot skill evals. In VS Code the Chat Customizations Evaluations extension (wraps waza) shows the same diagnostics. |
 | `codex doctor --json` | Codex `config.toml` files Codex loads from the root | Reports settings Codex ignores (unknown keys) per layer; no model call, but it probes OpenAI reachability. `codex exec --strict-config` would bill a model turn and is never run. |
 
 ## Read the result
 
-`{ root, files[{ path, kind, sub, scope, reads[], host_results[{ host, errors[], warnings[], notes[] }] }], security[], external[], summary }`.
+`{ root, files[{ path, kind, sub, scope, reads[], host_results[{ host, errors[], warnings[], notes[] }] }], security[], external[], summary, internal_errors[]? }`; `summary.clean` is true only when nothing fails and `summary.unchecked` is 0.
 A finding is `{ rule, line, message, field?, evidence? }`. `reads` lists the hosts that load the file
 from where it lies, and only those get results: a skill in `.claude/skills` is checked for Claude
 Code and Copilot, `.github/skills` for Copilot, `.agents/skills` for Copilot and Codex, a source

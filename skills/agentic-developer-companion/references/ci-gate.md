@@ -37,8 +37,9 @@ Editing CI needs the user's consent: show the files first.
 | `agent-verify-<host>` | optional, PRs by coding agents (§7) | **no** |
 | `merge-ok` | `if: always()`; fails unless every needed job is `success` or `skipped` | the required check |
 
-Merge OK exports `executed`, `passed`, `failed`, `skipped`, `flaky` (also `workflow_call` outputs) so
-trends can be charted elsewhere. `.github/adc/gate.mjs` is the dependency-free helper the jobs call.
+Merge OK exports the first test job's `executed`, `passed`, `failed`, `skipped`, `flaky` (also
+`workflow_call` outputs) so trends can be charted elsewhere; every project's counts are in its
+`adc-counts-<project>.json` artifact. `.github/adc/gate.mjs` is the dependency-free helper the jobs call.
 
 ## 2. Scaffold it
 

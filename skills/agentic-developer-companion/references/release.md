@@ -25,7 +25,7 @@ All commands run from the repository root; `S=skills/agentic-developer-companion
   field removed or retyped, a ledger `schema` change, a hook template change that needs
   re-registration, a raised minimum (Node, Git, a host).
 - **One version, three places**: tag `vX.Y.Z`, `metadata.version: "X.Y.Z"` in
-  `$S/SKILL.md`, and the first entry of `$S/CHANGELOG.md`, written `## [X.Y.Z] - YYYY-MM-DD`
+  `$S/SKILL.md`, and the first entry of the root `CHANGELOG.md`, written `## [X.Y.Z] - YYYY-MM-DD`
   ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/) sections: Added, Changed,
   Deprecated, Removed, Fixed, Security). Do not leave an `[Unreleased]` heading above the
   release entry on the tagged commit.
@@ -37,42 +37,45 @@ All commands run from the repository root; `S=skills/agentic-developer-companion
 Manual check (works without Node):
 
 ```bash
-grep -n '^  version:' "$S/SKILL.md"; grep -m1 -n '^## \[' "$S/CHANGELOG.md"; git tag --list 'v*' --sort=-v:refname | head -3
+grep -n '^  version:' "$S/SKILL.md"; grep -m1 -n '^## \[' CHANGELOG.md; git tag --list 'v*' --sort=-v:refname | head -3
 ```
 
 ```powershell
-Select-String -Path "$S/SKILL.md" -Pattern '^  version:'; Select-String -Path "$S/CHANGELOG.md" -Pattern '^## \[' | Select-Object -First 1; git tag --list 'v*' --sort=-v:refname | Select-Object -First 3
+Select-String -Path "$S/SKILL.md" -Pattern '^  version:'; Select-String -Path CHANGELOG.md -Pattern '^## \[' | Select-Object -First 1; git tag --list 'v*' --sort=-v:refname | Select-Object -First 3
 ```
 
 ## 2. Pre-release checks (free)
 
 ```bash
 S=skills/agentic-developer-companion
-node "$S/scripts/adc.mjs" selftest --json > /tmp/adc-selftest.json; echo "selftest exit $?"
-node --test "$S/tests/unit/"
+node tests/selftest.mjs --json > "${TMPDIR:-/tmp}/adc-selftest.json"; echo "selftest exit $?"
+node --test "tests/unit/*.test.mjs"
 node "$S/scripts/adc.mjs" tooling lint "$S" --strict
-node "$S/scripts/adc.mjs" tooling trigger-set "$S"
+node "$S/scripts/adc.mjs" tooling trigger-set "$S" --set evals/trigger-set.json
 git status --porcelain
 ```
 
 ```powershell
 $S = "skills/agentic-developer-companion"
-node "$S/scripts/adc.mjs" selftest --json | Out-File -Encoding utf8 "$env:TEMP/adc-selftest.json"; "selftest exit $LASTEXITCODE"
-node --test "$S/tests/unit/"
+node tests/selftest.mjs --json | Out-File -Encoding utf8 "$env:TEMP/adc-selftest.json"; "selftest exit $LASTEXITCODE"
+node --test "tests/unit/*.test.mjs"
 node "$S/scripts/adc.mjs" tooling lint $S --strict
-node "$S/scripts/adc.mjs" tooling trigger-set $S
+node "$S/scripts/adc.mjs" tooling trigger-set $S --set evals/trigger-set.json
 git status --porcelain
 ```
 
 What must hold:
 
-- `selftest` exit 0 with `failed: 0` (areas: hooks, frontmatter, scripts, diffs, footprint,
-  adc, readme, prereqs, release, evals). `skipped` areas need a reason you accept.
+- `tests/selftest.mjs` exit 0 with `failed: 0` (areas: footprint, frontmatter, scripts,
+  prereqs, readme, release, evals, hooks, adc, diffs and the unit-file areas detect, reports,
+  evidence, live, tooling, scaffold). `skipped` cases need a reason you accept.
 - `tooling lint --strict` reports no errors and no warnings on the skill itself.
 - `tooling trigger-set` reports `ready: true` and no warnings (the set is valid).
 - `git status --porcelain` is empty: the release commit is what you tested.
 - Footprint: at most 100 files in `$S`, no folder above 50 entries, no file above 5 MB, LF
-  only, every `references/*.md` linked from SKILL.md, references at most 300 lines.
+  only, every `references/*.md` linked from SKILL.md, references at most 300 lines, and only
+  runtime files in `$S` (`SKILL.md`, `PREREQUISITES.md`, `references/`, `scripts/`, `assets/`).
+  Tests, evals, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md` and `.gitattributes` stay at the root.
 
 **Manual fallback** (no Node; expected result in the comments):
 
@@ -82,6 +85,7 @@ git ls-files --eol "$S" | grep -v 'w/lf' | grep -v 'w/none'    # no output (LF o
 grep -rnE -e '[$]ARGUMENTS' -e '[$][{]CLAUDE_SKILL_DIR[}]' "$S/SKILL.md" "$S/references"   # no output
 wc -l "$S"/references/*.md                                     # each at most 300
 find "$S" -name '.env*'                                       # no output (no .env file in the tree)
+ls "$S"                                   # PREREQUISITES.md SKILL.md assets references scripts
 ```
 
 ## 3. External validators (free)
@@ -112,20 +116,22 @@ meaning; optional for patch releases. Each run bills your account: set a ceiling
 
 ```bash
 OUT="${TMPDIR:-/tmp}/adc-evals"; mkdir -p "$OUT"
-claude plugin eval "$S" --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "$OUT" --report "$OUT/report.html" --json "$OUT/result.json"
-node "$S/scripts/adc.mjs" tooling trigger-set "$S" --host claude --run --runs 3 --max-cost-usd 10
-node "$S/scripts/adc.mjs" tooling trigger-set "$S" --host copilot --run --runs 3
+claude plugin eval . --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "$OUT" --report "$OUT/report.html" --json "$OUT/result.json"
+node "$S/scripts/adc.mjs" tooling trigger-set "$S" --set evals/trigger-set.json --host claude --run --runs 3 --max-cost-usd 10
+node "$S/scripts/adc.mjs" tooling trigger-set "$S" --set evals/trigger-set.json --host copilot --run --runs 3
 ```
 
 ```powershell
 $OUT = Join-Path $env:TEMP "adc-evals"; New-Item -ItemType Directory -Force $OUT | Out-Null
-claude plugin eval $S --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir $OUT --report "$OUT/report.html" --json "$OUT/result.json"
-node "$S/scripts/adc.mjs" tooling trigger-set $S --host claude --run --runs 3 --max-cost-usd 10
+claude plugin eval . --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir $OUT --report "$OUT/report.html" --json "$OUT/result.json"
+node "$S/scripts/adc.mjs" tooling trigger-set $S --set evals/trigger-set.json --host claude --run --runs 3 --max-cost-usd 10
 ```
 
-- The skill folder is the target: `claude plugin eval` resolves it as a plugin named after
-  the skill and runs each case with and without it (Claude Code 2.1.269+). `--output-dir` and
-  `--report` keep results out of the skill tree (the default is `$S/evals/results/`).
+- The repository root is the target, because `claude plugin eval` refuses an eval
+  directory outside the plugin root and the evals live in the root `evals/`. It resolves the
+  `skills/` directory as a skills-dir plugin and runs each case with and without the skill
+  (Claude Code 2.1.269+). `--output-dir` and `--report` keep results out of the checkout (the
+  default is `evals/results/`).
 - Cases: `evals/verify-false-pass-claim` (the skill is selected for a distrusted "tests
   pass" claim; its `tool_used: Skill` grader has `arm: both`, so it scores in both arms) and
   `evals/lint-broken-skill` (an `llm` grader checks the defects named in a broken SKILL.md).
@@ -158,10 +164,10 @@ never "pass".
 ```bash
 V=0.1.0; git switch main && git pull --ff-only
 git tag -s "v$V" -m "agentic-developer-companion $V" && git push origin "v$V"
-git archive --format=tar.gz --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.tar.gz" "v$V" skills/agentic-developer-companion LICENSE README.md
-git archive --format=zip --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.zip" "v$V" skills/agentic-developer-companion LICENSE README.md
+git archive --format=tar.gz --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.tar.gz" "v$V" skills/agentic-developer-companion LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md
+git archive --format=zip --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.zip" "v$V" skills/agentic-developer-companion LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md
 sha256sum "agentic-developer-companion-$V.tar.gz" "agentic-developer-companion-$V.zip" > SHA256SUMS
-node -e "const t=require('fs').readFileSync('skills/agentic-developer-companion/CHANGELOG.md','utf8');process.stdout.write('## '+t.split(/^## /m)[1])" > release-notes.md
+node -e "const t=require('fs').readFileSync('CHANGELOG.md','utf8');process.stdout.write('## '+t.split(/^## /m)[1])" > release-notes.md
 gh release create "v$V" --verify-tag --title "v$V" --notes-file release-notes.md "agentic-developer-companion-$V.tar.gz" "agentic-developer-companion-$V.zip" SHA256SUMS
 gh repo edit --add-topic agent-skills
 ```
@@ -169,9 +175,9 @@ gh repo edit --add-topic agent-skills
 ```powershell
 $V = "0.1.0"; git switch main; git pull --ff-only
 git tag -s "v$V" -m "agentic-developer-companion $V"; git push origin "v$V"
-git archive --format=zip --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.zip" "v$V" skills/agentic-developer-companion LICENSE README.md
+git archive --format=zip --prefix="agentic-developer-companion-$V/" -o "agentic-developer-companion-$V.zip" "v$V" skills/agentic-developer-companion LICENSE README.md CHANGELOG.md THIRD_PARTY_NOTICES.md
 Get-FileHash "agentic-developer-companion-$V.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  agentic-developer-companion-$V.zip" } | Out-File -Encoding ascii SHA256SUMS
-node -e "const t=require('fs').readFileSync('skills/agentic-developer-companion/CHANGELOG.md','utf8');process.stdout.write('## '+t.split(/^## /m)[1])" | Out-File -Encoding utf8 release-notes.md
+node -e "const t=require('fs').readFileSync('CHANGELOG.md','utf8');process.stdout.write('## '+t.split(/^## /m)[1])" | Out-File -Encoding utf8 release-notes.md
 gh release create "v$V" --verify-tag --title "v$V" --notes-file release-notes.md "agentic-developer-companion-$V.zip" SHA256SUMS
 ```
 
@@ -197,8 +203,8 @@ Copy into the release pull request:
 
 ```text
 - [ ] version X.Y.Z in SKILL.md metadata.version, top CHANGELOG entry ## [X.Y.Z] - date, tag vX.Y.Z
-- [ ] selftest: failed 0 (skipped areas explained)
-- [ ] node --test tests/unit: all pass
+- [ ] node tests/selftest.mjs: failed 0 (skipped cases explained)
+- [ ] node --test "tests/unit/*.test.mjs": all pass
 - [ ] tooling lint --strict on the skill: clean
 - [ ] skills-ref validate: pass        - [ ] gh skill publish --dry-run: pass
 - [ ] copilot skill list --json lists it - [ ] codex debug prompt-input shows it

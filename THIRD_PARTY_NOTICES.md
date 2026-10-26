@@ -22,8 +22,8 @@ A file that ports or adapts code or text from another project:
    the license requires it to travel with the code;
 3. keeps the upstream copyright line.
 
-`selftest --only footprint` fails when a `Ported from` header has no entry here naming the
-same file and source. Only permissive licenses compatible with Apache-2.0 (MIT, BSD,
+`node tests/selftest.mjs --only footprint` fails when a `Ported from` header has no entry
+here naming the same file and source. Only permissive licenses compatible with Apache-2.0 (MIT, BSD,
 Apache-2.0, ISC) are accepted.
 
 Entry template:

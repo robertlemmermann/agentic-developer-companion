@@ -7,11 +7,13 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  parseFrontmatter, parseYaml, parseYamlDocument, stringifyYaml, stringifyFrontmatter, YamlError, resolvePlain,
-  normalizeSkillFrontmatter, INSTALL_METADATA_KEY,
+  parseFrontmatter, parseYaml, parseYamlDocument, parseYamlAll, stringifyYaml, stringifyFrontmatter, YamlError, resolvePlain,
+  normalizeSkillFrontmatter, INSTALL_METADATA_KEY, lineLocator,
 } from '../../skills/agentic-developer-companion/scripts/lib/frontmatter.mjs';
 import * as lint from '../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
+import * as hr from '../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs';
+import { toolingCommand } from '../../skills/agentic-developer-companion/scripts/lib/tooling.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
@@ -282,6 +284,40 @@ describe('frontmatter: YAML parser', () => {
     assert.equal(back.body, '\n# My skill\n\nBody.\n');
     assert.equal(stringifyFrontmatter({}), '---\n---\n');
   });
+
+  test('untrusted input: nesting deeper than the stack is an error, never a throw', () => {
+    const flow = `a: ${'['.repeat(20000)}${']'.repeat(20000)}\n`;
+    const block = Array.from({ length: 6000 }, (_, i) => `${' '.repeat(i)}k${i}:`).join('\n') + '\n';
+    for (const src of [flow, block]) {
+      const d = parseYamlDocument(src);
+      assert.equal(d.errors[0].code, 'TOO_DEEP');
+      assert.equal(d.value, null);
+      assert.throws(() => parseYaml(src), (e) => e instanceof YamlError && e.code === 'TOO_DEEP');
+    }
+    assert.deepEqual(parseYamlAll(`ok: 1\n---\n${flow}`), [{ ok: 1 }, null]);
+    const fm = parseFrontmatter(`---\nname: x\nmetadata: ${'['.repeat(20000)}${']'.repeat(20000)}\n---\nBody\n`);
+    assert.deepEqual([fm.errors[0].code, fm.errors[0].line], ['TOO_DEEP', 2], 'the line is the first frontmatter line');
+  });
+
+  test('untrusted input: alias expansion ("billion laughs") is capped', () => {
+    const lines = ['a0: &a0 [x, x, x, x, x, x, x, x, x, x]'];
+    for (let i = 1; i < 9; i++) lines.push(`a${i}: &a${i} [${Array(10).fill(`*a${i - 1}`).join(', ')}]`);
+    const d = parseYamlDocument(lines.join('\n') + '\n');
+    assert.equal(d.errors[0].code, 'ALIAS_LIMIT');
+    assert.equal(d.errors[0].line, 5, 'the alias that crosses the cap');
+    const block = parseYamlDocument('base: &b\n  k: [1, 2]\nuse:\n  - *b\n  - *b\nflow: [*b, *b]\n');
+    assert.deepEqual(block.errors, []);
+    assert.deepEqual(block.value.flow, [{ k: [1, 2] }, { k: [1, 2] }]);
+    assert.equal(parseYamlDocument('a: [1,\n  *nope]\n').errors[0].line, 2, 'flow alias errors keep their line');
+  });
+
+  test('lineLocator: 1-based lines of character offsets', () => {
+    const text = 'ab\ncd\n\nef\r\ngh';
+    const at = lineLocator(text);
+    assert.deepEqual([0, 2, 3, 6, 7, 8, 100].map(at), [1, 1, 2, 3, 4, 4, 5]);
+    for (let i = 0; i <= text.length; i++) assert.equal(at(i), core.lineOf(text, i), `offset ${i}`);
+    assert.equal(lineLocator('')(0), 1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -379,25 +415,13 @@ describe('tooling-lint: fixture cases', () => {
 // The skill itself, rendered hook configs, lintSkillDir
 
 describe('tooling-lint: the companion skill and its rendered hooks', () => {
-  test('the skill lints clean with --strict (links count only once their target exists)', async () => {
+  test('the skill lints clean with --strict', async () => {
     const res = await lint.lintSkillDir(SKILL_DIR, { strict: true });
     assert.equal(res.files.length, 1);
     assert.equal(res.files[0].kind, 'skill');
     assert.deepEqual(res.security, []);
-    const missing = [];
-    const bad = [];
-    for (const r of res.files[0].host_results) {
-      for (const f of [...r.errors, ...r.warnings]) {
-        const m = f.rule === 'SK-LINK-MISSING' && /link target (\S+) does not exist/.exec(f.message);
-        // Reference files written by other work packages may not exist yet during the build;
-        // the rule is right to report them, and the check tightens by itself once they land.
-        if (m && !fs.existsSync(path.join(SKILL_DIR, ...m[1].split('/')))) missing.push(m[1]);
-        else bad.push(`${r.host}: ${f.rule}: ${f.message}`);
-      }
-    }
-    assert.deepEqual(bad, []);
-    if (missing.length) console.error(`# not yet written: ${[...new Set(missing)].join(', ')}`);
-    assert.ok(fs.existsSync(path.join(SKILL_DIR, 'references', 'tooling-lint.md')), 'this work package\'s reference exists');
+    assert.deepEqual(findings(res).map((f) => `${f.host}: ${f.sev}: ${f.rule}: ${f.message}`), []);
+    assert.deepEqual([res.summary.clean, res.internal_errors], [true, undefined]);
   });
 
   test('lintSkillDir: lowercase skill.md is linted (and flagged); a folder without one is a usage error', async () => {
@@ -409,10 +433,7 @@ describe('tooling-lint: the companion skill and its rendered hooks', () => {
     await assert.rejects(lint.lintPaths([dir], { root: dir, host: 'vscode' }), (e) => e.exit === core.EXIT.USAGE);
   });
 
-  test('every hook config hooks-render produces lints without errors or warnings', async (t) => {
-    let hr;
-    try { hr = await import('../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs'); } catch { t.skip('hooks-render.mjs is not available'); return; }
-    if (typeof hr.renderHooks !== 'function') { t.skip('renderHooks is not available'); return; }
+  test('every hook config hooks-render produces lints without errors or warnings', async () => {
     const root = tmp();
     const home = path.join(root, 'home');
     fs.mkdirSync(path.join(root, '.git'));
@@ -465,6 +486,13 @@ describe('tooling-lint: external validators', () => {
     assert.ok(out[1].findings.every((f) => f.rule === 'EXT-SKILLS-REF' && f.severity === 'error' && f.host === 'spec'));
     const none = lint.runExternalValidators({ root, skills, hosts: ['spec'] }, fakeTools({})).filter((e) => e.tool === 'skills-ref');
     assert.ok(none.every((e) => e.status === 'skipped' && /uv tool install/.test(e.summary)));
+    // Measured: a missing path is a click usage error (exit 2); a crash prints a traceback. Neither is a verdict.
+    const usage = ok('', 2, "Usage: skills-ref validate [OPTIONS] SKILL_PATH\nTry 'skills-ref validate --help' for help.\n\nError: Invalid value\n");
+    for (const r of [usage, ok('', 1, 'Traceback (most recent call last):\n  File "x.py", line 1\nImportError: boom\n')]) {
+      const out = lint.runExternalValidators({ root, skills: skills.slice(0, 1), hosts: ['spec'] }, fakeTools({ 'skills-ref': () => r }))
+        .find((e) => e.tool === 'skills-ref');
+      assert.deepEqual([out.status, out.findings], ['error', []], out.summary);
+    }
   });
 
   test('claude plugin validate: a bare skills directory is not applicable, never a pass', () => {
@@ -626,14 +654,12 @@ function adc(args, { cwd, env = {} } = {}) {
 }
 
 describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
-  let available = true;
-  test('tooling lint is reachable through the tooling group', async (t) => {
-    try { const m = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs'); available = typeof m.toolingCommand === 'function'; } catch { available = false; }
-    if (!available) t.skip('tooling.mjs (WP-J) is not available; lintCommand is tested directly below');
+  test('tooling lint is the lint subcommand of the tooling group', async () => {
+    const help = await toolingCommand(['lint', '--help']);
+    assert.match(help.human, /usage: adc\.mjs tooling lint/);
   });
 
-  test('clean repository: exit 0, ASCII JSON with the documented shape', async (t) => {
-    if (!available) { t.skip('tooling.mjs missing'); return; }
+  test('clean repository: exit 0, ASCII JSON with the documented shape', async () => {
     const dir = materialize({ '.github/skills/good-skill/SKILL.md': skillMd('good-skill', '\nlicense: MIT'), 'AGENTS.md': '# Agents\n\nRun the tests with npm test.\n' });
     gitInit(dir);
     const r = adc(['tooling', 'lint', '--json', '--cwd', dir, '--strict']);
@@ -646,8 +672,7 @@ describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
     assert.match(r.stderr, /tooling: 2 file\(s\), 0 error\(s\)/);
   });
 
-  test('findings: exit 1; --host narrows the results; explicit paths', async (t) => {
-    if (!available) { t.skip('tooling.mjs missing'); return; }
+  test('findings: exit 1; --host narrows the results; explicit paths', async () => {
     const dir = materialize({ 'skills/Bad/SKILL.md': skillMd('Bad'), '.github/hooks/h.json': j({ version: 1, hooks: { preToolUse: [{ type: 'command', bash: 'x.sh' }] } }) });
     gitInit(dir);
     const all = adc(['tooling', 'lint', '--json', '--cwd', dir, 'skills']);
@@ -660,8 +685,7 @@ describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
     assert.ok(findings(hooks.json).some((f) => f.rule === 'HK-CP-NO-WINDOWS'));
   });
 
-  test('usage errors exit 2; a tracked .adc/ exits 3', async (t) => {
-    if (!available) { t.skip('tooling.mjs missing'); return; }
+  test('usage errors exit 2; a tracked .adc/ exits 3', async () => {
     const dir = materialize({ 'AGENTS.md': '# A\n' });
     gitInit(dir);
     const bad = adc(['tooling', 'lint', '--json', '--cwd', dir, '--host', 'vscode']);
@@ -686,5 +710,34 @@ describe('tooling-lint: CLI (adc.mjs tooling lint)', () => {
     assert.equal(allowed.exit, 0);
     const help = await lint.lintCommand(['--help']);
     assert.match(help.human, /--host all\|copilot\|claude\|codex/);
+  });
+
+  test('a file a linter cannot check exits 4, never clean; deep YAML is a finding, not a crash', async () => {
+    const deep = 20000;
+    const dir = materialize({
+      'skills/deep/SKILL.md': `---\nname: deep\ndescription: Does a thing. Use when testing.\nmetadata: ${'['.repeat(deep)}${']'.repeat(deep)}\n---\nBody.\n`,
+    });
+    const skill = await lint.lintCommand(['--cwd', dir, '--no-external', '--json']);
+    assert.equal(skill.result.internal_errors, undefined);
+    assert.ok(findings(skill.result).some((f) => f.rule === 'SK-FM-YAML' && /nests too deeply/.test(f.message)));
+    assert.equal(skill.exit, core.EXIT.FINDINGS);
+    // JSON nesting this deep overflows the MCP rules: the file is reported as not checked.
+    fs.writeFileSync(path.join(dir, '.mcp.json'), `{"mcpServers": {"a": {"command": "x", "args": ${'['.repeat(deep)}${']'.repeat(deep)}}}}`);
+    const crash = await lint.lintCommand([path.join(dir, '.mcp.json'), '--cwd', dir, '--no-external']);
+    assert.deepEqual(crash.result.internal_errors.map((e) => e.file), ['.mcp.json']);
+    assert.deepEqual([crash.exit, crash.result.summary.clean, crash.result.summary.unchecked], [core.EXIT.UNVERIFIABLE, false, 1]);
+    assert.match(crash.human, /not checked \.mcp\.json/);
+    assert.match(crash.summary, /1 file\(s\) could not be checked/);
+    const both = await lint.lintCommand(['--cwd', dir, '--no-external']);
+    assert.equal(both.exit, core.EXIT.FINDINGS, 'findings take precedence over unchecked files');
+  });
+
+  test('marketplace entry findings point at each entry, also with repeated names', async () => {
+    const plugins = ['a', 'b', 'a'].map((name) => ({ name, source: { source: 'github', repo: `o/${name}` } }));
+    const dir = materialize({ '.claude-plugin/marketplace.json': j({ name: 'm', owner: { name: 'o' }, plugins }) });
+    const res = await lint.lintPaths([dir], { root: dir, host: 'claude', home: path.join(dir, 'home'), env: {} });
+    const text = fs.readFileSync(path.join(dir, '.claude-plugin', 'marketplace.json'), 'utf8').split('\n');
+    const nameLines = text.flatMap((l, i) => (/^\s+"name": "[ab]"/.test(l) ? [i + 1] : []));
+    assert.deepEqual(findings(res).filter((f) => f.rule === 'MK-UNPINNED').map((f) => f.line), nameLines);
   });
 });

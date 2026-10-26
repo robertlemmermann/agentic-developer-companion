@@ -5,7 +5,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { defineCommand, usageError, readText, stripBom, toPosix, relPosix, listFiles, EXIT } from './core.mjs';
+import {
+  defineCommand, usageError, readText, stripBom, toPosix, relPosix, realPath, listFiles, uniq, EXIT,
+} from './core.mjs';
 import { repoRoot } from './git.mjs';
 import { prepareStateDir, writeOutputs, backupDirFactory } from './state.mjs';
 import { parseFrontmatter, stringifyFrontmatter, stringifyYaml, markdownLines } from './frontmatter.mjs';
@@ -21,8 +23,8 @@ const asList = (v) => (v == null ? [] : Array.isArray(v) ? v.map(String)
   : String(v).split(',').map((s) => s.trim()).filter(Boolean));
 const asBool = (v) => (v === true || /^(true|yes|on|1)$/i.test(String(v ?? '')) ? true
   : v === false || /^(false|no|off|0)$/i.test(String(v ?? '')) ? false : null);
-const uniq = (list) => [...new Set(list)];
-const json = (v) => JSON.stringify(v, null, 2) + '\n';
+/** Pretty JSON for files users own (non-ASCII text stays as written, unlike core.asciiJson). */
+export const json = (v) => JSON.stringify(v, null, 2) + '\n';
 const some = (o) => Object.keys(o || {}).length > 0;
 /** A row of `dropped_fields[]`. */
 const dropRow = (file, field, reason, value) => ({ file, field, ...(value !== undefined ? { value } : {}), reason });
@@ -357,7 +359,7 @@ export function parseHookConfig(text, host, file = 'hooks.json') {
   return { entries, dropped, notes };
 }
 
-const SCRIPT_EXT = /\.(mjs|cjs|js|ts|py|sh|ps1|rb|pl)$/i;
+export const SCRIPT_EXT = /\.(mjs|cjs|js|ts|py|sh|ps1|rb|pl)$/i;
 const relativeArg = (a) => !/^[-$/~\\]|^[A-Za-z]:|^[a-z]+:\/\//i.test(a) && (a.includes('/') || SCRIPT_EXT.test(a));
 
 /** Copilot preToolUse fails closed when the command crashes: print {} when the runtime is missing (§7.7). */
@@ -1184,8 +1186,10 @@ export function port({ path: srcPath, from = null, to = 'all', out = null, root 
   force = false, inPlace = false, backupDir = null } = {}) {
   if (!srcPath) throw usageError('tooling port needs a path (e.g. .github/agents/reviewer.agent.md)');
   const base = cwd || root || process.cwd();
-  const rootDir = root || repoRoot(base) || base;
-  let abs = path.resolve(base, srcPath);
+  // Resolved paths throughout: git reports the real root, while the cwd may pass through a
+  // symlink (macOS /var -> /private/var) and every source would otherwise look outside the repo.
+  const rootDir = realPath(root || repoRoot(base) || base);
+  let abs = realPath(path.resolve(base, srcPath));
   if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(srcPath)}`);
   if (fs.statSync(abs).isDirectory()) {
     if (!fs.existsSync(path.join(abs, 'SKILL.md'))) throw usageError(`${toPosix(srcPath)} has no SKILL.md`);
@@ -1213,10 +1217,13 @@ export function port({ path: srcPath, from = null, to = 'all', out = null, root 
   const acc = { outputs: [], dropped: [], manual: [], notes: [] };
   Object.assign(acc, { step: (...m) => acc.manual.push(...m), note: (...m) => acc.notes.push(...m) });
   CONVERTERS[cls.kind](src, cls, targets, acc, { inPlace });
-  const outRoot = out ? path.resolve(base, out) : rootDir;
+  const outRoot = out ? realPath(path.resolve(base, out)) : rootDir;
   const applied = writeOutputs(acc.outputs, { root: outRoot, dryRun, force, mergeNeedsForce: true, backupDir });
-  return { source: { path: src.rel, kind: cls.kind, host: fromHost }, targets, out: toPosix(path.relative(rootDir, outRoot) || '.'),
-    dry_run: Boolean(dryRun), ...applied, dropped_fields: acc.dropped, manual_steps: uniq(acc.manual), notes: uniq(acc.notes) };
+  return {
+    source: { path: src.rel, kind: cls.kind, host: fromHost }, targets,
+    out: toPosix(path.relative(rootDir, outRoot) || '.'), dry_run: Boolean(dryRun), ...applied,
+    dropped_fields: acc.dropped, manual_steps: uniq(acc.manual), notes: uniq(acc.notes),
+  };
 }
 
 /** Built-in migrations (§11.6); each maps to a port with a fixed source kind and target. */
@@ -1237,7 +1244,7 @@ export const MIGRATIONS = Object.freeze({
 export function migrationSources(kind, root, cwd, p) {
   const spec = MIGRATIONS[kind];
   if (!spec) throw usageError(`unknown migration "${kind}" (expected ${Object.keys(MIGRATIONS).join(', ')})`);
-  const abs = path.resolve(cwd, p);
+  const abs = realPath(path.resolve(cwd, p));
   if (!fs.existsSync(abs)) throw usageError(`not found: ${toPosix(p)}`);
   const ok = (rel) => {
     const c = classifyArtifact(rel);
@@ -1276,7 +1283,7 @@ export const portCommand = defineCommand({
   options: { from: { type: 'string' }, to: { type: 'string' }, out: { type: 'string' }, force: { type: 'boolean' } },
   async run(ctx, values, positionals) {
     if (positionals.length !== 1) throw usageError('tooling port takes one path');
-    const root = repoRoot(ctx.cwd) || ctx.cwd;
+    const root = realPath(repoRoot(ctx.cwd) || ctx.cwd);
     prepareStateDir({ ...ctx, cwd: root }, { create: false });
     const backupDir = backupDirFactory(ctx, root, 'tooling', 'backups');
     const res = port({ path: positionals[0], from: values.from || null, to: values.to || 'all', out: values.out || null,

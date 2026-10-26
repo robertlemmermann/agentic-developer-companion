@@ -7,16 +7,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   EXIT, AdcError, usageError, unverifiable, defineCommand, defineGroup, readText, writeFileAtomic,
-  writeJsonAtomic, withLock, sha256, nonce, nowIso, stamp, today, toPosix, relPosix, ensureDir, truncate,
-  redactLiterals, runShell, generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, tmpRoot,
+  writeJsonAtomic, withLock, sha256, sha256File, nonce, nowIso, stamp, today, toPosix, relPosix, ensureDir, truncate,
+  generatedBy, ADC_SCRIPT, readJson, IS_WINDOWS, canonicalJson, toArray, mdCell, isObj, hostFromEnv, statOrNull,
+  readInput, readJsonInput, numberOption, spawnCapture,
 } from './core.mjs';
-import { requireRepo, repoRoot, gitTry, git, gitRaw, headSha, gitPath, resolveBase, checkIgnore } from './git.mjs';
-import { prepareStateDir, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes } from './state.mjs';
+import { requireRepo, repoRoot, gitTry, createSnapshot } from './git.mjs';
+import {
+  prepareStateDir, prepareTarget, statePaths, newestOpenSession, readSession, appendMetrics, snapshotExcludes,
+  listLedgers,
+} from './state.mjs';
+import { makeRedactor, redactDeep } from './markers.mjs';
 import { citationChecker, evaluateMatrix, renderTraceMarkdown, readSpecInput } from './trace.mjs';
 
 export const SCHEMA = 'adc-evidence/1';
 export const STATUSES = Object.freeze(['pass', 'fail', 'finding', 'skipped', 'unverified', 'pass-with-baseline']);
-export const VERDICTS = Object.freeze(['PASS', 'PASS-WITH-FINDINGS', 'FAIL', 'UNVERIFIED']);
 export const TOOLS = Object.freeze(['copilot-cli', 'vscode', 'copilot-cloud', 'claude-code', 'codex', 'unknown']);
 export const CHECK_ID_RE = /^CK-[A-Z0-9][A-Z0-9-]{0,40}$/;
 
@@ -48,9 +52,9 @@ const HEADER_KEYS = ['schema', 'tool', 'mode', 'session_id', 'session_source', '
   'projects_summary', 'options', 'created_at', 'generated_by'];
 // Fields recomputed on every write; excluded from entry hashes.
 const DERIVED_KEYS = { checks: [], waivers: [], claims: ['status'] };
-const HASH_KEY_RE = /(?:sha256|^tree_digest$|^session_nonce$|^snapshot_commit$|^base$|^head$|^prev$|^tip$|^sha$|^tree$|^commit$)$/;
+/** Session ids from --session (the live runner and the hooks use the same shape). */
+export const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 
-const arr = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]);
 // Repository a ledger belongs to: explicit, else the one containing the ledger, else the cwd's.
 const rootFor = (file, root) => root || repoRoot(path.dirname(file)) || requireRepo(process.cwd());
 const posixRef = (root, file) => {
@@ -59,73 +63,13 @@ const posixRef = (root, file) => {
 };
 
 // ---------------------------------------------------------------------------
-// Snapshot target: git.createSnapshot / state.prepareTarget with two fixes (reported upstream)
-//
-// 1. git.createSnapshot passes `:(top,exclude).adc` to `git add -A`; Git (2.43 here) exits 1 with
-//    "paths are ignored" once `.adc/` is ignored, which prepareStateDir itself arranges. Ignored
-//    paths are never added by `git add -A`, so exclude pathspecs are kept only for state dirs that
-//    are not ignored (no state file is ever hashed) and every state dir is then removed from the
-//    temporary index.
-// 2. Copying the index gives the copy a new mtime. Git trusts the stat data of entries older than
-//    the index file, so a same-size edit made in the timestamp tick of the last index write is
-//    missed ("racy git"; about 4 in 100 snapshots in a tight loop). Backdating the copy keeps Git
-//    re-checking those entries by content.
-
-const SNAPSHOT_IDENT = {
-  GIT_AUTHOR_NAME: 'agentic-developer-companion', GIT_AUTHOR_EMAIL: 'adc@localhost',
-  GIT_COMMITTER_NAME: 'agentic-developer-companion', GIT_COMMITTER_EMAIL: 'adc@localhost',
-};
-
-/** Working-tree snapshot (§7.5) as `{ tree, commit, head }`; the user's index and working tree are untouched. */
-export function createQaSnapshot(root, { exclude = ['.adc'] } = {}) {
-  const head = headSha(root);
-  const tmpIndex = path.join(ensureDir(tmpRoot(root)), `index-${nonce()}`);
-  const env = { GIT_INDEX_FILE: tmpIndex };
-  const clean = exclude.filter(Boolean).map((p) => toPosix(p).replace(/\/+$/, ''));
-  try {
-    const realIndex = gitPath(root, 'index');
-    if (fs.existsSync(realIndex)) {
-      fs.copyFileSync(realIndex, tmpIndex);
-      const back = new Date(fs.statSync(realIndex).mtimeMs - 2000);
-      fs.utimesSync(tmpIndex, back, back);
-    } else if (head) git(root, ['read-tree', 'HEAD'], { env });
-    const keep = clean.filter((p) => !checkIgnore(root, p));
-    git(root, ['add', '-A', '--', '.', ...keep.map((p) => `:(top,exclude)${p}`)], { env, timeoutMs: 600_000 });
-    for (const p of clean) gitRaw(root, ['rm', '-r', '--cached', '--quiet', '--ignore-unmatch', '--', `:(top)${p}`], { env });
-    const tree = git(root, ['write-tree'], { env });
-    const commit = git(root, ['commit-tree', tree, ...(head ? ['-p', head] : []), '-m', 'agentic-developer-companion snapshot'],
-      { env: { ...env, ...SNAPSHOT_IDENT } });
-    return { tree, commit, head };
-  } finally {
-    fs.rmSync(tmpIndex, { force: true });
-    fs.rmSync(`${tmpIndex}.lock`, { force: true });
-  }
-}
-
-/** state.prepareTarget built on createQaSnapshot. Returns { root, state, base, snapshot }. */
-export async function prepareQaTarget(ctx, { base = null, snapshot = null, createState = true } = {}) {
-  const root = requireRepo(ctx.cwd);
-  const state = prepareStateDir({ ...ctx, cwd: root }, { create: createState });
-  const b = resolveBase(root, base);
-  return { root, state, base: b, snapshot: snapshot || createQaSnapshot(root, { exclude: snapshotExcludes(state) }) };
-}
-
-// ---------------------------------------------------------------------------
 // Host identity
 
 /** Host that runs this command, from environment markers (§8.4); 'unknown' when none is set. */
-export function detectTool(env = process.env) {
-  const on = (k) => Boolean(env[k]) && env[k] !== '0' && env[k] !== 'false';
-  if (on('COPILOT_AGENT_PROMPT') || on('GITHUB_COPILOT_API_TOKEN')) return 'copilot-cloud';
-  if (on('CLAUDECODE') || on('CLAUDE_CODE_ENTRYPOINT')) return 'claude-code';
-  if (['CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'CODEX_THREAD_ID'].some(on)) return 'codex';
-  if (on('COPILOT_CLI')) return 'copilot-cli';
-  // Heuristic: an integrated VS Code terminal; the Copilot harness sets no documented marker.
-  if (env.TERM_PROGRAM === 'vscode' || on('VSCODE_IPC_HOOK_CLI')) return 'vscode';
-  return 'unknown';
-}
+export const detectTool = (env = process.env) => hostFromEnv(env).tool;
 
-function checkTool(value) {
+/** A --tool value, lower-cased; a usage error unless it names a known host. */
+export function checkTool(value) {
   if (value == null) return null;
   const t = String(value).toLowerCase();
   if (!TOOLS.includes(t)) throw usageError(`--tool must be one of ${TOOLS.join(', ')}`);
@@ -133,83 +77,7 @@ function checkTool(value) {
 }
 
 // ---------------------------------------------------------------------------
-// Secret redaction (every string written under .adc/ passes through it, §7.3)
-
-const FALLBACK_SECRET_PATTERNS = [
-  { id: 'aws-access-key-id', re: new RegExp('\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b', 'g') },
-  { id: 'github-token', re: new RegExp('\\bgh[pousr]_[A-Za-z0-9]{36,}', 'g') },
-  { id: 'github-pat', re: new RegExp('\\bgithub' + '_pat_[A-Za-z0-9_]{22,}', 'g') },
-  { id: 'slack-token', re: new RegExp('\\bxox[abposr]-[A-Za-z0-9-]{10,}', 'g') },
-  { id: 'private-key', re: new RegExp('-----BEGIN [A-Z ]*' + 'PRIVATE KEY-----[\\s\\S]*?(?:-----END [A-Z ]*' + 'PRIVATE KEY-----|$)', 'g') },
-  { id: 'adc-live-token', re: /ADC_LIVE_TOKEN\s*[=:]\s*["']?[^\s"']+/g, replace: 'ADC_LIVE_TOKEN=<redacted>' },
-];
-let patternCache = null;
-
-async function secretPatterns() {
-  if (patternCache) return patternCache;
-  const list = [...FALLBACK_SECRET_PATTERNS];
-  try {
-    const m = await import('./markers.mjs');
-    for (const p of Array.isArray(m.SECRET_PATTERNS) ? m.SECRET_PATTERNS : []) {
-      if (p && p.re instanceof RegExp) {
-        list.push({ id: String(p.id || 'secret'), re: new RegExp(p.re.source, p.re.flags.includes('g') ? p.re.flags : `${p.re.flags}g`) });
-      }
-    }
-  } catch {
-    // markers.mjs is optional; the built-in shapes still apply.
-  }
-  patternCache = list;
-  return list;
-}
-
-function redactWith(patterns, literals, text) {
-  if (typeof text !== 'string' || !text) return text;
-  let out = literals.length ? redactLiterals(text, literals) : text;
-  for (const p of patterns) {
-    p.re.lastIndex = 0;
-    out = out.replace(p.re, p.replace || `[REDACTED:${p.id}]`);
-  }
-  return out;
-}
-
-/** A sync redactor for secret shapes plus the ADC_LIVE_TOKEN value in the environment. */
-export async function makeRedactor(env = process.env) {
-  const patterns = await secretPatterns();
-  const literals = env.ADC_LIVE_TOKEN ? [{ name: 'ADC_LIVE_TOKEN', value: env.ADC_LIVE_TOKEN }] : [];
-  return (text) => redactWith(patterns, literals, text);
-}
-
-function redactSync(text) {
-  const literals = process.env.ADC_LIVE_TOKEN ? [{ name: 'ADC_LIVE_TOKEN', value: process.env.ADC_LIVE_TOKEN }] : [];
-  return redactWith(patternCache || FALLBACK_SECRET_PATTERNS, literals, text);
-}
-
-/** Redact every string in a JSON value except hash-valued keys. */
-export function redactDeep(value, redact, key = '') {
-  if (key === 'artifact_sha256') return value;
-  if (typeof value === 'string') return HASH_KEY_RE.test(key) ? value : redact(value);
-  if (Array.isArray(value)) return value.map((v) => redactDeep(v, redact, key));
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = redactDeep(v, redact, k);
-    return out;
-  }
-  return value;
-}
-
-// ---------------------------------------------------------------------------
-// Hashing
-
-/** JSON with recursively sorted keys (the hashed form of every record). */
-export function canonicalJson(v) {
-  if (Array.isArray(v)) return `[${v.map((x) => canonicalJson(x === undefined ? null : x)).join(',')}]`;
-  if (v && typeof v === 'object') {
-    return `{${Object.keys(v).filter((k) => v[k] !== undefined).sort()
-      .map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
-  }
-  if (typeof v === 'number' && !Number.isFinite(v)) return 'null';
-  return JSON.stringify(v === undefined ? null : v);
-}
+// Hashing (every string written under .adc/ is redacted first with markers.makeRedactor, §7.3)
 
 const nonceHash = (ledger, value) => sha256(`${ledger.session_nonce}\n${canonicalJson(value)}`);
 
@@ -226,11 +94,8 @@ function recordHash(ledger, list, record) {
   return nonceHash(ledger, copy);
 }
 
-function sealHash(ledger) {
-  const copy = JSON.parse(JSON.stringify(ledger));
-  delete copy.integrity.ledger_sha256;
-  return nonceHash(ledger, copy);
-}
+// canonicalJson drops undefined keys, so a shallow copy without the seal itself is enough.
+const sealHash = (ledger) => nonceHash(ledger, { ...ledger, integrity: { ...ledger.integrity, ledger_sha256: undefined } });
 
 // Each record carries a global sequence number and the previous record's hash, so an edited,
 // removed or reordered entry breaks the chain (tamper-evident; a forger needs the nonce).
@@ -245,9 +110,8 @@ function appendRecord(ledger, list, record) {
   return record;
 }
 
-function hashFile(file) {
-  try { return sha256(fs.readFileSync(file)); } catch { return null; }
-}
+// Regular files only: an artifact path naming a FIFO or a device would block or never end.
+const hashArtifact = (file) => (statOrNull(file)?.isFile() ? sha256File(file) : null);
 
 /** Recompute header, entry, chain, artifact and seal hashes. Returns { ok, problems[] }. */
 export function verifyIntegrity(ledger, { root = null } = {}) {
@@ -271,7 +135,7 @@ export function verifyIntegrity(ledger, { root = null } = {}) {
     if (list === 'checks' && root && r.artifact_sha256 && typeof r.artifact_sha256 === 'object') {
       for (const [p, h] of Object.entries(r.artifact_sha256)) {
         if (h == null) continue;
-        const now = hashFile(path.resolve(root, p));
+        const now = hashArtifact(path.resolve(root, p));
         if (now !== h) problems.push({ kind: 'artifact', record: label, detail: `${p} ${now ? 'changed after it was recorded' : 'is missing'}` });
       }
     }
@@ -280,7 +144,7 @@ export function verifyIntegrity(ledger, { root = null } = {}) {
   if ((integ.count || 0) !== records.length) problems.push({ kind: 'count', detail: `integrity.count is ${integ.count}, the ledger holds ${records.length} entries` });
   if ((integ.head || null) !== prev) problems.push({ kind: 'head', detail: 'the newest entry does not match integrity.head (an entry was removed)' });
   if (root && ledger.spec_copy && ledger.spec_copy_sha256) {
-    if (hashFile(path.resolve(root, ledger.spec_copy)) !== ledger.spec_copy_sha256) problems.push({ kind: 'artifact', record: 'spec', detail: `${ledger.spec_copy} changed or is missing` });
+    if (hashArtifact(path.resolve(root, ledger.spec_copy)) !== ledger.spec_copy_sha256) problems.push({ kind: 'artifact', record: 'spec', detail: `${ledger.spec_copy} changed or is missing` });
   }
   if (ledger.finalized_at && integ.ledger_sha256 !== sealHash(ledger)) problems.push({ kind: 'seal', detail: 'the finalized ledger was changed' });
   return { ok: problems.length === 0, problems };
@@ -335,7 +199,7 @@ export function normalizeCheck(raw, { strict = false } = {}) {
     reason = `BAD_STATUS:${truncate(status, 30)}`;
     status = 'unverified';
   }
-  const fm = arr(raw.fm).map(String).filter((x) => /^FM-\d{2}$/.test(x));
+  const fm = toArray(raw.fm).map(String).filter((x) => /^FM-\d{2}$/.test(x));
   const total = Array.isArray(raw.findings) ? raw.findings.length : 0;
   const out = {
     id, fm: fm.length ? fm : [...(CHECK_FM[id] || [])], project: toPosix(String(raw.project || '.')),
@@ -346,7 +210,7 @@ export function normalizeCheck(raw, { strict = false } = {}) {
     duration_ms: Number.isFinite(Number(raw.duration_ms)) && raw.duration_ms !== null ? Math.round(Number(raw.duration_ms)) : null,
     summary: truncate(String(raw.summary || ''), 1000),
     output_sha256: /^[0-9a-f]{64}$/.test(String(raw.output_sha256 || '')) ? raw.output_sha256 : null,
-    artifacts: arr(raw.artifacts).map((a) => toPosix(String(a))).slice(0, 50),
+    artifacts: toArray(raw.artifacts).map((a) => toPosix(String(a))).slice(0, 50),
     findings: normalizeFindings(raw.findings, id),
     data: clampData(raw.data),
   };
@@ -375,34 +239,17 @@ export const markdownPath = (file) => file.replace(/\.json$/, '.md');
 /** Folder for a ledger's artifacts (trace matrix, spec copy, run logs). A subfolder keeps `evidence/*.json` ledger-only. */
 export const artifactsDir = (file) => file.replace(/\.json$/, '');
 
-function evidenceDir(stateInfo) {
-  return (stateInfo.paths || statePaths(stateInfo.dir)).evidence;
-}
-
-/** Ledgers in the state dir, newest first (by created_at, then name). */
-export function listLedgers(stateInfo) {
-  const dir = evidenceDir(stateInfo);
-  let names = [];
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
-  const rows = names.map((n) => {
-    const file = path.join(dir, n);
-    const doc = readJson(file, null);
-    return { file, created: doc && doc.schema === SCHEMA ? String(doc.created_at || '') : null, name: n };
-  }).filter((r) => r.created !== null);
-  rows.sort((a, b) => (a.created === b.created ? (a.name < b.name ? 1 : -1) : a.created < b.created ? 1 : -1));
-  return rows.map((r) => r.file);
-}
-
 /** `{ path, ledger }` for an explicit path, else the newest ledger; throws when there is none. */
 export function loadLedger(pathOrNull, stateInfo) {
-  const file = pathOrNull || listLedgers(stateInfo)[0];
+  const file = pathOrNull || listLedgers(stateInfo.dir)[0]?.file;
   if (!file) throw new AdcError(EXIT.USAGE, 'NO_LEDGER', 'no evidence ledger found; run `verify` (or `evidence init`) first');
   return { path: file, ledger: readLedgerFile(file) };
 }
 
 /** A fresh `.adc/evidence/<stamp>-<tree12>[-n].json` path (its artifacts folder is free too). */
 export function allocateLedgerPath(stateInfo, tree, { create = true } = {}) {
-  const dir = create ? ensureDir(evidenceDir(stateInfo)) : evidenceDir(stateInfo);
+  const dir = statePaths(stateInfo.dir).evidence;
+  if (create) ensureDir(dir);
   const base = `${stamp()}-${String(tree).slice(0, 12)}`;
   for (let i = 1; ; i++) {
     const file = path.join(dir, `${base}${i === 1 ? '' : `-${i}`}.json`);
@@ -418,9 +265,12 @@ function repoIdentity(root) {
 
 /** Session identity (§10.3.2): --session > newest open hook session file > generated run id. */
 export function resolveSession(stateInfo, explicit) {
-  if (explicit) return { id: String(explicit), source: 'flag' };
+  if (explicit) {
+    if (!SESSION_ID_RE.test(String(explicit))) throw usageError(`--session must match ${SESSION_ID_RE}`);
+    return { id: String(explicit), source: 'flag' };
+  }
   const open = newestOpenSession(stateInfo.dir);
-  if (open) return { id: String(open.id), source: 'session-file' };
+  if (open) return { id: String(open.id), source: 'session-file', record: open.session };
   return { id: `run-${stamp()}-${nonce().slice(0, 6)}`, source: 'generated' };
 }
 
@@ -440,26 +290,25 @@ function budgetSnapshot(stateInfo, sessionId, identitySource) {
   };
 }
 
-function observedRuns(stateInfo, sessionId) {
-  const s = readSession(stateInfo.dir, sessionId);
-  if (!s || typeof s !== 'object') return [];
-  const runs = [s.observed_runs, s.runs, s.events && s.events.observed_runs, s.events && s.events.runs].find(Array.isArray) || [];
-  return runs.filter((r) => r && typeof r === 'object').slice(-50).map((r) => ({
-    ts: r.ts ? String(r.ts) : null, cmd_head: truncate(String(r.cmd_head ?? r.cmd ?? ''), 200), class: r.class == null ? null : String(r.class),
-    exit: Number.isInteger(r.exit) ? r.exit : null, counts: r.counts && typeof r.counts === 'object' ? r.counts : null,
+// Runs the post-shell hook observed in this session (§8): reported, never evidence.
+function observedRuns(stateInfo, session) {
+  const s = session.record || (session.source === 'generated' ? null : readSession(stateInfo.dir, session.id));
+  return toArray(s?.observed_runs).filter(isObj).slice(-50).map((r) => ({
+    ts: r.ts ? String(r.ts) : null, cmd_head: truncate(String(r.cmd_head ?? ''), 200), class: r.class == null ? null : String(r.class),
+    exit: Number.isInteger(r.exit) ? r.exit : null, counts: isObj(r.counts) ? r.counts : null,
     parse_source: String(r.parse_source || 'none'), source: String(r.source || 'hook:post-shell'), narrowed: Boolean(r.narrowed),
   }));
 }
 
 /**
- * Create a ledger for `target` (from prepareQaTarget). Returns { path, ledger }.
+ * Create a ledger for `target` (from state.prepareTarget). Returns { path, ledger }.
  * `mode` is 'verify' (written by the orchestrator) or 'manual' (`evidence init`).
  */
 export async function initLedger({
   target, tool = null, spec = null, specText = null, sessionId = null, mode = 'manual', options = {},
   projectsSummary = null, effectiveTestGlobs = [], steps = null, file = null, dryRun = false,
 }) {
-  const redact = await makeRedactor();
+  const redact = makeRedactor();
   const st = target.state;
   const ledgerFile = file || allocateLedgerPath(st, target.snapshot.tree, { create: !dryRun });
   const session = sessionId && typeof sessionId === 'object' ? sessionId : resolveSession(st, sessionId);
@@ -469,10 +318,10 @@ export async function initLedger({
     base_source: target.base.source, tree_digest: target.snapshot.tree, snapshot_commit: target.snapshot.commit,
     head: target.snapshot.head, spec: spec == null ? null : truncate(String(spec), 500),
     spec_sha256: specText == null ? null : sha256(String(specText)), spec_copy: null, spec_copy_sha256: null,
-    effective_test_globs: [...new Set(arr(effectiveTestGlobs).map(String))].slice(0, 100),
+    effective_test_globs: [...new Set(toArray(effectiveTestGlobs).map(String))].slice(0, 100),
     projects_summary: projectsSummary == null ? null : truncate(String(projectsSummary), 500), options: clampData(options),
     budget: budgetSnapshot(st, session.id, session.source), steps: Array.isArray(steps) ? steps : [],
-    checks: [], observed_runs: observedRuns(st, session.id), waivers: [], claims: [],
+    checks: [], observed_runs: observedRuns(st, session), waivers: [], claims: [],
     verdict: 'UNVERIFIED', verdict_reasons: [], needs_human_triage: false,
     created_at: nowIso(), updated_at: null, finalized_at: null, generated_by: generatedBy(),
     integrity: { algorithm: 'sha256(session_nonce + LF + canonical JSON); entries chained by seq/prev', count: 0, head: null, header_sha256: null },
@@ -564,7 +413,7 @@ async function traceEntry(ledger, raw, { root, file, dryRun }) {
  * or 'run' (a command `evidence add --run` executed). Returns { ledger, added }.
  */
 export async function addChecks(file, checks, { source = 'script', root = null, inputTree = null, dryRun = false } = {}) {
-  const redact = await makeRedactor();
+  const redact = makeRedactor();
   const strict = source === 'input';
   const { ledger, result } = await mutateLedger(file, async (ledger) => {
     if (inputTree && inputTree !== ledger.tree_digest) {
@@ -572,7 +421,7 @@ export async function addChecks(file, checks, { source = 'script', root = null, 
     }
     const repo = rootFor(file, root);
     const added = [];
-    for (const raw0 of arr(checks)) {
+    for (const raw0 of toArray(checks)) {
       let raw = raw0;
       if (strict && raw && String(raw.id || '').toUpperCase() === 'CK-CLAIMS') throw usageError('CK-CLAIMS is derived at finalize; record claims with `evidence claims`');
       if (strict && raw && String(raw.id || '').toUpperCase() === 'CK-TRACE') raw = await traceEntry(ledger, raw, { root: repo, file, dryRun });
@@ -585,10 +434,14 @@ export async function addChecks(file, checks, { source = 'script', root = null, 
       const placeholder = ledger.checks.find((c) => c.pending && c.id === entry.id && !entry.pending);
       if (placeholder) entry.supersedes = placeholder.seq;
       const artifactHashes = {};
-      for (const a of entry.artifacts) artifactHashes[a] = hashFile(path.resolve(repo, a));
+      for (const a of entry.artifacts) artifactHashes[a] = hashArtifact(path.resolve(repo, a));
       entry.artifact_sha256 = artifactHashes;
       added.push(appendRecord(ledger, 'checks', redactDeep(entry, redact)));
     }
+    // The live runner's run summary carries the session's budget view (§10.3.2): the newest one is
+    // the ledger's `budget`. Input from the CLI cannot set it.
+    const live = strict || source === 'run' ? null : added.findLast((c) => c.id === 'CK-LIVE' && isObj(c.data.budget));
+    if (live) ledger.budget = live.data.budget;
     return added;
   }, { dryRun });
   return { ledger, added: result };
@@ -658,7 +511,7 @@ export function parseClaims(input) {
 
 /** Append claims (deduplicated by text). Any status in the input is ignored and re-derived. */
 export async function setClaims(file, claims, { dryRun = false } = {}) {
-  const redact = await makeRedactor();
+  const redact = makeRedactor();
   const parsed = parseClaims(claims);
   const { ledger, result } = await mutateLedger(file, (ledger) => {
     const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -704,7 +557,7 @@ export async function addWaiver(file, { check, file: wfile = null, reason }, { r
   if (NON_WAIVABLE.has(id)) throw usageError(`${id} cannot be waived: it records a fact (fix the cause and re-run verify)`);
   const text = String(reason || '').trim();
   if (!text) throw usageError('--reason "<quoted spec text>" is required');
-  const redact = await makeRedactor();
+  const redact = makeRedactor();
   const { ledger, result } = await mutateLedger(file, (ledger) => {
     const entries = ledger.checks.filter((c) => c.id === id && !c.pending);
     if (!entries.length) throw usageError(`the ledger has no ${id} entry to waive`);
@@ -757,7 +610,7 @@ function shortfallOnly(entry) {
 }
 
 function claimStatus(claim, rows) {
-  const ids = arr(claim.evidence);
+  const ids = toArray(claim.evidence);
   if (!ids.length) return 'unsupported';
   let allOk = true;
   for (const id of ids) {
@@ -843,7 +696,7 @@ export function deriveVerdict(ledger) {
     }
   }
 
-  const claims = (ledger.claims || []).map((c) => ({ seq: c.seq, text: c.text, evidence: arr(c.evidence), status: claimStatus(c, rows) }));
+  const claims = (ledger.claims || []).map((c) => ({ seq: c.seq, text: c.text, evidence: toArray(c.evidence), status: claimStatus(c, rows) }));
   const contradictedByFail = claims.some((c) => c.status === 'contradicted'
     && c.evidence.some((id) => rows.some((r) => r.id === id && r.effective === 'fail')));
   const claimsRow = {
@@ -914,7 +767,7 @@ export async function finalizeLedger(file, { target, dryRun = false } = {}) {
     }
     const d = deriveVerdict(ledger);
     const claimsRow = d.effective.find((r) => r.id === 'CK-CLAIMS');
-    const redact = await makeRedactor();
+    const redact = makeRedactor();
     const entry = normalizeCheck({ id: 'CK-CLAIMS', status: claimsRow.status, reason: claimsRow.reason, summary: claimsRow.summary,
       data: { claims: d.claims.map((c) => ({ text: c.text, status: c.status, evidence: c.evidence })) } });
     Object.assign(entry, { tree_digest: ledger.tree_digest, source: 'derived', added_at: nowIso(), artifact_sha256: {} });
@@ -934,7 +787,7 @@ export async function finalizeLedger(file, { target, dryRun = false } = {}) {
 
 /** Newest (or given) ledger with its verdict, integrity and staleness against a fresh snapshot. */
 export function ledgerStatus({ target, ledgerPath = null }) {
-  const file = ledgerPath || listLedgers(target.state)[0];
+  const file = ledgerPath || listLedgers(target.state.dir)[0]?.file;
   if (!file) return { ledger: null, verdict: null, finalized: false, stale: null, message: 'no evidence ledger; run verify' };
   const ledger = readLedgerFile(file);
   const integrity = verifyIntegrity(ledger, { root: target.root });
@@ -948,17 +801,17 @@ export function ledgerStatus({ target, ledgerPath = null }) {
   };
 }
 
-/** One metrics.jsonl record for a ledger (§10.6). */
-export function metricsFor(input, extra = {}) {
-  const ledger = { ...input, checks: arr(input.checks), waivers: arr(input.waivers), claims: arr(input.claims) };
+/** One metrics.jsonl record for a ledger (§10.6); pass `derived` when deriveVerdict already ran. */
+export function metricsFor(input, extra = {}, derived = null) {
+  const ledger = { ...input, checks: toArray(input.checks), waivers: toArray(input.waivers), claims: toArray(input.claims) };
   const pickData = (id) => ledger.checks.filter((c) => c.id === id).map((c) => c.data || {});
   const sum = (key) => pickData('CK-CLEANRUN').reduce((n, d) => n + (Number((d.run && d.run[key]) ?? d[key]) || 0), 0);
   const cov = pickData('CK-COVERAGE').map((d) => d.pct).find((v) => Number.isFinite(Number(v)));
   const mut = pickData('CK-MUTATION').map((d) => d.score).find((v) => Number.isFinite(Number(v)));
-  const suspects = pickData('CK-FLAKE').reduce((n, d) => n + arr(d.suspect_tests).length, 0);
-  const findings = (id) => ledger.checks.filter((c) => c.id === id).reduce((n, c) => n + arr(c.findings).length, 0);
+  const suspects = pickData('CK-FLAKE').reduce((n, d) => n + toArray(d.suspect_tests).length, 0);
+  const findings = (id) => ledger.checks.filter((c) => c.id === id).reduce((n, c) => n + toArray(c.findings).length, 0);
   const statusCounts = {};
-  for (const r of checkRows(deriveVerdict(ledger))) statusCounts[r.effective] = (statusCounts[r.effective] || 0) + 1;
+  for (const r of checkRows(derived || deriveVerdict(ledger))) statusCounts[r.effective] = (statusCounts[r.effective] || 0) + 1;
   return {
     kind: 'verify', verdict: ledger.verdict, tree: String(ledger.tree_digest || '').slice(0, 12), tool: ledger.tool,
     executed: sum('executed'), passed: sum('passed'), failed: sum('failed'), skipped: sum('skipped'), flaky: sum('flaky'),
@@ -970,11 +823,9 @@ export function metricsFor(input, extra = {}) {
 // ---------------------------------------------------------------------------
 // Markdown (D12: generated only; you or CI post it)
 
-const cell = (s, n = 160) => truncate(String(s == null ? '' : s).replace(/\r?\n/g, ' ').replace(/\|/g, '\\|'), n);
-
 /** Markdown for a ledger. `short` gives the postable summary: verdict, check table, reproduce commands. */
 export function renderMarkdown(input, { short = false } = {}) {
-  const ledger = { ...input, checks: arr(input.checks), waivers: arr(input.waivers), claims: arr(input.claims), observed_runs: arr(input.observed_runs) };
+  const ledger = { ...input, checks: toArray(input.checks), waivers: toArray(input.waivers), claims: toArray(input.claims), observed_runs: toArray(input.observed_runs) };
   const d = deriveVerdict(ledger);
   const out = [];
   const tree = String(ledger.tree_digest || '').slice(0, 12);
@@ -982,8 +833,8 @@ export function renderMarkdown(input, { short = false } = {}) {
   out.push(`## Verification evidence: ${d.verdict}${ledger.finalized_at ? '' : ' (provisional)'}`, '');
   out.push(`- Snapshot \`${tree}\` vs ${base} (base from ${ledger.base_source || 'unknown'}); host ${ledger.tool || 'unknown'}; ledger mode ${ledger.mode || 'unknown'}`);
   out.push(ledger.finalized_at ? `- Finalized ${ledger.finalized_at}` : `- Recorded ${ledger.created_at}; not finalized (\`evidence finalize\`)`);
-  if (ledger.projects_summary) out.push(`- Projects: ${cell(ledger.projects_summary, 300)}`);
-  if (ledger.spec) out.push(`- Spec: ${cell(ledger.spec, 200)}`);
+  if (ledger.projects_summary) out.push(`- Projects: ${mdCell(ledger.projects_summary, 300)}`);
+  if (ledger.spec) out.push(`- Spec: ${mdCell(ledger.spec, 200)}`);
   if (d.needs_human_triage) out.push('- **Needs human triage**: the review reported a critical finding that no reproducing command confirmed.');
   if (ledger.mode === 'manual') out.push('- Created with `evidence init`: checks were recorded from command output, not by `verify`.');
   if (d.effective.some((r) => r.id === 'CK-REVIEW' && r.entries.every((e) => e.pending))) out.push('- No adversarial review was recorded; this verdict carries no second opinion.');
@@ -992,11 +843,11 @@ export function renderMarkdown(input, { short = false } = {}) {
     const pending = r.entries.some((e) => e.pending);
     const st = pending ? `not recorded (${r.effective})` : r.effective === r.status ? r.effective : `${r.effective} (recorded ${r.status})`;
     const src = r.sources.includes('input') ? ' (input)' : '';
-    out.push(`| ${r.id}${src} | ${cell(r.project, 40)} | ${st}${r.reason ? ` [${cell(r.reason, 40)}]` : ''} | ${cell(r.summary)}${r.notes.length ? ` - ${cell(r.notes.join('; '), 200)}` : ''} |`);
+    out.push(`| ${r.id}${src} | ${mdCell(r.project, 40)} | ${st}${r.reason ? ` [${mdCell(r.reason, 40)}]` : ''} | ${mdCell(r.summary)}${r.notes.length ? ` - ${mdCell(r.notes.join('; '), 200)}` : ''} |`);
   }
   if (d.reasons.length && !short) {
     out.push('', '### Why this verdict', '');
-    for (const r of d.reasons.slice(0, 30)) out.push(`- ${cell(r, 300)}`);
+    for (const r of d.reasons.slice(0, 30)) out.push(`- ${mdCell(r, 300)}`);
   }
   if (!short) {
     const findings = ledger.checks.flatMap((c) => (c.findings || []).filter((f) => f.severity !== 'info').map((f) => ({ ...f, check: c.id })));
@@ -1004,24 +855,24 @@ export function renderMarkdown(input, { short = false } = {}) {
       out.push('', `### Findings (${findings.length}${findings.length > 40 ? ', first 40' : ''})`, '');
       for (const f of findings.slice(0, 40)) {
         const loc = f.file ? ` \`${f.file}${f.line ? `:${f.line}` : ''}\`` : f.rule ? ` ${f.rule}` : '';
-        out.push(`- **${f.check}** ${f.severity}${loc}: ${cell(f.message, 240)}${f.evidence ? ` (\`${cell(f.evidence, 120).replace(/`/g, "'")}\`)` : ''}`);
+        out.push(`- **${f.check}** ${f.severity}${loc}: ${mdCell(f.message, 240)}${f.evidence ? ` (\`${mdCell(f.evidence, 120).replace(/`/g, "'")}\`)` : ''}`);
       }
     }
     if (d.claims.length) {
       out.push('', '### Claims', '', '| Claim | Status | Evidence |', '|---|---|---|');
-      for (const c of d.claims) out.push(`| ${cell(c.text, 200)} | ${c.status} | ${c.evidence.join(', ') || '-'} |`);
+      for (const c of d.claims) out.push(`| ${mdCell(c.text, 200)} | ${c.status} | ${c.evidence.join(', ') || '-'} |`);
     }
     if (ledger.waivers.length) {
       out.push('', '### Waivers', '', '| Check | Finding | Reason | Quote verified |', '|---|---|---|---|');
-      for (const w of ledger.waivers) out.push(`| ${w.check} | ${cell(w.file || 'all')} | ${cell(w.reason, 240)} | ${w.quote_verified ? 'yes' : `no (${w.by})`} |`);
+      for (const w of ledger.waivers) out.push(`| ${w.check} | ${mdCell(w.file || 'all')} | ${mdCell(w.reason, 240)} | ${w.quote_verified ? 'yes' : `no (${w.by})`} |`);
     }
     if (ledger.observed_runs.length) {
       out.push('', `### Observed runs (${ledger.observed_runs.length}; hooks saw them, they are never evidence)`, '');
-      for (const r of ledger.observed_runs.slice(-10)) out.push(`- ${cell(r.ts, 30)} \`${cell(r.cmd_head, 100).replace(/`/g, "'")}\` ${r.class || ''} exit ${r.exit == null ? 'unknown' : r.exit}`);
+      for (const r of ledger.observed_runs.slice(-10)) out.push(`- ${mdCell(r.ts, 30)} \`${mdCell(r.cmd_head, 100).replace(/`/g, "'")}\` ${r.class || ''} exit ${r.exit == null ? 'unknown' : r.exit}`);
     }
     if (ledger.budget) {
       const b = ledger.budget;
-      out.push('', `### Live budget`, '', `Session ${cell(b.session_id, 60)} (${b.identity_source}): spent ${b.spent} of ${b.max_per_session} ${b.unit}; today ${b.spent_today} of ${b.max_per_day}; remaining ${b.remaining}.`);
+      out.push('', `### Live budget`, '', `Session ${mdCell(b.session_id, 60)} (${b.identity_source}): spent ${b.spent} of ${b.max_per_session} ${b.unit}; today ${b.spent_today} of ${b.max_per_day}; remaining ${b.remaining}.`);
     }
   }
   const cmds = [];
@@ -1040,7 +891,7 @@ export function renderMarkdown(input, { short = false } = {}) {
     out.push('', `<sub>${ledger.generated_by || generatedBy()}; ${integ.count || 0} chained entries, head \`${String(integ.head || '').slice(0, 12)}\`${integ.ledger_sha256 ? `, sealed \`${integ.ledger_sha256.slice(0, 12)}\`` : ''}. Tamper-evident, not tamper-proof: re-run verify for a ledger you did not see produced.</sub>`);
   }
   out.push('');
-  return redactSync(out.join('\n'));
+  return makeRedactor()(out.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,7 +947,7 @@ export function scoreAnswers(input, { root = null, tree = null } = {}) {
     if (cat) kinds.add(cat.kind);
     const passIf = normAnswer(cat ? cat.pass_if : raw.pass_if);
     const answer = normAnswer(raw.answer);
-    const citations = [...arr(raw.citation), ...arr(raw.citations)].map(String).slice(0, 20);
+    const citations = [...toArray(raw.citation), ...toArray(raw.citations)].map(String).slice(0, 20);
     const a = {
       id, dimension: String(cat ? cat.dimension : raw.dimension || 'general'), question: truncate(String(cat ? cat.question : raw.question || ''), 300),
       answer, pass_if: passIf, citations, outcome: null, note: truncate(String(raw.note || ''), 300),
@@ -1121,8 +972,8 @@ export function scoreAnswers(input, { root = null, tree = null } = {}) {
   totals.score = totals.answered ? Number((totals.passed / totals.answered).toFixed(3)) : null;
   totals.coverage = totals.questions ? Number((totals.answered / totals.questions).toFixed(3)) : 0;
 
-  const items = (list) => arr(list).filter((x) => x && typeof x === 'object').slice(0, 100).map((x) => {
-    const cit = [...arr(x.citation), ...arr(x.citations)].map(String);
+  const items = (list) => toArray(list).filter((x) => x && typeof x === 'object').slice(0, 100).map((x) => {
+    const cit = [...toArray(x.citation), ...toArray(x.citations)].map(String);
     return { title: truncate(String(x.title || x.message || ''), 240), citations: cit, repro: truncate(String(x.repro || ''), 500), ok: cit.some((c) => check(c).ok) };
   });
   const criticalRaw = items(doc.critical || doc.criticals);
@@ -1152,7 +1003,7 @@ export function scoreAnswers(input, { root = null, tree = null } = {}) {
     kind, answers, dimensions: dims, totals, verdict,
     severity: { critical: criticals.length, important: important.length, minor: minor.length, rejected_criticals: rejectedCriticals.length },
     criticals, important, minor, ready_to_merge: doc.ready_to_merge == null ? null : truncate(String(doc.ready_to_merge), 40),
-    declined_to_judge: arr(doc.declined_to_judge).map((x) => truncate(String(x), 300)).slice(0, 50),
+    declined_to_judge: toArray(doc.declined_to_judge).map((x) => truncate(String(x), 300)).slice(0, 50),
     check: {
       id: checkId, fm: [...CHECK_FM[checkId]], project: '.', status, reason, summary, findings,
       data: { totals, dimensions: dims, severity: { critical: criticals.length, important: important.length, minor: minor.length }, ready_to_merge: doc.ready_to_merge ?? null, criticals },
@@ -1172,6 +1023,8 @@ function citeLoc(citations) {
 // Recorded commands (`evidence add --run|--repro`)
 
 const NOT_FOUND_EXITS = new Set([126, 127, 9009]);
+// Live-test credentials reach `live run` only (§10.3.1), never a command recorded here.
+const recordedEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('ADC_LIVE_')));
 
 async function runRecorded({ root, file, id, command, repro, project, summary, timeoutS, dryRun }) {
   const cid = String(id || '').trim().toUpperCase();
@@ -1182,9 +1035,10 @@ async function runRecorded({ root, file, id, command, repro, project, summary, t
   if (rel == null) throw usageError('--project must be inside the repository');
   const base = { id: cid, project: rel, command, cwd: rel, cost: 0, findings: [] };
   if (dryRun) return { ...base, status: 'skipped', reason: 'DRY_RUN', exit_code: null, summary: 'dry run: command not executed', data: { repro } };
-  const res = runShell(command, { cwd, timeoutMs: Math.max(1, Number(timeoutS) || 600) * 1000 });
-  const output = `${res.stdout || ''}${res.stderr ? `${res.stdout ? '\n' : ''}${res.stderr}` : ''}`;
-  const redact = await makeRedactor();
+  // Async with a process-group kill on timeout: a child that outlives its shell cannot hang the CLI.
+  const res = await spawnCapture(command, [], { shell: true, cwd, env: recordedEnv(), timeoutMs: timeoutS * 1000 });
+  const output = [res.stdout, res.stderr].filter(Boolean).join('\n');
+  const redact = makeRedactor();
   const log = path.join(artifactsDir(file), `run-${stamp()}-${nonce().slice(0, 6)}.log`);
   writeFileAtomic(log, redact(output));
   let status;
@@ -1198,33 +1052,21 @@ async function runRecorded({ root, file, id, command, repro, project, summary, t
   const text = summary || (repro ? (confirmed ? `reproduced: command exited ${res.exit}` : `not reproduced: command exited ${res.exit}`) : `command exited ${res.exit}`);
   return {
     ...base, status, reason, exit_code: res.exit, duration_ms: res.ms, summary: text, output_sha256: sha256(output),
-    artifacts: [posixRef(root, log)], data: { repro, confirmed, signal: res.signal || null },
+    artifacts: [posixRef(root, log)], data: { repro, confirmed, signal: res.signal, ...(res.truncated ? { output_truncated: true } : {}) },
   };
 }
 
 // ---------------------------------------------------------------------------
 // CLI
 
-function readInputArg(arg, cwd) {
-  if (arg === '-') {
-    try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
-  }
-  const file = path.resolve(cwd, arg);
-  const text = readText(file);
-  if (text == null) throw usageError(`file not found: ${toPosix(file)}`);
-  return text;
-}
-
-function parseJsonArg(arg, cwd) {
-  const text = readInputArg(arg, cwd);
-  try { return JSON.parse(text); } catch { throw usageError(`${arg === '-' ? 'stdin' : arg} is not valid JSON`); }
-}
-
 function openRepoState(ctx) {
   const root = requireRepo(ctx.cwd);
   const state = prepareStateDir({ ...ctx, cwd: root }, { create: false });
   return { root, state };
 }
+
+// The working tree as it is now: the CLI recomputes the snapshot for every ledger command (§7.5).
+const currentTarget = ({ root, state }) => ({ root, state, base: null, snapshot: createSnapshot(root, { exclude: snapshotExcludes(state) }) });
 
 /**
  * The ledger plus a fresh snapshot of the working tree (§7.5: the CLI recomputes it). Changing
@@ -1234,12 +1076,13 @@ function openRepoState(ctx) {
 function openCurrent(ctx, values, { refuseStale = true } = {}) {
   const { root, state } = openRepoState(ctx);
   const found = loadLedger(ledgerArg(ctx, values), state);
-  const snapshot = createQaSnapshot(root, { exclude: snapshotExcludes(state) });
+  const target = currentTarget({ root, state });
+  const { snapshot } = target;
   if (refuseStale && snapshot.tree !== found.ledger.tree_digest) {
     throw unverifiable('LEDGER_STALE', `the working tree changed since this ledger was recorded (ledger ${String(found.ledger.tree_digest).slice(0, 12)}, now ${snapshot.tree.slice(0, 12)}); re-run verify. Keep scratch files (answers, matrices) outside the repository or under .adc/`,
       { ledger_tree: found.ledger.tree_digest, current_tree: snapshot.tree });
   }
-  return { root, state, target: { root, state, base: null, snapshot }, ...found };
+  return { root, state, target, ...found };
 }
 
 const ledgerArg = (ctx, values) => (values.ledger ? path.resolve(ctx.cwd, values.ledger) : null);
@@ -1253,7 +1096,7 @@ const initCmd = defineCommand({
   positionals: false,
   run: async (ctx, values) => {
     const tool = checkTool(values.tool);
-    const target = await prepareQaTarget(ctx, { base: values.base || null, createState: !ctx.dryRun });
+    const target = await prepareTarget(ctx, { base: values.base || null, createState: !ctx.dryRun });
     const spec = values.spec ? readSpecInput(values.spec, { cwd: ctx.cwd, root: target.root }) : null;
     const { path: file, ledger } = await initLedger({ target, tool, spec: spec ? spec.ref : null, specText: spec ? spec.text : null, sessionId: values.session || null, mode: 'manual', dryRun: ctx.dryRun });
     return { result: { ledger: posixRef(target.root, file), dry_run: ctx.dryRun, tree_digest: ledger.tree_digest, session_id: ledger.session_id, verdict: ledger.verdict }, exit: EXIT.OK, summary: `${ctx.dryRun ? 'would create' : 'created'} ${posixRef(target.root, file)}` };
@@ -1278,12 +1121,12 @@ const addCmd = defineCommand({
       if (values.run && values.repro) throw usageError('use either --run or --repro');
       if (pos.length) throw usageError('--run/--repro take no file argument');
       if (ledger.finalized_at) throw new AdcError(EXIT.USAGE, 'LEDGER_FINALIZED', 'the ledger is finalized and cannot change; run verify again');
-      if (values.timeout != null && !(Number(values.timeout) > 0)) throw usageError('--timeout must be a positive number of seconds');
-      checks = [await runRecorded({ root, file, id: values.check, command: values.run || values.repro, repro: Boolean(values.repro), project: values.project, summary: values.summary, timeoutS: values.timeout, dryRun: ctx.dryRun })];
+      const timeoutS = numberOption(values, 'timeout', 600);
+      checks = [await runRecorded({ root, file, id: values.check, command: values.run || values.repro, repro: Boolean(values.repro), project: values.project, summary: values.summary, timeoutS, dryRun: ctx.dryRun })];
       source = 'run';
     } else {
       if (pos.length !== 1) throw usageError('evidence add needs exactly one <file|-> (or --check with --run/--repro)');
-      const parsed = inputDocToChecks(parseJsonArg(pos[0], ctx.cwd));
+      const parsed = inputDocToChecks(readJsonInput(pos[0], ctx.cwd));
       checks = parsed.checks;
       inputTree = parsed.tree;
       source = 'input';
@@ -1303,7 +1146,7 @@ const claimsCmd = defineCommand({
   options: { ...LEDGER_OPT },
   run: async (ctx, values, pos) => {
     if (pos.length !== 1) throw usageError('evidence claims needs <file|->');
-    const input = readInputArg(pos[0], ctx.cwd);
+    const input = readInput(pos[0], ctx.cwd, { what: 'claims file' });
     const { root, path: file } = openCurrent(ctx, values);
     const res = await setClaims(file, input, { dryRun: ctx.dryRun });
     const d = deriveVerdict(res.ledger);
@@ -1346,7 +1189,6 @@ const renderCmd = defineCommand({
   options: { ...LEDGER_OPT, md: { type: 'boolean' }, short: { type: 'boolean' }, out: { type: 'string' } },
   positionals: false,
   run: async (ctx, values) => {
-    await secretPatterns();
     const state = prepareStateDir(ctx, { create: false });
     const { path: file, ledger } = loadLedger(ledgerArg(ctx, values), state);
     const markdown = renderMarkdown(ledger, { short: Boolean(values.short) });
@@ -1365,8 +1207,7 @@ const statusCmd = defineCommand({
   options: { ...LEDGER_OPT },
   positionals: false,
   run: async (ctx, values) => {
-    const { root, state } = openRepoState(ctx);
-    const target = { root, state, base: null, snapshot: createQaSnapshot(root, { exclude: snapshotExcludes(state) }) };
+    const target = currentTarget(openRepoState(ctx));
     const st = ledgerStatus({ target, ledgerPath: ledgerArg(ctx, values) });
     const summary = st.ledger
       ? `${st.verdict}${st.finalized ? ' (finalized)' : ' (provisional)'}${st.stale ? ', STALE: the working tree changed since' : ''}${st.integrity.ok ? '' : ', INTEGRITY FAILED'}`
@@ -1381,7 +1222,7 @@ const scoreCmd = defineCommand({
   options: { ...LEDGER_OPT, add: { type: 'boolean' } },
   run: async (ctx, values, pos) => {
     if (pos.length !== 1) throw usageError('evidence score needs <answers.json|->');
-    const input = parseJsonArg(pos[0], ctx.cwd);
+    const input = readJsonInput(pos[0], ctx.cwd, { what: 'answers file' });
     let root = null;
     let found = null;
     if (values.add) {
@@ -1390,7 +1231,8 @@ const scoreCmd = defineCommand({
       try {
         const opened = openRepoState(ctx);
         root = opened.root;
-        found = values.ledger || listLedgers(opened.state)[0] ? loadLedger(ledgerArg(ctx, values), opened.state) : null;
+        const file = ledgerArg(ctx, values) || listLedgers(opened.state.dir)[0]?.file;
+        found = file ? { path: file, ledger: readLedgerFile(file) } : null;
       } catch (err) {
         if (values.ledger) throw err;
       }

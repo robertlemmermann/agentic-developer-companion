@@ -7,7 +7,8 @@
 # makes a later `verify` report edits to them as findings rather than CK-CI failures. The JSON data
 # fragments say how each runner runs in CI: `ci` flags (retries off, a report in <d>), `tail`, `report`
 # (default <d>/junit.xml), `format` (default junit), `only`/`skip` for @quarantine tests, `coverage`
-# (`<cmd>` is the runner command; `requires`: a dependency that must be declared), and the audits.
+# (`<cmd>` is the runner command; `requires`: a dependency that must be declared), the audits and
+# the agent hosts of the optional agent-verify jobs.
 # Fragments named `next` are the result's next steps, one per line, picked by the same attributes.
 
 @@@ file: .github/workflows/ci-gate.yml unless=gate-script-only @@@
@@ -401,7 +402,7 @@ jobs:
           cache-dependency-path: {{lockfile}}
 
 @@@ file: fragment/setup-pnpm part=fragment name=setup-pnpm @@@
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -482,10 +483,10 @@ jobs:
           bundler-cache: true
           working-directory: {{project_root}}
 
-@@@ file: fragment/agent-copilot part=fragment name=agent-copilot @@@
+@@@ file: fragment/agent-job part=fragment name=agent-job @@@
 
-  agent-verify-copilot:
-    name: Agent verify (Copilot CLI; informational, costs premium requests)
+  agent-verify-{{agent}}:
+    name: Agent verify ({{agent_label}}; informational, costs {{agent_cost}})
     if: ${{ github.event_name == 'pull_request' && contains(format(',{0},', vars.ADC_AGENT_AUTHORS || 'Copilot,copilot-swe-agent[bot]'), format(',{0},', github.event.pull_request.user.login)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -503,110 +504,52 @@ jobs:
         with:
           node-version: 24
 {{get_adc}}
-      - name: Install the skill at user scope (outside the checkout) and the Copilot CLI
+      - name: Install the skill at user scope (outside the checkout) and {{agent_label}}
         run: |
-          mkdir -p "$HOME/.copilot/skills"
-          cp -R "$(dirname "$(dirname "$ADC")")" "$HOME/.copilot/skills/{{skill_name}}"
-          npm install -g @github/copilot
+          mkdir -p "$HOME/{{agent_home}}"
+          cp -R "$(dirname "$(dirname "$ADC")")" "$HOME/{{agent_home}}/{{skill_name}}"
+          npm install -g {{agent_package}}
+{{agent_verify}}
+      - name: Post the evidence ledger on the PR
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
+          head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+@@@ file: fragment/agent-verify-copilot part=fragment name=agent-verify-copilot @@@
       - name: Verify the change (headless)
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           copilot -p "Use the {{skill_name}} skill to verify origin/$BASE_REF and write the evidence ledger." --trust-folder --no-ask-user --allow-tool 'shell(node:*)' --allow-tool 'shell(git:*)' --output-format json > "$RUNNER_TEMP/agent-output.json"
-      - name: Post the evidence ledger on the PR
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
-          head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
-          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
 
-@@@ file: fragment/agent-claude part=fragment name=agent-claude @@@
-
-  agent-verify-claude:
-    name: Agent verify (Claude Code; informational, costs API usage)
-    if: ${{ github.event_name == 'pull_request' && contains(format(',{0},', vars.ADC_AGENT_AUTHORS || 'Copilot,copilot-swe-agent[bot]'), format(',{0},', github.event.pull_request.user.login)) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: write
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-{{get_adc}}
-      - name: Install the skill at user scope (outside the checkout) and Claude Code
-        run: |
-          mkdir -p "$HOME/.claude/skills"
-          cp -R "$(dirname "$(dirname "$ADC")")" "$HOME/.claude/skills/{{skill_name}}"
-          npm install -g @anthropic-ai/claude-code
+@@@ file: fragment/agent-verify-claude part=fragment name=agent-verify-claude @@@
       - name: Verify the change (headless)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           claude -p "/{{skill_name}} verify origin/$BASE_REF --yes" --allowedTools "Bash,Read,Glob,Grep" --output-format json > "$RUNNER_TEMP/agent-output.json"
-      - name: Post the evidence ledger on the PR
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
-          head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
-          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
 
-@@@ file: fragment/agent-codex part=fragment name=agent-codex @@@
-
-  agent-verify-codex:
-    name: Agent verify (Codex; informational, costs API usage)
-    if: ${{ github.event_name == 'pull_request' && contains(format(',{0},', vars.ADC_AGENT_AUTHORS || 'Copilot,copilot-swe-agent[bot]'), format(',{0},', github.event.pull_request.user.login)) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: write
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-{{get_adc}}
-      - name: Install the skill at user scope (outside the checkout) and the Codex CLI
-        run: |
-          mkdir -p "$HOME/.agents/skills"
-          cp -R "$(dirname "$(dirname "$ADC")")" "$HOME/.agents/skills/{{skill_name}}"
-          npm install -g @openai/codex
+@@@ file: fragment/agent-verify-codex part=fragment name=agent-verify-codex @@@
       - name: Verify the change (headless, workspace-write sandbox)
         env:
           CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           codex exec --json -s workspace-write -o "$RUNNER_TEMP/agent-last-message.txt" "Use \$agentic-developer-companion to verify origin/$BASE_REF and write the evidence ledger." > "$RUNNER_TEMP/agent-output.jsonl"
-      - name: Post the evidence ledger on the PR
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
-          head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
-          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+@@@ file: data/agents.json part=fragment name=agents @@@
+{
+  "copilot": {"label": "Copilot CLI", "cost": "premium requests", "home": ".copilot/skills", "package": "@github/copilot"},
+  "claude": {"label": "Claude Code", "cost": "API usage", "home": ".claude/skills", "package": "@anthropic-ai/claude-code"},
+  "codex": {"label": "Codex CLI", "cost": "API usage", "home": ".agents/skills", "package": "@openai/codex"}
+}
 
 @@@ file: data/runners.json part=fragment name=runners @@@
 {
@@ -755,10 +698,7 @@ export function expand(pattern) {
 async function loadReports() {
   const adc = process.env.ADC;
   if (!adc) throw new Error('ADC is not set: the workflow step that provides the companion skill must run first');
-  const lib = path.join(path.dirname(adc), 'lib', 'reports.mjs');
-  const mod = await import(pathToFileURL(lib).href);
-  if (typeof mod.parseReport !== 'function') throw new Error(`${lib} has no parseReport()`);
-  return mod;
+  return import(pathToFileURL(path.join(path.dirname(adc), 'lib', 'reports.mjs')).href);
 }
 
 async function counts(o) {
@@ -773,7 +713,7 @@ async function counts(o) {
     let r = null;
     try {
       if (o.format === 'summary') {
-        const s = typeof reports.parseSummaryText === 'function' ? reports.parseSummaryText(text) : null;
+        const s = reports.parseSummaryText(text);
         if (s) r = { executed: (s.passed || 0) + (s.failed || 0), passed: s.passed || 0, failed: s.failed || 0, errors: 0, skipped: s.skipped || 0, flaky: 0 };
       } else r = reports.parseReport(o.format, text);
     } catch (err) {

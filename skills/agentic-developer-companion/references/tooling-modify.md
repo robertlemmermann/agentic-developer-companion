@@ -34,7 +34,8 @@ compare, accept or reject, record**. The built-in migrations run the same loop.
    - with `--external`: what the hosts render themselves, free and without sign-in
      (`copilot instruction list --json` or `copilot skill list --json`, the skills and
      `AGENTS.md` parts of `codex debug prompt-input`, `skills-ref to-prompt`), machine paths
-     replaced by `<repo>` and `~`;
+     replaced by `<repo>` and `~`; credential-shaped values in both snapshots are stored and
+     printed as `[REDACTED:<id>]`;
    - `files/`: a copy of every file of the artifact (for restore).
 4. If a skill has no trigger score yet, say so: a change to its description cannot be
    accepted later without one (see step 3).

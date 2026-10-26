@@ -1,12 +1,12 @@
-// `selftest`: the skill's own tests (§13) behind one command, run from the repository:
-//   node tests/selftest.mjs [--only area,...]
+// `selftest`: the skill's own tests (§13) behind one command, run from the repository root:
+//   node tests/selftest.mjs [--only area,...] [--jobs n]
 // It is development tooling and is not shipped: the skill folder carries only what a consumer
-// needs, while tests/, evals/, CHANGELOG.md and THIRD_PARTY_NOTICES.md live at the repo root.
-// Areas backed by unit files run
-// `node --test --test-reporter=tap <file>` in a child process and parse the TAP stream (a
-// missing unit file makes it `skipped`, not failed, while the build is in progress); the
-// cross-cutting areas check the skill tree directly. Scenarios run in temp repositories that
-// are removed afterwards: the skill tree and the user's repositories are only ever read.
+// needs, while tests/, evals/, README.md, CHANGELOG.md and THIRD_PARTY_NOTICES.md live at the
+// repository root. Areas backed by unit files (tests/unit/) run `node --test --test-reporter=tap
+// <file>` in a child process and parse the TAP stream; the cross-cutting areas check the skill
+// folder (footprint, frontmatter, prerequisites) and the root material (README, release, evals)
+// directly. Scenarios run in temp repositories that are removed afterwards: the skill tree and
+// the user's repositories are only ever read.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -23,8 +23,13 @@ import { materializeTemplates, prepareStateDir } from '../skills/agentic-develop
 const OWN_LIB = path.join(SKILL_DIR, 'scripts', 'lib');
 /** The repository root that holds tests/, evals/, README.md, CHANGELOG.md for a skill at skills/<name>/. */
 const devRootOf = (skillDir) => path.resolve(skillDir, '..', '..');
-/** Development-only material that must never ship inside the skill folder. */
-const DEV_ONLY = ['tests', 'evals', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', '.gitattributes'];
+/** The only top-level entries a shipped skill folder may hold (owner decision 2026-10-25). */
+const SHIPPED_TOP = new Set(['SKILL.md', 'PREREQUISITES.md', 'references', 'scripts', 'assets']);
+/** True when `skillDir` sits at skills/<name>/ in a checkout of this repository (it has tests/selftest.mjs). */
+const isDevLayout = (skillDir) => path.basename(path.dirname(path.resolve(skillDir))) === 'skills'
+  && exists(path.join(devRootOf(skillDir), 'tests', 'selftest.mjs'));
+/** Development-only material: it lives at the repository root and never inside the skill folder. */
+const DEV_ONLY = ['tests', 'evals', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', '.gitattributes', 'README.md'];
 
 /** Unit files per area (tests/unit/); any other unit file present runs under `scripts`. */
 export const UNIT_FILES = Object.freeze({
@@ -42,16 +47,16 @@ export const UNIT_FILES = Object.freeze({
 
 /** Areas in run order with what each covers (`--only` takes these names). */
 export const AREAS = Object.freeze({
-  footprint: 'file count, folder size, file size, LF, references linked and within budget, links, substitution tokens, .env files, adc templates, notices',
+  footprint: 'skill folder only: file count, folder size, file size, LF, no development files, references linked and within budget, links, substitution tokens, .env files, adc templates, notices',
   frontmatter: 'SKILL.md frontmatter invariants, tooling-lint --strict, skills-ref / claude plugin validate / gh skill publish --dry-run when installed',
   scripts: 'node --check on every module, the adc.mjs command table, version and help, core unit tests',
   prereqs: 'assets/prerequisites.json and PREREQUISITES.md agree; optional items have fallbacks; doctor probes have entries',
-  readme: 'README sections in order, links resolve, Mermaid fences, no absolute local paths',
-  release: 'git tag = metadata.version = top CHANGELOG.md entry',
-  evals: 'evals/ layout and trigger set; prints the paid eval commands (never runs them)',
+  readme: 'root README.md: sections in order, links resolve, Mermaid fences, no absolute local paths',
+  release: 'git tag = metadata.version = top entry of the root CHANGELOG.md',
+  evals: 'root evals/ layout and trigger set; prints the paid eval commands (never runs them)',
   hooks: 'malformed input, old Node, ASCII-only output, session-start latency, hook unit tests',
   adc: 'tracked .adc/ refusals, snapshot exclusion, exclude entry in worktrees and submodules, leak checks',
-  diffs: 'no secret-shaped literal in the skill tree, diff-scope unit tests (scenarios and evasion matrix)',
+  diffs: 'no secret-shaped literal in the repository, diff-scope unit tests (scenarios and evasion matrix)',
   detect: 'detect unit tests',
   reports: 'report parser, clean-run and probe unit tests',
   evidence: 'evidence ledger, trace and verify unit tests',
@@ -587,6 +592,9 @@ function makeContext({ skillDir, env, timeoutS, external, keep }) {
   const sx = {
     skillDir: dir,
     devRoot,
+    // The repository checkout (skills/<name>/ next to tests/, evals/, README.md, CHANGELOG.md); an
+    // installed copy has none of the development material, so those checks are skipped for it.
+    devLayout: isDevLayout(dir),
     name: path.basename(dir),
     adc: exists(targetAdc) ? targetAdc : ownAdc,
     repoRoot: top.exit === 0 ? path.resolve(top.stdout.trim()) : null,
@@ -663,12 +671,17 @@ async function areaFootprint(sx) {
     const idx = text.indexOf('\r');
     if (idx !== -1) crlf.push(`${f.rel}:${text.slice(0, idx).split('\n').length}`);
   }
-  sx.texts = texts;
   cases.push(verdict('LF line endings', crlf.map((x) => `CR in ${x}`), `${texts.size} text file(s), no CR`));
   cases.push(verdict('no symlinks', t.symlinks.map((s) => `${s} is a symlink`), 'none'));
-  const devOnly = DEV_ONLY.filter((n) => exists(path.join(S, n))).map((n) => `${n} is development material; keep it at the repository root`);
-  devOnly.push(...t.files.filter((f) => /\.test\.m?js$/.test(f.rel)).map((f) => `${f.rel} is a test file`));
-  cases.push(verdict('skill folder ships only consumer files', devOnly, 'no tests, evals, changelog or notices inside the skill'));
+  // The tree walk drops ignored paths; the folder listing below does not, so an ignored test
+  // folder inside the skill (which `gh skill install` from a working copy would still copy) is caught too.
+  let top = [];
+  try { top = fs.readdirSync(S); } catch {}
+  const devOnly = top.filter((n) => !SHIPPED_TOP.has(n)).map((n) => (DEV_ONLY.includes(n)
+    ? `${n} is development material; keep it at the repository root` : `${n} is not one of ${[...SHIPPED_TOP].join(', ')}`));
+  devOnly.push(...t.files.filter((f) => /\.test\.[cm]?[jt]s$|(?:^|\/)selftest\.m?js$/.test(f.rel)).map((f) => `${f.rel} is test code`));
+  devOnly.push(...t.dirs.filter((d) => /(?:^|\/)(?:fixtures|snapshots|__tests__)$/.test(d.rel)).map((d) => `${d.rel}/ is test data`));
+  cases.push(verdict('skill folder ships only consumer files', devOnly, `top level: ${top.sort().join(', ')}; no tests, fixtures, evals, changelog or notices`));
 
   const markers = (await sx.lib('markers.mjs')).mod;
   const credNames = [];
@@ -763,8 +776,12 @@ async function areaFootprint(sx) {
       if (m) { ported.push({ rel, source: m[1] }); break; }
     }
   }
-  const notices = readText(path.join(sx.devRoot, 'THIRD_PARTY_NOTICES.md'));
+  const notices = sx.devLayout ? readText(path.join(sx.devRoot, 'THIRD_PARTY_NOTICES.md')) : null;
   const noticeProblems = [];
+  if (!sx.devLayout && ported.length) {
+    cases.push(skip('THIRD_PARTY_NOTICES.md covers every "Ported from" header', `${ported.length} ported file(s); not a repository checkout (the notices live at the repository root)`));
+    return cases;
+  }
   for (const p of ported) {
     if (notices == null) { noticeProblems.push(`${p.rel} has a "Ported from" header but THIRD_PARTY_NOTICES.md is missing`); continue; }
     if (!notices.includes(p.rel) && !notices.includes(path.posix.basename(p.rel))) noticeProblems.push(`${p.rel} is not listed in THIRD_PARTY_NOTICES.md`);
@@ -920,13 +937,18 @@ async function areaFrontmatter(sx) {
 async function areaScripts(sx) {
   const cases = [];
   const t = sx.getTree();
-  const modules = t.files.filter((f) => /\.(?:mjs|cjs|js)$/.test(f.rel) && /^(?:scripts|tests)\//.test(f.rel) && !/^tests\/fixtures\//.test(f.rel));
+  const modules = t.files.filter((f) => /\.(?:mjs|cjs|js)$/.test(f.rel) && /^scripts\//.test(f.rel));
+  // The repository's own test code (selftest and the unit files) at the root, when this is the repository layout.
+  const devTests = path.join(sx.devRoot, 'tests');
+  const devModules = !sx.devLayout || !exists(devTests) ? [] : [devTests, path.join(devTests, 'unit')].flatMap((d) => {
+    try { return fs.readdirSync(d).filter((n) => /\.m?js$/.test(n)).map((n) => ({ rel: toPosix(path.relative(sx.devRoot, path.join(d, n))), abs: path.join(d, n) })); } catch { return []; }
+  });
   const broken = [];
-  for (const f of modules) {
+  for (const f of [...modules, ...devModules]) {
     const r = run(process.execPath, ['--check', f.abs], { cwd: sx.skillDir, env: sx.env, timeoutMs: 60_000 });
     if (r.exit !== 0) broken.push(`${f.rel}: ${firstLine(r.stderr.split('\n').filter((l) => /Error/.test(l)).join('\n') || r.stderr) || `exit ${r.exit}`}`);
   }
-  cases.push(verdict('node --check', broken, `${modules.length} module(s) parse`));
+  cases.push(verdict('node --check', broken, `${modules.length} skill module(s) and ${devModules.length} repository test file(s) parse`));
 
   const adcText = readText(path.join(sx.skillDir, 'scripts', 'adc.mjs'));
   if (adcText == null) {
@@ -939,6 +961,7 @@ async function areaScripts(sx) {
   const table = [...adcText.matchAll(/^\s*'([a-z][a-z-]*)':\s*\['([\w.-]+\.mjs)',\s*'(\w+)'\]/gm)].map((m) => ({ command: m[1], file: m[2], exportName: m[3] }));
   const problems = [];
   if (!table.length) problems.push('no COMMANDS entries found in scripts/adc.mjs');
+  if (table.some((c) => c.command === 'selftest')) problems.push('adc.mjs has a selftest command (selftest is development tooling: node tests/selftest.mjs)');
   for (const c of table) {
     if (!exists(path.join(sx.skillDir, 'scripts', 'lib', c.file))) { problems.push(`${c.command}: scripts/lib/${c.file} is missing`); continue; }
     const { mod, error } = await sx.lib(c.file);
@@ -955,6 +978,7 @@ async function areaScripts(sx) {
   if (v.exit !== 0 || v.stdout.trim() !== want) vp.push(`"adc.mjs version" printed "${truncate(v.stdout.trim(), 40)}" (exit ${v.exit}), SKILL.md says "${want}"`);
   if (h.exit !== 0) vp.push(`"adc.mjs help" exited ${h.exit}`);
   for (const c of table) if (!h.stdout.includes(c.command)) vp.push(`help does not mention "${c.command}"`);
+  if (/\bselftest\b/.test(h.stdout)) vp.push('help mentions selftest, which the shipped skill does not have');
   const u = adc(sx, ['no-such-command'], { cwd: sx.skillDir });
   if (u.exit !== EXIT.USAGE) vp.push(`an unknown command exited ${u.exit} (expected ${EXIT.USAGE})`);
   cases.push(verdict('adc.mjs version, help and usage exit', vp, `version ${want}; help lists every command; unknown command exits 2`));
@@ -1151,7 +1175,8 @@ export function checkReadme(file, { root = path.dirname(file), skillName = SKILL
 }
 
 async function areaReadme(sx) {
-  if (!sx.readme) return [skip('README.md', 'no README.md two levels above the skill (installed copies do not carry it)')];
+  if (!sx.devLayout) return [skip('README.md', 'not a repository checkout (installed copies carry no README.md)')];
+  if (!sx.readme) return [fail('README.md', `${toPosix(path.join(sx.devRoot, 'README.md'))} is missing`)];
   return checkReadme(sx.readme, { root: path.dirname(sx.readme), skillName: sx.name });
 }
 
@@ -1183,8 +1208,9 @@ async function areaRelease(sx) {
   version = version != null ? String(version) : foundationVersion(skillText);
   if (!version) return [fail('metadata.version', 'SKILL.md has no metadata.version')];
 
-  const changelog = readText(path.join(sx.devRoot, 'CHANGELOG.md'));
-  if (changelog == null) cases.push(fail('CHANGELOG.md top entry = metadata.version', 'CHANGELOG.md is missing'));
+  const changelog = sx.devLayout ? readText(path.join(sx.devRoot, 'CHANGELOG.md')) : null;
+  if (!sx.devLayout) cases.push(skip('CHANGELOG.md top entry = metadata.version', 'not a repository checkout (CHANGELOG.md lives at the repository root)'));
+  else if (changelog == null) cases.push(fail('CHANGELOG.md top entry = metadata.version', 'CHANGELOG.md is missing at the repository root'));
   else {
     const top = changelogTop(changelog);
     if (!top) cases.push(fail('CHANGELOG.md top entry = metadata.version', 'no "## [x.y.z]" entry'));
@@ -1229,11 +1255,19 @@ async function areaEvals(sx) {
   const dir = path.join(sx.devRoot, 'evals');
   const S = toPosix(sx.skillDir);
   const adcPath = toPosix(sx.adc);
+  const repo = sx.devLayout ? toPosix(sx.devRoot) : '<repo>';
+  const set = `${repo}/evals/trigger-set.json`;
+  // `claude plugin eval` refuses an eval dir outside the plugin root, so it targets the repository root.
   const paid = [
-    `claude plugin eval "${toPosix(sx.devRoot)}" --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "<tmp>/adc-evals" --json "<tmp>/adc-evals/result.json"`,
-    `node "${adcPath}" tooling trigger-set "${S}" --host claude --run --runs 3 --max-cost-usd 10`,
-    `node "${adcPath}" tooling trigger-set "${S}" --host copilot --run --runs 3`,
+    `claude plugin eval "${repo}" --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir "<tmp>/adc-evals" --json "<tmp>/adc-evals/result.json"`,
+    `node "${adcPath}" tooling trigger-set "${S}" --set "${set}" --host claude --run --runs 3 --max-cost-usd 10`,
+    `node "${adcPath}" tooling trigger-set "${S}" --set "${set}" --host copilot --run --runs 3`,
   ];
+  if (!sx.devLayout) {
+    cases.push(skip('evals/ present', 'not a repository checkout (evals/ lives at the repository root)'));
+    cases.push(skip('paid evals (manual)', `never run by selftest; run by hand from a checkout: ${paid.join(' ; ')}`, { commands: paid }));
+    return cases;
+  }
   if (!exists(dir)) {
     cases.push(fail('evals/ present', 'evals/ is missing (the skill\'s own trigger set and eval cases live there)'));
     cases.push(skip('paid evals (manual)', `never run by selftest; run by hand: ${paid.join(' ; ')}`, { commands: paid }));
@@ -1244,7 +1278,7 @@ async function areaEvals(sx) {
   walk(dir);
   cases.push(evalFiles.length <= LIMITS.evalFiles ? pass('evals/ file count', `${evalFiles.length} file(s) (limit ${LIMITS.evalFiles})`)
     : fail('evals/ file count', `${evalFiles.length} files, limit ${LIMITS.evalFiles}`));
-  if (exists(path.join(dir, 'results'))) cases.push(fail('no eval results in the tree', 'evals/results/ exists; pass --output-dir outside the skill'));
+  if (exists(path.join(dir, 'results'))) cases.push(fail('no eval results in the tree', 'evals/results/ exists; pass --output-dir outside the repository'));
 
   const setFile = path.join(dir, 'trigger-set.json');
   const tooling = await sx.lib('tooling.mjs');
@@ -1408,7 +1442,7 @@ async function areaHooks(sx) {
 export const STATE_COMMANDS = Object.freeze([
   ['detect'], ['diff-scope'], ['deps-check', '--offline'], ['typecheck'], ['clean-run', '--no-install'], ['coverage-delta'],
   ['mutation-scope'], ['flake-probe'], ['evidence', 'status'], ['trace', '--spec', 'spec.md'], ['verify', '--quick'],
-  ['live', 'run', '--dry-run'], ['budget', 'show'], ['tooling', 'lint', '.'], ['doctor', '--no-discovery', '--no-probes'],
+  ['live', 'run', '--dry-run'], ['budget', 'show'], ['tooling', 'lint', '.'], ['scaffold', 'regress', '--dry-run'], ['doctor', '--no-probes'],
 ]);
 
 const notBuilt = (r) => /internal error: .*(?:Cannot find module|ERR_MODULE_NOT_FOUND)/s.test(r.stderr) || /NOT_IMPLEMENTED/.test(r.stdout);
@@ -1582,7 +1616,7 @@ function leakChecks(sx) {
     cases.push(verdict('token absent from diff-scope output and the snapshot tree', p, `tree ${String(tree).slice(0, 12)}: no .adc/, no token`));
   }
 
-  const dr = sx.libExists('doctor.mjs') ? adc(sx, ['doctor', '--json', '--no-discovery', '--no-probes', '--cwd', repo], { cwd: repo, env }) : null;
+  const dr = sx.libExists('doctor.mjs') ? adc(sx, ['doctor', '--json', '--no-probes', '--cwd', repo], { cwd: repo, env }) : null;
   if (!dr || notBuilt(dr)) cases.push(skip('token absent from doctor output', 'doctor is not built yet'));
   else {
     const out = parseJsonOut(dr.stdout);
@@ -1640,35 +1674,46 @@ function leakChecks(sx) {
 
 async function areaDiffs(sx) {
   const cases = [];
-  const t = sx.getTree();
+  // In the repository layout the committed tree is the whole repository: the skill plus the
+  // development material at the root (tests and fixtures, evals, README, changelog).
+  const scope = sx.devLayout ? walkSkillTree(sx.devRoot, { env: sx.env }) : sx.getTree();
+  const where = sx.devLayout ? 'the repository' : 'the skill tree';
+  const name = `no secret-shaped literal in ${where}`;
   const markers = await sx.lib('markers.mjs');
-  if (!markers.mod?.scanSecrets) cases.push(skip('no secret-shaped literal in the skill tree', markers.error || 'markers.mjs has no scanSecrets'));
+  if (!markers.mod?.scanSecrets) cases.push(skip(name, markers.error || 'markers.mjs has no scanSecrets'));
   else {
     const hits = [];
-    const targets = t.files.map((f) => ({ rel: f.rel, abs: f.abs, size: f.size }));
-    if (sx.readme) targets.push({ rel: '../../README.md', abs: sx.readme, size: 0 });
     let scanned = 0;
-    for (const f of targets) {
+    for (const f of scope.files) {
       if (f.size > LIMITS.fileBytes) continue;
-      const text = sx.texts?.get(f.rel) ?? readTextFile(f.abs);
+      const text = readTextFile(f.abs);
       if (text == null) continue;
       scanned++;
       for (const h of markers.mod.scanSecrets(text)) hits.push(`${f.rel}:${h.line} ${h.id} (${h.severity}): ${truncate(h.redacted, 100)}`);
     }
-    cases.push(verdict('no secret-shaped literal in the skill tree', hits, `${scanned} text file(s) scanned with the built-in patterns`));
+    cases.push(verdict(name, hits, `${scanned} text file(s) in ${where} scanned with the built-in patterns`));
   }
   const gl = which('gitleaks', sx.env);
   if (!gl) cases.push(skip('gitleaks finds nothing', 'gitleaks is not on PATH'));
   else {
-    const report = path.join(sx.tmp(), 'gitleaks.json');
-    const common = ['--redact', '--no-banner', '--exit-code', '1', '--report-format', 'json', '--report-path', report];
-    let r = run(gl, ['dir', sx.skillDir, ...common], { env: sx.env, timeoutMs: 300_000 });
-    if (r.exit !== 0 && r.exit !== 1) r = run(gl, ['detect', '--no-git', '--source', sx.skillDir, ...common], { env: sx.env, timeoutMs: 300_000 });
-    const found = readJson(report, []);
-    const cmd = `gitleaks dir ${toPosix(sx.skillDir)} --redact`;
-    if (r.exit === 0) cases.push(pass('gitleaks finds nothing', 'no leaks', { command: cmd }));
-    else if (r.exit === 1) cases.push(fail('gitleaks finds nothing', listDetail((Array.isArray(found) ? found : []).map((x) => `${toPosix(x.File || '')}:${x.StartLine} ${x.RuleID}`)) || 'leaks reported', { command: cmd }));
-    else cases.push(skip('gitleaks finds nothing', `gitleaks failed (exit ${r.exit}): ${firstLine(r.stderr)}`, { command: cmd }));
+    // One run per top-level path, so `.git/` and ignored state never reach the scanner.
+    const roots = sx.devLayout ? [sx.skillDir, ...DEV_ONLY.map((n) => path.join(sx.devRoot, n))].filter(exists) : [sx.skillDir];
+    const leaks = [];
+    const errors = [];
+    for (const [k, src] of roots.entries()) {
+      const report = path.join(sx.tmp(), `gitleaks-${k}.json`);
+      const common = ['--redact', '--no-banner', '--exit-code', '1', '--report-format', 'json', '--report-path', report];
+      let r = run(gl, ['dir', src, ...common], { env: sx.env, timeoutMs: 300_000 });
+      if (r.exit !== 0 && r.exit !== 1) r = run(gl, ['detect', '--no-git', '--source', src, ...common], { env: sx.env, timeoutMs: 300_000 });
+      if (r.exit === 1) {
+        const found = readJson(report, []);
+        leaks.push(...(Array.isArray(found) && found.length ? found.map((x) => `${toPosix(x.File || '')}:${x.StartLine} ${x.RuleID}`) : [`${toPosix(src)}: leaks reported`]));
+      } else if (r.exit !== 0) errors.push(`${toPosix(src)}: exit ${r.exit} ${firstLine(r.stderr)}`);
+    }
+    const cmd = `gitleaks dir <path> --redact (${roots.map((p) => toPosix(path.relative(sx.devRoot, p)) || '.').join(', ')})`;
+    if (leaks.length) cases.push(fail('gitleaks finds nothing', listDetail(leaks), { command: cmd }));
+    else if (errors.length) cases.push(skip('gitleaks finds nothing', `gitleaks failed: ${listDetail(errors)}`, { command: cmd }));
+    else cases.push(pass('gitleaks finds nothing', `no leaks in ${roots.length} path(s)`, { command: cmd }));
   }
   return cases;
 }
@@ -1709,7 +1754,8 @@ async function runUnits(sx, plan, { jobs, units, progress }) {
   const todo = [];
   for (const u of plan) {
     if (!units) results.set(u.rel, [skip(u.rel, 'unit files not run (--skip-units)', { kind: 'unit-file' })]);
-    else if (!u.present) results.set(u.rel, [skip(u.rel, `${u.rel} is not present yet`, { kind: 'unit-file' })]);
+    else if (!u.present && !sx.devLayout) results.set(u.rel, [skip(u.rel, 'not a repository checkout (unit files live in tests/unit/)', { kind: 'unit-file' })]);
+    else if (!u.present) results.set(u.rel, [fail(u.rel, `${u.rel} is missing`, { kind: 'unit-file' })]);
     else todo.push(u);
   }
   const onSignal = () => { killAll(); process.exit(130); };
@@ -1826,11 +1872,11 @@ function renderHuman(res) {
 }
 
 const USAGE = [
-  'selftest [--only area,area] [--list] [--jobs n] [--timeout s] [--skip-units] [--no-external] [--keep] [--skill-dir dir] [--quiet] [--json]',
+  'node tests/selftest.mjs [--only area,area] [--list] [--jobs n] [--timeout s] [--skip-units] [--no-external] [--keep] [--skill-dir dir] [--quiet] [--json]',
   '',
   `Areas: ${Object.keys(AREAS).join(', ')}.`,
-  'Unit-file areas run `node --test --test-reporter=tap <file>` (a missing file is skipped);',
-  'the other checks read the skill tree. Paid evals are printed, never run. Exit 1 on any failure.',
+  'Unit-file areas run `node --test --test-reporter=tap tests/unit/<file>`; the other checks read the',
+  'skill folder and the repository root. Paid evals are printed, never run. Exit 1 on any failure.',
   '  --only        comma-separated areas (default: all)',
   '  --list        print the plan without running anything (also --dry-run)',
   '  --jobs        unit files run in parallel (default 1: timing checks stay meaningful)',
@@ -1838,7 +1884,8 @@ const USAGE = [
   '  --skip-units  direct checks only',
   '  --no-external do not run skills-ref, claude plugin validate or gh skill publish',
   '  --keep        keep the temp repositories (path printed on stderr)',
-  '  --skill-dir   test another copy of the skill (default: this one)',
+  '  --skill-dir   test another copy of the skill (default: this one); an installed copy skips the',
+  '                checks of root material (README, CHANGELOG, evals, unit files)',
 ].join('\n');
 
 export const selftestCommand = defineCommand({

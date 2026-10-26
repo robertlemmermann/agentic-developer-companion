@@ -3,8 +3,8 @@
 All notable changes to the `agentic-developer-companion` skill. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The top entry always equals
-`metadata.version` in [SKILL.md](SKILL.md) and the Git tag `v<version>`
-([release checklist](references/release.md)).
+`metadata.version` in [SKILL.md](skills/agentic-developer-companion/SKILL.md) and the Git tag
+`v<version>` ([release checklist](skills/agentic-developer-companion/references/release.md)).
 
 ## [0.1.0] - 2026-10-25
 
@@ -26,7 +26,11 @@ Linux, with a zero-dependency Node 24 runtime.
   notes, explicit non-prerequisites.
 - Root `README.md` (install matrix with bash, PowerShell and cmd variants, invocation cheat
   sheet, hooks, the `.adc/` directory, the evidence ledger, use at work, security policy) and
-  the Apache-2.0 `LICENSE`; `.gitattributes` enforcing LF inside the skill.
+  the Apache-2.0 `LICENSE`; `.gitattributes` enforcing LF line endings.
+- Repository layout: the skill folder ships only runtime files (`SKILL.md`,
+  `PREREQUISITES.md`, `references/`, `scripts/`, `assets/`); the unit tests, fixtures,
+  `tests/selftest.mjs`, `evals/`, this changelog and the third-party notices stay at the
+  repository root and are never installed.
 - `scripts/adc.mjs`, the single CLI entry point: Node version guard (exit 3, or `{}` for
   hooks), one ASCII-only JSON document per command, exit codes 0/1/2/3/4, global options
   `--json --cwd --state-dir --dry-run --yes`.
@@ -107,9 +111,9 @@ Linux, with a zero-dependency Node 24 runtime.
   with the fallback in effect, installed copies, registered hooks, launcher probes, the
   state directory, credential status (never the value), remaining budget; `--init` and
   `--verify-vendored`.
-- `selftest` with areas for hooks, frontmatter, scripts, diffs, footprint, `.adc/`, README,
-  prerequisites, release consistency and evals; `node --test` unit suites; the manual
-  OS × host matrix.
+- `tests/selftest.mjs` (repository only, not an `adc.mjs` command) with areas for hooks,
+  frontmatter, scripts, diffs, footprint, `.adc/`, README, prerequisites, release consistency
+  and evals; `node --test` unit suites; the manual OS × host matrix.
 
 **Playbooks** (`references/`): verify, audit-tests, review, trace, regress, e2e, live,
 flake, ci-gate, tooling-scaffold, tooling-lint, tooling-optimize, tooling-eval,
@@ -129,7 +133,7 @@ host-notes and install, each with manual fallbacks for guidance-only mode.
   0.164.0, gh 2.99.0); the Windows and macOS rows of `tests/manual-matrix.md` are open.
 - Open host questions (Copilot's Windows hook launcher, Codex hooks on native Windows, the
   cloud agent's skill directories and tool names) are tracked in
-  [host notes](references/host-notes.md) §9.
+  [host notes](skills/agentic-developer-companion/references/host-notes.md) §9.
 - The trigger-set and `claude plugin eval` gates of 0.8 have not been run for this release
   (paid); they are required before 1.0.0.
 

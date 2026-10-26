@@ -8,15 +8,17 @@ import path from 'node:path';
 import {
   EXIT, SKILL_DIR, SKILL_NAME, usageError, envError, parseOpts, makeContext, loadBundle, renderString, readText,
   readJson, listFiles, toPosix, relPosix, today, generatedBy, skillVersion, truncate, isDir, numberOption,
-  selectSections, shellWords,
+  selectSections, shellWords, realPath, samePath,
 } from './core.mjs';
-import { repoRoot, checkIgnore } from './git.mjs';
-import { prepareStateDir, materializeTemplates, writeOutputs, backupDirFactory } from './state.mjs';
+import { repoRoot, gitRaw } from './git.mjs';
+import {
+  resolveStateDir, assertStateUntracked, prepareStateDir, materializeTemplates, writeOutputs, backupDirFactory,
+} from './state.mjs';
 import { detect } from './detect.mjs';
 import { parseToml } from './formats.mjs';
 import { scaffoldTooling, TOOLING_KINDS, TOOLING_SCAFFOLD_OPTIONS } from './tooling.mjs';
 
-export const TEST_KINDS = Object.freeze(['e2e-web', 'e2e-api', 'e2e-cli', 'live', 'regress', 'ci-gate', 'flake']);
+const TEST_KINDS = Object.freeze(['e2e-web', 'e2e-api', 'e2e-cli', 'live', 'regress', 'ci-gate', 'flake']);
 
 /** Languages per kind with their default output dir (the first is used when detection finds none). */
 const KINDS = {
@@ -57,7 +59,11 @@ Playbooks: references/{e2e,live,regress,ci-gate,flake}.md`;
 // Rendering, paths, inputs and detection
 
 /** Render a template; GitHub Actions `${{ ... }}` expressions pass through untouched. */
-export const renderTemplate = (text, vars) => renderString(text, vars, { actions: true });
+const render = (text, vars) => renderString(text, vars, { actions: true });
+
+// Bundles are parsed once per process: ci-gate.tmpl is read by several builders and once per project.
+const bundles = new Map();
+const tmpl = (name) => bundles.get(name) || bundles.set(name, loadBundle(name)).get(name);
 
 /** Sections whose attributes all match the filter (when/unless test `features`); fragments only for part=fragment. */
 export const pickSections = (sections, filter = {}, features = new Set()) =>
@@ -71,15 +77,17 @@ const fragments = (bundle, name, filter, features) =>
 function fragment(bundle, name, filter, vars, features = new Set()) {
   const hit = fragments(bundle, name, filter, features)[0];
   if (!hit) throw envError('TEMPLATE_MISSING', `template fragment "${name}" not found for ${JSON.stringify(filter)}`);
-  return renderTemplate(hit.content, vars).replace(/\n$/, '');
+  return render(hit.content, vars).replace(/\n$/, '');
 }
 
 /** The bundle's `next` fragments for this render, one next step per non-empty line. */
 const nextSteps = (bundle, filter, features, vars) => fragments(bundle, 'next', filter, features)
-  .flatMap((s) => renderTemplate(s.content, vars).split('\n')).map((l) => l.trim()).filter(Boolean);
+  .flatMap((s) => render(s.content, vars).split('\n')).map((l) => l.trim()).filter(Boolean);
 
-/** A JSON data fragment of ci-gate.tmpl: `runners` (how each runner runs in CI) or `audits`. */
-const ciData = (name) => JSON.parse(fragments(loadBundle('ci-gate'), name, {}, new Set())[0].content);
+/** A JSON data fragment of ci-gate.tmpl (parsed once, read-only): `runners`, `audits` or `agents`. */
+const ciDataCache = {};
+const ciData = (name) =>
+  (ciDataCache[name] ??= JSON.parse(fragments(tmpl('ci-gate'), name, {}, new Set())[0].content));
 
 export function slugify(text, max = 48) {
   const s = String(text || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
@@ -116,13 +124,6 @@ export function toCommonJs(text) {
   return out;
 }
 
-/** Split a --bin command line into argv (quotes respected, no shell features, backslashes kept). */
-export function splitArgv(line) {
-  const argv = shellWords(line);
-  if (!argv) throw usageError('--bin has an unterminated quote');
-  return argv;
-}
-
 const abs = (root, rel) => path.join(root, ...String(rel).split('/'));
 const joinOut = (out, rel) => (!out || out === '.' ? rel : `${out}/${rel}`);
 const under = (rel, dir) => dir === '.' || rel === dir || rel.startsWith(`${dir}/`);
@@ -134,8 +135,10 @@ const projectPkg = (env) => readJson(path.join(projectDir(env), 'package.json'),
 /** A repo-relative path as seen from the project root (the tests run from there). */
 const projectRelative = (env, rel) => toPosix(path.relative(projectDir(env), abs(env.root, rel))) || '.';
 
+/** An http(s) URL that is safe inside generated string literals (RFC 3986 characters, no quote) and has no
+ * credentials in its authority. */
 function httpUrl(url, hint = '') {
-  if (/^https?:\/\/[^\s'"`]+$/.test(url) && !/^https?:\/\/[^/]*@/.test(url)) return url;
+  if (/^https?:\/\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]+$/.test(url) && !/^https?:\/\/[^/?#]*@/.test(url)) return url;
   throw usageError(`--base-url must be an http(s) URL without credentials${hint}`);
 }
 
@@ -207,7 +210,7 @@ function nodeSetup(env, lang) {
 
 /** The companion vendored inside the target repository (repo-relative POSIX path), or null. */
 function vendoredSkill(env, explicit) {
-  const candidates = explicit ? [path.resolve(env.ctx.cwd, explicit)]
+  const candidates = explicit ? [realPath(path.resolve(env.cwd, explicit))]
     : ['.github/skills', '.agents/skills', '.claude/skills'].map((d) => abs(env.root, `${d}/${SKILL_NAME}`));
   const hit = candidates.map((c) => relPosix(env.root, c))
     .find((rel) => rel && rel !== '.' && fs.existsSync(abs(env.root, `${rel}/scripts/adc.mjs`)));
@@ -217,7 +220,7 @@ function vendoredSkill(env, explicit) {
 
 /** The workflow step that sets ADC to the vendored skill or to a pinned fetch of it. */
 function getAdcStep(vendored, vars) {
-  const bundle = loadBundle('ci-gate');
+  const bundle = tmpl('ci-gate');
   if (vendored) return fragment(bundle, 'get-adc-vendored', {}, { ...vars, skill_rel: vendored });
   const m = /^\s+homepage:\s*["']?(https:\/\/[^\s"']+)/m.exec(readText(path.join(SKILL_DIR, 'SKILL.md'), ''));
   const repo = m ? m[1].replace(/\/+$/, '') : `https://github.com/robertlemmermann/${SKILL_NAME}`;
@@ -234,8 +237,8 @@ const commonVars = (env, extra) => ({ generated_by: generatedBy(), version: skil
 // lines; mode=keep never replaces an existing file.
 function renderFiles(bundle, filter, features, vars, out, { cjs = false } = {}) {
   return pickSections(bundle, filter, features).map((s) => {
-    const rel = renderTemplate(s.path, vars);
-    const content = renderTemplate(s.content, vars);
+    const rel = render(s.path, vars);
+    const content = render(s.content, vars);
     const target = s.attrs.scope === 'repo' ? rel : joinOut(out, rel);
     const o = { path: cjs ? target.replace(/\.mjs$/, '.cjs') : target, content: cjs ? toCommonJs(content) : content };
     if (s.attrs.scope === 'state') o.state = rel;
@@ -299,11 +302,14 @@ function webServerInfo(env) {
 async function buildE2eWeb(env) {
   const { values } = env;
   const { lang, out } = resolveLang(env);
-  const bundle = loadBundle('e2e');
+  const bundle = tmpl('e2e');
   const filter = { kind: 'web', lang };
   const server = lang === 'ts' ? webServerInfo(env) : null;
   const baseUrl = httpUrl(values['base-url'] || `http://localhost:${server ? server.port : 3000}`);
-  const journeys = `${values.journeys || ''}`.split(/[,;\n]/).map((j) => plainText(j, 80)).filter(Boolean).slice(0, 3);
+  // Unique by file name: two journeys that slug alike would otherwise share one spec file.
+  const slugs = new Set();
+  const journeys = `${values.journeys || ''}`.split(/[,;\n]/).map((j) => plainText(j, 80))
+    .filter((j) => j && !slugs.has(slugify(j, 40)) && slugs.add(slugify(j, 40))).slice(0, 3);
   const hosts = parseFor(values.for);
   const features = new Set([server ? 'server' : 'no-server', journeys.length ? 'journeys' : 'no-journeys', ...hosts]);
   const vars = commonVars(env, {
@@ -312,7 +318,7 @@ async function buildE2eWeb(env) {
   });
   const serverCwd = toPosix(path.relative(abs(env.root, out), projectDir(env))) || '.';
   vars.web_server = server ? fragment(bundle, 'web-server', filter,
-    { ...vars, server_cmd: jsString(server.cmd).slice(1, -1), server_cwd: serverCwd }) : '';
+    { ...vars, server_cmd: jsString(server.cmd).slice(1, -1), server_cwd: jsString(serverCwd).slice(1, -1) }) : '';
   vars.app_install = server ? fragment(bundle, 'app-install', filter,
     { ...vars, install_cmd: server.install, project_root: env.projectRoot }) : '';
   const outputs = renderFiles(bundle, filter, features, vars, out);
@@ -341,11 +347,11 @@ const SPEC_RULES = [
     'prefer getByRole / getByLabel / getByTestId over CSS structure and XPath'],
   ['P3', 'force-click', /\{\s*force\s*:\s*true\s*\}/, 'force: true skips actionability checks and hides real bugs'],
 ];
-// Config files: [priority, rule, applies(text, retries value), line pattern, fix].
+// Config files: [priority, rule, applies(text, retries expression, its highest count), line pattern, fix].
 const CONFIG_RULES = [
-  ['P1', 'retries-hide-flakes', (t, r) => r && !/failOnFlakyTests/.test(t), /retries\s*:/,
+  ['P1', 'retries-hide-flakes', (t, r, n) => n > 0 && !/failOnFlakyTests/.test(t), /retries\s*:/,
     'retried passes are silent: add failOnFlakyTests: !!process.env.CI (Playwright 1.52+)'],
-  ['P1', 'unbounded-retries', (t, r) => /^\s*(?:[3-9]|\d{2,})\s*$/.test(r || ''), /retries\s*:/, 'at most 2 retries'],
+  ['P1', 'unbounded-retries', (t, r, n) => n > 2, /retries\s*:/, 'at most 2 retries'],
   ['P2', 'retries-outside-ci', (t, r) => /^\s*[1-9]/.test(r || ''), /retries\s*:/, 'retries: process.env.CI ? 2 : 0'],
   ['P2', 'no-forbid-only', (t) => !/forbidOnly/.test(t), null, 'add forbidOnly: !!process.env.CI'],
   ['P2', 'no-trace', (t) => !/trace\s*:/.test(t), null, "set use.trace: 'retain-on-failure'"],
@@ -357,7 +363,9 @@ const CONFIG_RULES = [
 
 function auditE2eWeb(env) {
   const all = listFiles(env.root);
-  const text = (f) => (readText(abs(env.root, f), '') || '').replace(/\r\n/g, '\n');
+  const load = (f) => (readText(abs(env.root, f), '') || '').replace(/\r\n/g, '\n');
+  const texts = new Map();
+  const text = (f) => texts.get(f) ?? texts.set(f, load(f)).get(f);
   const configs = all.filter((f) => /(^|\/)playwright\.config\.[cm]?[jt]s$/.test(f));
   const pyTests = all.filter((f) => /(^|\/)test_[^/]*\.py$/.test(f));
   const pySuite = all.some((f) => /(^|\/)conftest\.py$/.test(f)) && pyTests.some((f) => /playwright/.test(text(f)));
@@ -369,7 +377,9 @@ function auditE2eWeb(env) {
     const t = text(cfg);
     const lines = t.split('\n');
     const retries = (/retries\s*:\s*([^,\n]+)/.exec(t) || [])[1];
-    for (const [priority, rule, applies, lineRe, fix] of CONFIG_RULES.filter((r) => r[2](t, retries))) {
+    // `process.env.CI ? 2 : 0` -> 2; an expression without a number counts as 1 (it may retry).
+    const most = retries == null ? 0 : Math.max(...(retries.match(/\d+/g) || ['1']).map(Number));
+    for (const [priority, rule, applies, lineRe, fix] of CONFIG_RULES.filter((r) => r[2](t, retries, most))) {
       const i = lineRe ? lines.findIndex((l) => lineRe.test(l)) : -1;
       add(priority, rule, cfg, i === -1 ? null : i + 1, i === -1 ? `${rule} (${cfg})` : lines[i], fix);
     }
@@ -377,6 +387,7 @@ function auditE2eWeb(env) {
   let tagged = 0;
   for (const f of specs.slice(0, 2000)) {
     const t = text(f);
+    texts.delete(f);
     if (/@smoke|@regression|tag\s*:\s*['"]@/.test(t)) tagged++;
     const hits = (l, i) => SPEC_RULES.forEach(([p, id, re, fix]) => re.test(l) && add(p, id, f, i + 1, l, fix));
     t.split('\n').forEach(hits);
@@ -398,7 +409,7 @@ const OPENAPI_FILES = ['', 'docs/', 'api/', 'spec/', 'specs/', 'openapi/', 'sche
 async function buildE2eApi(env) {
   const { values } = env;
   const { lang, out } = resolveLang(env);
-  const bundle = loadBundle('e2e');
+  const bundle = tmpl('e2e');
   const node = nodeSetup(env, lang);
   const openapi = OPENAPI_FILES.find((rel) => fs.existsSync(abs(env.root, rel))) || null;
   if (values.pact && !node.flavor) {
@@ -463,9 +474,10 @@ function rustCliTarget(env) {
 async function buildE2eCli(env) {
   const { values } = env;
   const { lang, out } = resolveLang(env, { strict: true });
-  const bundle = loadBundle('e2e');
+  const bundle = tmpl('e2e');
   const node = nodeSetup(env, lang);
-  const argv = values.bin == null ? null : splitArgv(values.bin);
+  const argv = values.bin == null ? null : shellWords(values.bin);
+  if (values.bin != null && !argv) throw usageError('--bin has an unterminated quote');
   if (argv && !argv.length) throw usageError('--bin needs a command');
   const vars = commonVars(env, { out, ...node.vars });
   const missing = (where) => usageError(`no entry point in ${where}: pass --bin "<command to start the CLI>"`);
@@ -549,10 +561,10 @@ function liveProbes(lang, out, syntheticCost, values) {
 async function buildLive(env) {
   const { values, root } = env;
   const { lang, out } = resolveLang(env);
-  const bundle = loadBundle('live');
+  const bundle = tmpl('live');
   const checklistOut = joinOut(out, 'live-checklist.md');
   const inProject = abs(root, checklistOut);
-  const checklist = values.checklist ? path.resolve(env.ctx.cwd, values.checklist) : inProject;
+  const checklist = values.checklist ? realPath(path.resolve(env.cwd, values.checklist)) : inProject;
   const gate = checklistGate(checklist);
   const shown = relPosix(root, checklist) || toPosix(checklist);
   const answered = (/estimated (?:credits|cost)[^:\n]*:\s*(\d+(?:\.\d+)?)/i.exec(gate.text) || [])[1];
@@ -578,7 +590,7 @@ async function buildLive(env) {
   vars.synthetic_job = gate.ok ? fragment(bundle, 'synthetic-job', { lang }, vars) : '';
   const outputs = renderFiles(bundle, { lang }, features, vars, out);
   // The checklist: the answered file when it was given elsewhere, else the template while none exists.
-  if (gate.ok && path.resolve(checklist) !== path.resolve(inProject)) {
+  if (gate.ok && !samePath(checklist, inProject)) {
     outputs.push({ path: checklistOut, content: gate.text.replace(/\r\n/g, '\n') });
   } else if (!fs.existsSync(inProject)) {
     outputs.push({ path: checklistOut, content: `${fragment(bundle, 'checklist', { lang }, vars)}\n` });
@@ -602,10 +614,13 @@ function liveAfterWrite(env, out) {
   const fail = (id, file, message, evidence = '') => ({ id, severity: 'fail', file, line: null, message, evidence });
   const { created, reason, path: envPath } = mat.envLive;
   const findings = created || !reason ? [] : [fail('LIVE-ENV-FILE', envPath, reason)];
-  if (!repoRoot(env.root)) return { state, findings, gitignore: { verified: false, reason: 'not a git repository' } };
+  if (!env.state.root) return { state, findings, gitignore: { verified: false, reason: 'not a git repository' } };
   // Traces, HAR files and reports record request headers, so every one of them must stay out of git.
-  const paths = ['test-results/x.xml', 'playwright-report/index.html', 'blob-report/x.zip', 'trace.har']
-    .map((p) => joinOut(out, p)).map((p) => ({ path: p, ignored: checkIgnore(env.root, p) }));
+  const rels = ['test-results/x.xml', 'playwright-report/index.html', 'blob-report/x.zip', 'trace.har']
+    .map((p) => joinOut(out, p));
+  const res = gitRaw(env.root, ['check-ignore', '--stdin', '-z'], { input: `${rels.join('\0')}\0` });
+  const ignored = new Set(res.exit === 0 ? res.stdout.split('\0') : []);
+  const paths = rels.map((p) => ({ path: p, ignored: ignored.has(p) }));
   for (const p of paths.filter((x) => !x.ignored)) {
     const message = `${p.path} would not be ignored by git (traces and reports record request headers); fix the `
       + `ignore rules (an in-tree negation overrides ${out}/.gitignore)`;
@@ -662,7 +677,7 @@ async function buildRegress(env) {
     golden_dir: projectRelative(env, `${out}/__golden__`), ...node.vars,
   });
   const features = new Set([level, values.characterize && 'characterize']);
-  const bundle = loadBundle('regress');
+  const bundle = tmpl('regress');
   const data = { issue: issueRef, test_name: testName, test_file: testPath, level, flavor: node.flavor };
   return {
     lang, out, outputs: renderFiles(bundle, { lang }, features, vars, out, { cjs: node.cjs }),
@@ -706,7 +721,7 @@ const SETUP = { python: 'python', go: 'go', rust: 'rust', dotnet: 'dotnet', jvm:
 
 /** Toolchain setup steps for a project's CI jobs (always with Node 24: adc.mjs and gate.mjs need it). */
 function setupFor(p, vars) {
-  const bundle = loadBundle('ci-gate');
+  const bundle = tmpl('ci-gate');
   const root = toPosix(p.root || '.');
   const dir = root === '.' ? '' : `${root}/`;
   const mgr = firstManager(p);
@@ -747,7 +762,7 @@ const PUBLISHER = { junit: 'java-junit', 'go-test-json': 'golang-json', trx: 'do
 
 async function buildCiGate(env) {
   const { values, root } = env;
-  const bundle = loadBundle('ci-gate');
+  const bundle = tmpl('ci-gate');
   const threshold = numberOption(values, 'threshold', 80, { allowZero: true });
   if (threshold > 100) throw usageError('--threshold is a percentage from 0 to 100');
   const maxFlaky = numberOption(values, 'max-flaky', 0, { integer: true, allowZero: true });
@@ -818,7 +833,12 @@ async function buildCiGate(env) {
     ...base, test_jobs: jobs.join('\n\n'), needs_list: needs.join(', '),
     merge_outputs: testJobs.length ? `    outputs:\n${outputsOf(testJobs[0])}` : '',
     audit_steps: audits.length ? audits.join('\n') : fragment(bundle, 'audit-none', {}, base),
-    agent_jobs: hosts.map((h) => fragment(bundle, `agent-${h}`, {}, base)).join('\n'),
+    agent_jobs: hosts.map((h) => {
+      const { label, cost, home, package: pkg } = ciData('agents')[h];
+      const verify = fragment(bundle, `agent-verify-${h}`, {}, base);
+      return fragment(bundle, 'agent-job', {}, { ...base, agent: h, agent_label: label, agent_cost: cost,
+        agent_home: home, agent_package: pkg, agent_verify: verify });
+    }).join('\n'),
     quarantine_job: registry ? fragment(bundle, 'quarantine-job', {}, base) : '',
   };
   const features = new Set([vendored ? 'vendored' : 'pinned', hosts.length && 'agents', registry && 'registry']);
@@ -858,10 +878,10 @@ async function buildFlake(env) {
   });
   vars.setup = setupFor(p, vars);
   const features = new Set(testId ? ['diagnosis'] : []);
-  const bundle = loadBundle('flake');
+  const bundle = tmpl('flake');
   // The helper the ci-gate workflow uses: identical content, so whichever scaffold runs second leaves it unchanged.
   const outputs = [...renderFiles(bundle, {}, features, vars, out),
-    ...renderFiles(loadBundle('ci-gate'), {}, new Set(['gate-script-only']), vars, '.')];
+    ...renderFiles(tmpl('ci-gate'), {}, new Set(['gate-script-only']), vars, '.')];
   return {
     lang: null, out, outputs, next: nextSteps(bundle, {}, features, vars),
     data: { runner: runner ? runner.name : null, max_flaky: maxFlaky, test: testId },
@@ -877,13 +897,17 @@ const BUILDERS = {
 };
 
 async function prepare(kind, ctx, values) {
-  const root = repoRoot(ctx.cwd) || ctx.cwd;
-  const outAbs = values.out ? path.resolve(ctx.cwd, values.out) : null;
-  if ([ctx.cwd, root, outAbs].some((p) => p && within(SKILL_DIR, p))) {
+  // Real paths throughout: git reports the resolved top level (macOS /var is /private/var; symlinked checkouts).
+  const cwd = realPath(ctx.cwd);
+  const gitRoot = repoRoot(cwd);
+  const root = gitRoot || cwd;
+  const outAbs = values.out ? realPath(path.resolve(cwd, values.out)) : null;
+  if ([cwd, root, outAbs].some((p) => p && within(SKILL_DIR, p))) {
     throw usageError('refusing to scaffold into the companion skill itself; pass --cwd <target repository>');
   }
-  // Exit 3 while anything under the state dir is tracked; nothing is created here.
-  const state = prepareStateDir({ ...ctx, cwd: root }, { create: false });
+  // Exit 3 while anything under the state dir is tracked; nothing is created here (and git is not asked twice).
+  const state = resolveStateDir({ cwd: root, stateDirOption: ctx.stateDirOption, root: gitRoot });
+  assertStateUntracked(state);
   const outRel = outAbs ? relPosix(root, outAbs) : null;
   if (outAbs && outRel == null) throw usageError(`--out must stay inside ${toPosix(root)} (got ${values.out})`);
   if (outRel && (outRel.split('/')[0] === '.git' || (state.rel && under(outRel, state.rel)))) {
@@ -892,7 +916,7 @@ async function prepare(kind, ctx, values) {
   const det = await detect({ root, stateInfo: fs.existsSync(state.dir) ? state : null, write: false });
   const project = pickProject(det, outRel);
   return {
-    kind, ctx, values, root, state, outRel, det, project, projectRoot: toPosix((project && project.root) || '.'),
+    kind, ctx, cwd, values, root, state, outRel, det, project, projectRoot: toPosix((project && project.root) || '.'),
     write: Boolean(values.write) && !ctx.dryRun, force: Boolean(values.force),
     defaultBranch: det.default_branch || 'main',
   };
@@ -949,16 +973,16 @@ export async function scaffold({ kind, ctx, values = {} }) {
 
 /** `scaffold <kind> [options]` (also `--kind <kind>`); tooling kinds also accept tooling's options. */
 export async function scaffoldCommand(argv) {
-  const at = argv.indexOf('--kind');
-  const guess = at >= 0 ? argv[at + 1]
-    : (argv.find((a) => a.startsWith('--kind=')) || '').slice(7) || argv.find((a) => !a.startsWith('-'));
-  const tooling = TOOLING_KINDS.includes(guess) ? TOOLING_SCAFFOLD_OPTIONS : {};
-  const { values, positionals } = parseOpts(argv, { ...tooling, ...OPTIONS });
+  // One parse with both option sets (shared names have the same types); the kind decides which apply.
+  const { values, positionals } = parseOpts(argv, { ...TOOLING_SCAFFOLD_OPTIONS, ...OPTIONS });
   if (values.help) return { result: { usage: USAGE }, exit: EXIT.OK, human: USAGE, summary: '' };
   if (values.kind && positionals[0] && positionals[0] !== values.kind) {
     throw usageError(`two kinds given: ${positionals[0]} and --kind ${values.kind}`);
   }
   const kind = values.kind || positionals[0] || null;
+  const foreign = TOOLING_KINDS.includes(kind) ? null : Object.keys(values).find((k) => !(k in OPTIONS)
+    && k in TOOLING_SCAFFOLD_OPTIONS);
+  if (foreign) throw usageError(`--${foreign} is a tooling scaffold option; ${kind || 'this kind'} does not take it`);
   const { exit, ...result } = await scaffold({ kind, ctx: makeContext(values), values });
   const n = (result.written || []).filter((w) => w.action !== 'unchanged').length;
   const findings = result.findings && result.findings.length ? `, ${result.findings.length} finding(s)` : '';

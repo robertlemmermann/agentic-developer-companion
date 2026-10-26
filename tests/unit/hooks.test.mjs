@@ -12,6 +12,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
+import * as markers from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
 import * as dialects from '../../skills/agentic-developer-companion/scripts/lib/hook-dialects.mjs';
 import * as hookRun from '../../skills/agentic-developer-companion/scripts/lib/hook-run.mjs';
 import * as hooksRender from '../../skills/agentic-developer-companion/scripts/lib/hooks-render.mjs';
@@ -345,8 +346,7 @@ test('formatOutput: the decision shapes per host, and Codex output uses only doc
   }
 });
 
-test('shell parsing, observed-run classes and runner summary lines', () => {
-  assert.deepEqual(hookRun.splitShell('cd a && git push -f || echo "x; y" ; ls | wc -l 2>&1'), [['cd', 'a'], ['git', 'push', '-f'], ['echo', 'x; y'], ['ls'], ['wc', '-l', '2>&1']]);
+test('observed-run classes, narrowed runs and a redacted command head', () => {
   const r = (cmd) => hookRun.classifyRun(cmd);
   assert.equal(r('npm test').class, 'test');
   assert.equal(r('CI=1 pnpm run test:unit').class, 'test');
@@ -366,42 +366,21 @@ test('shell parsing, observed-run classes and runner summary lines', () => {
   assert.equal(hookRun.classifyRun(`npm test -- ${AWS_KEY}`, (t) => t.includes(AWS_KEY)).head, 'npm test -- [REDACTED]');
   assert.equal(r(`npx jest --api-token=${TOKEN} -t x`).head, 'npx jest --api-token=[REDACTED] -t x');
   assert.equal(r(`pytest --password ${TOKEN} -q`).head, 'pytest --password [REDACTED] -q');
-  const s = hookRun.fallbackSummary;
-  assert.deepEqual(s('Tests:       1 failed, 2 skipped, 3 passed, 6 total'), { runner: 'jest', passed: 3, failed: 1, skipped: 2 });
-  assert.deepEqual(s(' Test Files  1 passed (1)\n      Tests  4 passed | 1 skipped (5)'), { runner: 'vitest', passed: 4, failed: 0, skipped: 1 });
-  assert.deepEqual(s('==== 2 failed, 5 passed, 1 skipped in 1.20s ===='), { runner: 'pytest', passed: 5, failed: 2, skipped: 1 });
-  assert.deepEqual(s('test result: ok. 3 passed; 0 failed; 1 ignored\ntest result: FAILED. 1 passed; 2 failed; 0 ignored'), { runner: 'cargo', passed: 4, failed: 2, skipped: 1 });
-  assert.deepEqual(s('Passed!  - Failed:     0, Passed:    12, Skipped:     1, Total:    13'), { runner: 'dotnet', passed: 12, failed: 0, skipped: 1 });
-  assert.deepEqual(s('10 examples, 2 failures, 1 pending'), { runner: 'rspec', passed: 7, failed: 2, skipped: 1 });
-  assert.deepEqual(s('Tests run: 9, Failures: 1, Errors: 1, Skipped: 2'), { runner: 'surefire', passed: 5, failed: 2, skipped: 2 });
-  assert.deepEqual(s('# pass 4\n# fail 1\n# skipped 0'), { runner: 'node-test', passed: 4, failed: 1, skipped: 0 });
-  assert.deepEqual(s('  5 passing (20ms)\n  1 failing'), { runner: 'mocha', passed: 5, failed: 1, skipped: 0 });
-  assert.deepEqual(s('--- PASS: TestA (0.00s)\n--- FAIL: TestB (0.00s)\nFAIL\tpkg\t0.01s'), { runner: 'go', passed: 1, failed: 2, skipped: 0 });
-  assert.equal(s('nothing here'), null);
+  assert.equal(r('bash -ec "npm test"').class, 'test', 'an inline script behind a flag cluster');
+  assert.equal(r('2>/dev/null npm test').head, 'npm test', 'a leading redirection is not the executable');
 });
 
-test('scanCatalog reports line numbers, honors patch line maps and multi-line patterns', () => {
-  const hits = hookRun.scanCatalog('a\ntry { x() } catch (e) {\n}\nit.only(1)', [{ id: 'empty-catch', re: /catch\s*(?:\([^)]*\))?\s*\{\s*\}/ }, { id: 'only', re: '\\bit\\.only\\(' }]);
-  assert.deepEqual(hits.map((h) => [h.id, h.line]), [['empty-catch', 2], ['only', 4]]);
-  assert.deepEqual(hookRun.scanCatalog('x\nit.only(1)', [{ id: 'only', re: /it\.only/ }], [10, 12]).map((h) => h.line), [12]);
-  // A patch hunk without line numbers maps to null, never to a guessed number.
-  assert.deepEqual(hookRun.scanCatalog('x\nit.only(1)', [{ id: 'only', re: /it\.only/ }], [null, null]).map((h) => h.line), [null]);
-});
-
-const HAS_MARKERS = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'markers.mjs'));
-
-test('scanEdit uses markers.mjs scanText: languages, comment masking and multi-line constructs', { skip: HAS_MARKERS ? false : 'markers.mjs not built yet' }, async () => {
-  const markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs');
-  const m = { scanText: markers.scanText };
+test('scanEdit uses markers.mjs scanText: languages, comment masking, multi-line constructs and patch line maps', () => {
   const multiCatch = 'try {\n  run();\n} catch (e) {\n  log(e);\n}\n';
-  assert.deepEqual(hookRun.scanEdit(m, multiCatch, markers.SWALLOW_PATTERNS, 'src/a.js'), [], 'a catch block with a body is not swallowing');
-  assert.deepEqual(hookRun.scanEdit(m, 'try { run(); } catch (e) {\n}\n', markers.SWALLOW_PATTERNS, 'src/a.js').map((h) => [h.id, h.line]), [['swallow.empty-catch', 1]]);
-  assert.deepEqual(hookRun.scanEdit(m, 'const a = 1; // # noqa\n', markers.SUPPRESSIONS, 'src/a.js'), [], 'a Python directive in a JS file');
-  assert.equal(hookRun.scanEdit(m, 'x = 1  # noqa\n', markers.SUPPRESSIONS, 'src/a.py')[0].id, 'suppress.py-noqa');
-  assert.deepEqual(hookRun.scanEdit(m, "// it.only was here\nit('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js'), [], 'commented-out focus');
-  assert.deepEqual(hookRun.scanEdit(m, "a\nit.only('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js', [7, null]).map((h) => h.line), [null]);
-  // Without markers.mjs the built-in scanner still reports.
-  assert.equal(hookRun.scanEdit({}, "it.only('x')", [{ id: 'only', re: /it\.only/ }], 'a.js').length, 1);
+  assert.deepEqual(hookRun.scanEdit(multiCatch, markers.SWALLOW_PATTERNS, 'src/a.js'), [], 'a catch block with a body is not swallowing');
+  assert.deepEqual(hookRun.scanEdit('try { run(); } catch (e) {\n}\n', markers.SWALLOW_PATTERNS, 'src/a.js').map((h) => [h.id, h.line]), [['swallow.empty-catch', 1]]);
+  assert.deepEqual(hookRun.scanEdit('const a = 1; // # noqa\n', markers.SUPPRESSIONS, 'src/a.js'), [], 'a Python directive in a JS file');
+  assert.equal(hookRun.scanEdit('x = 1  # noqa\n', markers.SUPPRESSIONS, 'src/a.py')[0].id, 'suppress.py-noqa');
+  assert.deepEqual(hookRun.scanEdit("// it.only was here\nit('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js'), [], 'commented-out focus');
+  // Patch hunks map scanned lines to file lines; a hunk without line numbers maps to null, never to a guess.
+  assert.deepEqual(hookRun.scanEdit("x\nit.only('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js', [10, 12]).map((h) => h.line), [12]);
+  assert.deepEqual(hookRun.scanEdit("a\nit.only('x', () => {});\n", markers.SKIP_MARKERS, 'tests/a.test.js', [7, null]).map((h) => h.line), [null]);
+  assert.deepEqual(hookRun.scanEdit('', markers.SKIP_MARKERS, 'tests/a.test.js'), []);
 });
 
 test('exitFromText reads the exit code the hosts print into results (Copilot trailer, Codex header)', () => {
@@ -463,19 +442,19 @@ test('newestLedger picks the newest created_at among recently written ledgers an
   assert.equal(hookRun.newestLedger(path.join(dir, 'missing')), null);
 });
 
-test('findRepo resolves linked worktrees, and the exclude entry lands in the common git dir', () => {
+test('locateRepo resolves linked worktrees, and the hook exclude entry lands in the common git dir', () => {
   const repo = makeRepo();
   const wt = path.join(tmp('adc-wt-'), 'wt');
   git(repo, 'worktree', 'add', '-q', wt, 'HEAD');
-  const found = hookRun.findRepo(path.join(wt));
+  const found = state.locateRepo(path.join(wt));
   assert.equal(found.root, fs.realpathSync(wt));
   assert.equal(fs.realpathSync(found.commonDir), fs.realpathSync(path.join(repo, '.git')));
   const info = hookRun.hookStateInfo(found, { env: {} });
   assert.equal(hookRun.ensureHookState(info, found), true);
   fs.writeFileSync(path.join(wt, '.adc', 'probe'), 'x');
   assert.equal(spawnSync('git', ['check-ignore', '-q', '.adc/probe'], { cwd: wt }).status, 0);
-  assert.equal(hookRun.findRepo(path.join(wt, 'missing', 'dir')), null);
-  assert.equal(hookRun.findRepo(path.join(repo, 'README.md')).root, repo);
+  assert.equal(state.locateRepo(path.join(wt, 'missing', 'dir')), null);
+  assert.equal(state.locateRepo(path.join(repo, 'README.md')).root, repo);
 });
 
 test('readStdin gives up on a stream that never ends; decodeStdin handles BOMs and UTF-16', async () => {
@@ -556,6 +535,19 @@ test('guard: shell access to .env.live by glob, other letter case or a recursive
   }
 });
 
+test('guard: Windows backslash paths, inline scripts behind flag clusters and leading redirections are seen through', async () => {
+  const repo = makeRepo();
+  const guard = async (command) => inproc(['pre-guard', '--dialect', 'claude', '--level', 'guard'], claudeBash(repo, command));
+  for (const c of ['Get-Content .adc\\*', 'Select-String -Path .adc\\* -Pattern TOKEN', `type ${repo.replace(/\//g, '\\')}\\.adc\\.env.live`,
+    '>/dev/null git push --force', '2>&1 git reset --hard', 'bash -ec "git push -f"', 'pwsh -NoProfile -Command "git push --force"']) {
+    assert.equal(decisionOf(await guard(c)), 'deny', c);
+  }
+  const del = await guard('Remove-Item tests\\unit\\a.test.js');
+  assert.equal(decisionOf(del), 'ask');
+  assert.match(del.hookSpecificOutput.permissionDecisionReason, /tests\/unit\/a\.test\.js/);
+  for (const c of ['Get-Content .adc\\budget.json', 'echo "a\\"b" > out.txt', 'Remove-Item build\\out.js']) assert.equal(decisionOf(await guard(c)), null, c);
+});
+
 test('guard: a call that starts two Claude handlers (two matching `if` rules) is counted once', async () => {
   const repo = makeRepo();
   const p = claudeBash(repo, 'cat .adc/.env.live', { session_id: 'dup', tool_use_id: 'toolu_dup1' });
@@ -566,13 +558,6 @@ test('guard: a call that starts two Claude handlers (two matching `if` rules) is
 });
 
 test('Copilot post-shell redacts the live token in every printed form, including the literal value of an exported ADC_LIVE_TOKEN', async () => {
-  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN=${TOKEN}\n`), 'ADC_LIVE_TOKEN=[REDACTED]\n');
-  assert.equal(hookRun.redactToken(`{"ADC_LIVE_TOKEN": "${TOKEN} x"}`), '{"ADC_LIVE_TOKEN": "[REDACTED]"}');
-  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN: ${TOKEN}`), 'ADC_LIVE_TOKEN: [REDACTED]');
-  assert.equal(hookRun.redactToken('ADC_LIVE_TOKEN: set (source: .adc/.env.live)'), 'ADC_LIVE_TOKEN: set (source: .adc/.env.live)', 'doctor output stays readable');
-  assert.equal(hookRun.redactToken(`ADC_LIVE_TOKEN                 ${TOKEN}\nPATH  /bin`), 'ADC_LIVE_TOKEN                 [REDACTED]\nPATH  /bin');
-  assert.equal(hookRun.redactToken(`printed ${ENV_TOKEN}.`, { ADC_LIVE_TOKEN: ENV_TOKEN }), 'printed [REDACTED:ADC_LIVE_TOKEN].');
-  assert.equal(hookRun.redactToken('a test run', { ADC_LIVE_TOKEN: 'test' }), 'a test run', 'short values are not treated as tokens');
   const repo = makeRepo();
   const shell = (text, env) => inproc(['post-shell', '--dialect', 'copilot'],
     { sessionId: 'rs', timestamp: 1761400000000, cwd: repo, toolName: 'bash', toolArgs: { command: 'echo $ADC_LIVE_TOKEN' }, toolResult: { resultType: 'success', textResultForLlm: text } }, env);
@@ -586,7 +571,7 @@ test('Copilot post-shell redacts the live token in every printed form, including
 // Fixture cases through adc.mjs hook-run
 
 const FIXTURE_FILES = ['copilot-camel', 'copilot-pascal', 'copilot-cloud', 'claude', 'codex'];
-const NO_GIT_ROOT = hookRun.findRepo(os.tmpdir()) == null;
+const NO_GIT_ROOT = state.locateRepo(os.tmpdir()) == null;
 
 for (const file of FIXTURE_FILES) {
   // Cases are independent (one fresh repository each), so a file's cases run concurrently.
@@ -1232,11 +1217,6 @@ test('renderHooks validates its inputs and resolves targets per host and scope',
   assert.equal(core.toPosix(hooksRender.targetFile('claude', 'user', { env })), core.toPosix(path.resolve('/cl/conf/settings.json')));
   assert.equal(core.toPosix(hooksRender.targetFile('codex', 'user', { env })), core.toPosix(path.resolve('/cx/home/hooks.json')));
   assert.equal(core.toPosix(hooksRender.targetFile('claude', 'project', { root: '/r' })), core.toPosix(path.join('/r', '.claude', 'settings.local.json')));
-  assert.equal(hooksRender.guessHost({ COPILOT_CLI: '1' }), 'copilot');
-  assert.equal(hooksRender.guessHost({ CLAUDECODE: '1' }), 'claude');
-  assert.equal(hooksRender.guessHost({ CODEX_SANDBOX: 'seatbelt' }), 'codex');
-  assert.equal(hooksRender.guessHost({ COPILOT_AGENT_PROMPT: 'x' }), 'copilot-cloud');
-  assert.equal(hooksRender.guessHost({}), null);
   const g = hooksRender.renderHooks({ host: 'claude', level: 'guard', skillDir: SNAP_SKILL, home: SNAP_HOME, env: {} });
   assert.deepEqual(g.permission_rules.claude.permissions.deny, ['Read(./.adc/**)', 'Edit(./.adc/**)']);
   const pg = g.config.hooks.PreToolUse;

@@ -45,8 +45,6 @@ function alive(pid) {
   try { process.kill(pid, 0); } catch { return false; }
   try { return !/^State:\s+Z/m.test(fs.readFileSync(`/proc/${pid}/status`, 'utf8')); } catch { return true; }
 }
-let HAS_MARKERS = false;
-try { HAS_MARKERS = Array.isArray((await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs')).SECRET_PATTERNS); } catch {}
 
 function makeRepo(files = {}) {
   const dir = tmp('adc-wpd-repo-');
@@ -276,12 +274,13 @@ describe('parseReport other formats', () => {
     assert.equal(outside.errors, 1);
     assert.equal(outside.tests[0].file, 'spec/broken_spec.rb');
   });
-  test('format detection and aliases; unknown formats throw', () => {
-    const want = { 'junit.xml': 'junit', 'dotnet.trx': 'trx', 'jest.json': 'jest-json', 'go-test.jsonl': 'go-test-json', 'cargo-test.txt': 'cargo-text', 'rspec.json': 'rspec-json' };
-    for (const [f, fmt] of Object.entries(want)) assert.equal(reports.detectReportFormat(fixture(f)), fmt, f);
-    assert.equal(reports.parseReport('auto', fixture('go-test.jsonl')).format, 'go-test-json');
-    assert.equal(reports.normalizeFormat('surefire'), 'junit');
-    assert.throws(() => reports.parseReport('nope', ''), /unknown report format/);
+  // The report format always comes from the runner (detect), so there is no content sniffing.
+  test('format aliases; unknown formats throw', () => {
+    const want = { surefire: 'junit', nextest: 'junit', 'node-test': 'junit', jest: 'jest-json', go: 'go-test-json', cargo: 'cargo-text', 'dotnet-trx': 'trx', rspec: 'rspec-json', TRX: 'trx' };
+    for (const [alias, fmt] of Object.entries(want)) assert.equal(reports.normalizeFormat(alias), fmt, alias);
+    assert.equal(reports.normalizeFormat('summary-text'), null);
+    assert.equal(reports.parseReport('surefire', fixture('junit.xml')).format, 'junit');
+    for (const f of ['nope', 'auto', '']) assert.throws(() => reports.parseReport(f, ''), /unknown report format/);
   });
 });
 
@@ -645,7 +644,7 @@ describe('clean-run end to end', () => {
       const log = fs.readFileSync(res.checks[0].artifacts.find((a) => a.endsWith('run.log')), 'utf8');
       assert.ok(log.includes('token=absent'));
       assert.ok(!log.includes(token));
-      if (HAS_MARKERS) assert.ok(!log.includes(shape), 'secret shape redacted');
+      assert.ok(!log.includes(shape), 'secret shape redacted');
       assert.ok(!JSON.stringify(res).includes(token));
     } finally {
       delete process.env.ADC_LIVE_TOKEN;
@@ -827,6 +826,10 @@ describe('coverage-delta', () => {
     assert.equal(strict.exit, 1);
     assert.equal(strict.json.checks[0].reason, 'BELOW_THRESHOLD');
     assert.equal(strict.json.source, 'cache', 'coverage map reused for the same tree');
+    // Another command line selects other tests: measured anew, never read from that cache.
+    const narrow = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', 'node --test test/math.test.mjs']);
+    assert.equal(narrow.json.source, 'run', narrow.stderr);
+    assert.ok(narrow.json.pct < r.json.pct, `${narrow.json.pct} < ${r.json.pct}`);
     const lcov = path.join(repo.state, 'given.info');
     fs.writeFileSync(lcov, 'SF:src/math.mjs\nDA:3,1\nDA:4,1\nDA:5,1\nDA:6,1\nDA:7,1\nDA:8,1\nend_of_record\n');
     const given = adc(['coverage-delta', '--cwd', repo.dir, '--state-dir', repo.state, '--report', lcov, '--fail-under', '90']);
@@ -1313,14 +1316,15 @@ describe('review regressions', () => {
     assert.deepEqual(cr.selectionArgs(runner, { files: ['src/util.rs'], names: [] }, dir).args, ['--lib', '--', 'util::']);
   });
 
-  test('CLI results and the counts cache never carry a secret-shaped literal from a command line', { skip: !HAS_MARKERS && 'markers.mjs not available' }, () => {
+  test('CLI results, progress lines and the counts cache never carry a secret-shaped literal from a command line', () => {
     const shape = ['ghp', '_', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('');
     const repo = makeRepo({ 'print.cjs': "console.log('# pass 1'); console.log('# fail 0');\n" });
     repo.write({ 'other.txt': 'changed\n' });
-    const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', `node print.cjs ${shape}`]);
+    const r = adc(['clean-run', '--cwd', repo.dir, '--state-dir', repo.state, '--runner', `node print.cjs ${shape}`], { env: { ADC_QUIET: '0' } });
     assert.equal(r.exit, 0, r.stderr);
     assert.ok(!r.stdout.includes(shape), 'stdout redacted');
-    assert.ok(!r.stderr.includes(shape), 'summary redacted');
+    assert.match(r.stderr, /adc: run: node print\.cjs \[REDACTED:/, 'progress lines are printed, redacted');
+    assert.ok(!r.stderr.includes(shape), 'summary and progress lines redacted');
     assert.match(r.json.projects[0].run.cmd, /\[REDACTED:/);
     const counts = path.join(repo.state, 'cache', 'counts');
     for (const f of fs.readdirSync(counts)) assert.ok(!fs.readFileSync(path.join(counts, f), 'utf8').includes(shape), f);
@@ -1401,9 +1405,17 @@ describe('round 3 fixes', () => {
     const parsed = cr.parseRunOutput(built.report, '', '', [dir]);
     assert.deepEqual([parsed.source, parsed.counts.executed, parsed.tests.map((t) => t.id).sort()], ['report', 2, ['a.T::t', 'b.T::t']]);
     const state = tmp('adc-wpd-st-');
-    const stored = cr.storeArtifacts({ root: state, state: { paths: { cache: path.join(state, 'cache') } } }, 'f'.repeat(40), 'root', { report_files: files });
+    const other = path.join(dir, 'c', 'TEST-U.xml');
+    fs.mkdirSync(path.dirname(other), { recursive: true });
+    fs.writeFileSync(other, '<testsuite name="c"/>');
+    const stored = cr.storeArtifacts({ root: state, state: { paths: { cache: path.join(state, 'cache') } } }, 'f'.repeat(40), 'root', { report_files: [...files, other] });
     assert.match(stored.report_path, /\/reports$/);
-    assert.deepEqual(fs.readdirSync(path.join(state, stored.report_path)).sort(), ['0-TEST-T.xml', '1-TEST-T.xml']);
+    assert.deepEqual(fs.readdirSync(path.join(state, stored.report_path)).sort(), ['0-TEST-T.xml', '1-TEST-T.xml', 'TEST-U.xml']);
+    // A detected report with module dirs only (no root dir) is kept, not replaced by the catalog default.
+    const dirsOnly = cr.resolveRunner({ runners: [{ name: 'maven', ecosystem: 'jvm', cmd: 'mvn -B test',
+      report: { glob: 'TEST-*.xml', format: 'junit', dirs: ['a/target/surefire-reports', 'b/target/surefire-reports'] } }] });
+    assert.deepEqual(cr.buildRunCommand(dirsOnly, { dir, outDir: tmp('adc-wpd-o-'), plan: true }).report.dirs.map((d) => path.relative(dir, d).split(path.sep).join('/')),
+      ['a/target/surefire-reports', 'b/target/surefire-reports']);
   });
 
   test('two ecosystems in one project: one suite each, each with its own install and check', async () => {
@@ -1430,5 +1442,58 @@ describe('round 3 fixes', () => {
 
   test('a runner exiting 127 is RUNNER_NOT_FOUND even when stale counts were parsed', () => {
     assert.equal(cr.evaluateRun({ exit: 127, counts: { executed: 1, passed: 1, failed: 0, errors: 0, skipped: 0, flaky: 0 } }, null).reason, 'RUNNER_NOT_FOUND');
+  });
+});
+
+// ===========================================================================
+// Round 3 consolidation: review fixes
+
+describe('round 3 consolidation fixes', () => {
+  const plan = (runner, extra = {}) => cr.buildRunCommand(runner, { dir: os.tmpdir(), outDir: path.join(os.tmpdir(), 'adc-wpd-plan'), plan: true, ...extra });
+
+  test('node --test: flags between base_cmd and the paths are kept, before the added flags', () => {
+    const r = cr.resolveRunner({ runners: [{ name: 'node-test', ecosystem: 'node', cmd: 'node --test --test-concurrency=1 t/a.test.mjs', base_cmd: 'node --test', paths: ['t/a.test.mjs'] }] });
+    assert.match(plan(r).cmd, /^node --test --test-concurrency=1 --test-reporter=junit .* t\/a\.test\.mjs$/);
+  });
+
+  test('go: large table tests are linear (report and summary lines), parents keep their own failures', () => {
+    const N = 20_000;
+    const ev = (a, t) => JSON.stringify({ Action: a, Package: 'p', Test: t });
+    const lines = [ev('run', 'TestT')];
+    for (let i = 0; i < N; i++) lines.push(ev('pass', `TestT/case_${i}`));
+    lines.push(ev('fail', 'TestT/case_x/inner'), ev('fail', 'TestT/case_x'), ev('fail', 'TestT'), ev('pass', 'TestOwn/a'), ev('fail', 'TestOwn'));
+    let started = Date.now();
+    const res = reports.parseReport('go-test-json', lines.join('\n'));
+    assert.ok(Date.now() - started < 1500, `go-test-json took ${Date.now() - started} ms`);
+    const t = byId(res);
+    assert.equal(res.passed, N + 1);
+    assert.equal(t['p::TestT/case_x/inner'].status, 'failed');
+    assert.ok(!t['p::TestT/case_x'] && !t['p::TestT'], 'parents of a failing subtest repeat its outcome');
+    assert.equal(t['p::TestOwn'].status, 'failed', 'a parent that fails with passing subtests failed on its own');
+    const text = ['=== RUN   TestT', ...Array.from({ length: N }, (_, i) => `    --- PASS: TestT/case_${i} (0.00s)`),
+      '    --- FAIL: TestT/case_x (0.00s)', '--- FAIL: TestT (0.00s)', '    --- PASS: TestOwn/a (0.00s)', '--- FAIL: TestOwn (0.00s)', 'FAIL\tm/p\t0.01s'].join('\n');
+    started = Date.now();
+    const s = reports.parseSummaryText(text);
+    assert.ok(Date.now() - started < 1500, `summary took ${Date.now() - started} ms`);
+    assert.deepEqual([s.runner, s.passed, s.failed], ['go', N + 1, 2]);
+  });
+
+  test('typecheck: Windows paths match the root whatever the drive letter case', () => {
+    const out = 'c:\\work\\repo\\src\\a.ts(1,7): error TS2322: Type string is not assignable to type number.\r\n';
+    assert.deepEqual(cr.parseTypeErrors(out, { roots: ['C:\\Work\\Repo'] }).map((e) => e.file), ['src/a.ts']);
+    assert.deepEqual(cr.parseTypeErrors('./pkg/a.go:3:4: undefined: x\n').map((e) => e.file), ['pkg/a.go']);
+  });
+
+  test('base counts cached for one --runner command line are not reused for another', async () => {
+    const repo = makeRepo({ 'all.cjs': "console.log('# pass 3'); console.log('# fail 0');\n", 'unit.cjs': "console.log('# pass 1'); console.log('# fail 0');\n" });
+    repo.write({ 'other.txt': 'changed\n' });
+    const det = { projects: [{ root: '.', managers: [], runners: [] }] };
+    const first = await cr.cleanRun({ target: await target(repo), detectResult: det, runner: 'node all.cjs' });
+    assert.equal(first.projects[0].base_counts.executed, 3);
+    const second = await cr.cleanRun({ target: await target(repo), detectResult: det, runner: 'node unit.cjs' });
+    assert.equal(second.status, 'pass', second.projects[0].summary);
+    assert.deepEqual([second.projects[0].base_counts.source, second.projects[0].base_counts.executed], ['run', 1]);
+    const again = await cr.cleanRun({ target: await target(repo), detectResult: det, runner: 'node unit.cjs' });
+    assert.equal(again.projects[0].base_counts.source, 'cache');
   });
 });

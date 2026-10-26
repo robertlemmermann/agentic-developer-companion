@@ -1,10 +1,17 @@
 # Manual test matrix
 
-Filled once per release tag. The automated suite (`node <skill>/scripts/adc.mjs selftest`) covers
-the scripts and hook handlers on the machine it runs on; this matrix covers what only a real
-host on a real OS can show: installation, discovery, the model following the playbooks, and
-hooks fired by the host itself. Rows are OS and launch path x host x step; columns are the
-version, the result and the date.
+Filled once per release tag. The automated suite (`node tests/selftest.mjs`, run from the
+repository root of a checkout of the tag) covers the scripts and hook handlers on the machine it
+runs on; this matrix covers what only a real host on a real OS can show: installation, discovery,
+the model following the playbooks, and hooks fired by the host itself. Rows are OS and launch
+path x host x step; columns are the version, the result and the date.
+
+The repository holds two kinds of material. The skill folder `skills/agentic-developer-companion/`
+is what gets installed (`SKILL.md`, `PREREQUISITES.md`, `references/`, `scripts/`, `assets/`);
+the development material stays at the repository root and is never installed: `tests/` (this
+file, `selftest.mjs`, `unit/`, `fixtures/`, `snapshots/`), `evals/`, `README.md`, `CHANGELOG.md`,
+`THIRD_PARTY_NOTICES.md`. The host steps (S1 to S5) use an installed copy; the selftest rows use
+the checkout.
 
 ## Contents
 
@@ -33,7 +40,8 @@ version, the result and the date.
   was observed), or `not run`. Leave `not run` rather than guessing.
 - **Date**: the day the row was run, `YYYY-MM-DD`.
 - A tag is releasable when every row is `pass`, `n/a` or an accepted `manual`, and the
-  selftest table has `failed 0` on each OS ([release](../references/release.md)).
+  selftest table has `failed 0` on each OS
+  ([release](../skills/agentic-developer-companion/references/release.md)).
 
 ## The steps
 
@@ -82,9 +90,15 @@ run the steps from cmd.
 
 ## selftest per OS and launch path
 
-Run `node <skill>/scripts/adc.mjs selftest --json` from the launch path named in the row
-(for example `pwsh -NoProfile -Command "node <skill>/scripts/adc.mjs selftest --json"`). Pass
-when it exits 0 with `failed: 0`; note every `skipped` area and why in Notes.
+Check out the tag, `cd` to the repository root and run `node tests/selftest.mjs --json` from the
+launch path named in the row (for example
+`pwsh -NoProfile -Command "node tests/selftest.mjs --json"`; from cmd,
+`node tests\selftest.mjs --json`). The skill has no `selftest` command: selftest and the unit
+files are not installed with it. Add `--jobs 3` to run the unit files in parallel (the latency
+check stays meaningful only on an otherwise idle machine). Pass when it exits 0 with
+`failed: 0`; note every `skipped` case and why in Notes. The paid evals are printed by the
+`evals` area and never run by selftest; run them by hand from the repository root
+(`claude plugin eval . --eval-dir evals ...`, see release).
 
 | OS and launch path | Step | Version | Result | Date | Notes |
 |---|---|---|---|---|---|
@@ -251,11 +265,34 @@ and code review enabled; without the entitlement record `manual` or `n/a (no ent
 
 ## Linux container (automated)
 
-<!-- Filled by the integrator from the automated container run: the tool versions, the
-selftest summary (passed, failed, skipped per area) and which host steps were exercised
-headless. -->
+What the integration run executes in the build container, without a person at a host. It
+complements the Ubuntu rows above; it does not replace them, because no VS Code, no Windows
+PowerShell 5.1 and no signed-in Copilot or Codex session exists there.
 
-| Item | Version | Result | Date | Notes |
-|---|---|---|---|---|
-| `selftest` (all areas) | — | not run | — | |
-| Host CLIs exercised headless | — | not run | — | |
+**Environment**: Linux container (x64), Node 24.22.1, Git 2.43.0, PowerShell 7.5.4 (`pwsh`),
+gh 2.99.0 at `/opt/ghnew/bin/gh` (side by side with gh 2.89.0 on PATH; selftest uses the first
+`gh` at 2.90 or newer from `ADC_GH`, PATH and the known side-by-side locations), GitHub Copilot CLI 1.0.103 and Codex CLI 0.164.0 (both installed, neither signed in), Claude
+Code 2.1.310 (signed in), `skills-ref` (via `uv`). Not installed: gitleaks, waza, dotnet, VS Code.
+
+Every command runs from the repository root of the checkout; `<adc>` is
+`skills/agentic-developer-companion/scripts/adc.mjs` for the scripted rows and the installed
+copy's `adc.mjs` for the host rows. Throwaway projects and host homes live under the OS temp dir
+(`HOME`, `CLAUDE_CONFIG_DIR`, `COPILOT_HOME` and `CODEX_HOME` pointed there), so the run leaves
+nothing in the real profile. Rows marked paid spend a few cents of the signed-in Claude account.
+
+| Item | What runs | Version | Result | Date | Notes |
+|---|---|---|---|---|---|
+| selftest, all 16 areas | `node tests/selftest.mjs --jobs 3 --json` | Node 24.22.1, Git 2.43.0 | pending integration run | — | 10 unit files plus the direct checks; gitleaks and waza cases are skipped (not installed) |
+| Hook launch strings under sh and pwsh | part of selftest (`tests/unit/hooks.test.mjs`): the rendered Copilot `bash`/`powershell` strings, the Codex `command`/`commandWindows` and the Claude shell form, each fed the dialect fixtures; old, missing and crashing `node` fail open; a non-ASCII payload through `pwsh -NoProfile -Command` gives byte-identical stdout | pwsh 7.5.4 | pending integration run | — | Windows PowerShell 5.1 and cmd stay manual (Windows rows) |
+| Frontmatter validators | part of selftest (`frontmatter` area): `skills-ref validate`, `gh skill publish --dry-run`, `claude plugin validate --strict --json` | skills-ref (uvx), gh 2.99.0, Claude Code 2.1.310 | pending integration run | — | `claude plugin validate` does not validate a bare skills folder; selftest records it as skipped, never as a pass |
+| `.adc/` handling and the leak matrix | part of selftest (`adc` area): tracked `.adc/` makes every state command exit 3 and every hook print `{}`; linked worktree, submodule and `.gitignore` negation cases; tokens from `.adc/.env.live` and the environment absent from diff-scope, doctor, hooks.log and verify output; `git status --porcelain` byte-identical around `verify` | Git 2.43.0 | pending integration run | — | |
+| S1 install, Claude Code | `gh skill install --from-local . agentic-developer-companion --agent claude-code` in a throwaway project, then `node <adc> doctor --json` | gh 2.99.0, Claude Code 2.1.310 | pending integration run | — | `gh skill install` rewrites the frontmatter (sorted keys, provenance under `metadata`); `doctor` must still list the copy |
+| S1 install, Codex | `gh skill install --from-local . agentic-developer-companion --agent codex`, then `codex debug prompt-input "hello"` (lists discovered skills without sign-in) | gh 2.99.0, Codex 0.164.0 | pending integration run | — | the copy lands in `.agents/skills/` |
+| S1 install, Copilot CLI | `gh skill install --from-local . agentic-developer-companion --dir .github/skills`, then `copilot skill list --json` (works without sign-in) | gh 2.99.0, Copilot CLI 1.0.103 | pending integration run | — | Copilot CLI also lists the `.claude/skills/` copy |
+| S2 `help`, Claude Code (paid) | `claude -p "/agentic-developer-companion help"` in the throwaway project | Claude Code 2.1.310 | pending integration run | — | pass when the answer shows the mode table and an existing absolute `adc.mjs` path; Copilot CLI and Codex need a sign-in, so their S2 to S4 stay manual |
+| S3 `verify`, scripted | the [sample repository](#sample-repository), then `node <adc> verify --json`; restore `test/sum.test.js` and run it again | Node 24.22.1 | pending integration run | — | first run `FAIL` with CK-SKIP and CK-ASSERT, second `PASS` or `PASS-WITH-FINDINGS`; `git status --porcelain` shows only the planted files |
+| S3 `verify`, Claude Code (paid) | `claude -p "/agentic-developer-companion verify"` in the sample repository | Claude Code 2.1.310 | pending integration run | — | same pass rule as the scripted row; the ledger lands in `.adc/evidence/` |
+| S4 hooks, scripted | `node <adc> setup hooks --host claude --scope project`, `--host copilot` and `--host codex` (print only), then the printed commands fed one payload per event through `sh -c` and `pwsh -NoProfile -Command` | pwsh 7.5.4 | pending integration run | — | every run exits 0 with one ASCII JSON object; nothing blocks at the default `advise` level |
+| S4 hooks, Claude Code (paid) | project-scope hooks written to `.claude/settings.json` of the sample repository, then `claude -p` (with `ADC_DEBUG=1`) asked to add `it.only` to a test | Claude Code 2.1.310 | pending integration run | — | pass when `.adc/hooks.log` shows session-start, post-edit (focus marker) and stop, and no tool call was blocked |
+| S5 credential file permissions (Linux) | `node <adc> doctor --init`, then `stat -c %a .adc/.env.live` and `node <adc> doctor --json` | Node 24.22.1 | pending integration run | — | mode `600` and no permission warning; the Windows ACL check stays in the Windows rows |
+| Paid evals (manual) | `claude plugin eval . --eval-dir evals --trust-plugin --no-publish --threshold 0.8 --max-cost-usd 10 --output-dir <tmp>/adc-evals` and `node <adc> tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json --host claude --run --runs 3 --max-cost-usd 10` | Claude Code 2.1.310 | pending integration run | — | run only with the owner's approval; `claude plugin eval` refuses an eval dir outside the plugin root, so it targets the repository root |

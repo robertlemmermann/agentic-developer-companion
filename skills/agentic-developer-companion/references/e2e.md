@@ -48,7 +48,7 @@ user the list, then re-run with `--write`. An existing file is never replaced: i
 | `--lang ts\|python` | e2e-web | Default: the detected language (TypeScript otherwise) |
 | `--lang ts\|js\|python\|java\|dotnet` | e2e-api | Java = JUnit 5 + REST-assured; .NET = xUnit + HttpClient |
 | `--lang ts\|js\|python\|go\|rust` | e2e-cli | A language without a template is a usage error (exit 2) |
-| `--base-url <http(s) url>` | web, api | Default URL baked into the config; URLs with credentials are refused |
+| `--base-url <http(s) url>` | web, api | Default URL baked into the config; credentials, quotes, backslashes and braces are refused |
 | `--journeys "a,b,c"` | web | The first three become `test.fixme` journey specs (skipped until implemented) |
 | `--for copilot\|claude\|codex\|all` | web | Adds next steps for Playwright test agents and Playwright MCP |
 | `--audit` | web | Hardening report for an existing suite (§6); writes nothing |

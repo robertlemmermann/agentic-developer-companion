@@ -20,12 +20,11 @@ const FM = await import('../../skills/agentic-developer-companion/scripts/lib/fr
 const { parseToml } = await import('../../skills/agentic-developer-companion/scripts/lib/formats.mjs');
 const fmOf = (text) => FM.parseFrontmatter(text);
 const tomlOf = (text) => parseToml(text, { lenient: true });
-const LINT_AVAILABLE = fs.existsSync(path.join(SKILL, 'scripts', 'lib', 'tooling-lint.mjs'));
 const CLAUDE = which('claude');
 // Real host CLIs run their free load checks when they are on PATH (nothing is installed or spent).
 const COPILOT = which('copilot');
 const CODEX = which('codex');
-const TL = LINT_AVAILABLE ? await import('../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs') : null;
+const TL = await import('../../skills/agentic-developer-companion/scripts/lib/tooling-lint.mjs');
 
 const dirs = [];
 after(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); });
@@ -598,7 +597,6 @@ describe('tooling scaffold', () => {
       for (const host of ['copilot', 'claude', 'codex', 'all']) {
         const out = path.join(dir, `lint-${kind}-${host}`);
         const res = await T.scaffoldTooling(kind, { values: { for: host, name: `demo-${kind}`, description: desc, out, write: true, cwd: dir } });
-        if (!TL) continue;
         const files = res.written.map((w) => path.join(out, ...w.path.split('/'))).filter((f) => !f.endsWith('.mjs'));
         const r = await TL.lintPaths(files, { host: 'all', root: out });
         const errors = r.files.flatMap((f) => f.host_results.flatMap((h) => h.errors.map((e) => `${h.host} ${f.path} ${e.rule}: ${e.message}`)));
@@ -871,10 +869,8 @@ describe('tooling modify', () => {
       const res = r.json.results.find((x) => x.artifact === produced);
       assert.ok(res, `${kind}: ${JSON.stringify(r.json.results.map((x) => x.artifact))}`);
       assert.equal(res.equivalence.equal, true, `${kind}: ${res.equivalence.reason}`);
-      if (LINT_AVAILABLE) {
-        assert.equal(res.lint.errors, 0, `${kind} lint errors`);
-        assert.equal(res.verdict, 'accept', `${kind}: ${JSON.stringify(res.failing)} ${JSON.stringify(res.unverified)}`);
-      }
+      assert.equal(res.lint.errors, 0, `${kind} lint errors`);
+      assert.equal(res.verdict, 'accept', `${kind}: ${JSON.stringify(res.failing)} ${JSON.stringify(res.unverified)}`);
       assert.ok(r.json.baselines.length >= 1, `${kind} keeps a baseline of the source`);
     }
     const hooks = JSON.parse(read(dir, '.github/hooks/legacy.json'));
@@ -1021,14 +1017,88 @@ describe('tooling plugin', () => {
   });
 });
 
+describe('paths, secrets and file fidelity', () => {
+  test('a cwd reached through a symlink still resolves repository paths (macOS /var -> /private/var)', (t) => {
+    const dir = tmpRepo({ 'AGENTS.md': '- Run the whole suite before reporting success.\n', 'package.json': { name: 'demo' },
+      '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes. Use for release notes.') });
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'adc-tooling-link-'));
+    dirs.push(parent);
+    const link = path.join(parent, 'repo');
+    try { fs.symlinkSync(dir, link, 'junction'); } catch { return t.skip('symlinks are not available'); }
+    const port = adc(link, 'tooling', 'port', 'AGENTS.md', '--to', 'claude', '--dry-run');
+    assert.equal(port.exit, 0, port.stderr);
+    assert.deepEqual([port.json.source.path, port.json.source.kind], ['AGENTS.md', 'instructions']);
+    assert.deepEqual(port.json.written.map((w) => w.path), ['CLAUDE.md']);
+    const base = adc(link, 'tooling', 'modify', 'baseline', 'AGENTS.md');
+    assert.equal(base.exit, 0, base.stderr);
+    assert.equal(base.json.artifact, 'AGENTS.md');
+    assert.equal(adc(link, 'tooling', 'trigger-set', '.claude/skills/notes', '--init').exit, 0);
+    assert.ok(has(dir, '.claude/skills/notes/evals/trigger-set.json'));
+    const plugin = adc(link, 'tooling', 'plugin', 'init', '--out', 'kit');
+    assert.equal(plugin.exit, 0, plugin.stderr);
+    assert.equal(plugin.json.plugin_dir, 'kit');
+    const cost = adc(link, 'tooling', 'cost', 'AGENTS.md');
+    assert.deepEqual(cost.json.files.map((f) => f.path), ['AGENTS.md']);
+  });
+
+  test('stale paths: one git call drops ignored paths and keeps the order of the findings', () => {
+    const dir = tmpRepo({ '.gitignore': 'dist/\n', 'AGENTS.md': '- Read `docs/a.md`, `dist/x.js`, `../outside/b.md` and `docs/c.md`.\n' });
+    const stale = T.toolingCost({ root: dir }).findings.filter((x) => x.id === 'STALE_PATH').map((x) => x.evidence);
+    assert.deepEqual(stale, ['docs/a.md', '../outside/b.md', 'docs/c.md']);
+  });
+
+  test('modify never prints or stores a literal credential from the rendered context', () => {
+    const token = ['gh', 'p_', 'Ab3'.repeat(12)].join('');
+    const server = (env) => ({ mcpServers: { docs: { command: 'npx', args: ['-y', 'docs-mcp@1.2.3'], ...env } } });
+    const dir = tmpRepo({ '.mcp.json': server({}) });
+    assert.equal(adc(dir, 'tooling', 'modify', 'baseline', '.mcp.json').exit, 0);
+    write(dir, '.mcp.json', server({ env: { DOCS_TOKEN: token } }));
+    const cmp = adc(dir, 'tooling', 'modify', 'compare', '.mcp.json', '--note', 'add a token');
+    assert.ok(cmp.json?.deltas, cmp.stderr);
+    assert.ok(cmp.json.deltas.context.added > 0, 'the change is still visible');
+    assert.ok(!`${cmp.stdout}${cmp.stderr}`.includes(token));
+    const acc = adc(dir, 'tooling', 'modify', 'baseline', '.mcp.json');
+    const ctx = read(dir, `${acc.json.baseline_dir}/context.txt`);
+    assert.ok(ctx.includes('DOCS_TOKEN') && !ctx.includes(token));
+  });
+
+  test('plugin init copies hook scripts, never data arguments such as an env file', () => {
+    const cmd = 'node scripts/check.mjs --env-file .env';
+    const dir = tmpRepo({
+      '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes. Use for release notes.'),
+      '.github/hooks/check.json': { version: 1, hooks: { postToolUse: [{ type: 'command', bash: cmd, powershell: cmd, timeoutSec: 10 }] } },
+      'scripts/check.mjs': 'process.stdout.write("{}\\n");\n',
+      '.env': 'EXAMPLE_SETTING=1\n',
+    });
+    const r = adc(dir, 'tooling', 'plugin', 'init', '--for', 'claude', '--name', 'kit', '--include-hooks');
+    assert.equal(r.exit, 0, r.stderr);
+    const files = r.json.written.map((w) => w.path);
+    assert.ok(files.includes('plugins/kit/hooks/scripts/check.mjs'), files.join(', '));
+    assert.ok(!files.some((f) => f.endsWith('.env')), files.join(', '));
+    assert.ok(r.json.manual_steps.some((m) => /\.env are not scripts/.test(m)), JSON.stringify(r.json.manual_steps));
+  });
+
+  test('plugin release keeps non-ASCII manifest text; test commands quote paths per shell', () => {
+    const description = 'Café notes — résumés';
+    const dir = tmpRepo({ 'my kit/.claude-plugin/plugin.json': { name: 'kit', version: '0.1.0', description } });
+    const r = adc(dir, 'tooling', 'plugin', 'release', 'my kit', '--version', '0.2.0', '--write');
+    assert.equal(r.exit, 0, r.stderr);
+    const text = read(dir, 'my kit/.claude-plugin/plugin.json');
+    assert.ok(text.includes(description), text);
+    assert.equal(JSON.parse(text).version, '0.2.0');
+    const t = adc(dir, 'tooling', 'plugin', 'test', 'my kit');
+    const v = t.json.local_test_commands.find((c) => /plugin validate/.test(c.bash));
+    assert.deepEqual([v.bash, v.powershell, v.cmd], ["claude plugin validate --strict --json 'my kit'",
+      "claude plugin validate --strict --json 'my kit'", 'claude plugin validate --strict --json "my kit"']);
+  });
+});
+
 describe('group, lint delegation, state guard', () => {
-  test('tooling lint delegates to tooling-lint.mjs when it exists', () => {
+  test('tooling lint delegates to tooling-lint.mjs', () => {
     const dir = tmpRepo({ '.claude/skills/notes/SKILL.md': SKILL_MD('notes', 'Formats release notes. Use for release notes.') });
     const r = adc(dir, 'tooling', 'lint', '.claude/skills/notes');
-    if (LINT_AVAILABLE) {
-      assert.equal(r.exit, 0, r.stderr);
-      assert.ok(Array.isArray(r.json.files));
-    } else assert.equal(r.exit, 3);
+    assert.equal(r.exit, 0, r.stderr);
+    assert.ok(Array.isArray(r.json.files));
   });
 
   test('every tooling subcommand refuses a tracked .adc/ with exit 3', () => {

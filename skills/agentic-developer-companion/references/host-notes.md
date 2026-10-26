@@ -40,7 +40,7 @@ Explicit non-interactive switch for scripts on every host: `--yes` (also implied
 Every command is `node "<skill>/scripts/adc.mjs" <command> [options] --json`; locate `<skill>`
 as SKILL.md describes or read it from `doctor`. Output is one ASCII-only JSON document on
 stdout and a one-line summary on stderr. Global options: `--json`, `--cwd <dir>`,
-`--state-dir <dir>`, `--dry-run`, `--yes`, `--help`. Exit codes: `0` ok, `1` findings, `2`
+`--base <ref>`, `--state-dir <dir>`, `--dry-run`, `--yes`, `--help`. Exit codes: `0` ok, `1` findings, `2`
 usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4` could not verify.
 
 | Command | Purpose | Key options | JSON output |
@@ -54,10 +54,10 @@ usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4
 | `coverage-delta` | changed-line coverage (CK-COVERAGE, soft) | `--fail-under <pct>` `--report <file>` | `{ tool, changed_lines, covered, pct, uncovered[], untested_branches[], precision, checks[] }` |
 | `mutation-scope` | mutation testing on changed files (CK-MUTATION, soft) | `--budget <min>` | `{ tool, mutants, killed, survived, score, survivors[], checks[] }` |
 | `flake-probe` | repeat and shuffle new or changed tests (CK-FLAKE) | `--times <n>` `--tests <file[::name]>` | `{ runs, shuffle, seeds[], failures[], suspect_tests[], checks[] }` |
-| `evidence init\|add\|claims\|waive\|finalize\|render\|status\|score` | the ledger; claim status derived; waivers quote the spec; `score` aggregates yes/no/unknown answers | `--ledger` `--check` `--run` `--repro` `--reason` `--file` `--short` `--out` `--add` | ledger summary per subcommand ([verify](verify.md) §6) |
+| `evidence init\|add\|claims\|waive\|finalize\|render\|status\|score` | the ledger; claim status derived; waivers quote the spec; `score` aggregates yes/no/unknown answers | `--ledger` `--check` `--run` `--repro` `--reason` `--file` `--md` `--short` `--out` `--add` | ledger summary per subcommand ([verify](verify.md) §6) |
 | `trace` | requirement candidates and unmapped hunks (CK-TRACE) | `--spec` `--matrix <completed.json>` `--md` | `{ requirements[], extras[], hunks_total, checks[] }` |
 | `scaffold <kind>` | `e2e-web e2e-api e2e-cli live regress ci-gate flake` and the tooling kinds | `--lang` `--for` `--out` `--write` `--force` `--checklist` | `{ written[], next_steps[] }` |
-| `live run` | live probes under the budget ledger (CK-LIVE) | `--probes` `--session` `--credits` `--credits-override` (terminal only) | `{ session_id, identity_source, probes[{id, status, cost, duration_ms}], spent, remaining, stopped_reason }` |
+| `live run` | live probes under the budget ledger (CK-LIVE) | `--manifest` `--probes` `--session` `--credits` `--credits-override` (terminal only) `--no-ledger` | `{ session_id, identity_source, probes[{id, status, cost, duration_ms}], spent, remaining, stopped_reason }` |
 | `budget show\|reset\|prune` | inspect or maintain `.adc/budget.json` | `--session` | `{ unit, max_per_session, max_per_day, today, sessions[] }` |
 | `tooling lint` | host-rule validation incl. the security group | `--host` `--strict` `--no-external` `--allow-host` | `{ files[{path, kind, host_results[]}], security[], summary }` |
 | `tooling cost` | context cost per file and host | `--host` `--context-tokens` `--max-tokens` `--top` | `{ files[{path, chars, est_tokens, always_on}], totals, biggest_always_on[] }` |
@@ -69,7 +69,7 @@ usage, `3` environment missing (Git, Node 24, runner, tool, tracked `.adc/`), `4
 | `hooks render` (alias `setup hooks`) | render, merge (`--write`) or remove (`--remove`) the hook config | `--host` `--scope` `--level` `--node-path` | `{ host, target_file, config, warnings[], next_steps[], permission_rules }` |
 | `hooks list` | registered hooks of this skill | — | `{ hooks[{host, scope, file, events[], level}] }` |
 | `hook-run <event>` | the hook handler: stdin payload in, one decision object out, always exit 0 | `--dialect` `--level` | host-specific decision (`{}` for none) |
-| `doctor` | host, OS, Node, Git, host CLIs, prerequisites, installed copies, hooks, launcher probes, state dir | `--init` `--verify-vendored [--against] [--ref]` `--no-probes` | `{ host_guess, os, node, git, hosts[], install_paths[], hooks[], probes[], state, warnings[] }` |
+| `doctor` | host, OS, Node, Git, host CLI versions, prerequisites, installed copies, hooks, launcher probes, state dir | `--init` `--verify-vendored [--against] [--ref]` `--no-probes` | `{ host_guess, os, node, git, hosts[], install_paths[], hooks[], probes[], state, warnings[] }` |
 | `version` · `help` | the skill version · the command list | — | plain text |
 
 **Manual fallback** (guidance-only mode, no Node): each playbook lists the Git and runner
@@ -171,12 +171,14 @@ names, `toolArgs` shapes, where context arrives): [install](install.md) §6.
   for a bare skills directory even when a SKILL.md in it is broken, and "No manifest found"
   for a skill folder: for standalone skills it is **not a validator**. `tooling lint` treats
   `contents: []` as not applicable, never as a pass.
-- **`claude plugin eval`**: a skill folder given as the target resolves as a plugin named
-  after the skill, and the ablation defaults to `with-without` (C8). `claude plugin eval init
-  --bare <case>` run inside a skill folder writes `evals/<case>/prompt.md` and
-  `evals/<case>/graders/criteria.md`. Results go to `<skill>/evals/results/` unless
-  `--output-dir` and `--report` point elsewhere. In the default two-arm mode a `tool_used:
-  Skill` grader only counts with `arm: both` (or under `--ablation none`).
+- **`claude plugin eval`**: a skill folder or a skills directory given as the target
+  resolves as a plugin, and the ablation defaults to `with-without` (C8). It refuses an
+  `--eval-dir` outside the target, so this repository keeps its cases in the root `evals/`
+  and runs `claude plugin eval <repo> --eval-dir evals`. `claude plugin eval init --bare
+  <case>` writes `evals/<case>/prompt.md` and `evals/<case>/graders/criteria.md`. Results go
+  to `<target>/<eval-dir>/results/` unless `--output-dir` and `--report` point elsewhere. In
+  the default two-arm mode a `tool_used: Skill` grader only counts with `arm: both` (or under
+  `--ablation none`).
 - **`skills-ref validate`** (`uvx --from 'git+https://github.com/agentskills/agentskills#subdirectory=skills-ref' skills-ref validate <skill>`) passes.
 - **`npx skills add … -a github-copilot -a claude-code -a codex --copy`** (skills 1.7.4)
   writes byte-identical real folders to `.agents/skills/` (Copilot and Codex) and
@@ -199,7 +201,7 @@ Status as of 2026-10-25 (C numbers refer to the build plan's Appendix C).
 | C9 | VS Code behavior with non-spec frontmatter keys | open (this skill uses none) |
 | C11 | Codex project-root markers for the upward walk; a TOML agent format | partly measured: `.codex/skills/` is read without trust |
 | C12 | `npx skills add --copy` on Windows without symlink privileges | partly measured: `--copy` writes real folders (Linux, §8); Windows open |
-| C13 | Copilot's related-files listing for a skill with `tests/` and `evals/` | open; the footprint gate keeps ≤100 files |
+| C13 | Copilot's related-files listing for a skill with `tests/` and `evals/` | open; moot for this skill since 2026-10-26 (it ships runtime files only, ≤100) |
 | C14 | Codex `config.toml` `[mcp_servers.<name>]` table for the `mcp` scaffold | open |
 | C15 | Waza `copilot-sdk` executor authentication in a Business tenant | open |
 | C16 | Cloud-agent tool names for edits and reads | CLI measured ([install](install.md) §6); cloud agent open |

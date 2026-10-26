@@ -15,7 +15,7 @@ const raw = String.raw;
 
 const ENTITIES = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
 
-export function decodeEntities(s) {
+function decodeEntities(s) {
   if (!s || !s.includes('&')) return s;
   return s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (m, e) => {
     if (e[0] !== '#') return ENTITIES[e] ?? m;
@@ -77,6 +77,10 @@ function* walk(node, name) {
 // ---------------------------------------------------------------------------
 // Shared helpers
 
+const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
+/** Text without terminal color and title escape sequences. */
+export const stripAnsi = (s) => String(s ?? '').replace(ANSI_RE, '');
+
 const shortMessage = (s) => {
   const line = firstLine(s);
   return line.length > MESSAGE_CAP ? line.slice(0, MESSAGE_CAP - 3) + '...' : line;
@@ -96,7 +100,10 @@ export function rootVariants(root) {
   return [...out].filter(Boolean).sort((a, b) => b.length - a.length);
 }
 
-/** Normalize a path from a report: file:// URLs, backslashes, `./`, absolute paths under `root`. */
+/**
+ * Normalize a path from a report: file:// URLs, backslashes, `./`, absolute paths under `opts.root`
+ * (drive letters compare case-insensitively). `opts.roots` (from rootVariants) skips recomputing them.
+ */
 export function normalizeReportPath(p, opts = {}) {
   if (p == null || p === '') return null;
   let s = String(p).trim();
@@ -107,7 +114,7 @@ export function normalizeReportPath(p, opts = {}) {
   s = toPosix(s);
   const drive = /^[A-Za-z]:\//.test(s);
   const under = (r) => s === r || (drive ? s.toLowerCase().startsWith(r.toLowerCase() + '/') : s.startsWith(r + '/'));
-  const r = rootVariants(opts.root).find(under);
+  const r = (opts.roots || rootVariants(opts.root)).find(under);
   if (r) s = s === r ? '.' : s.slice(r.length + 1);
   return s.replace(/^(?:\.\/)+/, '');
 }
@@ -132,7 +139,7 @@ const ABORTED = /^(?:hookFailure|cancelledByParent|testTimeoutFailure|parentAlre
 export const isTestPath = (p) => TEST_PATH_RE.test(toPosix(String(p || '')));
 
 /** Location of the failing frame in a failure body: last frame for Python tracebacks, first otherwise. */
-export function failureLocation(body) {
+function failureLocation(body) {
   // Head and tail only: failure bodies can be large, and the generic pattern scans every position.
   const all = String(body || '');
   const text = all.length > 8000 ? `${all.slice(0, 4000)}\n${all.slice(-4000)}` : all;
@@ -163,7 +170,7 @@ export function classifyFailure({ element = 'failure', type = '', message = '', 
 const STATUS_KEY = { passed: 'passed', failed: 'failed', error: 'errors', flaky: 'flaky', skipped: 'skipped' };
 
 /** Counts from test entries. `executed` is every test that ran (passed, failed, error, flaky). */
-export function countTests(tests) {
+function countTests(tests) {
   const c = { executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, flaky: 0 };
   for (const t of tests.filter((x) => STATUS_KEY[x.status])) {
     c[STATUS_KEY[t.status]]++;
@@ -187,21 +194,28 @@ function collapse(entries, mode) {
   if (!ran.length) final.status = 'skipped';
   else if (ok === ran.length) final.status = ran.some((e) => e.status === 'flaky') ? 'flaky' : 'passed';
   else if (ok === 0) Object.assign(final, bad[bad.length - 1], { attempts: entries.length });
-  else Object.assign(final, { status: 'flaky' }, bad[0] && { failure_kind: bad[0].failure_kind, message: bad[0].message });
+  else {
+    Object.assign(final, { status: 'flaky' }, bad[0] && { failure_kind: bad[0].failure_kind, message: bad[0].message });
+  }
   final.runs = { passed: ok, failed: ran.length - ok, skipped: entries.length - ran.length };
   return final;
 }
 
 function groupCollapse(list, keyOf, mode) {
   const groups = new Map();
-  for (const e of list) groups.set(keyOf(e), [...(groups.get(keyOf(e)) || []), e]);
+  for (const e of list) {
+    const k = keyOf(e);
+    if (groups.has(k)) groups.get(k).push(e);
+    else groups.set(k, [e]);
+  }
   return [...groups.values()].map((g) => collapse(g, mode));
 }
 
 const result = (tests, extra = {}) => ({ ...countTests(tests), tests, ...extra });
 // Some writers emit only aggregate numbers; use them rather than report "nothing ran".
 const aggregate = (c, source) => ({ ...c, passed: Math.max(0, c.passed), flaky: 0, tests: [], source });
-const suiteError = (id, message, extra) => ({ id, status: 'error', failure_kind: 'error', ...extra, message: shortMessage(message) });
+const suiteError = (id, message, extra) => ({ id, status: 'error', failure_kind: 'error', ...extra,
+  message: shortMessage(message) });
 
 // ---------------------------------------------------------------------------
 // JUnit family
@@ -239,7 +253,8 @@ function junitCase(tc, suite, opts, chain = []) {
     const reruns = kids(tc, 'rerunFailure').length + kids(tc, 'rerunError').length;
     const kind = classifyFailure({ element: bad.name, type: bad.attrs.type, message: bad.attrs.message, body }, opts);
     Object.assign(entry, { status: bad.name === 'failure' ? 'failed' : 'error', failure_kind: kind,
-      message: shortMessage(bad.attrs.message || body || a.failure) }, reruns && { reruns }, flaky && { retried: true });
+      message: shortMessage(bad.attrs.message || body || a.failure) },
+    reruns && { reruns }, flaky && { retried: true });
   } else if (skipped || SKIPPED_STATUS.has(st)) {
     entry.status = 'skipped';
     const msg = skipped ? skipped.attrs.message || skipped.text : '';
@@ -328,6 +343,23 @@ const GO_RESULT = { pass: 'passed', fail: 'failed', skip: 'skipped' };
 const GO_NOISE = /^(?:=== (?:RUN|PAUSE|CONT)|--- (?:FAIL|PASS|SKIP))/;
 const getOr = (map, key, init) => map.get(key) || map.set(key, init()).get(key);
 
+/**
+ * Go subtest structure in one pass (a quadratic scan is slow for large table tests): `parents`
+ * holds every name with subtests, `failing` every name with a failing subtest (`failed(name)`).
+ */
+function subtestParents(names, failed) {
+  const parents = new Set();
+  const failing = new Set();
+  for (const n of names) {
+    const bad = failed(n);
+    for (let i = n.indexOf('/'); i !== -1; i = n.indexOf('/', i + 1)) {
+      parents.add(n.slice(0, i));
+      if (bad) failing.add(n.slice(0, i));
+    }
+  }
+  return { parents, failing };
+}
+
 function parseGoTestJson(text) {
   const pkgs = new Map();
   const builds = new Map();
@@ -360,14 +392,11 @@ function parseGoTestJson(text) {
   }
   const tests = [];
   for (const [name, p] of pkgs) {
-    const names = [...p.tests.keys()];
-    const failedChild = (n) => names.some((o) => o.startsWith(n + '/') && p.tests.get(o).results.includes('fail'));
+    const { parents, failing } = subtestParents(p.tests.keys(), (n) => p.tests.get(n).results.includes('fail'));
     let anyFailed = false;
-    for (const n of names) {
-      const t = p.tests.get(n);
+    for (const [n, t] of p.tests) {
       // Leaf tests only: a parent of subtests repeats their outcome (unless it failed on its own).
-      const parent = names.some((o) => o !== n && o.startsWith(n + '/'));
-      if (!t.results.length || (parent && !(t.results.includes('fail') && !failedChild(n)))) continue;
+      if (!t.results.length || (parents.has(n) && !(t.results.includes('fail') && !failing.has(n)))) continue;
       const msg = t.output.find((l) => l.trim() && !GO_NOISE.test(l.trim()));
       const fail = { failure_kind: 'assertion', ...(msg && { message: shortMessage(msg) }) };
       const entry = collapse(t.results.map((r) => ({ id: `${name}::${n}`, status: GO_RESULT[r], package: name,
@@ -403,7 +432,7 @@ function parseCargoText(text) {
   const compileErrors = [];
   let [binary, running, done, section, panicNext] = ['', false, true, null, false];
   for (const rawLine of String(text).split(/\r?\n/)) {
-    const line = rawLine.replace(/\x1b\[[0-9;]*m/g, '');
+    const line = stripAnsi(rawLine);
     const doc = /^\s*Doc-tests (\S+)/.exec(line);
     const bin = doc ? `doctest:${doc[1]}` : /^\s*Running /.test(line) ? cargoBinary(line) : null;
     const t = /^test (.+?) \.\.\. (ok|FAILED|ignored(?:, (.*))?)$/.exec(line);
@@ -433,7 +462,9 @@ function parseCargoText(text) {
     }
   }
   if (running && !done) crashes.push(binary);
-  for (const b of crashes) tests.push(suiteError(`${b}::[binary crashed]`, 'test binary exited before printing a result'));
+  for (const b of crashes) {
+    tests.push(suiteError(`${b}::[binary crashed]`, 'test binary exited before printing a result'));
+  }
   if (compileErrors.some((l) => /could not compile|^error\[E/.test(l))) {
     tests.push(suiteError('[build failed]', compileErrors.find((l) => /^error\[E/.test(l)) || compileErrors[0]));
   }
@@ -482,14 +513,16 @@ function parseTrx(text, opts) {
   if (!counters) return result(tests);
   const n = (k) => Number(counters.attrs[k] || 0);
   const errors = n('error') + n('timeout') + n('aborted');
-  return aggregate({ executed: n('executed') || n('passed') + n('failed') + errors, passed: n('passed'), failed: n('failed'),
-    errors, skipped: n('notExecuted') + n('inconclusive') + n('notRunnable') }, 'aggregate-counters');
+  const skipped = n('notExecuted') + n('inconclusive') + n('notRunnable');
+  return aggregate({ executed: n('executed') || n('passed') + n('failed') + errors, passed: n('passed'),
+    failed: n('failed'), errors, skipped }, 'aggregate-counters');
 }
 
 // ---------------------------------------------------------------------------
 // RSpec JSON (`--format json`)
 
-const RSPEC_EXPECTATION = /ExpectationNotMetError|MockExpectationError|MultipleExpectationsNotMetError|PendingExampleFixedError/;
+const RSPEC_EXPECTATION = new RegExp('ExpectationNotMetError|MockExpectationError|MultipleExpectationsNotMetError'
+  + '|PendingExampleFixedError');
 
 function parseRspecJson(text, opts) {
   const json = JSON.parse(stripBom(text));
@@ -553,7 +586,7 @@ export const normalizeFormat = (format) => {
 export function parseReport(format, text, opts = {}) {
   const f = normalizeFormat(format);
   if (!f) throw new Error(`unknown report format "${format}"`);
-  return { ...PARSERS[f](String(text ?? ''), opts), format: f };
+  return { ...PARSERS[f](String(text ?? ''), { ...opts, roots: rootVariants(opts.root) }), format: f };
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +624,7 @@ function parseLcov(text, opts) {
 
 function parseCobertura(text, opts) {
   const root = parseXml(text);
-  const roots = rootVariants(opts.root);
+  const { roots } = opts;
   // A relative filename is relative to a <source>; use the one inside the root, if any.
   const source = [...walk(root, 'source')].map((s) => toPosix(s.text.trim()))
     .find((s) => s && roots.some((r) => s === r || s.startsWith(r + '/')));
@@ -670,6 +703,10 @@ export function detectCoverageFormat(text) {
   if (s.startsWith('mode:')) return 'go-cover';
   if (s.startsWith('<')) return /<coverage\b/.test(s.slice(0, 4000)) ? 'cobertura' : null;
   if (!s.startsWith('{')) return /^(?:TN:|SF:)/m.test(s) ? 'lcov' : null;
+  // The writers put these keys first: decide from the head, so a large report is parsed only once.
+  const head = s.slice(0, 64 * 1024);
+  if (/"statementMap"\s*:/.test(head)) return 'istanbul';
+  if (/^\{\s*"total"\s*:\s*\{\s*"lines"\s*:\s*\{[^{}]*"pct"\s*:/.test(head)) return 'istanbul-summary';
   try {
     const j = JSON.parse(s);
     const first = Object.values(j).find((v) => v && typeof v === 'object');
@@ -683,7 +720,7 @@ export function detectCoverageFormat(text) {
 export function parseCoverage(format, text, opts = {}) {
   const f = format === 'auto' || !format ? detectCoverageFormat(text) : String(format).toLowerCase();
   if (!COVERAGE_PARSERS[f]) throw new Error(`unknown coverage format "${format}"`);
-  return { format: f, files: COVERAGE_PARSERS[f](String(text ?? ''), opts) };
+  return { format: f, files: COVERAGE_PARSERS[f](String(text ?? ''), { ...opts, roots: rootVariants(opts.root) }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +728,6 @@ export function parseCoverage(format, text, opts = {}) {
 // Line-anchored patterns use [ \t] rather than \s: with the m flag, `^\s*` spans newlines and makes
 // a long run of blank lines quadratic (tool output can be megabytes).
 
-const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
 const SAME = { failed: 'failed', passed: 'passed', skipped: 'skipped' };
 
 function words(s, map) {
@@ -717,9 +753,11 @@ const PYTEST_RE = new RegExp(raw`^(?:=+ )?((?:\d+ (?:failed|passed|skipped|desel
   + raw`|rerun|subtests? passed|subtests? failed)(?:, )?)+) in [\d.]+s(?: \([^)]*\))?(?: =+)?[ \t]*$`, 'gm');
 const VITEST_RE = new RegExp(raw`^[ \t]*Tests[ \t]+((?:\d+ (?:failed|passed|skipped|todo|expected fail)[ \t]*`
   + raw`(?:\|[ \t]*)?)+)\(\d+\)[ \t]*$`, 'gm');
-const RSPEC_RE = /^(\d+) examples?, (\d+) failures?(?:, (\d+) pending)?(?:, (\d+) errors? occurred outside of examples)?/gm;
+const RSPEC_RE = new RegExp(raw`^(\d+) examples?, (\d+) failures?(?:, (\d+) pending)?`
+  + raw`(?:, (\d+) errors? occurred outside of examples)?`, 'gm');
 const VSTEST_RE = /(?:Passed|Failed)!\s+-\s+Failed:\s+(\d+),\s+Passed:\s+(\d+),\s+Skipped:\s+(\d+),\s+Total:\s+(\d+)/g;
-const MAVEN_RE = /Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)(?:, Flakes: (\d+))?(?!,\s*Time elapsed)/g;
+const MAVEN_RE = new RegExp(raw`Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)`
+  + raw`(?:, Flakes: (\d+))?(?!,\s*Time elapsed)`, 'g');
 
 function goSummary(t) {
   const results = new Map([...t.matchAll(/^[ \t]*--- (PASS|FAIL|SKIP): (\S+)/gm)].map((m) => [m[2], m[1]]));
@@ -727,11 +765,10 @@ function goSummary(t) {
   const failPkgs = (t.match(/^FAIL\s+\S+\s+(?:[\d.]+s|\[[^\]]+\])/gm) || []).length;
   if (!results.size && !okPkgs && !failPkgs) return null;
   // Leaf tests only: a parent of subtests repeats their outcome.
-  const names = [...results.keys()];
-  const leaves = names.filter((x) => !names.some((o) => o !== x && o.startsWith(x + '/')));
+  const { parents, failing } = subtestParents(results.keys(), (x) => results.get(x) === 'FAIL');
+  const leaves = [...results.keys()].filter((x) => !parents.has(x));
   const count = (s) => leaves.filter((x) => results.get(x) === s).length;
-  const failedParents = names.filter((x) => !leaves.includes(x) && results.get(x) === 'FAIL'
-    && !names.some((o) => o.startsWith(x + '/') && results.get(o) === 'FAIL')).length;
+  const failedParents = [...parents].filter((x) => results.get(x) === 'FAIL' && !failing.has(x)).length;
   // Without -v, passing tests print nothing: the passed count is then unknown, not zero.
   const verbose = /^=== RUN /m.test(t) || count('PASS') > 0;
   const failed = count('FAIL') + failedParents;
@@ -743,7 +780,8 @@ const SUMMARY_DETECTORS = [
   ['pytest', (t) => {
     const m = lastMatch(t, PYTEST_RE);
     if (!m) return /^=+ no tests ran in [\d.]+s =+$/m.test(t) ? { passed: 0, failed: 0, skipped: 0 } : null;
-    const w = words(m[1], { ...SAME, xfailed: 'skipped', xpassed: 'passed', error: 'errors', errors: 'errors', rerun: 'reruns' });
+    const w = words(m[1], { ...SAME, xfailed: 'skipped', xpassed: 'passed', error: 'errors', errors: 'errors',
+      rerun: 'reruns' });
     return { ...w, errors: w.errors || 0 };
   }],
   ['jest', (t) => {
@@ -779,7 +817,8 @@ const SUMMARY_DETECTORS = [
   }],
   ['dotnet', (t) => {
     const vstest = sumAll(t, VSTEST_RE, ['failed', 'passed', 'skipped', 'total']);
-    const mtp = vstest ? null : lastMatch(t, /Test summary: total: (\d+), failed: (\d+), succeeded: (\d+), skipped: (\d+)/gi);
+    const mtp = vstest ? null
+      : lastMatch(t, /Test summary: total: (\d+), failed: (\d+), succeeded: (\d+), skipped: (\d+)/gi);
     return vstest || (mtp && { total: int(mtp, 1), failed: int(mtp, 2), passed: int(mtp, 3), skipped: int(mtp, 4) });
   }],
   ['maven', (t) => {
@@ -796,9 +835,13 @@ const SUMMARY_DETECTORS = [
     return p && { passed: int(p, 1), failed: g('failing'), skipped: g('pending') };
   }],
   ['node-test', (t) => {
-    const get = (k) => { const m = lastMatch(t, new RegExp(`^(?:ℹ|#) ${k} (\\d+)[ \\t]*$`, 'gm')); return m ? Number(m[1]) : null; };
-    if (get('pass') == null || get('fail') == null) return null;
-    return { passed: get('pass'), failed: get('fail') + get('cancelled'), skipped: get('skipped') + get('todo'), total: get('tests') };
+    const get = (k) => {
+      const m = lastMatch(t, new RegExp(`^(?:ℹ|#) ${k} (\\d+)[ \\t]*$`, 'gm'));
+      return m ? Number(m[1]) : null;
+    };
+    const [passed, failed] = [get('pass'), get('fail')];
+    if (passed == null || failed == null) return null;
+    return { passed, failed: failed + get('cancelled'), skipped: get('skipped') + get('todo'), total: get('tests') };
   }],
   ['bun', (t) => {
     const ran = lastMatch(t, /^Ran (\d+) tests? across \d+ files?/gm);
@@ -808,27 +851,30 @@ const SUMMARY_DETECTORS = [
   ['playwright', (t) => {
     if (!/^[ \t]+\d+ (?:passed|failed) ?(?:\([\d.]+m?s\))?[ \t]*$/m.test(t)) return null;
     const g = (k) => int(lastMatch(t, new RegExp(`^[ \\t]+(\\d+) ${k}(?: \\([\\d.]+m?s\\))?[ \\t]*$`, 'gm')), 1);
-    return { passed: g('passed'), failed: g('failed') + g('interrupted'), skipped: g('skipped') + g('did not run'), flaky: g('flaky') };
+    return { passed: g('passed'), failed: g('failed') + g('interrupted'), skipped: g('skipped') + g('did not run'),
+      flaky: g('flaky') };
   }],
   ['phpunit', (t) => {
     const ok = lastMatch(t, /^OK \((\d+) tests?, \d+ assertions?\)/gm);
     if (ok) return { passed: int(ok, 1), failed: 0, skipped: 0, total: int(ok, 1) };
     const m = lastMatch(t, /^Tests: (\d+), Assertions: \d+(.*)\.$/gm);
     const num = (k) => int(new RegExp(`${k}: (\\d+)`).exec(m ? m[2] : ''), 1);
-    return m && fromTotal(int(m, 1), { failed: num('Failures'), errors: num('Errors'), skipped: num('Skipped') + num('Incomplete') });
+    return m && fromTotal(int(m, 1), { failed: num('Failures'), errors: num('Errors'),
+      skipped: num('Skipped') + num('Incomplete') });
   }],
 ];
 
 /** Runner summary from console output → `{ runner, passed, failed, skipped, ... }` (null when not stated), or null. */
 export function parseSummaryText(text) {
   if (text == null) return null;
-  const t = String(text).replace(ANSI_RE, '').replace(/\r\n?/g, '\n');
+  const t = stripAnsi(text).replace(/\r\n?/g, '\n');
   if (!/\d/.test(t)) return null;
   for (const [runner, fn] of SUMMARY_DETECTORS) {
     let o = null;
     try { o = fn(t); } catch {}
     if (!o) continue;
-    const extra = Object.fromEntries(['errors', 'flaky', 'total', 'reruns'].filter((k) => o[k] != null).map((k) => [k, o[k]]));
+    const extra = Object.fromEntries(['errors', 'flaky', 'total', 'reruns'].filter((k) => o[k] != null)
+      .map((k) => [k, o[k]]));
     return { runner, passed: o.passed ?? null, failed: o.failed ?? null, skipped: o.skipped ?? null, ...extra };
   }
   return null;

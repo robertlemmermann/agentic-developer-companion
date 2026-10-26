@@ -39,10 +39,12 @@ by Claude Code: no `claude-`, `anthropic-`, `anthropics-`, `cc-plugin-` prefix, 
   to `agents/<n>.md` (Claude Code) and `com.github.copilot/agents/<n>.agent.md`; Codex plugins
   have no agents (port the agent to a skill first and pass it with `--skills`).
 - **Hooks** (`--include-hooks`): command hooks from `.github/hooks/*.json`,
-  `.claude/settings.json` and `.codex/hooks.json`; referenced scripts are copied to
+  `.claude/settings.json` and `.codex/hooks.json`; the program and script arguments
+  (`.mjs .cjs .js .ts .py .sh .ps1 .rb .pl`) inside the repository are copied to
   `hooks/scripts/` and addressed through `${PLUGIN_ROOT}` (Copilot, Codex) or
   `${CLAUDE_PLUGIN_ROOT}` (Claude Code exec form), because the install folder changes with every
-  version. Copilot `preToolUse` entries get `"cwd": "${PLUGIN_ROOT}"` (github/copilot-cli#2540).
+  version. Other file arguments (an env file, a key) are never copied; a manual step names them.
+  Copilot `preToolUse` entries get `"cwd": "${PLUGIN_ROOT}"` (github/copilot-cli#2540).
   Shell-string hooks are a manual step.
 - **MCP servers** (`--include-mcp`): from `.mcp.json`, `.github/mcp.json`, `.vscode/mcp.json`.
   Agent Plugins `mcp.json` expands only `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`, so environment
@@ -88,7 +90,7 @@ folder. The marketplace entry is `{ "name", "source": "./plugins/<name>", "descr
   `${CLAUDE_PLUGIN_DATA}`), Copilot `bash` + `powershell` rather than `command`, `cwd` on
   `preToolUse`; eval cases without `TODO`.
 - **Collisions**: a project skill with the same name as a plugin skill silently wins in
-  Copilot and Claude Code (`PL-SKILL-COLLISION` from lint, or `SKILL_SHADOWED`).
+  Copilot and Claude Code (`PL-SKILL-COLLISION` from the lint run below).
 - **[tooling lint](tooling-lint.md)** on the whole plugin folder.
 - **Host validators**, each free and without sign-in; statuses `pass`, `fail`, `error`,
   `unknown`, `skipped`, `not-applicable` (only `pass` is a pass):

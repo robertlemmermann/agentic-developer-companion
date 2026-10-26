@@ -20,10 +20,9 @@ The skill folder is `skills/agentic-developer-companion` in the public repositor
 
 ## 1. Before you install
 
-Git 2.31+, a supported host, and Node.js 24 for scripts and hooks; everything else is
-optional with a fallback, listed in [PREREQUISITES.md](../PREREQUISITES.md). Without Node the
-skill still works in guidance-only mode (the playbooks list the manual commands) and no hook
-can run.
+Git 2.31+, a supported host, and Node.js 24 for scripts and hooks; everything else is optional with a fallback, listed
+in [PREREQUISITES.md](../PREREQUISITES.md). Without Node the skill still works in guidance-only mode (the playbooks
+list the manual commands) and no hook can run.
 
 ## 2. Install matrix
 
@@ -86,6 +85,27 @@ then list the skill directories you use, for example
 `ls -d .github/skills/* .agents/skills/* .claude/skills/* ~/.copilot/skills/* ~/.claude/skills/* ~/.agents/skills/* 2>/dev/null`
 (PowerShell: `Get-ChildItem .github\skills, .agents\skills, $HOME\.copilot\skills -ErrorAction SilentlyContinue`).
 
+`doctor` options (`node <skill>/scripts/adc.mjs doctor [options] --json`):
+
+| Option | Effect |
+|---|---|
+| `--init` | creates `.adc/` owner-only, adds `/.adc/` to the repository's exclude file and writes `budget.json` and the `.env.live` template; refuses while `.adc/` is tracked; with `--dry-run` it lists what it would do |
+| `--verify-vendored` | compares every copy in a project skill folder (`.github/skills/`, `.agents/skills/`, `.claude/skills/`) with its release, SKILL.md semantically (installers rewrite its frontmatter) |
+| `--against <dir \| clone \| URL>` | the reference for `--verify-vendored`: a folder holding the skill, a Git clone or a repository URL (default: the upstream in the copy's install provenance, else its local source, else the copy running `doctor`) |
+| `--ref <tag \| sha>` | the release to compare with; needs a clone or URL in `--against`, or provenance that names the upstream |
+| `--no-probes` | skips the launcher probes (no host shell is started; faster) |
+| `--session <id>` | reports the budget caps for that session instead of the newest open one |
+
+Exit codes: 0 ok, 3 when `.adc/` is tracked by git (the report is still printed), and with
+`--verify-vendored` 1 on drift and 4 when no vendored copy exists or none could be compared.
+**Manual fallback** for `--init`:
+`mkdir -p .adc && chmod 700 .adc && echo '/.adc/' >> "$(git rev-parse --git-path info/exclude)"`,
+then copy `assets/templates/adc/budget.json` to `.adc/budget.json` and
+`assets/templates/adc/env.live.example` to `.adc/.env.live` (`chmod 600`; on Windows
+`icacls .adc\.env.live /inheritance:r /grant:r "%USERNAME%:(R,W)"`). For `--verify-vendored`:
+`git diff --no-index --stat <release clone>/skills/agentic-developer-companion .github/skills/agentic-developer-companion`
+(SKILL.md differs only in frontmatter after `gh skill install`).
+
 ## 4. Update, pin, uninstall
 
 - **Pin**: `gh skill install … @v1.2.0`, `@<40-char sha>` or `--pin`. At work pin by tag **and** SHA.
@@ -98,9 +118,8 @@ then list the skill directories you use, for example
 
 ## 5. Register hooks (`setup hooks`)
 
-Hooks are optional, advisory by default, offline, and fail open: every handler prints one
-JSON object and exits 0, and a missing Node yields `{}`. No host registers hooks from a
-skill, so registration is an explicit, confirmed step.
+Hooks are optional, advisory by default, offline, and fail open: every handler prints one JSON object and exits 0, and
+a missing Node yields `{}`. No host registers hooks from a skill, so registration is an explicit, confirmed step.
 
 | Level | What it adds | When |
 |---|---|---|
@@ -126,20 +145,18 @@ skill, so registration is an explicit, confirmed step.
    Codex) whose `bash`, `powershell`, `command`, `commandWindows` or `args` contain
    `adc.mjs` and `hook-run`; delete `~/.copilot/hooks/agentic-developer-companion.json` outright.
 
-Options: `--node-path` renders the absolute path of the Node running the command (for Node
-from nvm, fnm, Volta or asdf that the hook launcher's PATH does not see); `--node <path>`
-names one; `--skill-dir <dir>` renders for another copy (for example a vendored one).
+Options: `--node-path` renders the absolute path of the Node running the command (for Node from nvm, fnm, Volta or
+asdf that the hook launcher's PATH does not see); `--node <path>` names one; `--skill-dir <dir>` renders for another
+copy (for example a vendored one).
 
-**Manual fallback** (no Node, or you prefer to edit by hand): copy the template from
-`assets/hooks/` ([copilot](../assets/hooks/copilot.hooks.json),
-[copilot cloud](../assets/hooks/copilot.cloud.hooks.json),
-[claude](../assets/hooks/claude.settings.hooks.json), [codex](../assets/hooks/codex.hooks.json)),
-replace every `<SKILL>` with the absolute skill path written with forward slashes
-(`C:/Users/me/.copilot/skills/agentic-developer-companion` on Windows), delete the
-`preToolUse` / `PreToolUse` entries unless you want `guard`, change `--level advise` on the
-stop entry to `gate` (or to `guard` when you keep the pre-tool entries), and merge the `hooks`
-block into the target file below. Without Node
-the guarded Copilot strings print `{}`, so nothing breaks, but nothing runs either.
+**Manual fallback** (no Node, or you prefer to edit by hand): copy the template from `assets/hooks/`
+([copilot](../assets/hooks/copilot.hooks.json), [copilot cloud](../assets/hooks/copilot.cloud.hooks.json),
+[claude](../assets/hooks/claude.settings.hooks.json), [codex](../assets/hooks/codex.hooks.json)), replace every
+`<SKILL>` with the absolute skill path written with forward slashes
+(`C:/Users/me/.copilot/skills/agentic-developer-companion` on Windows), delete the `preToolUse` / `PreToolUse` entries
+unless you want `guard`, change `--level advise` on the stop entry to `gate` (or to `guard` when you keep the pre-tool
+entries), and merge the `hooks` block into the target file below. Without Node the guarded Copilot strings print `{}`,
+so nothing breaks, but nothing runs either.
 
 ## 6. Hook registration per host
 
@@ -150,21 +167,18 @@ the guarded Copilot strings print `{}`, so nothing breaks, but nothing runs eith
 | Claude Code | `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`), exec form | `.claude/settings.local.json`, shell strings, `--dialect auto` | `/hooks` shows them; settings-file hooks wait for workspace trust |
 | Codex | `~/.codex/hooks.json` (`$CODEX_HOME`) | `.codex/hooks.json` (project must be trusted) | approve each new hook once in `/hooks` |
 
-**Copilot (CLI, VS Code, Copilot app).** Each entry has a `bash` and a `powershell` string,
-never `command` (it would be copied to both shells). The strings check for Node and print
-`{}` otherwise, because a failing `preToolUse` hook denies the tool call. Repository hooks
-(`.github/hooks/`, `.claude/settings*.json`) load only in a trusted folder; in `copilot -p` that
-means `--trust-folder`, `COPILOT_ALLOW_ALL=true` or `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS=true`
-(`--allow-all` alone does not trust the folder). User hooks in `~/.copilot/hooks/` need no
-trust. A project file that names a skill outside the repository carries your machine's path:
-do not commit it (the render warns). `ask` decisions are denials in `-p` ("unable to ask user
-for confirmation"), in autopilot and in the cloud agent.
+**Copilot (CLI, VS Code, Copilot app).** Each entry has a `bash` and a `powershell` string, never `command` (it would
+be copied to both shells). The strings check for Node and print `{}` otherwise, because a failing `preToolUse` hook
+denies the tool call. Repository hooks (`.github/hooks/`, `.claude/settings*.json`) load only in a trusted folder; in
+`copilot -p` that means `--trust-folder`, `COPILOT_ALLOW_ALL=true` or `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS=true`
+(`--allow-all` alone does not trust the folder). User hooks in `~/.copilot/hooks/` need no trust. A project file that
+names a skill outside the repository carries your machine's path: do not commit it (the render warns). `ask` decisions
+are denials in `-p` ("unable to ask user for confirmation"), in autopilot and in the cloud agent.
 
-**Copilot cloud agent.** Only `.github/hooks/*.json` on the default branch is read, only the
-`bash` strings run (Linux), and `ask` is treated as deny. Vendor the skill first
-(`.github/skills/agentic-developer-companion/` or `.agents/skills/…`) and protect
-`.github/hooks/**` and the vendored folder with CODEOWNERS and branch protection: those files
-run on every colleague's machine that opens the repository with Copilot.
+**Copilot cloud agent.** Only `.github/hooks/*.json` on the default branch is read, only the `bash` strings run
+(Linux), and `ask` is treated as deny. Vendor the skill first (`.github/skills/agentic-developer-companion/` or
+`.agents/skills/…`) and protect `.github/hooks/**` and the vendored folder with CODEOWNERS and branch protection:
+those files run on every colleague's machine that opens the repository with Copilot.
 
 **Claude Code.** User scope uses the exec form (`"command": "node", "args": ["<SKILL>/scripts/adc.mjs", "hook-run", …]`),
 which needs no shell and no Git Bash on Windows. Project scope is written to
@@ -181,17 +195,16 @@ absent) has its own entry; `Read`, `Grep`, `Glob` and the edit tools are covered
 matcher. Under `claude -p` an `ask` cannot be answered: the call does not run. Add the printed
 `permissions.deny` rules (`Read(./.adc/**)`, `Edit(./.adc/**)`) for a second layer.
 
-**Codex.** `command` and `commandWindows` are the same bare `node "<SKILL>/scripts/adc.mjs" hook-run …`
-string, valid under cmd.exe, Windows PowerShell and pwsh. Codex rejects unknown output fields,
-so the handler sends only documented keys (the stop notice is a `systemMessage`). The edit
-matcher is `apply_patch|Write|Edit`; Codex reads files through `Bash`, which is why the guard
-inspects shell arguments. New hooks run only after review in `/hooks` (or for one run with
-`codex exec --dangerously-bypass-hook-trust`, meant for automation that vets its hooks). Under
-`codex exec` with approvals off an `ask` lets the call run; only `deny` stops it.
+**Codex.** `command` and `commandWindows` are the same bare `node "<SKILL>/scripts/adc.mjs" hook-run …` string, valid
+under cmd.exe, Windows PowerShell and pwsh. Codex rejects unknown output fields, so the handler sends only documented
+keys (the stop notice is a `systemMessage`). The edit matcher is `apply_patch|Write|Edit`; Codex reads files through
+`Bash`, which is why the guard inspects shell arguments. New hooks run only after review in `/hooks` (or for one run
+with `codex exec --dangerously-bypass-hook-trust`, meant for automation that vets its hooks). Under `codex exec` with
+approvals off an `ask` lets the call run; only `deny` stops it.
 
 **Measured payloads** (2026-10-25: Copilot CLI 1.0.103, Claude Code 2.1.310, Codex 0.164.0,
-each driven offline by a scripted model endpoint; `tests/unit/hooks.test.mjs` repeats this
-when the CLIs are installed):
+each driven offline by a scripted model endpoint; the source repository's `tests/unit/hooks.test.mjs`
+repeats this when the CLIs are installed):
 
 | Host | What the hooks receive and how output arrives |
 |---|---|
@@ -201,17 +214,16 @@ when the CLIs are installed):
 
 ## 7. What the hooks write
 
-Hooks read `.adc/detect.json`, the newest ledger in `.adc/evidence/` and their session file,
-and write `.adc/sessions/<id>.json` (edit counts and classes, observed runs as a command head
-plus counts, gate and guard bookkeeping, the ended flag). The state directory is created the
-first time there is something to record, after `/.adc/` is added to `.git/info/exclude`.
-`hooks.log` holds metadata only (event, tool, key names, sizes, timings; with `ADC_DEBUG=1`
-for every call), never payload bodies. On Copilot the post-shell hook rewrites a shell result
-that shows the live-test token (`ADC_LIVE_TOKEN=…`, its JSON/YAML form, a `Get-ChildItem Env:`
-row, or the literal value of an `ADC_LIVE_TOKEN` exported into the session) before the model
-sees it; Claude Code and Codex rely on the guard denials. While `.adc/` is tracked by git the session brief says
-so and every other hook prints `{}` and writes nothing; the guard still denies commit and push.
-`ADC_HOME` or `--state-dir` relocate the directory.
+Hooks read `.adc/detect.json`, the newest ledger in `.adc/evidence/` and their session file, and write
+`.adc/sessions/<id>.json` (edit counts and classes, observed runs as a command head plus counts, gate and guard
+bookkeeping, the ended flag). The state directory is created the first time there is something to record, after
+`/.adc/` is added to `.git/info/exclude`. `hooks.log` holds metadata only (event, tool, key names, sizes, timings;
+with `ADC_DEBUG=1` for every call), never payload bodies. On Copilot the post-shell hook rewrites a shell result that
+shows the live-test token (`ADC_LIVE_TOKEN=…`, its JSON/YAML form, a `Get-ChildItem Env:` row, or the literal value of
+`ADC_LIVE_TOKEN` or another `ADC_LIVE_*` credential exported into the session) before the model sees it; Claude Code
+and Codex rely on the guard denials. While `.adc/` is tracked by git the session brief says so and every other hook
+prints `{}` and writes nothing; the guard still denies commit and push. `ADC_HOME` or `--state-dir` relocate the
+directory.
 
 ## 8. Overview diagrams (ASCII)
 

@@ -2,32 +2,20 @@
 // diff hunks of the working-tree snapshot, and the script-side evaluation of the matrix the
 // model completes (CK-TRACE). Claimed statuses are checked against real file:line citations.
 
-import fs from 'node:fs';
 import path from 'node:path';
 import {
-  EXIT, usageError, defineCommand, readText, sha256, toPosix, relPosix, truncate, run, which,
-  matchAny, writeFileAtomic, asciiJson,
+  EXIT, usageError, defineCommand, sha256, toPosix, relPosix, truncate, run, which, writeJsonAtomic, asciiJson,
+  toArray, mdCell, statOrNull, readInput, readJsonInput, makeCheck,
 } from './core.mjs';
-import { git, emptyTree, showFile } from './git.mjs';
-
-// The QA target (repo, state dir, base, snapshot) via evidence.prepareQaTarget, which carries the snapshot fixes.
-async function qaTarget(ctx, opts) {
-  const ev = await import('./evidence.mjs');
-  return ev.prepareQaTarget(ctx, opts);
-}
+import { emptyTree, showFile, diffLines } from './git.mjs';
+import { prepareTarget } from './state.mjs';
+import { isTestFile as isTestPath, makeRedactor, redactDeep } from './markers.mjs';
 
 export const TRACE_SCHEMA = 'adc-trace/1';
 const MAX_SPEC_BYTES = 1024 * 1024;
 const MAX_REQUIREMENTS = 200;
 const MAX_HUNKS = 500;
 const REQ_STATUSES = ['implemented', 'partial', 'missing', 'unknown', 'dismissed'];
-
-// Default test-file globs (§7.4), used when neither detect nor markers is available.
-export const DEFAULT_TEST_GLOBS = Object.freeze([
-  '**/__tests__/**', '**/*.{test,spec}.*', '**/test_*.py', '**/*_test.py', '**/conftest.py',
-  '**/*_test.go', '**/tests/**', '**/test/**', '**/spec/**', '**/src/test/**', '**/*Tests*/**',
-  '**/*.Tests/**', '**/e2e/**', '**/cypress/**', '**/playwright/**',
-]);
 
 export const MATRIX_INSTRUCTIONS = Object.freeze([
   'For every requirement set status to implemented, partial, missing or unknown (weak candidates may be dismissed).',
@@ -50,8 +38,7 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
   const value = String(ref || '').trim();
   if (!value) throw usageError('--spec needs a file, "-" or an issue/PR URL');
   if (value === '-') {
-    let text = '';
-    try { text = fs.readFileSync(0, 'utf8'); } catch { text = ''; }
+    const text = readInput('-');
     if (!text.trim()) throw usageError('--spec - read nothing from stdin');
     return { ref: 'stdin', text: text.slice(0, MAX_SPEC_BYTES), kind: 'stdin' };
   }
@@ -70,10 +57,8 @@ export function readSpecInput(ref, { cwd = process.cwd(), root = null } = {}) {
     throw usageError(`could not read the spec from ${value}${m ? (gh ? ' with gh' : ' (gh is not installed)') : ''}; save the issue or PR text to a file and pass --spec <file>`);
   }
   const file = path.resolve(cwd, value);
-  let stat;
-  try { stat = fs.statSync(file); } catch { throw usageError(`spec file not found: ${toPosix(file)}`); }
-  if (!stat.isFile()) throw usageError(`spec is not a file: ${toPosix(file)}`);
-  const text = readText(file, '');
+  if (statOrNull(file)?.isFile() === false) throw usageError(`spec is not a file: ${toPosix(file)}`);
+  const text = readInput(file, cwd, { what: 'spec file' });
   const rel = root ? relPosix(root, file) : null;
   return { ref: rel && rel !== '.' ? rel : toPosix(file), text: text.slice(0, MAX_SPEC_BYTES), kind: 'file' };
 }
@@ -264,8 +249,6 @@ export function specPaths(text) {
 // ---------------------------------------------------------------------------
 // Diff hunks
 
-const unquote = (s) => (s.startsWith('"') && s.endsWith('"') ? (() => { try { return JSON.parse(s); } catch { return s.slice(1, -1); } })() : s);
-
 function isTrivialLine(t) {
   return /^\s*$/.test(t) || /^\s*[{}()[\];,]+\s*$/.test(t)
     || /^\s*(import\b|from\s+\S+\s+import\b|#include\b|using\s+[\w.]+\s*;|use\s+[\w:{}, ]+;|package\s+[\w.]+\s*;?|require\s*\()/.test(t);
@@ -273,63 +256,30 @@ function isTrivialLine(t) {
 
 /** Zero-context hunks between two revisions: [{ key, file, status, kind, start, end, old_start, after_line, added, removed, trivial, preview, text }]. */
 export function diffHunks(root, from, to) {
-  const out = git(root, ['-c', 'core.quotePath=false', 'diff', '-U0', '-M', '--no-color', '--no-ext-diff', '--no-textconv', from, to, '--']);
   const hunks = [];
-  let file = null;
-  let cur = null;
-  const push = () => {
-    if (!cur) return;
-    const h = cur;
-    cur = null;
-    const lines = h.newCount > 0 ? h.addedText : h.removedText;
-    const preview = (h.addedText.find((t) => t.trim()) || h.removedText.find((t) => t.trim()) || '').trim();
-    hunks.push({
-      key: h.newCount > 0 ? `${h.file}:${h.newStart}-${h.newStart + h.newCount - 1}` : `${h.file}:-${h.oldStart}`,
-      file: h.file, status: file.status, kind: h.newCount > 0 ? (h.oldCount > 0 ? 'change' : 'addition') : 'deletion',
-      start: h.newCount > 0 ? h.newStart : null, end: h.newCount > 0 ? h.newStart + h.newCount - 1 : null,
-      old_start: h.oldCount > 0 ? h.oldStart : null, after_line: h.newCount > 0 ? null : h.newStart,
-      added: h.newCount, removed: h.oldCount, trivial: lines.every(isTrivialLine),
-      preview: truncate(preview, 120), text: truncate(lines.join('\n'), 2000),
-    });
-  };
-  for (const raw of String(out).split('\n')) {
-    const line = raw.replace(/\r$/, '');
-    if (line.startsWith('diff --git ')) {
-      push();
-      const m = /^diff --git (?:"?a\/)(.+?)"? (?:"?b\/)(.+?)"?$/.exec(line);
-      file = { path: m ? m[2] : null, oldPath: m ? m[1] : null, status: 'M', binary: false, hunks: 0 };
+  for (const f of diffLines(root, from, to)) {
+    const file = toPosix(f.path || f.oldPath);
+    if (f.binary) {
+      hunks.push({ key: `${file}:binary`, file, status: f.status, kind: 'binary', start: null, end: null, old_start: null, after_line: null, added: 0, removed: 0, trivial: false, preview: '', text: '' });
       continue;
     }
-    if (!file) continue;
-    if (line.startsWith('@@')) {
-      push();
-      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
-      if (!m) continue;
-      file.hunks++;
-      cur = {
-        file: toPosix(file.path || file.oldPath), oldStart: Number(m[1]), oldCount: m[2] == null ? 1 : Number(m[2]),
-        newStart: Number(m[3]), newCount: m[4] == null ? 1 : Number(m[4]), addedText: [], removedText: [],
-      };
-      continue;
-    }
-    if (cur) {
-      if (line.startsWith('+')) cur.addedText.push(line.slice(1));
-      else if (line.startsWith('-')) cur.removedText.push(line.slice(1));
-      continue;
-    }
-    if (line.startsWith('new file mode')) file.status = 'A';
-    else if (line.startsWith('deleted file mode')) file.status = 'D';
-    else if (line.startsWith('rename from ')) { file.status = 'R'; file.oldPath = line.slice(12); }
-    else if (line.startsWith('rename to ')) file.path = line.slice(10);
-    else if (line.startsWith('--- ')) { const p = unquote(line.slice(4).trim()); if (p !== '/dev/null') file.oldPath = p.replace(/^a\//, ''); }
-    else if (line.startsWith('+++ ')) { const p = unquote(line.slice(4).trim()); file.path = p === '/dev/null' ? file.oldPath : p.replace(/^b\//, ''); }
-    else if (line.startsWith('Binary files ')) {
-      file.binary = true;
-      const f = toPosix(file.path || file.oldPath);
-      hunks.push({ key: `${f}:binary`, file: f, status: file.status, kind: 'binary', start: null, end: null, old_start: null, after_line: null, added: 0, removed: 0, trivial: false, preview: '', text: '' });
+    for (const h of f.hunks) {
+      // Texts keep the trailing \r of CRLF files in git's parse; hunks compare and show them without it.
+      const added = h.added.map((l) => l.text.replace(/\r$/, ''));
+      const removed = h.removed.map((l) => l.text.replace(/\r$/, ''));
+      const lines = h.newCount > 0 ? added : removed;
+      const end = h.newStart + h.newCount - 1;
+      hunks.push({
+        key: h.newCount > 0 ? `${file}:${h.newStart}-${end}` : `${file}:-${h.oldStart}`,
+        file, status: f.status, kind: h.newCount > 0 ? (h.oldCount > 0 ? 'change' : 'addition') : 'deletion',
+        start: h.newCount > 0 ? h.newStart : null, end: h.newCount > 0 ? end : null,
+        old_start: h.oldCount > 0 ? h.oldStart : null, after_line: h.newCount > 0 ? null : h.newStart,
+        added: h.newCount, removed: h.oldCount, trivial: lines.every(isTrivialLine),
+        preview: truncate((added.find((t) => t.trim()) || removed.find((t) => t.trim()) || '').trim(), 120),
+        text: truncate(lines.join('\n'), 2000),
+      });
     }
   }
-  push();
   return { hunks: hunks.slice(0, MAX_HUNKS), truncated: Math.max(0, hunks.length - MAX_HUNKS) };
 }
 
@@ -359,19 +309,11 @@ function hintsFor(hunk, reqTokens) {
 // ---------------------------------------------------------------------------
 // Skeleton
 
-async function redactor() {
-  try {
-    const ev = await import('./evidence.mjs');
-    if (typeof ev.makeRedactor === 'function') return await ev.makeRedactor();
-  } catch {}
-  return (s) => s;
-}
-
 /** The traceability skeleton the model completes: requirement candidates + diff hunks + a pending CK-TRACE. */
-export async function trace({ target, specText, specPath = null }) {
-  const redact = await redactor();
+export function trace({ target, specText, specPath = null }) {
+  const redact = makeRedactor();
   const text = String(specText || '');
-  const requirements = extractRequirements(text).map((r) => ({ ...r, text: redact(r.text) }));
+  const requirements = extractRequirements(text).map((r) => redactDeep(r, redact));
   const from = target.base.sha || emptyTree(target.root);
   const { hunks, truncated } = diffHunks(target.root, from, target.snapshot.commit);
   const reqTokens = requirements.map((r) => [r.id, tokens(r.text)]);
@@ -386,11 +328,10 @@ export async function trace({ target, specText, specPath = null }) {
     base: target.base.sha, base_ref: target.base.ref, tree_digest: target.snapshot.tree, snapshot_commit: target.snapshot.commit,
     requirements, extras, hunks_total: hunks.length, hunks_truncated: truncated,
     instructions: [...MATRIX_INSTRUCTIONS],
-    checks: [{
-      id: 'CK-TRACE', fm: ['FM-14', 'FM-11'], project: '.', status: 'unverified', reason: 'AWAITING_MATRIX', pending: true,
-      cost: 0, command: null, cwd: null, exit_code: null, duration_ms: null, summary, output_sha256: null, artifacts: [],
-      findings: [], data: { requirements: requirements.length, strong, hunks: hunks.length, spec: specPath },
-    }],
+    checks: [makeCheck({
+      id: 'CK-TRACE', fm: ['FM-14', 'FM-11'], reason: 'AWAITING_MATRIX', pending: true, summary,
+      data: { requirements: requirements.length, strong, hunks: hunks.length, spec: specPath },
+    })],
   };
 }
 
@@ -428,21 +369,6 @@ export function citationChecker(root, tree) {
   };
 }
 
-async function defaultTestMatcher() {
-  try {
-    const m = await import('./markers.mjs');
-    if (typeof m.classifyPath === 'function') {
-      return (file) => {
-        try { if (m.classifyPath(file).test) return true; } catch {}
-        return matchAny(file, DEFAULT_TEST_GLOBS);
-      };
-    }
-  } catch {}
-  return (file) => matchAny(file, DEFAULT_TEST_GLOBS);
-}
-
-const arr = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]);
-
 function hits(cit, hunk) {
   if (cit.file !== hunk.file) return false;
   if (hunk.start != null) return cit.start <= hunk.end && cit.end >= hunk.start;
@@ -458,13 +384,13 @@ function hits(cit, hunk) {
  * from the skeleton count as unknown, unmapped non-trivial hunks are extra functionality.
  * Returns { requirements, extras, counts, status, reason, summary, findings }.
  */
-export async function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = null, isTestFile = null }) {
+export function evaluateMatrix({ root, base, commit, tree, matrix, skeleton = null, isTestFile = (f) => isTestPath(f) }) {
   if (!matrix || typeof matrix !== 'object' || !Array.isArray(matrix.requirements)) {
     throw usageError('a traceability matrix needs a "requirements" array');
   }
-  const isTest = isTestFile || await defaultTestMatcher();
   const check = citationChecker(root, tree);
-  const skeletonReqs = skeleton && Array.isArray(skeleton.requirements) ? skeleton.requirements : [];
+  const skeletonReqs = toArray(skeleton?.requirements);
+  const skeletonById = new Map(skeletonReqs.map((r) => [r.id, r]));
   const reqs = [];
   const seen = new Set();
   for (const raw of matrix.requirements.slice(0, MAX_REQUIREMENTS)) {
@@ -472,19 +398,19 @@ export async function evaluateMatrix({ root, base, commit, tree, matrix, skeleto
     const id = String(raw.id || `M${reqs.length + 1}`).slice(0, 40);
     if (seen.has(id)) continue;
     seen.add(id);
-    const sk = skeletonReqs.find((r) => r.id === id);
+    const sk = skeletonById.get(id);
     const strength = sk ? sk.strength : 'strong';
     const claimed = REQ_STATUSES.includes(String(raw.status || '').toLowerCase()) ? String(raw.status).toLowerCase() : 'unknown';
     const valid = [];
     const invalid = [];
     const take = (list, role) => {
-      for (const c of arr(list).slice(0, 50)) {
+      for (const c of toArray(list).slice(0, 50)) {
         const r = check(c);
-        if (r.ok) valid.push({ ...r.citation, raw: String(c), role: role === 'test' || isTest(r.citation.file) ? 'test' : 'impl' });
+        if (r.ok) valid.push({ ...r.citation, raw: String(c), role: role === 'test' || isTestFile(r.citation.file) ? 'test' : 'impl' });
         else invalid.push({ citation: truncate(String(c), 200), reason: r.reason });
       }
     };
-    take([...arr(raw.evidence), ...arr(raw.implementation), ...arr(raw.files)], 'impl');
+    take([...toArray(raw.evidence), ...toArray(raw.implementation), ...toArray(raw.files)], 'impl');
     take(raw.tests, 'test');
     let status = claimed;
     let note = truncate(String(raw.note || ''), 300);
@@ -499,7 +425,7 @@ export async function evaluateMatrix({ root, base, commit, tree, matrix, skeleto
       id, text: sk ? sk.text : truncate(String(raw.text || ''), 400), strength, kind: sk ? sk.kind : 'model',
       claimed_status: claimed, status, evidence: valid.filter((v) => v.role === 'impl').map((v) => v.raw),
       tests: valid.filter((v) => v.role === 'test').map((v) => v.raw), invalid_citations: invalid,
-      tested: valid.some((v) => v.role === 'test'), hunks: arr(raw.hunks).map(String).slice(0, 100), note, _valid: valid,
+      tested: valid.some((v) => v.role === 'test'), hunks: toArray(raw.hunks).map(String).slice(0, 100), note, _valid: valid,
     });
   }
   for (const sk of skeletonReqs) {
@@ -513,13 +439,19 @@ export async function evaluateMatrix({ root, base, commit, tree, matrix, skeleto
   const { hunks } = diffHunks(root, base || emptyTree(root), commit);
   const live = new Set(reqs.filter((r) => r.status === 'implemented' || r.status === 'partial').map((r) => r.id));
   const explicit = new Map();
-  for (const e of arr(matrix.extras)) if (e && e.key && e.requirement) explicit.set(String(e.key), String(e.requirement));
+  for (const e of toArray(matrix.extras)) if (e && e.key && e.requirement) explicit.set(String(e.key), String(e.requirement));
   for (const r of reqs) for (const k of r.hunks) if (!explicit.has(k)) explicit.set(k, r.id);
+  // Citations of implemented/partial requirements by file, so each hunk looks at its own file only.
+  const cited = new Map();
+  for (const v of reqs.flatMap((r) => (live.has(r.id) ? r._valid : []))) {
+    if (cited.has(v.file)) cited.get(v.file).push(v);
+    else cited.set(v.file, [v]);
+  }
   const extras = [];
   let mapped = 0;
   for (const h of hunks) {
     const ex = explicit.get(h.key);
-    const byCitation = reqs.some((r) => live.has(r.id) && r._valid.some((v) => hits(v, h)));
+    const byCitation = (cited.get(h.file) || []).some((v) => hits(v, h));
     if ((ex && live.has(ex)) || byCitation) { mapped++; continue; }
     if (h.trivial) continue;
     extras.push({ key: h.key, file: h.file, start: h.start, end: h.end, kind: h.kind, added: h.added, removed: h.removed, preview: h.preview });
@@ -558,8 +490,6 @@ export async function evaluateMatrix({ root, base, commit, tree, matrix, skeleto
 // ---------------------------------------------------------------------------
 // Markdown
 
-const cell = (s) => truncate(String(s == null ? '' : s).replace(/\r?\n/g, ' ').replace(/\|/g, '\\|'), 160);
-
 /** Markdown matrix for a skeleton or an evaluated matrix. */
 export function renderTraceMarkdown(m) {
   const reqs = Array.isArray(m && m.requirements) ? m.requirements : [];
@@ -568,20 +498,20 @@ export function renderTraceMarkdown(m) {
   if (m && m.status) out.push(`CK-TRACE: **${m.status}**${m.reason ? ` (${m.reason})` : ''}. ${m.summary || ''}`, '');
   out.push('| Req | Requirement | Status | Implementation | Tests |', '|---|---|---|---|---|');
   for (const r of reqs) {
-    out.push(`| ${cell(r.id)}${r.strength === 'weak' ? ' (weak)' : ''} | ${cell(r.text)} | ${cell(r.status)} | ${cell(arr(r.evidence).join(', '))} | ${cell(arr(r.tests).join(', '))} |`);
+    out.push(`| ${mdCell(r.id)}${r.strength === 'weak' ? ' (weak)' : ''} | ${mdCell(r.text)} | ${mdCell(r.status)} | ${mdCell(toArray(r.evidence).join(', '))} | ${mdCell(toArray(r.tests).join(', '))} |`);
   }
   if (!reqs.length) out.push('| - | no requirements | - | - | - |');
   const missing = reqs.filter((r) => r.status === 'missing');
   if (missing.length) {
     out.push('', '## Missing functionality', '');
-    for (const r of missing) out.push(`- ${r.id}: ${cell(r.text)}${r.note ? ` (${cell(r.note)})` : ''}`);
+    for (const r of missing) out.push(`- ${r.id}: ${mdCell(r.text)}${r.note ? ` (${mdCell(r.note)})` : ''}`);
   }
   const listed = m && m.status ? extras : extras.filter((e) => !e.requirement);
   out.push('', m && m.status ? '## Extra functionality (hunks mapped to no requirement)' : '## Diff hunks to map', '');
   if (!listed.length) out.push('None.');
   else {
     out.push('| Hunk | Kind | Preview | Hint |', '|---|---|---|---|');
-    for (const e of listed.slice(0, 200)) out.push(`| ${cell(e.key)} | ${cell(e.kind)} | ${cell(e.preview ? `\`${e.preview}\`` : '')} | ${cell(arr(e.hint).join(', '))} |`);
+    for (const e of listed.slice(0, 200)) out.push(`| ${mdCell(e.key)} | ${mdCell(e.kind)} | ${mdCell(e.preview ? `\`${e.preview}\`` : '')} | ${mdCell(toArray(e.hint).join(', '))} |`);
     if (listed.length > 200) out.push('', `(${listed.length - 200} more)`);
   }
   out.push('');
@@ -609,25 +539,21 @@ export const traceCommand = defineCommand({
     if (!values.spec && !values.matrix) throw usageError('trace needs --spec <file|-|url> or --matrix <file>');
     if (values.spec && values.matrix) throw usageError('use either --spec or --matrix');
     if (values.matrix) {
-      const file = path.resolve(ctx.cwd, values.matrix);
-      const text = values.matrix === '-' ? fs.readFileSync(0, 'utf8') : readText(file);
-      if (text == null) throw usageError(`matrix file not found: ${toPosix(file)}`);
-      let matrix;
-      try { matrix = JSON.parse(text); } catch { throw usageError('the matrix is not valid JSON'); }
-      const target = await qaTarget(ctx, { base: values.base || matrix.base_ref || null, createState: false });
-      const ev = await evaluateMatrix({ root: target.root, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree, matrix });
+      const matrix = readJsonInput(values.matrix, ctx.cwd, { what: 'matrix file' });
+      const target = await prepareTarget(ctx, { base: values.base || matrix.base_ref || null, createState: false });
+      const ev = evaluateMatrix({ root: target.root, base: target.base.sha, commit: target.snapshot.commit, tree: target.snapshot.tree, matrix });
       const stale = Boolean(matrix.tree_digest && matrix.tree_digest !== target.snapshot.tree);
       const result = { schema: TRACE_SCHEMA, tree_digest: target.snapshot.tree, stale, ...ev };
       const exit = ev.status === 'pass' ? EXIT.OK : ev.status === 'unverified' ? EXIT.UNVERIFIABLE : EXIT.FINDINGS;
       return { result, exit, human: renderTraceMarkdown(ev), summary: `CK-TRACE ${ev.status}: ${ev.summary}${stale ? ' (working tree changed since the skeleton)' : ''}` };
     }
-    const target = await qaTarget(ctx, { base: values.base || null, createState: false });
+    const target = await prepareTarget(ctx, { base: values.base || null, createState: false });
     const spec = readSpecInput(values.spec, { cwd: ctx.cwd, root: target.root });
-    const skeleton = await trace({ target, specText: spec.text, specPath: spec.ref });
+    const skeleton = trace({ target, specText: spec.text, specPath: spec.ref });
     let written = null;
     if (values.out) {
       written = path.resolve(ctx.cwd, values.out);
-      if (!ctx.dryRun) writeFileAtomic(written, asciiJson(skeleton) + '\n');
+      if (!ctx.dryRun) writeJsonAtomic(written, skeleton);
     }
     const result = { ...skeleton, ...(written ? { written: toPosix(written), dry_run: ctx.dryRun } : {}) };
     return {

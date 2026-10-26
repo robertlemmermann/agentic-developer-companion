@@ -517,9 +517,12 @@ function plausibleUrlCredential(userPass, host) {
   return pass !== user;
 }
 
-/** Secret values on one line: [{ id, severity, value }]; a specific rule wins over the generic one. */
+/**
+ * Secret values on one line: [{ id, severity, value }]; a specific rule wins over the generic one.
+ * Long lines (minified bundles, one-line JSON) are scanned too: every pattern is linear.
+ */
 function secretHits(line) {
-  if (!line || line.length > 20_000) return [];
+  if (!line) return [];
   const hits = [];
   for (const p of SECRET_GLOBAL) {
     for (const m of line.matchAll(p.g)) {
@@ -600,13 +603,26 @@ export function scanText(text, catalogs, opts = {}) {
   };
   const entries = list.filter((e) => !e.langs || !lang || e.langs.includes(lang));
   const out = [];
+  const seen = new Set();
+  // Line i in each form an entry asks for (raw or comment-masked; strings blanked or not),
+  // computed once per line instead of once per entry.
+  const forms = new Map();
+  const formOf = (i, code, blank) => {
+    const k = `${code ? 'm' : 'r'}${blank || ''}`;
+    if (!forms.has(k)) {
+      const line = code ? getMasked()[i] : raw[i];
+      forms.set(k, blank === 'index' ? blankNonIndex(line) : blank ? blankStrings(line) : line);
+    }
+    return forms.get(k);
+  };
   for (let i = 0; i < raw.length; i++) {
     if (opts.lines && !opts.lines.has(i + 1)) continue;
-    const seen = new Set();
+    seen.clear();
+    forms.clear();
     for (const e of entries) {
       if (seen.has(e.id)) continue;
-      const code = e.code ? getMasked()[i] : raw[i];
-      const subject = e.blank === 'index' ? blankNonIndex(code) : e.blank ? blankStrings(code) : code;
+      const code = formOf(i, e.code, false);
+      const subject = e.blank ? formOf(i, e.code, e.blank) : code;
       const m = subject ? e.re.exec(subject) : null;
       if (!m || (e.blank && !e.re.test(code))) continue;
       if (e.next) {

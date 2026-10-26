@@ -14,6 +14,7 @@ import * as state from '../../skills/agentic-developer-companion/scripts/lib/sta
 import * as M from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
 import { diffScope, extractSpecPaths, narrowsCommand, keyPath, ciCommand, ciBlock, workflowEvents } from '../../skills/agentic-developer-companion/scripts/lib/diff-scope.mjs';
 import * as deps from '../../skills/agentic-developer-companion/scripts/lib/deps.mjs';
+import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/formats.mjs';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 export function tableSection(name) {
@@ -328,6 +329,12 @@ describe('markers', () => {
     assert.deepEqual(hits, []);
   });
 
+  test('secrets inside very long lines (minified bundles, one-line JSON) are found and masked', () => {
+    const line = `${'x'.repeat(30_000)} const k = '${AWS_KEY}'; ${'y'.repeat(30_000)}`;
+    assert.deepEqual(M.scanSecrets(line).map((h) => h.id), ['secret.aws-access-key-id']);
+    assert.ok(!M.redactSecrets(line).includes(AWS_KEY));
+  });
+
   test('redactSecrets masks every detected value in place and leaves other text alone', () => {
     const text = `run: jest --token=${GH_TOKEN}\nplain line\r\nkey ${AWS_KEY} and ${GH_TOKEN}`;
     const out = M.redactSecrets(text);
@@ -373,8 +380,8 @@ describe('markers', () => {
 // deps.mjs (pure parts)
 
 describe('deps parsing', () => {
-  test('parseTomlLite: tables, arrays of tables, inline tables, multi-line arrays', () => {
-    const t = deps.parseTomlLite('a = 1\n[project]\nname = "x" # c\ndependencies = [\n  "requests>=2",\n  \'six\',\n]\n[tool.uv.sources]\nlib = { path = "../lib" }\n[[package]]\nname = "p1"\n[[package]]\nname = "p2"\n[package.source]\nregistry = "r"\nbad line here\nz = true\n');
+  test('lenient TOML (manifests, lockfiles): tables, arrays of tables, inline tables, multi-line arrays', () => {
+    const t = parseToml('a = 1\n[project]\nname = "x" # c\ndependencies = [\n  "requests>=2",\n  \'six\',\n]\n[tool.uv.sources]\nlib = { path = "../lib" }\n[[package]]\nname = "p1"\n[[package]]\nname = "p2"\n[package.source]\nregistry = "r"\nbad line here\nz = true\n', { lenient: true }).value;
     assert.equal(t.a, 1);
     assert.deepEqual(t.project.dependencies, ['requests>=2', 'six']);
     assert.equal(t.tool.uv.sources.lib.path, '../lib');
@@ -494,6 +501,23 @@ describe('deps parsing', () => {
     assert.deepEqual(deps.goSumNeeded(deps.parseManifest('package.json', '{}')), []);
   });
 
+  test('blobReader: one batch for many blobs, same answers as git show (text, binary, missing, oversized)', () => {
+    const files = { 'a.txt': 'alpha\r\n', 'b.bin': 'x\u0000y', 'big.txt': 'z'.repeat(100), 'sub/c.js': 'c\n' };
+    const dir = initRepo(files);
+    const head = sh(dir, 'rev-parse', 'HEAD');
+    const names = [...Object.keys(files), 'nope.txt'];
+    const batched = deps.blobReader(dir, { maxBytes: 50 });
+    batched.prefetch(names.map((f) => [head, f]));
+    // Without the repository, only what the batch loaded can still be read.
+    fs.renameSync(path.join(dir, '.git'), path.join(dir, '.git-away'));
+    assert.equal(batched.read(head, 'a.txt'), 'alpha\r\n');
+    assert.equal(batched.read(head, 'sub/c.js'), 'c\n');
+    fs.renameSync(path.join(dir, '.git-away'), path.join(dir, '.git'));
+    const single = deps.blobReader(dir, { maxBytes: 50 });
+    for (const f of names) assert.equal(batched.read(head, f), single.read(head, f), f);
+    assert.deepEqual(['b.bin', 'big.txt', 'nope.txt'].map((f) => single.read(head, f)), [null, null, null]);
+  });
+
   test('offline is the default inside the Codex sandbox', () => {
     assert.equal(deps.defaultOffline({ CODEX_SANDBOX: 'seatbelt' }), true);
     assert.equal(deps.defaultOffline({ CODEX_SANDBOX_NETWORK_DISABLED: '1' }), true);
@@ -600,10 +624,16 @@ describe('evasion matrix (plan §13)', () => {
     for (const e of DIFFS.evasion) {
       const row = doc.split('\n').find((l) => l.startsWith(`| ${e.strategy} |`));
       assert.ok(row, `failure-modes.md has a row for "${e.strategy}"`);
-      const cell = row.split('|')[2];
-      const checks = [...Object.keys(e.expect), ...Object.keys(e.deps_expect || {})];
-      if (!checks.length) assert.match(cell, /not caught/i, row);
-      for (const id of new Set(checks)) assert.ok(cell.includes(id), `${e.strategy}: ${id} missing in "${cell}"`);
+      const [, , scripted, cleanRun, deep] = row.split('|').map((c) => c.trim());
+      const outcomes = [...Object.entries(e.expect), ...Object.entries(e.deps_expect || {})];
+      if (!outcomes.length) assert.match(scripted, /^not caught$/i, row);
+      for (const [id, sev] of outcomes) {
+        const published = `${id} ${[...new Set(sev)].join('/')}`;
+        assert.ok(scripted.includes(published), `${e.strategy}: "${published}" missing in "${scripted}"`);
+      }
+      if (e.deps_expect) assert.match(scripted, /deps-check/, row);
+      assert.equal(cleanRun, e.clean_run, row);
+      assert.equal(deep, e.deep, row);
     }
   });
 });
@@ -709,6 +739,32 @@ describe('diff-scope behaviour', () => {
     assert.deepEqual(res.findings.filter((f) => f.rule === 'secret.adc-live-token-value').map((f) => f.line), [1]);
   });
 
+  test('every live credential (ADC_LIVE_*KEY, *SECRET, ...) is redacted and flagged like the token', async () => {
+    const key = ['hunter2', 'abcKey'].join('');
+    const dir = prepare([{ op: 'edit', path: 'tests/math.test.js', find: "  it('adds', () => {", replace: `  it.only('adds ${key}', () => {` }], 'uncommitted');
+    const res = await diffScope({ target: await targetFor(dir), env: { ...ENV, ADC_LIVE_API_KEY: key } });
+    assert.ok(!JSON.stringify(res).includes(key), "the value never appears, not even in another check's evidence");
+    assert.deepEqual(severities(res.findings), { 'CK-SECRETS': ['fail'], 'CK-SKIP': ['fail'] });
+    assert.match(res.findings.find((f) => f.rule === 'secret.adc-live-token-value').message, /ADC_LIVE_API_KEY/);
+  });
+
+  test('lockfiles above the 2 MiB line-scan limit are still parsed (CK-LOCK static)', async () => {
+    const lock = JSON.parse(DIFFS.base['package-lock.json']);
+    for (let i = 0; i < 12000; i++) {
+      lock.packages[`node_modules/pad-${i}`] = { version: '1.0.0', resolved: `https://registry.npmjs.org/pad-${i}/-/pad-${i}-1.0.0.tgz`, integrity: `sha512-${'A'.repeat(88)}` };
+    }
+    const big = JSON.stringify(lock, null, 2) + '\n';
+    assert.ok(big.length > 2 * 1024 * 1024);
+    const dir = initRepo({ ...DIFFS.base, 'package-lock.json': big });
+    const pkg = JSON.parse(DIFFS.base['package.json']);
+    pkg.dependencies['adc-new-dep'] = '^1.0.0';
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
+    // The lockfile changes, but not to record the new dependency.
+    fs.writeFileSync(path.join(dir, 'package-lock.json'), big.replace('"version": "1.0.0"', '"version": "1.0.1"'));
+    const res = await diffScope({ target: await targetFor(dir), env: ENV });
+    assert.deepEqual(res.findings.filter((f) => f.id === 'CK-LOCK').map((f) => f.rule), ['lock.missing-entry']);
+  });
+
   test('a changed manifest that cannot be parsed leaves CK-DEPS unverified, never pass', async () => {
     const dir = prepare([{ op: 'edit', path: 'package.json', find: '"left-pad": "^1.3.0"', replace: '"left-pad": "^1.3.0",' }], 'uncommitted');
     const d = await deps.depsCheck({ target: await targetFor(dir), offline: true, tools: false, env: ENV });
@@ -716,6 +772,7 @@ describe('diff-scope behaviour', () => {
     assert.equal(c.status, 'unverified');
     assert.equal(c.reason, 'MANIFEST_UNPARSABLE');
     assert.deepEqual(d.unparsable, ['package.json']);
+    assert.equal(d.checks.find((x) => x.id === 'CK-LOCK').status, 'unverified', 'the lockfile cannot be judged either');
   });
 
   test('a forced secret scanner that is not installed falls back and says so', async () => {
@@ -746,15 +803,14 @@ describe('diff-scope behaviour', () => {
 
   test('a step that throws makes only that check unverified', async () => {
     const dir = prepare([{ op: 'edit', path: 'tests/math.test.js', find: "  it('adds', () => {", replace: "  it.only('adds', () => {" }], 'uncommitted');
-    const target = await targetFor(dir);
-    const broken = { ...target, snapshot: { ...target.snapshot } };
-    // An env object whose ADC_SECRETS_SCANNER getter throws breaks only the secrets step.
-    const env = { ...ENV };
-    Object.defineProperty(env, 'ADC_SECRETS_SCANNER', { get() { throw new Error('boom'); }, enumerable: true });
-    const res = await diffScope({ target: broken, env });
+    // Spec paths that are not an array break only the scope step.
+    const res = await diffScope({ target: await targetFor(dir), env: ENV, specPaths: { length: 1 } });
     const byId = Object.fromEntries(res.checks.map((c) => [c.id, c]));
-    assert.equal(byId['CK-SECRETS'].status, 'unverified');
+    assert.equal(byId['CK-SCOPE'].status, 'unverified');
+    assert.equal(byId['CK-SCOPE'].reason, 'STEP_ERROR');
+    assert.match(byId['CK-SCOPE'].data.error, /not a function/);
     assert.equal(byId['CK-SKIP'].status, 'fail');
+    assert.equal(byId['CK-SECRETS'].status, 'pass');
   });
 });
 
@@ -794,6 +850,22 @@ for (const file of files) {
 }
 `;
   const planted = [{ op: 'write', path: 'src/aws.js', content: "module.exports = { accessKeyId: '{{AWS_KEY}}' };\n" }];
+
+  test('package managers and secret scanners run without the live credentials in their environment', async () => {
+    const SPY = `import fs from 'node:fs';
+fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(Object.keys(process.env).filter((k) => k.startsWith('ADC_LIVE_'))) + '\\n');
+if (process.argv[2] === 'version') console.log('v8.21.2');
+`;
+    const log = path.join(fs.mkdtempSync(path.join(TMP, 'envspy-')), 'calls.jsonl');
+    const env = { ...ENV, PATH: [fakeBin('npm', SPY), fakeBin('gitleaks', SPY), process.env.PATH].join(path.delimiter),
+      FAKE_LOG: log, ADC_SECRETS_SCANNER: 'gitleaks', ADC_LIVE_TOKEN: ['live', 'token', '123'].join('-'),
+      ADC_LIVE_API_KEY: ['live', 'key', '456'].join('-') };
+    assert.equal(deps.runLockTool('npm', fs.mkdtempSync(path.join(TMP, 'envspy-npm-')), { env }).status, 'consistent');
+    await diffScope({ target: await targetFor(prepare(planted, 'uncommitted')), env });
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(calls.length, 3, 'npm, gitleaks version and gitleaks git ran');
+    assert.deepEqual(calls.flat(), []);
+  });
 
   test('gitleaks is preferred when installed; its findings and command are recorded, values never', async () => {
     const bin = fakeBin('gitleaks', GITLEAKS);

@@ -3,66 +3,66 @@
 // a crash), one evidence ledger, the derived verdict, and per-host next steps for the parts only
 // the model can do (traceability matrix, adversarial review, claims).
 
-import fs from 'node:fs';
 import path from 'node:path';
 import {
-  EXIT, AdcError, usageError, defineCommand, toPosix, relPosix, truncate, readText, ADC_SCRIPT,
-  writeFileAtomic, writeJsonAtomic,
+  EXIT, AdcError, usageError, defineCommand, toPosix, relPosix, truncate, ADC_SCRIPT, writeFileAtomic,
+  writeJsonAtomic, ensureDir, makeCheck, numberOption, readInput, toArray,
 } from './core.mjs';
-import { gitRaw, requireRepo, resolveBase } from './git.mjs';
-import { prepareStateDir, appendMetrics, snapshotExcludes } from './state.mjs';
+import { requireRepo, resolveBase, createSnapshot, statusPorcelain } from './git.mjs';
+import { prepareStateDir, prepareTarget, appendMetrics, snapshotExcludes } from './state.mjs';
 import {
   initLedger, addChecks, setClaims, finalizeLedger, deriveVerdict, checkRows, verdictExit, readLedgerFile,
-  renderMarkdown, markdownPath, artifactsDir, detectTool, metricsFor, resolveSession, allocateLedgerPath,
-  prepareQaTarget, createQaSnapshot, TOOLS, CHECK_FM,
+  renderMarkdown, markdownPath, artifactsDir, detectTool, checkTool, metricsFor, resolveSession, allocateLedgerPath,
+  CHECK_FM,
 } from './evidence.mjs';
 import { readSpecInput, specPaths, renderTraceMarkdown } from './trace.mjs';
 
 const DIFF_SCOPE_IDS = ['CK-SCOPE', 'CK-TEST-DEL', 'CK-SKIP', 'CK-ASSERT', 'CK-TEST-CFG', 'CK-SUPPRESS', 'CK-CI', 'CK-SWALLOW', 'CK-SECRETS'];
 
+// Options every worktree-based step shares: --no-install and --keep apply to all of them.
+const wt = (s) => ({ target: s.target, detectResult: s.detectResult, noInstall: s.opts.noInstall, keep: s.opts.keep });
+
 /**
  * The scripted steps, in order. Each entry names the module (relative to this file) and export to
- * import, the check ids it must produce, and how to call it with the shared state `s`.
- * When detection fails the steps still run with `detectResult: null` (the QA modules fall back to
- * their own detection); a step marked `needsDetect` is recorded `unverified` instead. A `when`
- * that returns false records the step's checks as `skipped`.
+ * import, the check ids it must produce, and how to call it with the shared state `s`. When
+ * detection fails the steps still run with `detectResult: null` (each QA module then detects
+ * itself, and a step that cannot is recorded `unverified`). A `when` that returns false records
+ * the step's checks as `skipped`; `after(result, checks, s)` stores what the step produced.
  */
 export const DEFAULT_STEPS = Object.freeze([
   { name: 'detect', step: '1', module: './detect.mjs', export: 'detect', ids: [], kind: 'detect',
     call: (fn, s) => fn({ root: s.target.root, stateInfo: s.target.state, refresh: s.opts.refresh }) },
   { name: 'diff-scope', step: '2-8', module: './diff-scope.mjs', export: 'diffScope', ids: DIFF_SCOPE_IDS,
     call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, specPaths: s.specPaths, allow: s.opts.allow }) },
+  // `offline: null` lets deps-check apply its own default (Codex sandbox, ADC_OFFLINE).
   { name: 'deps-check', step: '9', module: './deps.mjs', export: 'depsCheck', ids: ['CK-DEPS', 'CK-LOCK'],
-    call: (fn, s) => fn({ target: s.target, offline: s.opts.offline }) },
+    call: (fn, s) => fn({ target: s.target, offline: s.opts.offline || null }) },
   { name: 'typecheck', step: '10', module: './clean-run.mjs', export: 'typecheck', ids: ['CK-TYPES'],
-    call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, strict: false, runner: s.opts.runner }) },
+    call: (fn, s) => fn({ ...wt(s), strict: false, runner: s.opts.runner }) },
   { name: 'clean-run', step: '11', module: './clean-run.mjs', export: 'cleanRun', ids: ['CK-CLEANRUN'],
     call: (fn, s) => fn({
-      target: s.target, detectResult: s.detectResult, noInstall: s.opts.noInstall, runner: s.opts.runner,
-      allProjects: s.opts.allProjects, baseCountsFile: s.opts.baseCounts, noBase: s.opts.noBase, keep: s.opts.keep,
+      ...wt(s), runner: s.opts.runner, allProjects: s.opts.allProjects, baseCountsFile: s.opts.baseCounts,
+      noBase: s.opts.noBase,
       // §9.1.1: the skip-increase and shortfall rules depend on what diff-scope found; no waivers exist yet.
       firedChecks: s.fired(), waivers: [],
     }) },
   { name: 'coverage-delta', step: '12', module: './probes.mjs', export: 'coverageDelta', ids: ['CK-COVERAGE'],
     when: (o) => !o.quick, skipReason: 'QUICK', skipSummary: 'skipped by --quick',
-    call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, failUnder: s.opts.failUnder, report: null }) },
+    call: (fn, s) => fn({ ...wt(s), runner: s.opts.runner, failUnder: s.opts.failUnder, report: null }) },
   { name: 'mutation-scope', step: '13', module: './probes.mjs', export: 'mutationScope', ids: ['CK-MUTATION'],
     when: (o) => o.deep, skipReason: 'NOT_REQUESTED', skipSummary: 'mutation testing runs with --deep',
-    call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, budgetMin: s.opts.budgetMin }) },
+    call: (fn, s) => fn({ ...wt(s), budgetMin: s.opts.budgetMin }) },
   { name: 'flake-probe', step: '14', module: './probes.mjs', export: 'flakeProbe', ids: ['CK-FLAKE'],
     when: (o) => o.deep, skipReason: 'NOT_REQUESTED', skipSummary: 'the flake probe runs with --deep',
-    call: (fn, s) => fn({ target: s.target, detectResult: s.detectResult, times: s.opts.times, tests: null }) },
-  { name: 'trace', step: '15', module: './trace.mjs', export: 'trace', ids: ['CK-TRACE'], kind: 'trace',
+    call: (fn, s) => fn({ ...wt(s), runner: s.opts.runner, times: s.opts.times, tests: null }) },
+  { name: 'trace', step: '15', module: './trace.mjs', export: 'trace', ids: ['CK-TRACE'],
     when: (o, s) => s.spec != null, skipReason: 'NO_SPEC', skipSummary: 'no --spec given',
-    call: (fn, s) => fn({ target: s.target, specText: s.spec.text, specPath: s.spec.ref }) },
+    call: (fn, s) => fn({ target: s.target, specText: s.spec.text, specPath: s.spec.ref }), after: storeTrace },
 ]);
 
-function placeholder(id, status, reason, summary, step) {
-  return {
-    id, fm: [...(CHECK_FM[id] || [])], project: '.', status, reason, cost: 0, command: null, cwd: null, exit_code: null,
-    duration_ms: null, summary: truncate(summary, 600), output_sha256: null, artifacts: [], findings: [], data: { step: step.name },
-  };
-}
+const placeholder = (id, status, reason, summary, step) => makeCheck({
+  id, fm: [...(CHECK_FM[id] || [])], status, reason, summary: truncate(summary, 600), data: { step: step.name },
+});
 
 const moduleUrl = (spec) => (/^file:/.test(spec) ? spec : new URL(spec, import.meta.url).href);
 
@@ -88,30 +88,23 @@ async function runStep(step, s) {
     return { checks: step.ids.map((id) => placeholder(id, status, reason, summary, step)), log };
   };
   if (step.when && !step.when(s.opts, s)) return degrade(step.skipReason || 'NOT_REQUESTED', step.skipSummary || 'not requested', 'skipped');
-  if (step.needsDetect && !s.detectOk) return degrade('DETECT_UNAVAILABLE', `not run: project detection failed (${s.detectError || 'unknown'})`);
   const { fn, detail } = await loadStepFn(step);
-  if (!fn) {
-    if (step.kind === 'detect') s.detectError = `MODULE_UNAVAILABLE: ${detail}`;
-    return degrade('MODULE_UNAVAILABLE', `${step.name}: ${detail}`);
-  }
+  if (!fn) return degrade('MODULE_UNAVAILABLE', `${step.name}: ${detail}`);
   let res;
   try {
     res = await step.call(fn, s);
   } catch (err) {
     const code = err instanceof AdcError ? err.code : 'STEP_ERROR';
-    if (step.kind === 'detect') s.detectError = `${code}: ${truncate(err.message, 200)}`;
     return degrade(code, `${step.name} failed: ${truncate(err && err.message ? err.message : String(err), 400)}`);
   }
   if (step.kind === 'detect') {
     log.ms = Date.now() - started;
-    if (!res || typeof res !== 'object' || !Array.isArray(res.projects)) {
-      s.detectError = 'detect returned no projects[]';
+    if (!Array.isArray(res?.projects)) {
       log.status = 'degraded';
       log.reason = 'BAD_RESULT';
       return { checks: [], log };
     }
     s.detectResult = res;
-    s.detectOk = true;
     log.status = 'ran';
     log.summary = truncate(String(res.summary || `${res.projects.length} project(s)`), 300);
     return { checks: [], log };
@@ -155,11 +148,6 @@ function storeTrace(res, checks, s) {
   s.traceMatrix = ref(work);
 }
 
-function porcelain(root) {
-  const res = gitRaw(root, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all']);
-  return res.exit === 0 ? res.stdout : null;
-}
-
 const REVIEW_DISPATCH = {
   'claude-code': 'Claude Code: run the review in a fresh subagent with read-only tools (Read, Grep, Glob; isolation: worktree when available) and the references/review.md template; `/code-review` is a useful second opinion, not a replacement.',
   'copilot-cli': 'Copilot CLI: run `/review` with the references/review.md checklist, or a custom read-only agent; `/rubber-duck` adds a second model.',
@@ -180,7 +168,6 @@ function nextSteps({ derived, ledger, tool, ledgerRef, matrixRef, scratchDir, fi
     SHALLOW: 'run `git fetch --unshallow` (CI: checkout with fetch-depth 0) and re-run verify',
     PATH_TOO_LONG: 'run `git config --global core.longpaths true` and re-run verify',
     MODULE_UNAVAILABLE: 'this installation lacks the step module; run the manual fallback for that step from references/verify.md and record its output with `evidence add`',
-    DETECT_UNAVAILABLE: 'fix project detection (`detect --json` shows why) or run the manual fallback from references/verify.md',
   };
   const groups = new Map();
   for (const r of derived.effective) {
@@ -209,44 +196,25 @@ function nextSteps({ derived, ledger, tool, ledgerRef, matrixRef, scratchDir, fi
   return out;
 }
 
-function parsePositive(value, name, { integer = false } = {}) {
-  if (value == null || value === '') return null;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0 || (integer && !Number.isInteger(n))) throw usageError(`--${name} must be a positive ${integer ? 'integer' : 'number'}`);
-  return n;
-}
-
-function readArg(arg, cwd) {
-  if (arg === '-') {
-    try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
-  }
-  const file = path.resolve(cwd, arg);
-  const text = readText(file);
-  if (text == null) throw usageError(`--claims file not found: ${toPosix(file)}`);
-  return text;
-}
-
 function options(values) {
   if (values.quick && values.deep) throw usageError('--quick and --deep are mutually exclusive');
   if (values.spec === '-' && values.claims === '-') throw usageError('only one of --spec and --claims can read stdin');
-  if (values.tool && !TOOLS.includes(String(values.tool).toLowerCase())) throw usageError(`--tool must be one of ${TOOLS.join(', ')}`);
+  // Absent numbers stay undefined so each step applies its own default.
   return {
     quick: Boolean(values.quick), deep: Boolean(values.deep), finalize: Boolean(values.finalize),
-    allow: Array.isArray(values.allow) ? values.allow : values.allow ? [values.allow] : [],
-    offline: Boolean(values.offline) || Object.keys(process.env).some((k) => k.startsWith('CODEX_SANDBOX') && process.env[k]),
+    allow: toArray(values.allow), offline: Boolean(values.offline),
     noInstall: Boolean(values['no-install']), runner: values.runner || null, allProjects: Boolean(values['all-projects']),
     baseCounts: values['base-counts'] || null, noBase: Boolean(values['no-base']), keep: Boolean(values.keep),
-    failUnder: parsePositive(values['fail-under'], 'fail-under'), budgetMin: parsePositive(values.budget, 'budget'),
-    times: parsePositive(values.times, 'times', { integer: true }), refresh: Boolean(values.refresh),
-    tool: values.tool ? String(values.tool).toLowerCase() : null,
+    failUnder: numberOption(values, 'fail-under', undefined), budgetMin: numberOption(values, 'budget', undefined),
+    times: numberOption(values, 'times', undefined, { integer: true }), refresh: Boolean(values.refresh),
+    tool: checkTool(values.tool),
   };
 }
 
-async function dryRunPlan(ctx, values, opts, steps, spec) {
-  const root = requireRepo(ctx.cwd);
+async function dryRunPlan(ctx, root, values, opts, steps, spec) {
   const state = prepareStateDir({ ...ctx, cwd: root }, { create: false });
   const base = resolveBase(root, values.base || null);
-  const s = { opts, spec, detectOk: true };
+  const s = { opts, spec };
   const plan = [];
   for (const step of steps) {
     const { fn, detail } = await loadStepFn(step);
@@ -265,24 +233,25 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
   const opts = options(values);
   const root = requireRepo(ctx.cwd);
   const spec = values.spec ? readSpecInput(values.spec, { cwd: ctx.cwd, root }) : null;
-  const claimsText = values.claims ? readArg(values.claims, ctx.cwd) : null;
-  if (ctx.dryRun) return dryRunPlan(ctx, values, opts, steps, spec);
+  const claimsText = values.claims ? readInput(values.claims, ctx.cwd, { what: '--claims file' }) : null;
+  if (ctx.dryRun) return dryRunPlan(ctx, root, values, opts, steps, spec);
 
-  const target = await prepareQaTarget(ctx, { base: values.base || null });
-  const before = porcelain(target.root);
+  const target = await prepareTarget(ctx, { base: values.base || null });
+  const before = statusPorcelain(target.root);
   const tool = opts.tool || detectTool();
   const session = resolveSession(target.state, values.session || null);
   const ledgerFile = allocateLedgerPath(target.state, target.snapshot.tree);
   const ledgerRef = relPosix(target.root, ledgerFile) || toPosix(ledgerFile);
+  // The scratch folder next_steps names for review answers must exist before the model writes there.
+  ensureDir(artifactsDir(ledgerFile));
   const s = {
-    ctx, values, opts, target, spec, specPaths: spec ? specPaths(spec.text) : null, detectResult: null, detectOk: false,
-    detectError: null, ledgerFile, ledgerRef, traceMatrix: null,
+    ctx, values, opts, target, spec, specPaths: spec ? specPaths(spec.text) : null, detectResult: null,
+    ledgerFile, ledgerRef, traceMatrix: null,
   };
   const checks = [];
   s.fired = () => [...new Set(checks.filter((c) => c.status === 'fail' || c.status === 'finding').map((c) => String(c.id).toUpperCase()))];
   const stepLog = [];
-  for (const step0 of steps) {
-    const step = step0.kind === 'trace' && !step0.after ? { ...step0, after: storeTrace } : step0;
+  for (const step of steps) {
     const { checks: got, log } = await runStep(step, s);
     checks.push(...got);
     stepLog.push(log);
@@ -292,8 +261,8 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
     pending: true, data: { step: 'review', dispatch: REVIEW_DISPATCH[tool] || REVIEW_DISPATCH.unknown },
   });
 
-  const projects = s.detectResult && Array.isArray(s.detectResult.projects) ? s.detectResult.projects : [];
-  const globs = projects.flatMap((p) => (p && Array.isArray(p.test_globs) ? p.test_globs : []));
+  const projects = s.detectResult?.projects || [];
+  const globs = projects.flatMap((p) => toArray(p?.test_globs));
   const summaryText = s.detectResult ? (s.detectResult.summary || projects.map((p) => p.root).join(', ')) : null;
   await initLedger({
     target, tool, spec: spec ? spec.ref : null, specText: spec ? spec.text : null, sessionId: session, mode: 'verify', file: ledgerFile,
@@ -307,19 +276,19 @@ export async function runVerify(ctx, values = {}, { steps = DEFAULT_STEPS } = {}
   if (opts.finalize) {
     try {
       // The CLI's staleness rule (§7.5): finalize compares against a freshly computed snapshot.
-      const fresh = { ...target, snapshot: createQaSnapshot(target.root, { exclude: snapshotExcludes(target.state) }) };
+      const fresh = { ...target, snapshot: createSnapshot(target.root, { exclude: snapshotExcludes(target.state) }) };
       await finalizeLedger(ledgerFile, { target: fresh });
     } catch (err) {
       if (!(err instanceof AdcError)) throw err;
       finalizeError = { code: err.code, message: err.message };
     }
   }
-  const after = porcelain(target.root);
+  const after = statusPorcelain(target.root);
   const porcelainChanged = before != null && after != null && before !== after;
   const ledger = readLedgerFile(ledgerFile);
   const derived = deriveVerdict(ledger);
   const durationMs = Date.now() - started;
-  try { appendMetrics(target.state.dir, metricsFor(ledger, { duration_ms: durationMs, finalized: Boolean(ledger.finalized_at) })); } catch {}
+  try { appendMetrics(target.state.dir, metricsFor(ledger, { duration_ms: durationMs, finalized: Boolean(ledger.finalized_at) }, derived)); } catch {}
 
   const rows = checkRows(derived).map((r) => ({
     id: r.id, project: r.project, status: r.effective, ...(r.status !== r.effective ? { recorded_status: r.status } : {}),

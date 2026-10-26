@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as state from '../../skills/agentic-developer-companion/scripts/lib/state.mjs';
 import { parseToml } from '../../skills/agentic-developer-companion/scripts/lib/formats.mjs';
+import { scanSecrets } from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
+import { parseReport } from '../../skills/agentic-developer-companion/scripts/lib/reports.mjs';
+import * as cr from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
 import {
   detect, isTestFile, projectForFile, RUNNERS, DEFAULT_TEST_GLOBS, detectCommand, parseMakeTargets, normalizeGlob, portableArg,
 } from '../../skills/agentic-developer-companion/scripts/lib/detect.mjs';
@@ -136,11 +139,10 @@ test('RUNNERS catalog: every runner has a report, retries-off and globs; node-te
 });
 
 test('splitShell (the tokenizer detect uses): quotes, operators, redirections, continuations, CRLF', () => {
-  const tokenizeShell = core.splitShell;
-  const segs = tokenizeShell("FOO='a b' jest --ci && echo \"x \\\"y\\\"\" 2>&1 | tee log.txt; npm run test:unit > out.txt\r\nnode --test 'test/**'");
+  const segs = core.splitShell("FOO='a b' jest --ci && echo \"x \\\"y\\\"\" 2>&1 | tee log.txt; npm run test:unit > out.txt\r\nnode --test 'test/**'");
   assert.deepEqual(segs.map((s) => s.tokens), [['FOO=a b', 'jest', '--ci'], ['echo', 'x "y"'], ['tee', 'log.txt'], ['npm', 'run', 'test:unit'], ['node', '--test', 'test/**']]);
-  assert.deepEqual(tokenizeShell('pytest \\\n  -q tests').map((s) => s.tokens), [['pytest', '-q', 'tests']]);
-  assert.deepEqual(tokenizeShell('(cd web && npm test)').map((s) => s.tokens), [['cd', 'web'], ['npm', 'test']]);
+  assert.deepEqual(core.splitShell('pytest \\\n  -q tests').map((s) => s.tokens), [['pytest', '-q', 'tests']]);
+  assert.deepEqual(core.splitShell('(cd web && npm test)').map((s) => s.tokens), [['cd', 'web'], ['npm', 'test']]);
 });
 
 test('portableArg quotes for sh and cmd.exe alike', () => {
@@ -148,6 +150,10 @@ test('portableArg quotes for sh and cmd.exe alike', () => {
   assert.deepEqual(portableArg('test/**/*.mjs'), { text: '"test/**/*.mjs"', portable: true });
   assert.equal(portableArg('$HOME').portable, false);
   assert.equal(portableArg('50%').portable, false);
+  // sh turns `\\` into `\` inside double quotes, and a trailing `\` escapes the closing quote.
+  assert.equal(portableArg('src\\unit tests').portable, true);
+  assert.equal(portableArg('a\\\\b c').portable, false);
+  assert.equal(portableArg('dir with space\\').portable, false);
 });
 
 test('lenient parseToml (detect reads manifests with it): tables, arrays of tables, inline tables, CRLF, bad lines', () => {
@@ -271,11 +277,9 @@ test('malformed inputs never break detection: bad JSON, BOM, CRLF, unparseable Y
   } finally { cleanup(dir); }
 });
 
-test('own source files carry no secret-shaped literals', async (t) => {
-  const markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs').catch(() => null);
-  if (!markers || typeof markers.scanSecrets !== 'function') { t.skip('markers.mjs not available in this build'); return; }
+test('own source files carry no secret-shaped literals', () => {
   const files = [path.join(core.SKILL_DIR, 'scripts', 'lib', 'detect.mjs'), fileURLToPath(import.meta.url), path.join(FIX, '_parts', 'detect.json')];
-  for (const f of files) assert.deepEqual(markers.scanSecrets(fs.readFileSync(f, 'utf8')).map((h) => `${h.id}:${h.line}`), [], f);
+  for (const f of files) assert.deepEqual(scanSecrets(fs.readFileSync(f, 'utf8')).map((h) => `${h.id}:${h.line}`), [], f);
 });
 
 test('secrets in CI commands and the live token never reach the result or detect.json', async () => {
@@ -315,6 +319,18 @@ test('a cd line in a CI script moves the commands after it; the workspace variab
     assert.deepEqual(res.ci.steps.map((s) => [s.cmd, s.cwd, s.project, s.line]), [['npm test', 'frontend', 'frontend', 9],
       ['go test ./...', '.', '.', 11], ['npm test -- --ci', 'frontend', 'frontend', 15]]);
     assert.deepEqual(res.projects.map((p) => [p.root, p.runners.map((r) => r.name)]), [['.', ['go']], ['frontend', ['vitest']]]);
+  } finally { cleanup(dir); }
+});
+
+test('a numeric CI working directory (a YAML 1.2 number) still names the folder', async () => {
+  const dir = writeFiles(tmpDir(), {
+    '.github/workflows/ci.yml': 'on: push\njobs:\n  t:\n    runs-on: x\n    defaults:\n      run:\n        working-directory: 2024\n'
+      + '    steps:\n      - run: npm test\n',
+    '2024/package.json': { scripts: { test: 'vitest' }, devDependencies: { vitest: '2' } },
+  });
+  try {
+    const res = await detect({ root: dir, platform: 'linux', which: () => true, env: {} });
+    assert.deepEqual(res.ci.steps.map((s) => [s.cmd, s.cwd, s.project, s.line]), [['npm test', '2024', '2024', 9]]);
   } finally { cleanup(dir); }
 });
 
@@ -450,18 +466,13 @@ test('real run: the node-test runner with the report flag before its paths write
     assert.equal(run.exit, 0, run.stderr || run.stdout);
     const xml = fs.readFileSync(report, 'utf8');
     assert.match(xml, /<testcase[^>]*name="adds"/);
-    const reports = await import('../../skills/agentic-developer-companion/scripts/lib/reports.mjs').catch(() => null);
-    if (reports && typeof reports.parseReport === 'function') {
-      const counts = reports.parseReport(r.report.format, xml);
-      assert.equal(counts.passed, 1);
-      assert.equal(counts.skipped, 1);
-    }
+    const counts = parseReport(r.report.format, xml);
+    assert.equal(counts.passed, 1);
+    assert.equal(counts.skipped, 1);
   } finally { cleanup(dir); }
 });
 
-test('clean-run compatibility: every detected runner builds a command with its report target resolved', async (t) => {
-  const cr = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs').catch(() => null);
-  if (!cr || typeof cr.resolveRunner !== 'function' || typeof cr.buildRunCommand !== 'function') { t.skip('clean-run.mjs not available in this build'); return; }
+test('clean-run compatibility: every detected runner builds a command with its report target resolved', async () => {
   const out = tmpDir();
   try {
     for (const c of fixture.cases) {

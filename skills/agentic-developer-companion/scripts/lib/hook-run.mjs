@@ -2,38 +2,40 @@
 // returns one decision object; adc.mjs prints it exactly once and exits 0 (2 s watchdog).
 // Performance contract: no git (except one `git ls-files` for the tracked-state check in
 // session-start and before `git commit`/`git push` in the guard), no filesystem scans, no
-// network; it reads `.adc/detect.json`, the newest ledger and the session file only.
+// network; it reads `.adc/detect.json`, the newest ledger and the session file only, and
+// imports only core, state, hook-dialects, markers and reports.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import {
-  SKILL_DIR, ensureDir, globToRegExp, matchAny, nowIso, readJson, readText, redactLiterals, relPosix, run, sha256, tmpRoot, toPosix,
-  truncate, writeJsonAtomic,
+  SKILL_DIR, globToRegExp, hostFromEnv, isAbsolutePath, nowIso, readJson, realPath, redactLiveToken, relPosix, sha256,
+  splitShell, tmpRoot, toPosix, truncate, writeJsonAtomic,
 } from './core.mjs';
-import { STATE_DIR_NAME, hookLog, readSession, setOwnerOnly, statePaths, updateSession } from './state.mjs';
 import {
-  HOOK_EVENTS, detectDialect, extractContent, extractPaths, extractPatterns, formatOutput, normalizePayload,
+  STATE_DIR_NAME, createStateDir, ensureExcluded, hookLog, listLedgers, locateRepo, readSession, resolveStateDir,
+  statePaths, trackedStateFiles, updateSession,
+} from './state.mjs';
+import * as M from './markers.mjs';
+import { parseSummaryText } from './reports.mjs';
+import {
+  HOOK_EVENTS, LEVELS, detectDialect, extractContent, extractPaths, extractPatterns, formatOutput, normalizePayload,
   parsePatch, shellCommand,
 } from './hook-dialects.mjs';
 
-export const LEVELS = Object.freeze(['advise', 'gate', 'guard']);
 const STDIN_TIMEOUT_MS = 1200;
 const STDIN_MAX_BYTES = 16 * 1024 * 1024;
 const BRIEF_LIMIT = 1500;
 const MAX_CONSECUTIVE_BLOCKS = 7; // hosts end the turn at 8 consecutive stop blocks
 const KEEP = 50;
 const TRACKED_TTL_MS = 12 * 60 * 60 * 1000;
-const SCRIPT = `${toPosix(SKILL_DIR)}/scripts/adc.mjs`;
-const ADC_CMD = `node "${SCRIPT}"`;
+const ADC_CMD = `node "${toPosix(SKILL_DIR)}/scripts/adc.mjs"`;
 const debugOn = (env) => env.ADC_DEBUG === '1' || env.ADC_DEBUG === 'true';
-// Built from parts so the skill tree carries no `NAME=value`-shaped token literal.
-const TOKEN_REDACTED = ['ADC_LIVE_TOKEN', '[REDACTED]'].join('=');
 
 // ---------------------------------------------------------------------------
 // stdin
 
-/** Read stdin to the end (or until the timeout); a TTY counts as empty. Never throws. */
+/** Read stdin to the end (or until the timeout); a TTY counts as empty, overflow is null. Never throws. */
 export function readStdin({ timeoutMs = STDIN_TIMEOUT_MS, maxBytes = STDIN_MAX_BYTES, stream = process.stdin } = {}) {
   return new Promise((resolve) => {
     if (!stream || stream.isTTY) { resolve(Buffer.alloc(0)); return; }
@@ -52,8 +54,7 @@ export function readStdin({ timeoutMs = STDIN_TIMEOUT_MS, maxBytes = STDIN_MAX_B
     try {
       stream.on('data', (c) => {
         size += c.length;
-        if (size > maxBytes) { finish(true); return; }
-        chunks.push(c);
+        if (size > maxBytes) finish(true); else chunks.push(c);
       });
       stream.on('end', () => finish(false));
       stream.on('error', () => finish(false));
@@ -66,11 +67,7 @@ export function readStdin({ timeoutMs = STDIN_TIMEOUT_MS, maxBytes = STDIN_MAX_B
 export function decodeStdin(buf) {
   if (!buf || !buf.length) return '';
   if (buf[0] === 0xff && buf[1] === 0xfe) return buf.subarray(2).toString('utf16le');
-  if (buf[0] === 0xfe && buf[1] === 0xff) {
-    const swapped = Buffer.from(buf.subarray(2));
-    swapped.swap16();
-    return swapped.toString('utf16le');
-  }
+  if (buf[0] === 0xfe && buf[1] === 0xff) return Buffer.from(buf.subarray(2)).swap16().toString('utf16le');
   const text = buf.toString('utf8');
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
@@ -85,468 +82,192 @@ export function parsePayload(text) {
   try {
     const v = JSON.parse(t);
     if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
-    return PAYLOAD_KEYS.some((k) => Object.prototype.hasOwnProperty.call(v, k)) ? v : null;
+    return PAYLOAD_KEYS.some((k) => Object.hasOwn(v, k)) ? v : null;
   } catch {
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Repository and state, without git
+// State, without git
 
-/** Walk up from `start` to the first directory holding `.git` (dir or worktree/submodule file). */
-export function findRepo(start) {
-  if (!start || typeof start !== 'string') return null;
-  let dir;
-  try { dir = path.resolve(start); } catch { return null; }
-  try { if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir); } catch { return null; }
-  for (let i = 0; i < 64; i++) {
-    const dotgit = path.join(dir, '.git');
-    let st = null;
-    try { st = fs.statSync(dotgit); } catch {}
-    if (st) {
-      let gitDir = dotgit;
-      if (st.isFile()) {
-        const m = /^gitdir:\s*(.+?)\s*$/m.exec(readText(dotgit, '') || '');
-        if (!m) return null;
-        gitDir = path.resolve(dir, m[1]);
-      }
-      let commonDir = gitDir;
-      const common = readText(path.join(gitDir, 'commondir'));
-      if (common && common.trim()) commonDir = path.resolve(gitDir, common.trim());
-      return { root: canonical(dir), gitDir, commonDir };
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-  return null;
-}
-
-/** State dir for a hook: --state-dir > ADC_HOME > <root>/.adc (same order as state.resolveStateDir). */
+/** State dir for a hook (--state-dir > ADC_HOME > <root>/.adc) with its symlink-resolved form and paths. */
 export function hookStateInfo(repo, { stateDir = null, env = process.env } = {}) {
-  let dir;
-  if (stateDir) dir = path.resolve(repo.root, stateDir);
-  else if (env.ADC_HOME) dir = path.resolve(env.ADC_HOME);
-  else dir = path.join(repo.root, STATE_DIR_NAME);
-  const rel = relPosix(repo.root, dir);
-  const insideRepo = Boolean(rel && rel !== '.');
-  return { dir, canonicalDir: canonical(dir), rel: insideRepo ? rel : null, insideRepo, paths: statePaths(dir), ready: null };
+  const info = resolveStateDir({ root: repo.root, stateDirOption: stateDir, env });
+  return { ...info, canonicalDir: realPath(info.dir), paths: statePaths(info.dir), ready: null };
 }
 
 /**
  * Make the state dir usable: the exclude entry first (git-free: <common git dir>/info/exclude,
- * the file `git rev-parse --git-path info/exclude` names), then the directory. False when either
- * cannot be written, in which case the hook records nothing.
+ * the file `git rev-parse --git-path info/exclude` names), then the owner-only directory. False
+ * when either cannot be written, in which case the hook records nothing.
  */
 export function ensureHookState(info, repo) {
-  if (info.ready != null) return info.ready;
-  info.ready = false;
-  try {
-    if (info.insideRepo) {
-      const exclude = path.join(repo.commonDir, 'info', 'exclude');
-      const current = readText(exclude, '') || '';
-      const lines = current.split(/\r?\n/).map((l) => l.trim());
-      const entry = `/${info.rel}/`;
-      if (!lines.includes(entry) && !lines.includes(`/${info.rel}`) && !lines.includes(`${info.rel}/`)) {
-        ensureDir(path.dirname(exclude));
-        const sep = current && !current.endsWith('\n') ? '\n' : '';
-        fs.appendFileSync(exclude, `${sep}# agentic-developer-companion state (never commit)\n${entry}\n`);
-      }
+  if (info.ready == null) {
+    try {
+      const excludeFile = path.join(repo.commonDir, 'info', 'exclude');
+      info.ready = ensureExcluded(info, { excludeFile }).ok && createStateDir(info);
+    } catch {
+      info.ready = false;
     }
-    if (!fs.existsSync(info.dir)) {
-      ensureDir(info.dir, 0o700);
-      setOwnerOnly(info.dir, { dir: true });
-    }
-    info.ready = fs.statSync(info.dir).isDirectory();
-  } catch {
-    info.ready = false;
   }
   return info.ready;
 }
+
+const trackedCacheFile = (repo) => path.join(tmpRoot(repo.root), 'state-tracked.json');
 
 /**
  * Files under the state dir that git tracks (one `git ls-files`); null when git cannot tell.
  * The answer is cached outside the repository (OS temp dir) so the other hooks can honor it
  * without running git: while the state dir is tracked they print `{}` and write nothing.
  */
-export function trackedState(info, repo) {
-  if (!info.insideRepo) return [];
-  const res = run('git', ['ls-files', '-z', '--', `:(top)${info.rel}`], { cwd: repo.root, timeoutMs: 1500 });
-  if (res.exit !== 0) return null;
-  const files = res.stdout.split('\0').filter(Boolean);
-  try { writeJsonAtomic(trackedCacheFile(repo), { root: toPosix(repo.root), rel: info.rel, tracked: files.length, ts: nowIso() }); } catch {}
+function trackedState(info, repo) {
+  const files = trackedStateFiles(info, { timeoutMs: 1500, strict: true });
+  if (files && info.insideRepo) {
+    const record = { root: toPosix(repo.root), rel: info.rel, tracked: files.length, ts: nowIso() };
+    try { writeJsonAtomic(trackedCacheFile(repo), record); } catch {}
+  }
   return files;
 }
 
-const trackedCacheFile = (repo) => path.join(tmpRoot(repo.root), 'state-tracked.json');
-
 /** The cached tracked-state answer from the last session-start or guard check (no git). */
-export function trackedCached(repo) {
+function trackedCached(repo) {
   const c = readJson(trackedCacheFile(repo), null);
   if (!c || typeof c.tracked !== 'number' || Date.now() - (Date.parse(c.ts) || 0) > TRACKED_TTL_MS) return false;
   return c.tracked > 0;
 }
 
-// ---------------------------------------------------------------------------
-// Optional modules from other work packages (markers.mjs, reports.mjs), with fallbacks
-
-const FALLBACK = {
-  SKIP_MARKERS: [
-    { id: 'focus-or-skip-call', re: /\b(?:it|test|describe|context|suite|specify)\.(?:only|skip|todo)\s*\(/ },
-    { id: 'x-or-f-prefixed-test', re: /(?:^|[^\w.$])(?:xit|xdescribe|xtest|xcontext|fit|fdescribe|fcontext)\s*\(/ },
-    { id: 'pytest-skip', re: /@pytest\.mark\.(?:skip|skipif|xfail)\b|\bpytest\.(?:skip|xfail)\s*\(/ },
-    { id: 'unittest-skip', re: /@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b/ },
-    { id: 'go-skip', re: /\bt\.Skip(?:Now|f)?\s*\(/ },
-    { id: 'rust-ignore', re: /#\[ignore(?:\s*=\s*"[^"]*")?\]/ },
-    { id: 'junit-disabled', re: /@(?:Disabled|Ignore)\b/ },
-    { id: 'dotnet-skip', re: /\[(?:Fact|Theory)\s*\([^)]*\bSkip\s*=|\[Ignore\b/ },
-    { id: 'rspec-skip', re: /^\s*(?:xit|xdescribe|xcontext|skip|pending)\b/m },
-  ],
-  SUPPRESSIONS: [
-    { id: 'eslint-disable', re: /eslint-disable(?:-next-line|-line)?\b/ },
-    { id: 'ts-ignore', re: /@ts-(?:ignore|nocheck|expect-error)\b/ },
-    { id: 'noqa', re: /#\s*noqa\b/i },
-    { id: 'type-ignore', re: /#\s*type:\s*ignore\b/ },
-    { id: 'pylint-disable', re: /#\s*pylint:\s*disable\b/ },
-    { id: 'nolint', re: /\/\/\s*nolint\b/ },
-    { id: 'rust-allow', re: /#!?\[allow\(/ },
-    { id: 'suppress-warnings', re: /@SuppressWarnings\b|#pragma\s+warning\s+disable\b/ },
-    { id: 'rubocop-disable', re: /rubocop:disable\b/ },
-    { id: 'coverage-ignore', re: /\b(?:istanbul|c8|v8)\s+ignore\b|\bpragma:\s*no\s+cover\b/ },
-    { id: 'nosonar', re: /\bNOSONAR\b/ },
-    { id: 'biome-ignore', re: /\bbiome-ignore\b/ },
-  ],
-  SWALLOW_PATTERNS: [
-    { id: 'empty-catch', re: /catch\s*(?:\([^)]*\))?\s*\{\s*\}/ },
-    { id: 'except-pass', re: /except(?:\s+[^:\n]+)?:\s*(?:\r?\n\s*)?pass\b/ },
-    { id: 'promise-catch-noop', re: /\.catch\(\s*\(?\s*\w*\s*\)?\s*=>\s*(?:\{\s*\}|null|undefined)\s*\)/ },
-    { id: 'go-empty-err', re: /if\s+err\s*!=\s*nil\s*\{\s*\}/ },
-  ],
-  CI_WEAKENING: [
-    { id: 'continue-on-error', re: /continue-on-error:\s*true\b/ },
-    { id: 'or-true', re: /\|\|\s*(?:true|exit\s+0|:)\s*$/m },
-    { id: 'pass-with-no-tests', re: /--passWithNoTests\b/ },
-    { id: 'allow-failure', re: /allow_failure:\s*true\b/ },
-  ],
-  IN_SOURCE_RETRIES: [
-    { id: 'jest-retry-times', re: /\bjest\.retryTimes\s*\(/ },
-    { id: 'pytest-flaky', re: /@pytest\.mark\.flaky\b|@flaky\b/ },
-    { id: 'retries-config', re: /\bretries\s*[:=]\s*[1-9]/ },
-    { id: 'mocha-retries', re: /\bthis\.retries\s*\(\s*[1-9]/ },
-    { id: 'junit-retry', re: /@(?:RepeatedTest|RetryingTest|Retry)\b|rerunFailingTestsCount/ },
-  ],
-};
-
-const FALLBACK_SECRETS = [
-  { id: 'aws-access-key-id', re: new RegExp('\\b(?:' + ['AK', 'AS'].map((p) => p + 'IA').join('|') + ')[0-9A-Z]{16}\\b') },
-  { id: 'github-token', re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/ },
-  { id: 'private-key', re: new RegExp(['-----BEGIN', '[A-Z ]*PRIVATE', 'KEY-----'].join(' ')) },
-  { id: 'slack-token', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/ },
-  { id: 'assigned-secret', re: /(?:api[_-]?key|secret|token|passw(?:or)?d)["']?\s*[:=]\s*["'][^"'\s]{16,}["']/i },
-];
-
-function fallbackClassify(file) {
-  const f = toPosix(file).replace(/^\.\//, '');
-  const lower = f.toLowerCase();
-  const base = lower.split('/').pop();
-  return {
-    test: /(^|\/)(__tests__|tests?|spec|specs|e2e)\//.test(lower) || /\.(test|spec|e2e)\.[a-z0-9]+$/.test(base) ||
-      /^test_.*\.py$/.test(base) || /_test\.(py|go|rb|exs)$/.test(base) || /_spec\.rb$/.test(base) ||
-      /tests?\.(cs|java|kt|swift)$/.test(base) || base === 'conftest.py',
-    runnerConfig: /^(jest|vitest|playwright|cypress|karma|ava|wdio|mocha)\.config\.[a-z0-9.]+$/.test(base) ||
-      /^\.mocharc(\.[a-z]+)?$/.test(base) || ['pytest.ini', 'tox.ini', 'setup.cfg', 'conftest.py', 'noxfile.py', '.nycrc', '.c8rc'].includes(base) ||
-      /\.runsettings$/.test(base) || base === 'phpunit.xml',
-    ci: /^\.github\/workflows\/[^/]+\.ya?ml$/.test(lower) || /(^|\/)\.gitlab-ci\.ya?ml$/.test(lower) ||
-      /(^|\/)azure-pipelines\.ya?ml$/.test(lower) || /^\.circleci\//.test(lower) || base === 'jenkinsfile' || /^\.buildkite\//.test(lower),
-    lockfile: ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb', 'poetry.lock',
-      'uv.lock', 'pipfile.lock', 'pdm.lock', 'cargo.lock', 'go.sum', 'gemfile.lock', 'composer.lock', 'packages.lock.json', 'gradle.lockfile'].includes(base),
-    lintConfig: /^\.eslintrc(\.[a-z]+)?$/.test(base) || /^eslint\.config\.[a-z]+$/.test(base) || /^\.prettierrc/.test(base) ||
-      /^tsconfig.*\.json$/.test(base) || ['ruff.toml', '.ruff.toml', '.flake8', 'mypy.ini', '.pylintrc', '.golangci.yml', '.golangci.yaml',
-        'clippy.toml', '.rubocop.yml', 'biome.json', '.stylelintrc', '.editorconfig'].includes(base),
-    manifest: ['package.json', 'pyproject.toml', 'cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gemfile',
-      'setup.py', 'makefile', 'justfile', 'pipfile'].includes(base) || /\.csproj$/.test(base) || /^requirements.*\.txt$/.test(base),
-    generated: /(^|\/)(dist|build|out|coverage|node_modules|vendor)\//.test(lower) || /\.min\.(js|css)$/.test(base) ||
-      /\.generated\./.test(base) || /_pb2\.py$/.test(base) || /\.pb\.go$/.test(base),
-  };
-}
-
-// Source files whose comments and code the marker catalogs are written for (markers.isCodeFile fallback).
-const FALLBACK_CODE_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte|py|pyi|go|rs|java|kt|kts|scala|groovy|cs|fs|vb|rb|rake|php|swift|dart|c|cc|cpp|cxx|h|hpp|m|mm|sh|bash|zsh|ps1|psm1|lua|ex|exs)$/i;
-
-let markersCache;
-async function loadMarkers() {
-  if (markersCache !== undefined) return markersCache;
-  const m = { classifyPath: fallbackClassify, scanSecrets: null, scanText: null, isCodeFile: (f) => FALLBACK_CODE_FILE.test(f), source: 'fallback', ...FALLBACK };
-  try {
-    const mod = await import('./markers.mjs');
-    if (typeof mod.classifyPath === 'function') m.classifyPath = mod.classifyPath;
-    if (typeof mod.scanSecrets === 'function') m.scanSecrets = mod.scanSecrets;
-    if (typeof mod.scanText === 'function') m.scanText = mod.scanText;
-    if (typeof mod.isCodeFile === 'function') m.isCodeFile = mod.isCodeFile;
-    for (const k of Object.keys(FALLBACK)) if (Array.isArray(mod[k]) && mod[k].length) m[k] = mod[k];
-    m.source = 'markers.mjs';
-  } catch {}
-  markersCache = m;
-  return m;
-}
-
-let summaryCache;
-async function loadSummaryParser() {
-  if (summaryCache !== undefined) return summaryCache;
-  summaryCache = { parse: fallbackSummary, source: 'fallback' };
-  try {
-    const mod = await import('./reports.mjs');
-    if (typeof mod.parseSummaryText === 'function') summaryCache = { parse: mod.parseSummaryText, source: 'reports.mjs' };
-  } catch {}
-  return summaryCache;
-}
-
-/** Runner summary lines in tool output → `{runner, passed, failed, skipped}` or null (fallback parser). */
-export function fallbackSummary(text) {
-  const s = String(text || '').replace(/\x1b\[[0-9;]*m/g, '');
-  if (!s) return null;
-  const lines = s.split(/\r?\n/);
-  const num = (re, line) => { const m = re.exec(line); return m ? Number(m[1]) : 0; };
-  let found = null;
-  const set = (runner, passed, failed, skipped) => { found = { runner, passed, failed, skipped }; };
-  for (const line of lines) {
-    const l = line.trim();
-    if (/^Tests:\s+.*\d+ total/.test(l)) set('jest', num(/(\d+) passed/, l), num(/(\d+) failed/, l), num(/(\d+) (?:skipped|todo)/, l));
-    else if (/^Tests\s+.*\(\d+\)/.test(l)) set('vitest', num(/(\d+) passed/, l), num(/(\d+) failed/, l), num(/(\d+) (?:skipped|todo)/, l));
-    else if (/^=+ .*\b(passed|failed|error|errors|skipped|no tests ran)\b.* in [\d.]+s/.test(l)) {
-      set('pytest', num(/(\d+) passed/, l), num(/(\d+) failed/, l) + num(/(\d+) errors?/, l), num(/(\d+) skipped/, l));
-    } else if (/^test result: (ok|FAILED)\./.test(l)) {
-      const prev = found && found.runner === 'cargo' ? found : { passed: 0, failed: 0, skipped: 0 };
-      set('cargo', prev.passed + num(/(\d+) passed/, l), prev.failed + num(/(\d+) failed/, l), prev.skipped + num(/(\d+) ignored/, l));
-    } else if (/^(?:Passed|Failed)!\s+-\s+Failed:/.test(l)) set('dotnet', num(/Passed:\s*(\d+)/, l), num(/Failed:\s*(\d+)/, l), num(/Skipped:\s*(\d+)/, l));
-    else if (/^\d+ examples?, \d+ failures?/.test(l)) {
-      const total = num(/^(\d+) examples?/, l); const failed = num(/(\d+) failures?/, l); const pending = num(/(\d+) pending/, l);
-      set('rspec', Math.max(0, total - failed - pending), failed, pending);
-    } else if (/^Tests run: \d+, Failures: \d+, Errors: \d+, Skipped: \d+$/.test(l)) {
-      const total = num(/Tests run: (\d+)/, l); const failed = num(/Failures: (\d+)/, l) + num(/Errors: (\d+)/, l); const skipped = num(/Skipped: (\d+)/, l);
-      set('surefire', Math.max(0, total - failed - skipped), failed, skipped);
-    } else if (/^(?:#|ℹ) (pass|fail|skipped) \d+$/.test(l)) {
-      const prev = found && found.runner === 'node-test' ? found : { passed: 0, failed: 0, skipped: 0 };
-      const n = num(/(\d+)$/, l);
-      if (/ pass /.test(l)) set('node-test', n, prev.failed, prev.skipped);
-      else if (/ fail /.test(l)) set('node-test', prev.passed, n, prev.skipped);
-      else set('node-test', prev.passed, prev.failed, n);
-    } else if (/^\d+ passing\b/.test(l)) set('mocha', num(/^(\d+) passing/, l), 0, 0);
-    else if (/^\d+ failing\b/.test(l) && found && found.runner === 'mocha') found.failed = num(/^(\d+) failing/, l);
-    else if (/^\d+ pending\b/.test(l) && found && found.runner === 'mocha') found.skipped = num(/^(\d+) pending/, l);
-    else if (/^\d+ (passed|failed|flaky|skipped)\b/.test(l) && /\(\d/.test(l)) {
-      const prev = found && found.runner === 'playwright' ? found : { passed: 0, failed: 0, skipped: 0 };
-      set('playwright', /passed/.test(l) ? num(/^(\d+)/, l) : prev.passed, /failed/.test(l) ? num(/^(\d+)/, l) : prev.failed, /skipped/.test(l) ? num(/^(\d+)/, l) : prev.skipped);
-    } else if (/^(ok|FAIL)\s+\S+\s+(?:[\d.]+s|\(cached\))/.test(l) || /^--- (PASS|FAIL|SKIP):/.test(l)) {
-      const prev = found && found.runner === 'go' ? found : { passed: 0, failed: 0, skipped: 0 };
-      if (/^--- PASS/.test(l) || /^ok\s/.test(l)) set('go', prev.passed + 1, prev.failed, prev.skipped);
-      else if (/^--- SKIP/.test(l)) set('go', prev.passed, prev.failed, prev.skipped + 1);
-      else set('go', prev.passed, prev.failed + 1, prev.skipped);
-    }
-  }
-  return found;
+/** The newest evidence ledger among the 5 most recently written: `{file, verdict, ts, finalized}` or null. */
+export function newestLedger(evidenceDir) {
+  const r = listLedgers(null, { evidenceDir, max: 5 })[0];
+  return r ? { file: r.name, verdict: r.verdict, ts: r.created_at, finalized: r.finalized } : null;
 }
 
 // ---------------------------------------------------------------------------
-// Scanning helpers
+// Classification and scanning (markers.mjs)
+
+/** Path classes; `test` also from the cached detect.json test globs (markers.isTestFile). */
+function classify(rel, detect) {
+  const c = M.classifyPath(rel);
+  return { ...c, test: c.test || M.isTestFile(rel, detect, { heuristic: false }) };
+}
+
+const CLASS_LABEL = { test: 'test file', runnerConfig: 'runner config', ci: 'CI', lockfile: 'lockfile',
+  lintConfig: 'lint/type config', manifest: 'manifest', generated: 'generated' };
+const classNames = (c) => Object.keys(CLASS_LABEL).filter((k) => c[k]);
 
 /** Line `n` (1-based) of the scanned text in the edited file; null where a patch hunk gives no number. */
-const mapLine = (lineMap, n) => (lineMap ? (n - 1 < lineMap.length ? lineMap[n - 1] ?? null : null) : n);
+const mapLine = (lineMap, n) => (lineMap ? lineMap[n - 1] ?? null : n);
 
 /**
- * Run `{id, re}` catalog entries over text; returns `[{id, line, text}]` (line numbers 1-based).
- * The built-in fallback for when markers.mjs is absent: it ignores `langs`, `code` and `next`.
+ * Catalog hits in edited text. markers.scanText honors each entry's `langs` (by the file name),
+ * masks comments for `code` entries and checks `next` for multi-line constructs, so a
+ * commented-out `it.only`, a Python `# noqa` regex on a JS file or a catch block with a body
+ * produce no note. `lineMap` maps scanned lines to file lines (patch hunks).
  */
-export function scanCatalog(text, catalog, lineMap = null) {
-  const hits = [];
-  if (!text || !Array.isArray(catalog)) return hits;
-  const starts = [0];
-  for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1);
-  const lineAt = (idx) => {
-    let lo = 0; let hi = starts.length - 1;
-    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= idx) lo = mid; else hi = mid - 1; }
-    return lo;
-  };
-  for (const entry of catalog) {
-    if (!entry) continue;
-    let re = entry.re;
-    if (typeof re === 'string') { try { re = new RegExp(re); } catch { continue; } }
-    if (!(re instanceof RegExp)) continue;
-    const flags = new Set(re.flags.split(''));
-    flags.add('g'); flags.add('m');
-    let g;
-    try { g = new RegExp(re.source, [...flags].join('')); } catch { continue; }
-    let m;
-    let guard = 0;
-    while ((m = g.exec(text)) && guard++ < 50) {
-      const idx = lineAt(m.index);
-      const lineText = text.slice(starts[idx], idx + 1 < starts.length ? starts[idx + 1] - 1 : text.length);
-      hits.push({ id: entry.id || 'marker', line: mapLine(lineMap, idx + 1), text: truncate(lineText.trim(), 80) });
-      if (m[0] === '') g.lastIndex++;
-    }
-  }
-  const seen = new Set();
-  return hits.filter((h) => { const k = `${h.id}:${h.line}`; if (seen.has(k)) return false; seen.add(k); return true; });
-}
-
-/**
- * Scan with markers.mjs `scanText` when it is loaded: it honors each entry's `langs` (by the file
- * name), masks comments for `code` entries and checks `next` for multi-line constructs, so a
- * commented-out `it.only`, a Python `# noqa` regex on a JS file or a multi-line catch block with
- * a body do not produce notes. Falls back to scanCatalog.
- */
-export function scanEdit(markers, text, catalog, file, lineMap = null) {
-  if (!text || !Array.isArray(catalog)) return [];
-  if (markers && typeof markers.scanText === 'function') {
-    try {
-      const res = markers.scanText(text, catalog, { file: file || undefined });
-      if (Array.isArray(res)) return res.map((h) => ({ id: h.id || 'marker', line: mapLine(lineMap, h.line), text: truncate(String(h.text || '').trim(), 80) }));
-    } catch {}
-  }
-  return scanCatalog(text, catalog, lineMap);
-}
-
-function scanSecretsIn(markers, text, lineMap) {
+export function scanEdit(text, catalog, file, lineMap = null) {
   if (!text) return [];
-  if (markers.scanSecrets) {
-    try {
-      const res = markers.scanSecrets(text);
-      if (Array.isArray(res)) return res.map((r) => ({ id: r.id || 'secret', line: mapLine(lineMap, r.line || 1), text: '' }));
-    } catch {}
-  }
-  return scanCatalog(text, FALLBACK_SECRETS, lineMap).map((h) => ({ ...h, text: '' }));
+  return M.scanText(text, catalog, { file: file || undefined })
+    .map((h) => ({ id: h.id, line: mapLine(lineMap, h.line), text: truncate(h.text, 80) }));
 }
+
+const secretsIn = (text, lineMap) => (text
+  ? M.scanSecrets(text).map((r) => ({ id: r.id, line: mapLine(lineMap, r.line) })) : []);
 
 const at = (x) => (x.line != null ? `at line ${x.line}` : 'in an added line');
 
-/** Classification merged with the cached detect.json test globs. */
-function classify(markers, rel, detectCache) {
-  let c;
-  try { c = markers.classifyPath(rel) || {}; } catch { c = fallbackClassify(rel); }
-  const out = { ...fallbackClassify(rel), ...c };
-  if (!out.test && detectCache) {
-    for (const p of detectCache.projects || []) {
-      const root = p && typeof p.root === 'string' ? p.root.replace(/^\.\/?/, '') : '';
-      if (root && !rel.startsWith(`${root}/`)) continue;
-      const sub = root ? rel.slice(root.length + 1) : rel;
-      if (Array.isArray(p.test_globs) && matchAny(sub, p.test_globs.filter((g) => typeof g === 'string'))) { out.test = true; break; }
-    }
-  }
-  return out;
-}
-
 // A manifest or runner-config line that is about running tests (scripts.test, addopts, test tasks).
-const TEST_COMMAND_LINE = /(?:^|[^\w-])(?:tests?|spec|jest|vitest|mocha|ava|karma|playwright|cypress|pytest|addopts|tox|nox|rspec|phpunit|nextest|ctest|check)(?:[^\w-]|$)/i;
+const TEST_COMMAND_LINE = new RegExp('(?:^|[^\\w-])(?:tests?|spec|jest|vitest|mocha|ava|karma|playwright|cypress|pytest'
+  + '|addopts|tox|nox|rspec|phpunit|nextest|ctest|check)(?:[^\\w-]|$)', 'i');
 
-const CLASS_LABEL = { test: 'test file', runnerConfig: 'runner config', ci: 'CI', lockfile: 'lockfile', lintConfig: 'lint/type config', manifest: 'manifest', generated: 'generated' };
-const classNames = (c) => Object.keys(CLASS_LABEL).filter((k) => c[k]);
-
-const isAbs = (p) => path.isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p);
-
-/** Resolve symlinks of the longest existing prefix (macOS /var -> /private/var), keep the rest. */
-function canonical(p) {
-  let cur = p;
-  const rest = [];
-  for (let i = 0; i < 64; i++) {
-    try { return path.join(fs.realpathSync.native(cur), ...rest.reverse()); } catch {}
-    const parent = path.dirname(cur);
-    if (parent === cur) return p;
-    rest.push(path.basename(cur));
-    cur = parent;
-  }
-  return p;
-}
+// ---------------------------------------------------------------------------
+// Paths and the state dir
 
 /** Absolute, symlink-resolved form of a tool path (relative paths resolve against the payload cwd). */
-function absPath(h, p) {
-  return canonical(isAbs(p) ? p : path.resolve(h.norm.cwd || h.root, p));
-}
+const absPath = (h, p) => realPath(isAbsolutePath(p) ? p : path.resolve(h.norm.cwd || h.root, p));
 
-/** Path relative to the repo root (POSIX), or null when it is outside. */
-function repoRel(h, p) {
-  if (!p) return null;
-  return relPosix(h.root, absPath(h, p));
+/** Is `abs` the state dir or inside it? (`path.relative` is case-insensitive on Windows.) */
+function inStateDir(abs, st) {
+  const r = path.relative(st.canonicalDir, abs);
+  return r === '' || (!r.startsWith('..') && !path.isAbsolute(r));
 }
 
 function underState(rel, abs, st) {
-  if (!rel && !abs) return false;
-  const names = [STATE_DIR_NAME, st.rel].filter(Boolean);
-  if (rel && names.some((n) => rel === n || rel.startsWith(`${n}/`))) return true;
-  if (abs) {
-    const r = path.relative(st.canonicalDir || st.dir, abs);
-    if (r === '' || (!r.startsWith('..') && !path.isAbsolute(r))) return true;
-  }
-  return false;
+  if (rel && [STATE_DIR_NAME, st.rel].some((n) => n && (rel === n || rel.startsWith(`${n}/`)))) return true;
+  return Boolean(abs) && inStateDir(abs, st);
 }
 
-// Case-insensitive: `.ADC/.env.live` is the same file on Windows and macOS volumes.
-const mentionsState = (token, st) => {
+/**
+ * The part of a shell token after a state dir component (`''` for the dir itself), or null when it
+ * names none. Case-insensitive: `.ADC/.env.live` is the same file on Windows and macOS volumes.
+ */
+function stateRemainder(token, st) {
+  st.nameRes ??= [STATE_DIR_NAME, st.rel].filter(Boolean)
+    .map((n) => new RegExp(`(?:^|[/=:'"])${RegExp.escape(n)}(/.*)?$`, 'i'));
   const t = toPosix(token);
-  return [STATE_DIR_NAME, st.rel].filter(Boolean).some((n) => new RegExp(`(^|[/=:'"])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(/|$)`, 'i').test(t));
-};
+  for (const re of st.nameRes) {
+    const m = re.exec(t);
+    if (m) return m[1] || '';
+  }
+  return null;
+}
+
+const mentionsState = (token, st) => stateRemainder(token, st) != null;
+
+/** Does a shell token reach `.env.live`: the name itself, or a glob under the state dir that matches it? */
+function tokenReachesEnvLive(token, st) {
+  if (/\.env\.live\b/i.test(token)) return true;
+  const rest = stateRemainder(token, st);
+  return rest != null && /[*?[]/.test(rest) && globToRegExp(rest.replace(/^\/+/, '') || '*').test('.env.live');
+}
 
 // ---------------------------------------------------------------------------
 // Shell parsing (guard and post-shell)
 
-/** Split a command line into simple commands (arrays of tokens) on `&& || ; | &` and newlines. */
-export function splitShell(cmd) {
-  const segs = [];
-  let tokens = [];
-  let cur = '';
-  let has = false;
-  let q = null;
-  const flushTok = () => { if (has) tokens.push(cur); cur = ''; has = false; };
-  const flushSeg = () => { flushTok(); if (tokens.length) segs.push(tokens); tokens = []; };
-  const s = String(cmd || '');
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (q === "'") { if (c === "'") q = null; else cur += c; continue; }
-    if (q === '"') {
-      if (c === '\\' && (s[i + 1] === '"' || s[i + 1] === '\\')) { cur += s[++i]; continue; }
-      if (c === '"') q = null; else cur += c;
-      continue;
-    }
-    if (c === "'" || c === '"') { q = c; has = true; continue; }
-    if (c === '\n' || c === '\r') { flushSeg(); continue; }
-    if (c === ' ' || c === '\t') { flushTok(); continue; }
-    if (c === ';' || c === '|' || c === '&') {
-      if (c === '&' && /\d>$/.test(cur)) { cur += c; continue; } // 2>&1
-      flushSeg();
-      if (s[i + 1] === c) i++;
-      continue;
-    }
-    cur += c; has = true;
-  }
-  flushSeg();
-  return segs;
-}
+// Backslashes are path separators in PowerShell and cmd commands (and in the Windows paths agents
+// pass to bash), so they become `/` before POSIX word splitting; escapes of whitespace, quotes,
+// `$`, backticks and backslashes keep their meaning. Redirections stay visible (`> .adc/x`).
+const shellSegments = (cmd) => splitShell(String(cmd).replace(/\\(?=[^\s"'$`\\])/g, '/'), { redirects: 'keep' })
+  .map((s) => s.tokens);
 
 const WRAPPERS = new Set(['sudo', 'command', 'exec', 'env', 'time', 'nohup', 'builtin', 'noglob', 'call']);
+const REDIRECT = /^(?:\d*|&)[<>]/;
 const exeName = (t) => toPosix(t).split('/').pop().toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/, '');
 
-/** Drop env assignments and wrappers; returns the tokens starting at the executable. */
+/** Drop env assignments, wrappers and leading redirections; the tokens starting at the executable. */
 function commandTokens(tokens) {
   let i = 0;
-  while (i < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]) || WRAPPERS.has(tokens[i]) || tokens[i] === '&')) i++;
+  for (; i < tokens.length; i++) {
+    const t = tokens[i];
+    // `2>&1` duplicates a descriptor; every other redirection operator is followed by its target.
+    if (REDIRECT.test(t)) { if (!/[<>]&[\d-]+$/.test(t)) i++; continue; }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) && !WRAPPERS.has(t)) break;
+  }
   return tokens.slice(i);
 }
+
+// The flag that introduces an inline script: sh -c / -lc / -ec, pwsh -c / -Command, cmd /c.
+const SCRIPT_FLAG = {
+  sh: /^-[a-z]*c[a-z]*$/, bash: /^-[a-z]*c[a-z]*$/, zsh: /^-[a-z]*c[a-z]*$/, dash: /^-[a-z]*c[a-z]*$/,
+  pwsh: /^-(?:c|command)$/i, powershell: /^-(?:c|command)$/i, cmd: /^\/[ck]$/i,
+};
 
 /** Every simple command, with nested `sh -c "..."` / `pwsh -Command "..."` bodies expanded. */
 function simpleCommands(cmd, depth = 0) {
   const out = [];
-  for (const seg of splitShell(cmd)) {
+  for (const seg of shellSegments(cmd)) {
     const toks = commandTokens(seg);
     if (!toks.length) continue;
     out.push(toks);
-    const exe = exeName(toks[0]);
-    if (depth < 2 && ['sh', 'bash', 'zsh', 'dash', 'pwsh', 'powershell', 'cmd'].includes(exe)) {
-      const k = toks.findIndex((t, i) => i > 0 && ['-c', '-lc', '-ic', '-Command', '-command', '-c', '/c', '/C'].includes(t));
-      if (k > 0 && toks[k + 1]) out.push(...simpleCommands(toks.slice(k + 1).join(' '), depth + 1));
-    }
+    const flag = depth < 2 ? SCRIPT_FLAG[exeName(toks[0])] : null;
+    const k = flag ? toks.findIndex((t, i) => i > 0 && flag.test(t)) : -1;
+    if (k > 0 && toks[k + 1]) out.push(...simpleCommands(toks.slice(k + 1).join(' '), depth + 1));
   }
   return out;
 }
+
+const GIT_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix',
+  '--config-env']);
 
 function gitParts(toks) {
   if (exeName(toks[0]) !== 'git') return null;
@@ -554,7 +275,7 @@ function gitParts(toks) {
   const dirs = [];
   while (i < toks.length && toks[i].startsWith('-')) {
     if (toks[i] === '-C' && toks[i + 1] != null) dirs.push(toks[i + 1]);
-    i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'].includes(toks[i]) ? 2 : 1;
+    i += GIT_VALUE_OPTS.has(toks[i]) ? 2 : 1;
   }
   return i < toks.length ? { sub: toks[i], args: toks.slice(i + 1), dirs } : null;
 }
@@ -567,47 +288,35 @@ function forceAddCoversState(h, g) {
   if (!h.st.insideRepo || !fs.existsSync(h.st.dir)) return false;
   const afterDd = g.args.indexOf('--');
   const specs = g.args.filter((a, i) => (afterDd >= 0 && i > afterDd) || (!a.startsWith('-') && a !== '--'));
-  const all = g.args.some((a, i) => (afterDd < 0 || i < afterDd) && (a === '--all' || a === '--no-ignore-removal' || /^-[A-Za-z]*A[A-Za-z]*$/.test(a)));
+  const all = g.args.some((a, i) => (afterDd < 0 || i < afterDd)
+    && (a === '--all' || a === '--no-ignore-removal' || /^-[A-Za-z]*A[A-Za-z]*$/.test(a)));
   if (!specs.length) return all;
   const base = g.dirs.reduce((d, c) => path.resolve(d, c), h.norm.cwd || h.root);
   return specs.some((s) => {
     if (/[*?[]/.test(s)) return true;
     const top = /^:(?:\/|\(top\))/.exec(s);
     const target = top ? path.resolve(h.root, s.slice(top[0].length) || '.') : path.resolve(base, s);
-    const r = path.relative(canonical(target), h.st.canonicalDir || h.st.dir);
+    const r = path.relative(realPath(target), h.st.canonicalDir);
     return r === '' || (!r.startsWith('..') && !path.isAbsolute(r));
   });
 }
 
 // Commands that read or copy a whole directory tree (a state dir argument exposes `.env.live`).
-const TREE_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'tar', 'zip', '7z', '7za', 'cp', 'rsync', 'scp',
-  'select-string', 'sls', 'copy-item', 'cpi', 'copy', 'compress-archive', 'robocopy', 'xcopy', 'strings']);
-const readsTree = (exe, toks) => TREE_READERS.has(exe) || (exe === 'find' && toks.some((t) => /^-(?:exec|execdir|ok|okdir)$/.test(t)));
-
-/** Does a shell token reach `.env.live`: the name itself, or a glob under the state dir that matches it? */
-function tokenReachesEnvLive(token, st) {
-  const t = toPosix(token);
-  if (/\.env\.live\b/i.test(t)) return true;
-  const rest = stateRemainder(t, st);
-  return rest != null && /[*?[]/.test(rest) && globToRegExp(rest.replace(/^\/+/, '') || '*').test('.env.live');
-}
-
-/** The part of a token after the state dir component (`''` for the dir itself), or null when it names none. */
-function stateRemainder(t, st) {
-  for (const n of [STATE_DIR_NAME, st.rel].filter(Boolean)) {
-    const m = new RegExp(`(?:^|[/=:'"])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(/.*)?$`, 'i').exec(t);
-    if (m) return m[1] || '';
-  }
-  return null;
-}
+const TREE_READERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'tar', 'zip', '7z', '7za', 'cp', 'rsync',
+  'scp', 'select-string', 'sls', 'copy-item', 'cpi', 'copy', 'compress-archive', 'robocopy', 'xcopy', 'strings']);
+const readsTree = (exe, toks) => TREE_READERS.has(exe)
+  || (exe === 'find' && toks.some((t) => /^-(?:exec|execdir|ok|okdir)$/.test(t)));
+const DELETERS = new Set(['rm', 'del', 'erase', 'unlink', 'rmdir', 'rd', 'remove-item', 'ri']);
 
 // Command classes for observed runs (post-shell), tested on a normalized simple command.
 const RUN_CLASSES = [
   ['companion', /\badc\.mjs\s+(?:verify|clean-run|typecheck|flake-probe|coverage-delta|mutation-scope|live)\b/],
   ['test', /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|t)(?::\S*)?(?:\s|$)/],
-  ['test', /^(?:npx|pnpx|bunx|yarn\s+dlx|pnpm\s+(?:dlx|exec)|yarn\s+exec)\s+(?:jest|vitest|mocha|ava|tap|karma|playwright\s+test|cypress\s+run)\b/],
+  ['test', new RegExp('^(?:npx|pnpx|bunx|yarn\\s+dlx|pnpm\\s+(?:dlx|exec)|yarn\\s+exec)\\s+'
+    + '(?:jest|vitest|mocha|ava|tap|karma|playwright\\s+test|cypress\\s+run)\\b')],
   ['test', /^(?:jest|vitest|mocha|ava|karma|playwright\s+test|cypress\s+run|phpunit)\b/],
-  ['test', /^(?:(?:uv|poetry|pdm|hatch|pipenv)\s+run\s+)?(?:python[0-9.]*\s+-m\s+)?(?:pytest|py\.test|unittest|nose2|tox|nox)\b/],
+  ['test', new RegExp('^(?:(?:uv|poetry|pdm|hatch|pipenv)\\s+run\\s+)?(?:python[0-9.]*\\s+-m\\s+)?'
+    + '(?:pytest|py\\.test|unittest|nose2|tox|nox)\\b')],
   ['test', /^(?:go\s+test|cargo\s+(?:test|nextest)|dotnet\s+test|deno\s+test|bun\s+test|swift\s+test|mix\s+test)\b/],
   ['test', /^(?:mvnw?|gradlew?)\b.*\b(?:test|verify|check)\b/],
   ['test', /^(?:bundle\s+exec\s+)?(?:rspec|rake\s+(?:test|spec)|rails\s+test)\b/],
@@ -627,63 +336,39 @@ const RUN_CLASSES = [
   ['build', /^(?:make|just)(?:\s|$)/],
 ];
 
-const NARROWING = /(?:\s-t\s|\s--testNamePattern\b|\s--testPathPattern\b|\s-k\s|\s--grep\b|\s-run\s|\s--filter\b|\s--only\b|\s--spec\b|\s--lf\b|\s--last-failed\b|\s--onlyChanged\b|\s--changed\b|::|\s\S+\.(?:test|spec)\.[A-Za-z0-9]+(?:\s|$)|\stest_\w+\.py\b|\s\S+_test\.go\b)/;
+const NARROWING = new RegExp('(?:\\s-t\\s|\\s--testNamePattern\\b|\\s--testPathPattern\\b|\\s-k\\s|\\s--grep\\b'
+  + '|\\s-run\\s|\\s--filter\\b|\\s--only\\b|\\s--spec\\b|\\s--lf\\b|\\s--last-failed\\b|\\s--onlyChanged\\b'
+  + '|\\s--changed\\b|::'
+  + '|\\s\\S+\\.(?:test|spec)\\.[A-Za-z0-9]+(?:\\s|$)|\\stest_\\w+\\.py\\b|\\s\\S+_test\\.go\\b)');
+// Values of credential-named flags (`--token=x`, `--password x`) never reach the stored head.
+const SENSITIVE_FLAG = /^--?[\w-]*(?:token|secret|passw|apikey|api-key|auth|credential)[\w-]*$/i;
 
 /** `{class, head, narrowed}` for a shell command line, or null when it is not a run we track. */
 export function classifyRun(cmd, secretCheck = null) {
   for (const toks of simpleCommands(cmd)) {
     const norm = [exeName(toks[0]), ...toks.slice(1)].join(' ');
-    const companion = /\badc\.mjs\b/.test(toks.join(' ')) && RUN_CLASSES[0][1].test(toks.map((t) => toPosix(t).split('/').pop()).join(' '));
+    const companion = /\badc\.mjs\b/.test(toks.join(' '))
+      && RUN_CLASSES[0][1].test(toks.map((t) => toPosix(t).split('/').pop()).join(' '));
     for (const [cls, re] of RUN_CLASSES) {
       if (cls === 'companion' ? !companion : !re.test(norm)) continue;
-      // A normalized head, never the full line: secret-shaped tokens and values of credential-named
-      // flags (`--token=x`, `--password x`) are dropped before anything is stored.
-      const sensitiveFlag = /^--?[\w-]*(?:token|secret|passw|apikey|api-key|auth|credential)[\w-]*$/i;
+      // A normalized head, never the full line: secret-shaped tokens and credential flag values are dropped.
       const head = toks.slice(0, 5).map((t, i, arr) => {
         if (/ADC_LIVE_TOKEN/i.test(t) || (secretCheck && secretCheck(t))) return '[REDACTED]';
         const eq = t.indexOf('=');
-        if (eq > 0 && sensitiveFlag.test(t.slice(0, eq))) return `${t.slice(0, eq)}=[REDACTED]`;
-        if (i > 0 && sensitiveFlag.test(arr[i - 1])) return '[REDACTED]';
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) return t.split('=')[0] + '=...';
-        const p = t.replace(/\\/g, '/');
-        return p.length > 40 ? truncate(p, 40) : p;
+        if (eq > 0 && SENSITIVE_FLAG.test(t.slice(0, eq))) return `${t.slice(0, eq)}=[REDACTED]`;
+        if (i > 0 && SENSITIVE_FLAG.test(arr[i - 1])) return '[REDACTED]';
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) return `${t.split('=')[0]}=...`;
+        return truncate(toPosix(t), 40);
       }).join(' ');
-      return { class: cls, head: truncate(head, 80), narrowed: cls === 'test' && NARROWING.test(` ${toks.slice(1).join(' ')} `) };
+      const narrowed = cls === 'test' && NARROWING.test(` ${toks.slice(1).join(' ')} `);
+      return { class: cls, head: truncate(head, 80), narrowed };
     }
   }
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// Session and ledger
-
-/** The newest evidence ledger: `{file, verdict, ts}` or null (reads one or a few files). */
-export function newestLedger(evidenceDir) {
-  let names;
-  try { names = fs.readdirSync(evidenceDir).filter((n) => n.endsWith('.json')); } catch { return null; }
-  const stats = [];
-  for (const n of names) {
-    try {
-      const st = fs.statSync(path.join(evidenceDir, n));
-      if (st.isFile()) stats.push({ name: n, mtimeMs: st.mtimeMs });
-    } catch {}
-  }
-  stats.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? 1 : -1));
-  // The few most recently written files are read; among them the newest by created_at wins, the
-  // order `evidence` itself uses (an `evidence add` to an older ledger only bumps its mtime).
-  let best = null;
-  for (const s of stats.slice(0, 5)) {
-    const led = readJson(path.join(evidenceDir, s.name), null);
-    if (!led || typeof led !== 'object' || Array.isArray(led)) continue;
-    if (led.schema && !String(led.schema).startsWith('adc-evidence')) continue;
-    // created_at is when verify snapshotted the tree; later `evidence add` calls do not make it fresher.
-    const ts = [led.created_at, led.finalized_at, led.updated_at].find((t) => typeof t === 'string' && !Number.isNaN(Date.parse(t)))
-      || new Date(s.mtimeMs).toISOString();
-    const row = { file: s.name, verdict: typeof led.verdict === 'string' ? led.verdict : null, ts, finalized: Boolean(led.finalized_at) };
-    if (!best || Date.parse(row.ts) > Date.parse(best.ts)) best = row;
-  }
-  return best;
-}
+// Session
 
 /**
  * The last assistant message from the tail of a host transcript (bounded read, no scan). Copilot's
@@ -705,13 +390,16 @@ export function lastAssistantMessage(file, { maxBytes = 256 * 1024 } = {}) {
     if (size > len) lines.shift();
     for (let i = lines.length - 1; i >= 0; i--) {
       const l = lines[i].trim();
-      if (!l.startsWith('{') || !/assistant/.test(l)) continue;
+      if (!l.startsWith('{') || !l.includes('assistant')) continue;
       let e;
       try { e = JSON.parse(l); } catch { continue; }
-      if (e && e.type === 'assistant.message' && e.data && typeof e.data.content === 'string' && e.data.content.trim()) return e.data.content;
-      const content = e && e.type === 'assistant' && e.message ? e.message.content : null;
+      if (e?.type === 'assistant.message' && typeof e.data?.content === 'string' && e.data.content.trim()) {
+        return e.data.content;
+      }
+      const content = e?.type === 'assistant' ? e.message?.content : null;
       if (Array.isArray(content)) {
-        const text = content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n');
+        const text = content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text)
+          .join('\n');
         if (text.trim()) return text;
       }
     }
@@ -724,29 +412,27 @@ export function lastAssistantMessage(file, { maxBytes = 256 * 1024 } = {}) {
 }
 
 function hostTool(dialect, env) {
-  if (dialect === 'copilot') {
-    if (env.COPILOT_AGENT_PROMPT || env.GITHUB_COPILOT_API_TOKEN) return 'copilot-cloud';
-    if (env.COPILOT_CLI) return 'copilot-cli';
-    if (env.VSCODE_PID || env.TERM_PROGRAM === 'vscode') return 'vscode';
-    return 'unknown';
-  }
-  return dialect === 'claude' ? 'claude-code' : 'codex';
+  if (dialect !== 'copilot') return dialect === 'claude' ? 'claude-code' : 'codex';
+  return hostFromEnv(env).candidates.find((c) => c.startsWith('copilot') || c === 'vscode') || 'unknown';
 }
 
 function baseSession(cur, h) {
   const s = cur || {};
+  const obj = (v) => v && typeof v === 'object';
   s.schema = s.schema || 'adc-session/1';
   s.host = s.host || h.dialect;
   s.dialect = h.dialect;
   s.tool = s.tool && s.tool !== 'unknown' ? s.tool : hostTool(h.dialect, h.env);
   if (h.norm.permission_mode) s.permission_mode = h.norm.permission_mode;
   s.root = toPosix(h.root);
-  s.events = s.events && typeof s.events === 'object' ? s.events : {};
+  s.events = obj(s.events) ? s.events : {};
   s.events[h.event] = (s.events[h.event] || 0) + 1;
-  s.edits = s.edits && typeof s.edits === 'object' ? s.edits : { count: 0, first: null, last: null, classes: {}, files: [], times: [], findings: 0, state_dir_edits: 0 };
+  s.edits = obj(s.edits) ? s.edits
+    : { count: 0, first: null, last: null, classes: {}, files: [], times: [], findings: 0, state_dir_edits: 0 };
   s.observed_runs = Array.isArray(s.observed_runs) ? s.observed_runs : [];
-  s.gate = s.gate && typeof s.gate === 'object' ? s.gate : { notices: 0, last_notice_epoch: null, blocks: 0, last_block_epoch: null, consecutive: 0 };
-  s.guard = s.guard && typeof s.guard === 'object' ? s.guard : { denials: 0, asks: 0, last: null };
+  s.gate = obj(s.gate) ? s.gate
+    : { notices: 0, last_notice_epoch: null, blocks: 0, last_block_epoch: null, consecutive: 0 };
+  s.guard = obj(s.guard) ? s.guard : { denials: 0, asks: 0, last: null };
   if (s.ended === undefined) s.ended = false;
   // A resumed session (Claude and Codex keep the id on resume) is open again.
   if (s.ended && h.event !== 'session-end') { s.resumed = nowIso(); s.ended = false; }
@@ -775,7 +461,7 @@ async function record(h, mutate, { create = true } = {}) {
 
 function log(h, entry, verbose = false) {
   if (verbose && !debugOn(h.env)) return;
-  if (!h.st || !h.st.ready || h.noWrite) {
+  if (!h.st.ready || h.noWrite) {
     if (debugOn(h.env)) process.stderr.write(`adc hook-run: ${JSON.stringify(entry)}\n`);
     return;
   }
@@ -786,24 +472,35 @@ function log(h, entry, verbose = false) {
 // Handlers
 
 async function sessionStart(h) {
-  const lines = [];
-  lines.push(`agentic-developer-companion is installed (QA of agent-made changes, agentic tooling). Scripts: ${ADC_CMD} <command> --json; modes: verify, audit-tests, review, trace, regress, e2e, live, flake, ci-gate, tooling, doctor.`);
+  const lines = ['agentic-developer-companion is installed (QA of agent-made changes, agentic tooling). Scripts:'
+    + ` ${ADC_CMD} <command> --json; modes: verify, audit-tests, review, trace, regress, e2e, live, flake, ci-gate,`
+    + ' tooling, doctor.'];
   const detect = readJson(h.st.paths.detect, null);
-  const summary = detect && (typeof detect.summary === 'string' ? detect.summary : (detect.result && detect.result.summary));
-  if (typeof summary === 'string' && summary.trim()) lines.push(`Detected stack (cached): ${truncate(summary.trim(), 200)}.`);
+  const summary = detect && (typeof detect.summary === 'string' ? detect.summary : detect.result?.summary);
+  if (typeof summary === 'string' && summary.trim()) {
+    lines.push(`Detected stack (cached): ${truncate(summary.trim(), 200)}.`);
+  }
   const led = newestLedger(h.st.paths.evidence);
+  const evidenceDir = h.st.rel ? `${h.st.rel}/evidence` : toPosix(h.st.paths.evidence);
   lines.push(led
-    ? `Newest verification ledger: ${h.st.rel ? `${h.st.rel}/evidence` : toPosix(h.st.paths.evidence)}/${led.file}, verdict ${led.verdict || 'none yet'}, ${led.ts}.`
+    ? `Newest verification ledger: ${evidenceDir}/${led.file}, verdict ${led.verdict || 'none yet'}, ${led.ts}.`
     : 'No verification ledger exists in this repository yet.');
-  if (h.level !== 'advise') lines.push(h.level === 'guard'
-    ? 'Hook level guard: completion is gated on a current ledger; force-push, history rewrites and access to .adc/ are denied.'
-    : 'Hook level gate: completion is gated once per edit epoch on a ledger newer than the last edit.');
-  lines.push('Operating rules: a claim counts as verified only with a ledger entry (command, exit code, output hash); tests, assertions, CI steps and lint settings are never weakened to get green; .adc/.env.live is never opened.');
+  if (h.level !== 'advise') {
+    lines.push(h.level === 'guard'
+      ? 'Hook level guard: completion is gated on a current ledger; force-push, history rewrites and access to .adc/'
+        + ' are denied.'
+      : 'Hook level gate: completion is gated once per edit epoch on a ledger newer than the last edit.');
+  }
+  lines.push('Operating rules: a claim counts as verified only with a ledger entry (command, exit code, output hash);'
+    + ' tests, assertions, CI steps and lint settings are never weakened to get green; .adc/.env.live is never'
+    + ' opened.');
   const tracked = trackedState(h.st, h.repo);
-  if (tracked && tracked.length) {
-    lines.push(`The companion state dir ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); scripts refuse to run and hooks stay silent until it is untracked: ${ADC_CMD} doctor.`);
+  if (tracked?.length) {
+    lines.push(`The companion state dir ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); scripts refuse to`
+      + ` run and hooks stay silent until it is untracked: ${ADC_CMD} doctor.`);
     // A diagnostic, never a different exit code (Copilot denies tool calls on non-zero preToolUse exits).
-    process.stderr.write(`adc hook-run: ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); hooks stay silent until it is untracked\n`);
+    process.stderr.write(`adc hook-run: ${h.st.rel}/ is tracked by git (${tracked.length} file(s)); hooks stay silent`
+      + ' until it is untracked\n');
     h.noWrite = true;
   }
   await record(h, (s) => {
@@ -814,21 +511,68 @@ async function sessionStart(h) {
   return { context: truncate(lines.join('\n'), BRIEF_LIMIT) };
 }
 
+/** Notes for one edited file in the repository (marker scan by class) and the number of findings. */
+function editNotes(rel, c, content, op) {
+  const names = classNames(c);
+  const text = content ? content.text : '';
+  const lineMap = content?.lines ?? (content?.fragment ? [] : null);
+  const hits = [];
+  // Notebook cells are scanned as Python; the code catalogs never run on prose, data or config
+  // files (a README that quotes `eslint-disable` is not a suppression), the same rule diff-scope uses.
+  const scanName = /\.ipynb$/i.test(rel) ? rel.replace(/\.ipynb$/i, '.py') : rel;
+  const code = M.isCodeFile(scanName);
+  const scan = (catalog) => scanEdit(text, catalog, scanName, lineMap);
+  if (c.test && code) {
+    for (const x of scan(M.SKIP_MARKERS)) hits.push(`adds a skip/focus marker (${x.id}) ${at(x)}: ${x.text}`);
+    for (const x of scan(M.IN_SOURCE_RETRIES)) hits.push(`adds an in-source retry (${x.id}) ${at(x)}`);
+  }
+  if (c.ci) for (const x of scan(M.CI_WEAKENING)) hits.push(`weakens a CI step (${x.id}) ${at(x)}: ${x.text}`);
+  else if (c.manifest || c.runnerConfig) {
+    // A manifest test script or runner config that turns a failing run green
+    // (`"test": "jest --passWithNoTests"`, `|| true`).
+    for (const x of scan(M.CI_WEAKENING)) {
+      if (/pass-?with-?no-?tests|no-tests/i.test(x.id) || TEST_COMMAND_LINE.test(x.text)) {
+        hits.push(`weakens a test command (${x.id}) ${at(x)}: ${x.text}`);
+      }
+    }
+  }
+  if (!c.generated && code) {
+    for (const x of scan(M.SUPPRESSIONS)) hits.push(`adds a lint/type suppression (${x.id}) ${at(x)}`);
+    for (const x of scan(M.SWALLOW_PATTERNS)) hits.push(`adds an exception-swallowing pattern (${x.id}) ${at(x)}`);
+  }
+  for (const x of secretsIn(text, lineMap)) hits.push(`adds a value shaped like a secret (${x.id}) ${at(x)}`);
+  const label = names.length ? ` (${names.map((n) => CLASS_LABEL[n]).join(', ')})` : '';
+  const notes = [];
+  if (op === 'delete' && c.test) {
+    notes.push(`- ${rel}${label}: deleted; test deletions are a CK-TEST-DEL check in verify.`);
+  }
+  else if (op === 'delete' && (c.ci || c.runnerConfig)) notes.push(`- ${rel}${label}: deleted.`);
+  if (hits.length) notes.push(`- ${rel}${label}: ${hits.slice(0, 6).join('; ')}.`);
+  else if (op !== 'delete') {
+    const why = c.runnerConfig ? 'test discovery and runner settings are compared with the base by verify (CK-TEST-CFG)'
+      : c.ci ? 'CI test steps are compared with the base by verify (CK-CI)'
+        : c.lockfile ? 'lockfile consistency with the manifest is a CK-LOCK check'
+          : c.lintConfig ? 'rules turned off here count as suppressions (CK-SUPPRESS)'
+            : c.manifest ? 'test scripts and new dependencies are checked by verify (CK-TEST-CFG, CK-DEPS)' : null;
+    if (why) notes.push(`- ${rel}${label}: ${why}.`);
+  }
+  return { notes, findings: hits.length };
+}
+
 async function postEdit(h) {
   const { norm } = h;
   if (norm.tool_kind !== 'edit') return {};
-  const markers = await loadMarkers();
   const detect = readJson(h.st.paths.detect, null);
   const contents = extractContent(norm);
-  const patch = parsePatch(norm.tool_input);
   const paths = extractPaths(norm);
-  const ops = new Map(patch.map((f) => [f.path, f.op]));
+  // Patch files carry their op (add, update, delete; the last one counts); other edits have one content entry.
+  const ops = new Map(contents.map((x) => [x.path, x.op]));
+  const single = contents.length === 1 && (!contents[0].path || paths.length === 1) ? contents[0] : null;
   const notes = [];
   const classes = {};
   const files = [];
   let findings = 0;
   let stateEdits = 0;
-  let codeEdits = 0;
   let outside = 0;
   for (const p of paths) {
     const abs = absPath(h, p);
@@ -836,64 +580,26 @@ async function postEdit(h) {
     const rel = inRepo || toPosix(p);
     if (underState(rel, abs, h.st)) {
       stateEdits++;
-      notes.push(`- ${rel}: companion state under ${h.st.rel || STATE_DIR_NAME}/ (evidence, budget, credentials); evidence finalize re-checks ledger entry hashes.`);
+      notes.push(`- ${rel}: companion state under ${h.st.rel || STATE_DIR_NAME}/ (evidence, budget, credentials);`
+        + ' evidence finalize re-checks ledger entry hashes.');
       continue;
     }
     // Files outside the repository (the host's plan and memory files, scratch files in the temp dir)
     // are not part of the change verify checks: no notes, and they do not arm the stop gate.
     if (inRepo == null || inRepo === '.') { outside++; continue; }
-    codeEdits++;
-    const c = classify(markers, rel, detect);
-    const names = classNames(c);
-    for (const n of names) classes[n] = (classes[n] || 0) + 1;
+    const c = classify(rel, detect);
+    for (const n of classNames(c)) classes[n] = (classes[n] || 0) + 1;
     files.push(rel);
-    const content = contents.find((x) => x.path === p) || (contents.length === 1 && !contents[0].path ? contents[0] : null) ||
-      (paths.length === 1 ? contents[0] : null);
-    const text = content ? content.text : '';
-    const lineMap = content && content.lines ? content.lines : content && content.fragment ? [] : null;
-    const hits = [];
-    // Notebook cells are scanned as Python; the code catalogs never run on prose, data or config
-    // files (a README that quotes `eslint-disable` is not a suppression), the same rule diff-scope uses.
-    const scanName = /\.ipynb$/i.test(rel) ? rel.replace(/\.ipynb$/i, '.py') : rel;
-    let code = false;
-    try { code = Boolean(markers.isCodeFile(scanName)); } catch { code = FALLBACK_CODE_FILE.test(scanName); }
-    const scan = (catalog) => scanEdit(markers, text, catalog, scanName, lineMap);
-    if (c.test && code) {
-      for (const x of scan(markers.SKIP_MARKERS)) hits.push(`adds a skip/focus marker (${x.id}) ${at(x)}: ${x.text}`);
-      for (const x of scan(markers.IN_SOURCE_RETRIES)) hits.push(`adds an in-source retry (${x.id}) ${at(x)}`);
-    }
-    if (c.ci) for (const x of scan(markers.CI_WEAKENING)) hits.push(`weakens a CI step (${x.id}) ${at(x)}: ${x.text}`);
-    else if (c.manifest || c.runnerConfig) {
-      // A manifest test script or runner config that turns a failing run green (`"test": "jest --passWithNoTests"`, `|| true`).
-      for (const x of scan(markers.CI_WEAKENING)) {
-        if (/pass-?with-?no-?tests|no-tests/i.test(x.id) || TEST_COMMAND_LINE.test(x.text)) hits.push(`weakens a test command (${x.id}) ${at(x)}: ${x.text}`);
-      }
-    }
-    if (!c.generated && code) {
-      for (const x of scan(markers.SUPPRESSIONS)) hits.push(`adds a lint/type suppression (${x.id}) ${at(x)}`);
-      for (const x of scan(markers.SWALLOW_PATTERNS)) hits.push(`adds an exception-swallowing pattern (${x.id}) ${at(x)}`);
-    }
-    for (const x of scanSecretsIn(markers, text, lineMap)) hits.push(`adds a value shaped like a secret (${x.id}) ${at(x)}`);
-    findings += hits.length;
-    const label = names.length ? ` (${names.map((n) => CLASS_LABEL[n]).join(', ')})` : '';
-    const op = ops.get(p);
-    if (op === 'delete' && c.test) notes.push(`- ${rel}${label}: deleted; test deletions are a CK-TEST-DEL check in verify.`);
-    else if (op === 'delete' && (c.ci || c.runnerConfig)) notes.push(`- ${rel}${label}: deleted.`);
-    if (hits.length) notes.push(`- ${rel}${label}: ${hits.slice(0, 6).join('; ')}.`);
-    else if (op !== 'delete') {
-      if (c.runnerConfig) notes.push(`- ${rel}${label}: test discovery and runner settings are compared with the base by verify (CK-TEST-CFG).`);
-      else if (c.ci) notes.push(`- ${rel}${label}: CI test steps are compared with the base by verify (CK-CI).`);
-      else if (c.lockfile) notes.push(`- ${rel}${label}: lockfile consistency with the manifest is a CK-LOCK check.`);
-      else if (c.lintConfig) notes.push(`- ${rel}${label}: rules turned off here count as suppressions (CK-SUPPRESS).`);
-      else if (c.manifest) notes.push(`- ${rel}${label}: test scripts and new dependencies are checked by verify (CK-TEST-CFG, CK-DEPS).`);
-    }
+    const r = editNotes(rel, c, contents.find((x) => x.path === p) || single, ops.get(p));
+    notes.push(...r.notes);
+    findings += r.findings;
   }
-  if (codeEdits || stateEdits) {
+  if (files.length || stateEdits) {
     // The local clock, not the payload timestamp: the stop hook compares it with ledger times.
     const now = nowIso();
     await record(h, (s) => {
       const e = s.edits;
-      if (codeEdits) {
+      if (files.length) {
         e.count += 1;
         e.first = e.first || now;
         e.last = now;
@@ -905,26 +611,11 @@ async function postEdit(h) {
       e.state_dir_edits = (e.state_dir_edits || 0) + stateEdits;
     });
   }
-  log(h, { tool: norm.tool_name, files: paths.length, outside, classes, findings, keys: norm.keys, bytes: h.bytes, ms: Date.now() - h.t0, markers: markers.source }, true);
+  log(h, { tool: norm.tool_name, files: paths.length, outside, classes, findings, keys: norm.keys, bytes: h.bytes,
+    ms: Date.now() - h.t0 }, true);
   if (!notes.length) return {};
-  return { context: truncate(`agentic-developer-companion notes on this edit (notes, not verdicts; verify records evidence):\n${notes.join('\n')}`, 2000) };
-}
-
-/**
- * Tool output with the live-test token removed: the `ADC_LIVE_TOKEN=<value>` shape (§10.3.1), its
- * JSON/YAML form, the `Get-ChildItem Env:` table row, and the literal value when the host passed
- * ADC_LIVE_TOKEN in the hook's environment (an exported variable is what `echo $ADC_LIVE_TOKEN` prints).
- */
-export function redactToken(text, env = {}) {
-  let out = String(text)
-    .replace(/ADC_LIVE_TOKEN\s*=\s*\S+/g, TOKEN_REDACTED)
-    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:\s*)(["'])[^"'\r\n]*\2/g, '$1$2[REDACTED]$2')
-    .replace(/(["']?ADC_LIVE_TOKEN["']?\s*:[ \t]*)(?!["'\s[]|(?:set|unset)\b)[^\s,}]+/g, '$1[REDACTED]')
-    .replace(/^(\s*ADC_LIVE_TOKEN[ \t]{2,})\S.*$/gm, '$1[REDACTED]');
-  // Short values would mangle ordinary words in the output; real tokens are long.
-  const value = env && typeof env.ADC_LIVE_TOKEN === 'string' ? env.ADC_LIVE_TOKEN.trim() : '';
-  if (value.length >= 8) out = redactLiterals(out, [{ name: 'ADC_LIVE_TOKEN', value }]);
-  return out;
+  return { context: truncate(`agentic-developer-companion notes on this edit (notes, not verdicts; verify records`
+    + ` evidence):\n${notes.join('\n')}`, 2000) };
 }
 
 async function postShell(h) {
@@ -936,37 +627,39 @@ async function postShell(h) {
   const notes = [];
   // Copilot can rewrite the tool result the model sees (§10.3.1); Claude and Codex cannot.
   if (h.dialect === 'copilot' && text) {
-    const redacted = redactToken(text, h.env);
+    const redacted = redactLiveToken(text, h.env);
     if (redacted !== text) {
       decision.modifiedResult = { text: redacted, resultType: norm.tool_result_type || 'success' };
       notes.push('The tool output contained the ADC_LIVE_TOKEN credential; it was redacted from the result.');
       log(h, { condition: 'TOKEN_IN_OUTPUT', redacted: true });
     }
   }
-  if (/\.env\.live\b/.test(cmd)) notes.push('This command referenced .adc/.env.live; that file holds the live-test credential and only `adc.mjs live run` reads it.');
-  const markers = await loadMarkers();
-  const secretCheck = (t) => scanSecretsIn(markers, t, null).length > 0;
-  const runInfo = cmd ? classifyRun(cmd, secretCheck) : null;
+  if (/\.env\.live\b/.test(cmd)) {
+    notes.push('This command referenced .adc/.env.live; that file holds the live-test credential and only'
+      + ' `adc.mjs live run` reads it.');
+  }
+  const runInfo = cmd ? classifyRun(cmd, (t) => M.scanSecrets(t).length > 0) : null;
   if (runInfo) {
-    const parser = await loadSummaryParser();
-    let counts = null;
-    try { counts = text ? parser.parse(text) : null; } catch { counts = null; }
+    const counts = text ? parseSummaryText(text) : null;
     const obs = {
       ts: norm.timestamp || nowIso(),
       cmd_head: runInfo.head,
       class: runInfo.class,
       exit: norm.exit_code,
       exit_source: norm.exit_source,
-      counts: counts ? { passed: counts.passed ?? null, failed: counts.failed ?? null, skipped: counts.skipped ?? null, runner: counts.runner ?? null } : null,
+      counts: counts
+        ? { passed: counts.passed, failed: counts.failed, skipped: counts.skipped, runner: counts.runner } : null,
       parse_source: counts ? 'summary-line' : 'none',
       source: 'hook:post-shell',
       narrowed: runInfo.narrowed,
     };
     await record(h, (s) => { s.observed_runs = [...s.observed_runs, obs].slice(-KEEP); });
     if (runInfo.narrowed) {
-      notes.push(`Observed a narrowed test run (${runInfo.head}). Observed runs are not evidence for a "tests pass" claim; verify re-runs the whole suite of each affected project with retries off (CK-CLEANRUN).`);
+      notes.push(`Observed a narrowed test run (${runInfo.head}). Observed runs are not evidence for a "tests pass"`
+        + ' claim; verify re-runs the whole suite of each affected project with retries off (CK-CLEANRUN).');
     }
-    log(h, { tool: norm.tool_name, class: runInfo.class, counts: Boolean(counts), keys: norm.keys, bytes: h.bytes, ms: Date.now() - h.t0 }, true);
+    log(h, { tool: norm.tool_name, class: runInfo.class, counts: Boolean(counts), keys: norm.keys, bytes: h.bytes,
+      ms: Date.now() - h.t0 }, true);
   }
   if (notes.length) decision.context = notes.join('\n');
   return decision;
@@ -984,7 +677,7 @@ async function stop(h) {
   const { norm } = h;
   if (norm.stop_hook_active) return {};
   const session = readSession(h.st.dir, norm.session_id);
-  const edits = session && session.edits && Number(session.edits.count) > 0 ? session.edits : null;
+  const edits = Number(session?.edits?.count) > 0 ? session.edits : null;
   if (!edits) return {};
   const led = newestLedger(h.st.paths.evidence);
   const lastEdit = Date.parse(edits.last || '') || 0;
@@ -1002,19 +695,16 @@ async function stop(h) {
     return {};
   }
   const ledText = led ? `newest ledger ${led.file} (verdict ${led.verdict || 'none'}, ${led.ts})` : 'no ledger yet';
-  let claim = '';
   // Copilot payloads carry no last message; its transcript tail is read only when a notice is due.
   const lastMessage = norm.last_message || lastAssistantMessage(norm.transcript_path);
-  if (lastMessage) {
-    for (const re of CLAIM_RE) {
-      const m = re.exec(lastMessage);
-      if (m) { claim = ` The final message states "${truncate(m[0], 60)}"; observed test runs do not support that claim, only CK-CLEANRUN in a ledger does.`; break; }
-    }
-  }
+  const m = lastMessage ? CLAIM_RE.map((re) => re.exec(lastMessage)).find(Boolean) : null;
+  const claim = m ? ` The final message states "${truncate(m[0], 60)}"; observed test runs do not support that claim,`
+    + ' only CK-CLEANRUN in a ledger does.' : '';
   const reasonCore = `${epoch} edit event(s) in this session are newer than the verification evidence (${ledText}).`;
   if (h.level === 'advise') {
     await record(h, (s) => { s.gate.notices = (s.gate.notices || 0) + 1; s.gate.last_notice_epoch = epoch; });
-    return { context: `agentic-developer-companion: ${reasonCore} ${ADC_CMD} verify --json records a ledger and verdict.${claim}` };
+    return { context: `agentic-developer-companion: ${reasonCore} ${ADC_CMD} verify --json records a ledger and`
+      + ` verdict.${claim}` };
   }
   await record(h, (s) => {
     s.gate.blocks = (s.gate.blocks || 0) + 1;
@@ -1022,55 +712,125 @@ async function stop(h) {
     s.gate.consecutive = (s.gate.consecutive || 0) + 1;
   });
   log(h, { decision: 'block', epoch });
-  return { block: `agentic-developer-companion completion gate: ${reasonCore} Run ${ADC_CMD} verify --json (it writes the ledger), then finish; the gate blocks once per edit epoch.${claim}` };
+  return { block: `agentic-developer-companion completion gate: ${reasonCore} Run ${ADC_CMD} verify --json (it writes`
+    + ` the ledger), then finish; the gate blocks once per edit epoch.${claim}` };
 }
 
 const GUARD_PREFIX = 'agentic-developer-companion guard:';
+const INDEX_ONLY = new Set(['check-ignore', 'ls-files', 'status']);
+const askDeleteTests = (victims) => ({
+  ask: `${GUARD_PREFIX} this deletes test file(s) (${truncate(victims.join(', '), 120)}); verify flags test deletions`
+    + ' (CK-TEST-DEL) unless the spec asks for them. Confirm the deletion is intended.',
+  rule: 'delete-test',
+});
+const testVictims = (h, args) => args.filter((a) => !a.startsWith('-')).map((a) => toPosix(a).replace(/^\.\//, ''))
+  .filter((a) => classify(a, h.detect).test);
+
+/** The guard's verdict on a git command, or null. */
+function guardGit(h, g) {
+  const { sub, args } = g;
+  const flags = args.filter((a) => a.startsWith('-'));
+  const shortHas = (ch) => flags.some((a) => /^-[A-Za-z]+$/.test(a) && a.includes(ch));
+  if (sub === 'push' && (flags.some((a) => /^--force(?:-with-lease(?:=.*)?|-if-includes)?$/.test(a) || a === '--mirror')
+      || shortHas('f') || args.some((a) => !a.startsWith('-') && a.startsWith('+')))) {
+    return { deny: `${GUARD_PREFIX} \`git push --force\` rewrites published history. The guard level denies force-push`
+      + ' and history rewrites (rebase, reset --hard, commit --amend, filter-branch); run it outside the agent if it is'
+      + ' intended.', rule: 'force-push' };
+  }
+  if (sub === 'rebase' && !args.some((a) => ['--abort', '--quit', '--show-current-patch'].includes(a))) {
+    return { deny: `${GUARD_PREFIX} \`git rebase\` rewrites history; the guard level denies it (\`git rebase --abort\``
+      + ' stays allowed).', rule: 'rebase' };
+  }
+  if (sub === 'reset' && args.includes('--hard')) {
+    return { deny: `${GUARD_PREFIX} \`git reset --hard\` discards commits and working-tree changes; the guard level`
+      + ' denies it.', rule: 'reset-hard' };
+  }
+  if (sub === 'commit' && args.includes('--amend')) {
+    return { deny: `${GUARD_PREFIX} \`git commit --amend\` rewrites the last commit; the guard level denies it (make a`
+      + ' new commit instead).', rule: 'amend' };
+  }
+  if (sub === 'filter-branch' || sub === 'filter-repo') {
+    return { deny: `${GUARD_PREFIX} \`git ${sub}\` rewrites history; the guard level denies it.`,
+      rule: 'filter-branch' };
+  }
+  if (sub === 'add' && (flags.includes('--force') || shortHas('f'))
+      && (args.some((a) => mentionsState(a, h.st)) || forceAddCoversState(h, g))) {
+    return { deny: `${GUARD_PREFIX} \`git add -f\` of ${h.st.rel || STATE_DIR_NAME}/ would commit companion state`
+      + ' (credentials, budget, evidence); it stays git-ignored. Force-add the intended paths by name instead.',
+    rule: 'force-add-state' };
+  }
+  if (sub === 'commit' || sub === 'push') {
+    const tracked = trackedState(h.st, h.repo);
+    if (tracked?.length) {
+      h.noWrite = true;
+      return { deny: `${GUARD_PREFIX} ${h.st.rel}/ is tracked by git (${tracked.length} file(s)), so this ${sub} could`
+        + ` publish companion state (credentials, budget, evidence). Untrack it first: git rm -r --cached ${h.st.rel}`,
+      rule: 'state-tracked' };
+    }
+  }
+  if (sub === 'rm') {
+    const victims = testVictims(h, args);
+    if (victims.length) return askDeleteTests(victims);
+  }
+  return null;
+}
 
 function guardShell(h, cmd) {
-  const markers = h.markers;
   for (const toks of simpleCommands(cmd)) {
     const g = gitParts(toks);
     if (g) {
-      const { sub, args } = g;
-      const flags = args.filter((a) => a.startsWith('-'));
-      const shortHas = (ch) => flags.some((a) => /^-[A-Za-z]+$/.test(a) && a.includes(ch));
-      if (sub === 'push' && (flags.some((a) => /^--force(?:-with-lease(?:=.*)?|-if-includes)?$/.test(a) || a === '--mirror') || shortHas('f') ||
-          args.some((a) => !a.startsWith('-') && a.startsWith('+')))) {
-        return { deny: `${GUARD_PREFIX} \`git push --force\` rewrites published history. The guard level denies force-push and history rewrites (rebase, reset --hard, commit --amend, filter-branch); run it outside the agent if it is intended.`, rule: 'force-push' };
-      }
-      if (sub === 'rebase' && !args.some((a) => ['--abort', '--quit', '--show-current-patch'].includes(a))) {
-        return { deny: `${GUARD_PREFIX} \`git rebase\` rewrites history; the guard level denies it (\`git rebase --abort\` stays allowed).`, rule: 'rebase' };
-      }
-      if (sub === 'reset' && args.includes('--hard')) return { deny: `${GUARD_PREFIX} \`git reset --hard\` discards commits and working-tree changes; the guard level denies it.`, rule: 'reset-hard' };
-      if (sub === 'commit' && args.includes('--amend')) return { deny: `${GUARD_PREFIX} \`git commit --amend\` rewrites the last commit; the guard level denies it (make a new commit instead).`, rule: 'amend' };
-      if (sub === 'filter-branch' || sub === 'filter-repo') return { deny: `${GUARD_PREFIX} \`git ${sub}\` rewrites history; the guard level denies it.`, rule: 'filter-branch' };
-      if (sub === 'add' && (flags.includes('--force') || shortHas('f')) && (args.some((a) => mentionsState(a, h.st)) || forceAddCoversState(h, g))) {
-        return { deny: `${GUARD_PREFIX} \`git add -f\` of ${h.st.rel || STATE_DIR_NAME}/ would commit companion state (credentials, budget, evidence); it stays git-ignored. Force-add the intended paths by name instead.`, rule: 'force-add-state' };
-      }
-      if (sub === 'commit' || sub === 'push') {
-        const tracked = trackedState(h.st, h.repo);
-        if (tracked && tracked.length) {
-          h.noWrite = true;
-          return { deny: `${GUARD_PREFIX} ${h.st.rel}/ is tracked by git (${tracked.length} file(s)), so this ${sub} could publish companion state (credentials, budget, evidence). Untrack it first: git rm -r --cached ${h.st.rel}`, rule: 'state-tracked' };
-        }
-      }
-      if (sub === 'rm') {
-        const victims = args.filter((a) => !a.startsWith('-')).map(toPosix).filter((a) => classify(markers, a.replace(/^\.\//, ''), h.detect).test);
-        if (victims.length) return { ask: `${GUARD_PREFIX} this deletes test file(s) (${truncate(victims.join(', '), 120)}); verify flags test deletions (CK-TEST-DEL) unless the spec asks for them. Confirm the deletion is intended.`, rule: 'delete-test' };
-      }
-      if (['check-ignore', 'ls-files', 'status'].includes(sub)) continue;
+      const verdict = guardGit(h, g);
+      if (verdict) return verdict;
+      if (INDEX_ONLY.has(g.sub)) continue;
     }
     const exe = exeName(toks[0]);
-    const envLive = toks.slice(1).some((t) => tokenReachesEnvLive(t, h.st)) ||
-      (readsTree(exe, toks) && toks.slice(1).some((t) => { const r = stateRemainder(toPosix(t), h.st); return r === '' || r === '/'; }));
-    // Untracking (`git rm --cached`, the remedy for a tracked state dir) and ignore checks only touch the index.
-    if (envLive && !(g && (['check-ignore', 'ls-files', 'status'].includes(g.sub) || (g.sub === 'rm' && g.args.includes('--cached'))))) {
-      return { deny: `${GUARD_PREFIX} .adc/.env.live holds the live-test credential; only \`adc.mjs live run\` reads it, and host tools are denied access under the guard level.`, rule: 'env-live' };
+    const args = toks.slice(1);
+    const envLive = args.some((t) => tokenReachesEnvLive(t, h.st))
+      || (readsTree(exe, toks) && args.some((t) => ['', '/'].includes(stateRemainder(t, h.st))));
+    // Untracking (`git rm --cached`, the remedy for a tracked state dir) only touches the index.
+    if (envLive && !(g?.sub === 'rm' && g.args.includes('--cached'))) {
+      return { deny: `${GUARD_PREFIX} .adc/.env.live holds the live-test credential; only \`adc.mjs live run\``
+        + ' reads it, and host tools are denied access under the guard level.', rule: 'env-live' };
     }
-    if (['rm', 'del', 'erase', 'unlink', 'rmdir', 'rd', 'remove-item', 'ri'].includes(exe)) {
-      const victims = toks.slice(1).filter((a) => !a.startsWith('-')).map(toPosix).filter((a) => classify(markers, a.replace(/^\.\//, ''), h.detect).test);
-      if (victims.length) return { ask: `${GUARD_PREFIX} this deletes test file(s) (${truncate(victims.join(', '), 120)}); verify flags test deletions (CK-TEST-DEL) unless the spec asks for them. Confirm the deletion is intended.`, rule: 'delete-test' };
+    if (DELETERS.has(exe)) {
+      const victims = testVictims(h, args);
+      if (victims.length) return askDeleteTests(victims);
+    }
+  }
+  return null;
+}
+
+/** The guard's verdict on an edit or read tool call, or null. */
+function guardFiles(h) {
+  const { norm } = h;
+  const paths = extractPaths(norm);
+  const patterns = norm.tool_kind === 'read' ? extractPatterns(norm) : [];
+  if (!paths.length && !patterns.length) return null;
+  const where = h.st.rel || STATE_DIR_NAME;
+  const resolved = paths.map((p) => { const abs = absPath(h, p); return { p, abs, rel: relPosix(h.root, abs) }; });
+  if (resolved.some((r) => underState(r.rel, r.abs, h.st))) {
+    return norm.tool_kind === 'read'
+      ? { deny: `${GUARD_PREFIX} ${where}/ holds the live-test credential, the budget ledger and the evidence ledger;`
+        + ' the guard level denies reading or searching it with host tools.', rule: 'state-read' }
+      : { deny: `${GUARD_PREFIX} files under ${where}/ (evidence ledger, budget, credentials) are written only by the`
+        + ' companion\'s scripts; the guard level denies editing them.', rule: 'state-edit' };
+  }
+  if (patterns.some((pt) => mentionsState(pt, h.st) || /\.env\.live\b/.test(pt))) {
+    return { deny: `${GUARD_PREFIX} ${where}/ holds the live-test credential and evidence; the guard level denies`
+      + ' searching it with host tools.', rule: 'state-read' };
+  }
+  if (norm.tool_kind !== 'edit') return null;
+  const ops = new Map(parsePatch(norm.tool_input).map((f) => [f.path, f.op]));
+  for (const { p, rel: inRepo } of resolved) {
+    const rel = inRepo || toPosix(p);
+    const c = classify(rel, h.detect);
+    if (ops.get(p) === 'delete' && c.test) {
+      return { ask: `${GUARD_PREFIX} this deletes a test file (${rel}); verify flags test deletions (CK-TEST-DEL)`
+        + ' unless the spec asks for them. Confirm the deletion is intended.', rule: 'delete-test' };
+    }
+    if (c.ci) {
+      return { ask: `${GUARD_PREFIX} this edits CI configuration (${rel}); CI edits that weaken test steps fail verify`
+        + ' (CK-CI). Confirm the change is intended.', rule: 'ci-edit' };
     }
   }
   return null;
@@ -1078,55 +838,25 @@ function guardShell(h, cmd) {
 
 async function preGuard(h) {
   const { norm } = h;
-  h.markers = await loadMarkers();
   h.detect = readJson(h.st.paths.detect, null);
   let verdict = null;
   if (norm.tool_kind === 'shell') {
     const cmd = shellCommand(norm.tool_input);
-    if (!cmd) return {};
-    verdict = guardShell(h, cmd);
+    if (cmd) verdict = guardShell(h, cmd);
   } else if (norm.tool_kind === 'edit' || norm.tool_kind === 'read') {
-    const paths = extractPaths(norm);
-    const patterns = norm.tool_kind === 'read' ? extractPatterns(norm) : [];
-    if (!paths.length && !patterns.length) return {};
-    const ops = new Map(parsePatch(norm.tool_input).map((f) => [f.path, f.op]));
-    for (const p of paths) {
-      const abs = absPath(h, p);
-      const rel = relPosix(h.root, abs);
-      if (underState(rel, abs, h.st)) {
-        verdict = norm.tool_kind === 'read'
-          ? { deny: `${GUARD_PREFIX} ${h.st.rel || STATE_DIR_NAME}/ holds the live-test credential, the budget ledger and the evidence ledger; the guard level denies reading or searching it with host tools.`, rule: 'state-read' }
-          : { deny: `${GUARD_PREFIX} files under ${h.st.rel || STATE_DIR_NAME}/ (evidence ledger, budget, credentials) are written only by the companion's scripts; the guard level denies editing them.`, rule: 'state-edit' };
-        break;
-      }
-    }
-    if (!verdict && patterns.some((pt) => mentionsState(pt, h.st) || /\.env\.live\b/.test(pt))) {
-      verdict = { deny: `${GUARD_PREFIX} ${h.st.rel || STATE_DIR_NAME}/ holds the live-test credential and evidence; the guard level denies searching it with host tools.`, rule: 'state-read' };
-    }
-    if (!verdict && norm.tool_kind === 'edit') {
-      for (const p of paths) {
-        const rel = repoRel(h, p) || toPosix(p);
-        const c = classify(h.markers, rel, h.detect);
-        if (ops.get(p) === 'delete' && c.test) {
-          verdict = { ask: `${GUARD_PREFIX} this deletes a test file (${rel}); verify flags test deletions (CK-TEST-DEL) unless the spec asks for them. Confirm the deletion is intended.`, rule: 'delete-test' };
-          break;
-        }
-        if (c.ci) {
-          verdict = { ask: `${GUARD_PREFIX} this edits CI configuration (${rel}); CI edits that weaken test steps fail verify (CK-CI). Confirm the change is intended.`, rule: 'ci-edit' };
-          break;
-        }
-      }
-    }
+    verdict = guardFiles(h);
   }
   if (!verdict) return {};
+  const decision = verdict.deny ? 'deny' : 'ask';
   await record(h, (s) => {
     // Claude starts one handler per matching `if` rule (`cat .adc/.env.live` matches two); count the call once.
-    if (norm.tool_use_id && s.guard.last && s.guard.last.tool_use_id === norm.tool_use_id) return;
+    if (norm.tool_use_id && s.guard.last?.tool_use_id === norm.tool_use_id) return;
     if (verdict.deny) s.guard.denials = (s.guard.denials || 0) + 1;
     else s.guard.asks = (s.guard.asks || 0) + 1;
-    s.guard.last = { ts: nowIso(), rule: verdict.rule, decision: verdict.deny ? 'deny' : 'ask', ...(norm.tool_use_id ? { tool_use_id: norm.tool_use_id } : {}) };
+    s.guard.last = { ts: nowIso(), rule: verdict.rule, decision,
+      ...(norm.tool_use_id ? { tool_use_id: norm.tool_use_id } : {}) };
   });
-  log(h, { decision: verdict.deny ? 'deny' : 'ask', rule: verdict.rule, tool: norm.tool_name });
+  log(h, { decision, rule: verdict.rule, tool: norm.tool_name });
   return verdict.deny ? { deny: verdict.deny } : { ask: verdict.ask };
 }
 
@@ -1157,45 +887,36 @@ const HANDLERS = {
 // ---------------------------------------------------------------------------
 // Entry point
 
+const HOOK_OPTIONS = {
+  dialect: { type: 'string' }, level: { type: 'string' }, 'state-dir': { type: 'string' }, cwd: { type: 'string' },
+  json: { type: 'boolean' }, yes: { type: 'boolean' }, 'dry-run': { type: 'boolean' },
+};
+
 /** Handle one hook invocation. Returns the decision object (`{}` for no decision); never throws. */
 export async function hookRunCommand(argv = [], { stdin = process.stdin, env = process.env } = {}) {
   const t0 = Date.now();
   let h = null;
+  const debug = (msg) => { if (debugOn(env)) process.stderr.write(`adc hook-run: ${msg}\n`); };
   try {
-    const { values, positionals } = parseArgs({
-      args: argv,
-      options: {
-        dialect: { type: 'string' }, level: { type: 'string' }, 'state-dir': { type: 'string' }, cwd: { type: 'string' },
-        json: { type: 'boolean' }, yes: { type: 'boolean' }, 'dry-run': { type: 'boolean' },
-      },
-      allowPositionals: true,
-      strict: false,
-    });
+    const { values, positionals } = parseArgs({ args: argv, options: HOOK_OPTIONS, allowPositionals: true,
+      strict: false });
     const event = positionals[0];
     const buf = await readStdin({ stream: stdin });
-    if (!HOOK_EVENTS.includes(event)) {
-      if (debugOn(env)) process.stderr.write(`adc hook-run: unknown event "${event}"\n`);
-      return {};
-    }
-    const text = decodeStdin(buf);
-    const payload = parsePayload(text);
-    if (!payload) {
-      if (debugOn(env)) process.stderr.write(`adc hook-run: ${event}: empty or malformed payload (${buf ? buf.length : 'overflow'} bytes)\n`);
-      return {};
-    }
-    const explicit = typeof values.dialect === 'string' ? values.dialect : 'auto';
-    const dialect = detectDialect(payload, { explicit, env });
+    if (!HOOK_EVENTS.includes(event)) { debug(`unknown event "${event}"`); return {}; }
+    const payload = parsePayload(decodeStdin(buf));
+    if (!payload) { debug(`${event}: empty or malformed payload (${buf ? buf.length : 'overflow'} bytes)`); return {}; }
+    const str = (k) => (typeof values[k] === 'string' ? values[k] : null);
+    const dialect = detectDialect(payload, { explicit: str('dialect') || 'auto', env });
     const norm = normalizePayload(payload, dialect, event);
-    const repo = findRepo(norm.cwd) || findRepo(env.CLAUDE_PROJECT_DIR) || findRepo(typeof values.cwd === 'string' ? values.cwd : null) || findRepo(process.cwd());
-    if (!repo) {
-      if (debugOn(env)) process.stderr.write(`adc hook-run: ${event}: no git work tree for cwd ${norm.cwd || process.cwd()}\n`);
-      return {};
-    }
+    const repo = locateRepo(norm.cwd) || locateRepo(env.CLAUDE_PROJECT_DIR)
+      || locateRepo(str('cwd')) || locateRepo(process.cwd());
+    if (!repo) { debug(`${event}: no git work tree for cwd ${norm.cwd || process.cwd()}`); return {}; }
     const level = LEVELS.includes(values.level) ? values.level : 'advise';
-    const st = hookStateInfo(repo, { stateDir: typeof values['state-dir'] === 'string' ? values['state-dir'] : null, env });
+    const st = hookStateInfo(repo, { stateDir: str('state-dir'), env });
     // An existing state dir is usable for logging right away; a missing one is created lazily.
     if (fs.existsSync(st.dir)) ensureHookState(st, repo);
-    h = { event, dialect, norm, repo, root: repo.root, level, st, env, t0, bytes: buf ? buf.length : 0, noWrite: false };
+    h = { event, dialect, norm, repo, root: repo.root, level, st, env, t0, bytes: buf ? buf.length : 0,
+      noWrite: false };
     // A tracked state dir (cached by the last session-start or guard check): stay silent and write
     // nothing; session-start re-checks and says so, the guard still denies commit and push.
     if (event !== 'session-start' && trackedCached(repo)) {
@@ -1204,11 +925,12 @@ export async function hookRunCommand(argv = [], { stdin = process.stdin, env = p
     }
     const decision = await HANDLERS[event](h);
     const out = formatOutput(dialect, event, decision, { hostEvent: norm.host_event });
-    log(h, { kind: Object.keys(decision || {}).join(',') || 'none', ms: Date.now() - t0, session: sha256(norm.session_id).slice(0, 8) }, true);
+    log(h, { kind: Object.keys(decision || {}).join(',') || 'none', ms: Date.now() - t0,
+      session: sha256(norm.session_id).slice(0, 8) }, true);
     return out;
   } catch (err) {
-    try { if (h) log(h, { error: err && err.code ? err.code : 'HANDLER', message: truncate(err && err.message, 200) }); } catch {}
-    if (debugOn(env)) process.stderr.write(`adc hook-run: ${err && err.stack ? err.stack : err}\n`);
+    try { if (h) log(h, { error: err?.code || 'HANDLER', message: truncate(err?.message, 200) }); } catch {}
+    debug(err?.stack || err);
     return {};
   }
 }

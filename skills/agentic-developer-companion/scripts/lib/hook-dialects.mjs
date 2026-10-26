@@ -3,10 +3,13 @@
 // (including Codex `apply_patch` bodies and string-encoded Copilot `toolArgs`), and format a
 // decision in the shape each host expects. Imports only core.mjs: hooks load it on every call.
 
-import { sha256, toPosix, truncate } from './core.mjs';
+import { isObj, sha256, toPosix, truncate } from './core.mjs';
 
 export const DIALECTS = Object.freeze(['copilot', 'claude', 'codex']);
-export const HOOK_EVENTS = Object.freeze(['session-start', 'post-edit', 'post-shell', 'stop', 'pre-guard', 'session-end']);
+export const HOOK_EVENTS = Object.freeze(['session-start', 'post-edit', 'post-shell', 'stop', 'pre-guard',
+  'session-end']);
+/** Hook levels (§8.5), shared by the handler and the renderer. */
+export const LEVELS = Object.freeze(['advise', 'gate', 'guard']);
 export const CONTEXT_LIMIT = 2000;
 
 /** Host event names (Claude and Codex output carry them in hookSpecificOutput.hookEventName). */
@@ -19,7 +22,8 @@ export const HOST_EVENT = Object.freeze({
   'session-end': 'SessionEnd',
 });
 
-const KNOWN_HOST_EVENTS = new Set(['SessionStart', 'PostToolUse', 'Stop', 'PreToolUse', 'SessionEnd', 'SubagentStop', 'PostToolUseFailure']);
+const KNOWN_HOST_EVENTS = new Set(['SessionStart', 'PostToolUse', 'Stop', 'PreToolUse', 'SessionEnd', 'SubagentStop',
+  'PostToolUseFailure']);
 
 // Tool names per kind, compared lowercased. Copilot runtime names, Claude names, Codex payload
 // names; `str_replace_editor` is decided by its `command` argument (view is a read).
@@ -27,9 +31,10 @@ const EDIT_TOOLS = new Set(['edit', 'create', 'write', 'str_replace_editor', 'st
   'multiedit', 'notebookedit', 'edit_file', 'write_file', 'insert', 'replace']);
 const SHELL_TOOLS = new Set(['bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec']);
 const READ_TOOLS = new Set(['view', 'read', 'grep', 'glob', 'rg', 'ls', 'read_file', 'notebookread', 'search']);
+// Copilot's camelCase payload keys (the camelCase hook config).
+const CAMEL_KEYS = ['sessionId', 'toolName', 'toolArgs', 'toolResult', 'transcriptPath'];
 
-const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const has = (o, k) => isObj(o) && Object.prototype.hasOwnProperty.call(o, k);
+const has = (o, k) => isObj(o) && Object.hasOwn(o, k);
 
 /** Parse a value that may be a JSON-encoded string (Copilot camelCase `toolArgs`). */
 export function decodeMaybeJson(value) {
@@ -44,19 +49,17 @@ export function decodeMaybeJson(value) {
  * can be executed by Copilot); then an explicit `--dialect`; then the payload shape.
  */
 export function detectDialect(payload, { explicit = 'auto', env = process.env } = {}) {
-  const copilotEnv = env.COPILOT_CLI && env.COPILOT_CLI !== '0' && env.COPILOT_CLI !== 'false';
-  if (copilotEnv) return 'copilot';
+  if (env.COPILOT_CLI && env.COPILOT_CLI !== '0' && env.COPILOT_CLI !== 'false') return 'copilot';
   if (DIALECTS.includes(explicit)) return explicit;
   const p = isObj(payload) ? payload : {};
-  // Copilot camelCase config: sessionId / toolName / toolArgs / toolResult / transcriptPath.
-  if (['sessionId', 'toolName', 'toolArgs', 'toolResult', 'transcriptPath'].some((k) => has(p, k))) return 'copilot';
+  if (CAMEL_KEYS.some((k) => has(p, k))) return 'copilot';
   // Copilot PascalCase config: snake_case payload with tool_result{result_type,...} or an ISO timestamp.
-  if (isObj(p.tool_result) || (typeof p.timestamp === 'string' && /^\d{4}-\d\d-\d\dT/.test(p.timestamp))) return 'copilot';
+  if (isObj(p.tool_result) || (typeof p.timestamp === 'string' && /^\d{4}-\d\d-\d\dT/.test(p.timestamp))) {
+    return 'copilot';
+  }
   // Codex: turn_id, apply_patch, or model + permission_mode without Claude's prompt_id.
   if (has(p, 'turn_id') || String(p.tool_name || '').toLowerCase() === 'apply_patch') return 'codex';
   if (has(p, 'model') && has(p, 'permission_mode') && !has(p, 'prompt_id') && !has(p, 'effort')) return 'codex';
-  if (has(p, 'hook_event_name') || has(p, 'session_id')) return 'claude';
-  if (env.CLAUDECODE || env.CLAUDE_PROJECT_DIR) return 'claude';
   return 'claude';
 }
 
@@ -64,7 +67,9 @@ export function detectDialect(payload, { explicit = 'auto', env = process.env } 
 export function toolKind(name, input = {}) {
   const n = String(name || '').toLowerCase();
   if (!n) return 'none';
-  if (n === 'str_replace_editor') return String((isObj(input) && input.command) || '').toLowerCase() === 'view' ? 'read' : 'edit';
+  if (n === 'str_replace_editor') {
+    return String((isObj(input) && input.command) || '').toLowerCase() === 'view' ? 'read' : 'edit';
+  }
   if (EDIT_TOOLS.has(n)) return 'edit';
   if (SHELL_TOOLS.has(n)) return 'shell';
   if (READ_TOOLS.has(n)) return 'read';
@@ -74,28 +79,26 @@ export function toolKind(name, input = {}) {
 function isoFrom(ts) {
   if (typeof ts === 'number' && Number.isFinite(ts)) {
     // Copilot camelCase timestamps are epoch milliseconds; seconds are accepted too.
-    const ms = ts < 1e11 ? ts * 1000 : ts;
-    const d = new Date(ms);
+    const d = new Date(ts < 1e11 ? ts * 1000 : ts);
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
   }
   if (typeof ts === 'string' && !Number.isNaN(Date.parse(ts))) return new Date(ts).toISOString();
   return null;
 }
 
+const RESULT_TEXT_KEYS = ['textResultForLlm', 'text_result_for_llm', 'stdout', 'stderr', 'output', 'aggregated_output',
+  'formatted_output', 'text', 'content', 'result', 'message', 'error'];
+
 /** Collect readable text from a tool result (string, {stdout,stderr}, content blocks...). */
 export function resultText(value, max = 200_000) {
   const parts = [];
   let size = 0;
-  const push = (s) => { if (size < max) { parts.push(s); size += s.length; } };
   const walk = (v, depth) => {
     if (v == null || depth > 4 || size >= max) return;
-    if (typeof v === 'string') { push(v); return; }
+    if (typeof v === 'string') { parts.push(v); size += v.length; return; }
     if (Array.isArray(v)) { for (const x of v) walk(x, depth + 1); return; }
     if (!isObj(v)) return;
-    for (const k of ['textResultForLlm', 'text_result_for_llm', 'stdout', 'stderr', 'output', 'aggregated_output',
-      'formatted_output', 'text', 'content', 'result', 'message', 'error']) {
-      if (has(v, k)) walk(v[k], depth + 1);
-    }
+    for (const k of RESULT_TEXT_KEYS) if (Object.hasOwn(v, k)) walk(v[k], depth + 1);
   };
   walk(value, 0);
   const text = parts.join('\n');
@@ -106,7 +109,7 @@ function exitCodeFrom(...values) {
   for (const v of values) {
     if (!isObj(v)) continue;
     for (const k of ['exit_code', 'exitCode', 'exit_status', 'returncode', 'return_code']) {
-      if (typeof v[k] === 'number' && Number.isInteger(v[k])) return v[k];
+      if (Number.isInteger(v[k])) return v[k];
     }
   }
   return null;
@@ -136,8 +139,7 @@ export function shellCommand(input) {
     if (Array.isArray(c) && c.every((x) => typeof x === 'string')) {
       // ["bash", "-lc", "npm test"] -> "npm test"
       const i = c.findIndex((x) => ['-c', '-lc', '-Command', '-command', '/c', '/C'].includes(x));
-      if (i >= 0 && i + 1 < c.length) return c.slice(i + 1).join(' ');
-      return c.join(' ');
+      return i >= 0 && i + 1 < c.length ? c.slice(i + 1).join(' ') : c.join(' ');
     }
   }
   return '';
@@ -149,7 +151,7 @@ export function shellCommand(input) {
  */
 export function normalizePayload(payload, dialect, event) {
   const p = isObj(payload) ? payload : {};
-  const camel = ['sessionId', 'toolName', 'toolArgs', 'toolResult', 'transcriptPath'].some((k) => has(p, k));
+  const camel = CAMEL_KEYS.some((k) => has(p, k));
   const transcript = p.transcriptPath ?? p.transcript_path ?? null;
   let sessionId = p.sessionId ?? p.session_id ?? null;
   if (sessionId != null) sessionId = String(sessionId);
@@ -157,8 +159,7 @@ export function normalizePayload(payload, dialect, event) {
   else sessionId = 'unknown';
 
   const toolName = camel ? (p.toolName ?? null) : (p.tool_name ?? null);
-  let toolInput = camel ? decodeMaybeJson(p.toolArgs) : decodeMaybeJson(p.tool_input);
-  if (toolInput === undefined) toolInput = null;
+  const toolInput = decodeMaybeJson(camel ? p.toolArgs : p.tool_input) ?? null;
   const rawResult = camel ? p.toolResult : (has(p, 'tool_result') ? p.tool_result : p.tool_response);
   const resultObj = decodeMaybeJson(rawResult);
   const resultType = isObj(resultObj) ? (resultObj.resultType ?? resultObj.result_type ?? null) : null;
@@ -166,12 +167,13 @@ export function normalizePayload(payload, dialect, event) {
   const resultTextValue = rawResult == null ? null : resultText(resultObj);
   const payloadExit = exitCodeFrom(resultObj, p);
   const textExit = payloadExit == null ? exitFromText(resultTextValue) : null;
+  const snake = has(p, 'hook_event_name') || has(p, 'session_id') || has(p, 'tool_name');
 
   return {
     dialect,
     event,
     host_event: typeof p.hook_event_name === 'string' ? p.hook_event_name : null,
-    shape: camel ? 'camel' : (has(p, 'hook_event_name') || has(p, 'session_id') || has(p, 'tool_name') ? 'snake' : 'unknown'),
+    shape: camel ? 'camel' : snake ? 'snake' : 'unknown',
     session_id: sessionId,
     transcript_path: typeof transcript === 'string' ? transcript : null,
     cwd: typeof p.cwd === 'string' && p.cwd ? p.cwd : null,
@@ -202,6 +204,7 @@ const PATH_KEYS = new Set(['path', 'file_path', 'filePath', 'filepath', 'noteboo
 const PATH_LIST_KEYS = new Set(['paths', 'files', 'file_paths', 'filePaths']);
 const PATCH_HEADER = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/;
 const PATCH_MOVE = /^\*\*\* Move to:\s*(.+?)\s*$/;
+const PATCH_FILE = /\*\*\* (Add|Update|Delete) File:/;
 
 const cleanPath = (s) => toPosix(String(s).trim().replace(/^["']|["']$/g, ''));
 
@@ -265,18 +268,18 @@ export function extractPaths(norm) {
   };
   const input = norm && norm.tool_input;
   const name = String((norm && norm.tool_name) || '').toLowerCase();
-  if (name === 'apply_patch' || (typeof input === 'string' && /\*\*\* (Add|Update|Delete) File:/.test(input)) ||
-      (isObj(input) && Object.values(input).some((v) => typeof v === 'string' && /\*\*\* (Add|Update|Delete) File:/.test(v)))) {
+  if (name === 'apply_patch' || (typeof input === 'string' && PATCH_FILE.test(input)) ||
+      (isObj(input) && Object.values(input).some((v) => typeof v === 'string' && PATCH_FILE.test(v)))) {
     for (const f of parsePatch(input)) { add(f.path); if (f.moveTo) add(f.moveTo); }
   }
   const walk = (v, depth) => {
     if (depth > 3 || !isObj(v)) return;
     for (const [k, val] of Object.entries(v)) {
-      if (PATH_KEYS.has(k) && typeof val === 'string') add(val);
       // Copilot's grep/rg/glob take `paths` as one string or an array (measured, CLI 1.0.103).
-      else if (PATH_LIST_KEYS.has(k) && typeof val === 'string') add(val);
-      else if (PATH_LIST_KEYS.has(k) && Array.isArray(val)) val.forEach((x) => (typeof x === 'string' ? add(x) : walk(x, depth + 1)));
-      else if (Array.isArray(val)) val.forEach((x) => walk(x, depth + 1));
+      if ((PATH_KEYS.has(k) || PATH_LIST_KEYS.has(k)) && typeof val === 'string') add(val);
+      else if (PATH_LIST_KEYS.has(k) && Array.isArray(val)) {
+        val.forEach((x) => (typeof x === 'string' ? add(x) : walk(x, depth + 1)));
+      } else if (Array.isArray(val)) val.forEach((x) => walk(x, depth + 1));
       else if (isObj(val)) walk(val, depth + 1);
     }
   };
@@ -291,6 +294,10 @@ export function extractPatterns(norm) {
   return ['pattern', 'glob', 'include', 'includes', 'query'].map((k) => input[k]).filter((v) => typeof v === 'string');
 }
 
+const CONTENT_KEYS = ['content', 'file_text', 'fileText', 'new_string', 'newString', 'new_str', 'newStr',
+  'new_source', 'newSource', 'new_text', 'newText', 'text', 'code'];
+const EDIT_TEXT_KEYS = ['new_string', 'newString', 'new_str', 'newText', 'new_text'];
+
 /**
  * New content per edited file, for marker scanning: Write `content`, Edit `new_string`,
  * MultiEdit `edits[]`, NotebookEdit `new_source`, Copilot `file_text`/`new_str`, patch `+` lines.
@@ -300,42 +307,34 @@ export function extractPatterns(norm) {
 export function extractContent(norm) {
   const input = norm && norm.tool_input;
   const name = String((norm && norm.tool_name) || '').toLowerCase();
-  const out = [];
   const patchFiles = parsePatch(input);
   if (patchFiles.length) {
-    for (const f of patchFiles) {
-      out.push({ path: f.path, op: f.op, text: f.added.map((a) => a.text).join('\n'), lines: f.added.map((a) => a.line) });
-    }
-    return out;
+    return patchFiles.map((f) => ({ path: f.path, op: f.op, text: f.added.map((a) => a.text).join('\n'),
+      lines: f.added.map((a) => a.line) }));
   }
-  if (!isObj(input)) return out;
-  const paths = extractPaths(norm);
-  const file = paths[0] || null;
-  const texts = [];
-  for (const k of ['content', 'file_text', 'fileText', 'new_string', 'newString', 'new_str', 'newStr',
-    'new_source', 'newSource', 'new_text', 'newText', 'text', 'code']) {
-    if (typeof input[k] === 'string') texts.push(input[k]);
-  }
+  if (!isObj(input)) return [];
+  const file = extractPaths(norm)[0] || null;
+  const texts = CONTENT_KEYS.map((k) => input[k]).filter((v) => typeof v === 'string');
   if (Array.isArray(input.edits)) {
     for (const e of input.edits) {
-      if (isObj(e)) for (const k of ['new_string', 'newString', 'new_str', 'newText', 'new_text']) if (typeof e[k] === 'string') texts.push(e[k]);
+      if (isObj(e)) for (const k of EDIT_TEXT_KEYS) if (typeof e[k] === 'string') texts.push(e[k]);
     }
   }
-  let op = 'update';
-  if (name === 'create' || name === 'write' || (name === 'str_replace_editor' && input.command === 'create')) op = 'write';
+  const op = name === 'create' || name === 'write' || (name === 'str_replace_editor' && input.command === 'create')
+    ? 'write' : 'update';
+  if (!file && !texts.length) return [];
   // Replacement text (Edit new_string, edit new_str, MultiEdit, NotebookEdit cells) has no known
   // position in the file, so its line numbers are not reported.
-  if (file || texts.length) out.push({ path: file, op, text: texts.join('\n'), ...(op === 'write' ? {} : { fragment: true }) });
-  return out;
+  return [{ path: file, op, text: texts.join('\n'), ...(op === 'write' ? {} : { fragment: true }) }];
 }
 
 // ---------------------------------------------------------------------------
 // Output
 
 /**
- * Format an internal decision `{context?, block?, deny?, ask?, modifiedResult?: {text, resultType},
- * systemMessage?}` as the host expects. No decision yields `{}`. Codex rejects unknown fields,
- * so its shapes use only documented keys (Stop context becomes `systemMessage`).
+ * Format an internal decision `{context?, block?, deny?, ask?, modifiedResult?: {text, resultType}}`
+ * as the host expects. No decision yields `{}`. Codex rejects unknown fields, so its shapes use
+ * only documented keys (Stop context becomes `systemMessage`).
  */
 export function formatOutput(dialect, event, decision = {}, { hostEvent = null } = {}) {
   const d = decision || {};
@@ -347,20 +346,19 @@ export function formatOutput(dialect, event, decision = {}, { hostEvent = null }
     if (d.block) return { decision: 'block', reason: cap(d.block) };
     const out = {};
     if (d.modifiedResult && event === 'post-shell') {
-      out.modifiedResult = { resultType: d.modifiedResult.resultType || 'success', textResultForLlm: String(d.modifiedResult.text) };
+      out.modifiedResult = { resultType: d.modifiedResult.resultType || 'success',
+        textResultForLlm: String(d.modifiedResult.text) };
     }
     if (d.context && event !== 'session-end') out.additionalContext = cap(d.context);
     return out;
   }
   // Claude and Codex share the nested shape.
   if (d.deny || d.ask) {
-    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: d.deny ? 'deny' : 'ask', permissionDecisionReason: cap(d.deny || d.ask) } };
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: d.deny ? 'deny' : 'ask',
+      permissionDecisionReason: cap(d.deny || d.ask) } };
   }
   if (d.block) return { decision: 'block', reason: cap(d.block) };
-  if (d.context && event !== 'session-end') {
-    if (dialect === 'codex' && evName === 'Stop') return { systemMessage: cap(d.context) };
-    return { hookSpecificOutput: { hookEventName: evName, additionalContext: cap(d.context) } };
-  }
-  if (d.systemMessage) return { systemMessage: cap(d.systemMessage) };
-  return {};
+  if (!d.context || event === 'session-end') return {};
+  if (dialect === 'codex' && evName === 'Stop') return { systemMessage: cap(d.context) };
+  return { hookSpecificOutput: { hookEventName: evName, additionalContext: cap(d.context) } };
 }

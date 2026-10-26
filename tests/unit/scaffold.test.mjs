@@ -13,6 +13,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import * as core from '../../skills/agentic-developer-companion/scripts/lib/core.mjs';
 import * as scaffold from '../../skills/agentic-developer-companion/scripts/lib/scaffold.mjs';
+import * as M from '../../skills/agentic-developer-companion/scripts/lib/markers.mjs';
+import { importBaseCounts } from '../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs';
 
 const ADC = core.ADC_SCRIPT;
 const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'adc-scaffold-')));
@@ -76,7 +78,7 @@ function adc(args, { cwd, env } = {}) {
 /** Run a scaffold and assert its exit code; returns the parsed result. */
 function sc(dir, kind, extra = [], { exit = 0, env } = {}) {
   const r = adc(['scaffold', kind, ...extra], { cwd: dir, env });
-  assert.equal(r.status, exit, `scaffold ${kind} ${extra.join(' ')} exited ${r.status}\n${r.stderr}\n${r.stdout.slice(0, 2000)}`);
+  if (exit !== null) assert.equal(r.status, exit, `scaffold ${kind} ${extra.join(' ')} exited ${r.status}\n${r.stderr}\n${r.stdout.slice(0, 2000)}`);
   assert.ok(r.json, `no JSON on stdout: ${r.stdout.slice(0, 500)}`);
   return r.json;
 }
@@ -189,30 +191,20 @@ function validateAll(dir, res) {
   return n;
 }
 
-let markers;
-async function loadMarkers() {
-  if (markers !== undefined) return markers;
-  try { markers = await import('../../skills/agentic-developer-companion/scripts/lib/markers.mjs'); } catch { markers = null; }
-  return markers;
-}
-
 /** The companion's own diff checks must find nothing to flag in what the scaffolds generate. */
-async function assertNoSelfFindings(dir, res, { allowSkips = false } = {}) {
-  const M = await loadMarkers();
-  if (!M || typeof M.scanText !== 'function') return;
+function assertNoSelfFindings(dir, res, { allowSkips = false } = {}) {
   for (const w of res.written) {
     const file = path.isAbsolute(w.path) ? w.path : path.join(dir, ...w.path.split('/'));
     if (!fs.existsSync(file)) continue;
     const text = fs.readFileSync(file, 'utf8');
-    const catalogs = [M.SUPPRESSIONS, M.SWALLOW_PATTERNS, M.IN_SOURCE_RETRIES, ...(allowSkips ? [] : [M.SKIP_MARKERS])].filter(Array.isArray);
+    const catalogs = [M.SUPPRESSIONS, M.SWALLOW_PATTERNS, M.IN_SOURCE_RETRIES, ...(allowSkips ? [] : [M.SKIP_MARKERS])];
     if (/\.ya?ml$/.test(file)) catalogs.push(M.CI_WEAKENING);
     for (const cat of catalogs) {
-      let hits = [];
-      try { hits = M.scanText(text, cat, { path: w.path, file: w.path }); } catch { hits = M.scanText(text, cat); }
+      const hits = M.scanText(text, cat, { path: w.path, file: w.path });
       assert.deepEqual(hits.map((h) => `${h.id}:${h.line}`), [], `${w.path} trips the companion's own checks: ${JSON.stringify(hits.slice(0, 3))}`);
     }
-    if (typeof M.scanSecrets === 'function') assert.deepEqual(M.scanSecrets(text), [], `${w.path}: secret-shaped text`);
-    if (/^\.github\/workflows\//.test(w.path) && M.CI_GATE_HEADER) assert.match(text.split('\n')[0], M.CI_GATE_HEADER, `${w.path}: missing the ci-gate header`);
+    assert.deepEqual(M.scanSecrets(text), [], `${w.path}: secret-shaped text`);
+    if (/^\.github\/workflows\//.test(w.path)) assert.match(text.split('\n')[0], M.CI_GATE_HEADER, `${w.path}: missing the ci-gate header`);
   }
 }
 
@@ -266,12 +258,6 @@ const RUST_PROJECT = {
 // Pure helpers
 
 describe('rendering helpers', () => {
-  test('renderTemplate renders {{vars}} and passes GitHub ${{ }} expressions through', () => {
-    const out = scaffold.renderTemplate('a {{x}} ${{ matrix.os }} ${{ needs.{{x}}.result }} {{ y }}', { x: '1', y: 'two' });
-    assert.equal(out, 'a 1 ${{ matrix.os }} ${{ needs.{{x}}.result }} two');
-    assert.throws(() => scaffold.renderTemplate('{{missing}}', {}), (e) => e.code === 'TEMPLATE_VAR');
-  });
-
   test('pickSections: every attribute must match; when/unless use features; fragments are separate', () => {
     const sections = core.parseBundle([
       '@@@ file: a.txt lang=ts|js @@@', 'a',
@@ -302,11 +288,6 @@ describe('rendering helpers', () => {
     assert.match(cjs, /const \{ a: b \} = require\('\.\/harness\.cjs'\);/);
     assert.match(cjs, /module\.exports = \{ X, f, g \};\n$/);
     assert.ok(!/^(?:import|export) /m.test(cjs));
-  });
-
-  test('splitArgv honors quotes and rejects unterminated ones', () => {
-    assert.deepEqual(scaffold.splitArgv(`node "bin/my cli.mjs" --flag 'a b' ""`), ['node', 'bin/my cli.mjs', '--flag', 'a b', '']);
-    assert.throws(() => scaffold.splitArgv('node "x'), (e) => e.exit === core.EXIT.USAGE);
   });
 
   test('slugify, jsString and cString produce safe identifiers and literals', () => {
@@ -432,6 +413,30 @@ describe('scaffold command', () => {
     assert.match(sc(dir, 'e2e-cli', ['--out', '.git/x'], { exit: 2 }).error.message, /\.git/);
     assert.match(sc(dir, 'e2e-web', ['--base-url', 'https://user:pw@example.test'], { exit: 2 }).error.message, /without credentials/);
     assert.equal(adc(['scaffold', 'e2e-web', '--no-such-flag'], { cwd: dir }).status, 2);
+    assert.match(sc(dir, 'e2e-cli', ['--bin', 'node "bin/cli.mjs'], { exit: 2 }).error.message, /unterminated quote/);
+  });
+
+  test('--base-url must stay a valid string literal in every generated language', () => {
+    const dir = repo(nodeProject());
+    // A backslash or brace would end or break the quoted literal in playwright.config.ts and conftest.py.
+    for (const bad of ['http://localhost:3000/a\\', 'http://localhost:3000/{x}', 'http://localhost:3000/a`b']) {
+      assert.match(sc(dir, 'e2e-web', ['--base-url', bad], { exit: 2 }).error.message, /http\(s\) URL/, bad);
+    }
+    // An @ after the authority (in the path or query) is not a credential.
+    const ok = sc(dir, 'e2e-api', ['--base-url', 'http://localhost:3000/v1?owner=a@b.test']);
+    assert.equal(ok.base_url, 'http://localhost:3000/v1?owner=a@b.test');
+  });
+
+  test('a symlinked checkout (macOS: /var is /private/var) keeps --out and --checklist inside the repository', { skip: core.IS_WINDOWS }, () => {
+    const dir = repo(nodeProject());
+    const alias = path.join(TMP, `alias-${++seq}`);
+    fs.symlinkSync(dir, alias, 'dir');
+    const res = sc(alias, 'e2e-cli', ['--out', 'e2e/x']);
+    assert.equal(res.out, 'e2e/x');
+    assert.ok(paths(res).includes('e2e/x/harness.mjs'), paths(res).join(', '));
+    write(dir, { 'notes/live-checklist.md': '# answered\n' });
+    const live = sc(alias, 'live', ['--checklist', path.join(alias, 'notes', 'live-checklist.md'), '--synthetic-cost', '3']);
+    assert.equal(live.synthetic.checklist, 'notes/live-checklist.md');
   });
 
   test('a tracked state dir refuses with exit 3', () => {
@@ -456,15 +461,19 @@ describe('scaffold command', () => {
     assert.match(r.json.usage, /e2e-web .*e2e-api|ci-gate/s);
   });
 
-  test('tooling kinds are delegated to tooling.mjs scaffoldTooling', async (t) => {
-    let mod = null;
-    try { mod = await import('../../skills/agentic-developer-companion/scripts/lib/tooling.mjs'); } catch {}
-    if (!mod || typeof mod.scaffoldTooling !== 'function') return t.skip('tooling.mjs is not available in this build');
+  test('tooling kinds are delegated to tooling.mjs scaffoldTooling, with the kind anywhere among the options', () => {
     const dir = repo(nodeProject());
-    const res = sc(dir, 'skill', ['--for', 'claude', '--name', 'demo-skill', '--description', 'Use when testing the scaffold delegation of the companion.']);
+    const desc = 'Use when testing the scaffold delegation of the companion.';
+    const res = sc(dir, 'skill', ['--for', 'claude', '--name', 'demo-skill', '--description', desc]);
     assert.equal(res.delegated, 'tooling scaffold');
     assert.ok(Array.isArray(res.written) && res.written.length > 0);
     assert.ok(res.written.every((w) => String(w.action).startsWith('would-')));
+    // Options before the kind (the kind used to be guessed from the first non-option word, here "claude").
+    const late = adc(['scaffold', '--for', 'claude', 'skill', '--name', 'demo-skill', '--description', desc], { cwd: dir });
+    assert.equal(late.status, 0, late.stderr + late.stdout.slice(0, 500));
+    assert.deepEqual(paths(late.json), paths(res));
+    // A tooling-only option on a test kind is a usage error, as before.
+    assert.match(sc(dir, 'e2e-cli', ['--name', 'x'], { exit: 2 }).error.message, /--name is a tooling scaffold option/);
   });
 
   test('works outside a git repository (no ignore verification needed for non-live kinds)', () => {
@@ -484,7 +493,7 @@ describe('e2e-cli', () => {
     const res = sc(dir, 'e2e-cli', ['--write']);
     assert.deepEqual(paths(res).sort(), ['e2e/cli/cli.e2e.test.mjs', 'e2e/cli/harness.mjs']);
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
     assert.match(read(dir, 'e2e/cli/harness.mjs'), /export const CLI = \[process\.execPath, path\.resolve\(PROJECT_ROOT, 'bin\/cli\.mjs'\)\];/);
     const ci = spawnSync(process.execPath, ['--test', 'e2e/cli/cli.e2e.test.mjs'], { cwd: dir, encoding: 'utf8', env: baseEnv({ CI: 'true' }) });
     assert.notEqual(ci.status, 0, 'CI must not write a missing golden file');
@@ -521,7 +530,7 @@ describe('e2e-cli', () => {
     assert.match(read(jest, 'e2e/cli/cli.e2e.test.cjs'), /const \{ describe, it \} = require\('@jest\/globals'\);[\s\S]*require\('\.\/harness\.cjs'\)/);
     assert.match(read(jest, 'e2e/cli/harness.cjs'), /module\.exports = \{ PROJECT_ROOT, CLI, GOLDEN_DIR, runCli, normalize, expectGolden \};/);
     validateAll(jest, r3);
-    await assertNoSelfFindings(jest, r3);
+    assertNoSelfFindings(jest, r3);
   });
 
   test('--bin overrides the entry point; no bin entry and no --bin is a usage error', () => {
@@ -567,7 +576,7 @@ describe('e2e-cli', () => {
     assert.equal(res.lang, 'python');
     assert.deepEqual(paths(res).sort(), ['tests/e2e/cli/harness.py', 'tests/e2e/cli/test_cli_e2e.py']);
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
     assert.match(read(dir, 'tests/e2e/cli/harness.py'), /CLI = \[sys\.executable, "-c", "import sys; from pytool\.cli import main; sys\.exit\(main\(\)\)"\]/);
     if (!tool('python3')) return;
     // The harness itself runs without pytest: normalize() and run_cli() against the real entry point.
@@ -593,7 +602,7 @@ describe('e2e-cli', () => {
 // regress
 
 describe('regress', () => {
-  test('node-test: named, tagged, linked; red on the base and green after the fix (clean-run --red-green)', { timeout: 120_000 }, async (t) => {
+  test('node-test: named, tagged, linked; red on the base and green after the fix (clean-run --red-green)', { timeout: 120_000 }, async () => {
     const dir = repo(nodeProject());
     const res = sc(dir, 'regress', ['--issue', 'https://github.com/o/r/issues/7', '--behavior', 'sum of an empty list is 0', '--write']);
     const testFile = 'test/regression/7-sum-of-an-empty-list-is-0.test.mjs';
@@ -602,7 +611,7 @@ describe('regress', () => {
     assert.ok(paths(res).includes('.adc/repro/7-sum-of-an-empty-list-is-0/repro.md'));
     assert.ok(paths(res).includes('.adc/repro/7-sum-of-an-empty-list-is-0/repro.mjs'));
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
     const text = read(dir, testFile);
     assert.match(text, /describe\('@regression #7'/);
     assert.match(text, /it\('test_7_sum_of_an_empty_list_is_0'/);
@@ -618,9 +627,6 @@ describe('regress', () => {
       .replace("// ADAPT: import the code under test, e.g. import { parse } from '../../src/parse';", "import { sum } from '../../src/sum.mjs';")
       .replace(/assert\.fail\([^\n]*\);/, 'assert.equal(sum([]), 0);'));
     fs.writeFileSync(path.join(dir, 'src/sum.mjs'), 'export function sum(values) {\n  return values.reduce((a, b) => a + b, 0);\n}\n');
-    let cleanRun = null;
-    try { cleanRun = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs'); } catch {}
-    if (!cleanRun || typeof cleanRun.cleanRunCommand !== 'function') return t.skip('clean-run.mjs is not available in this build');
     const before = git(dir, 'status', '--porcelain');
     const rg = adc(['clean-run', '--red-green', testFile], { cwd: dir });
     assert.equal(rg.status, 0, rg.stderr + rg.stdout.slice(0, 2000));
@@ -648,7 +654,7 @@ describe('regress', () => {
       assert.ok(paths(res).includes(file), `${lang}: ${file} not in ${paths(res).join(', ')}`);
       assert.match(read(dir, file), re, `${lang}: ${file}`);
       validateAll(dir, res);
-      await assertNoSelfFindings(dir, res);
+      assertNoSelfFindings(dir, res);
       if (lang === 'go') assert.match(read(dir, file), /^package main$/m);
       if (lang === 'python') assert.match(read(dir, 'tests/regression/conftest.py'), /addinivalue_line\("markers", "regression:/);
     }
@@ -696,7 +702,7 @@ describe('e2e-api', () => {
     const res = sc(dir, 'e2e-api', ['--write', '--health-path', '/healthz']);
     assert.deepEqual(paths(res).sort(), ['e2e/api/api.e2e.test.mjs', 'e2e/api/client.mjs', 'e2e/api/contract.mjs']);
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
     const seen = [];
     const { server, url } = await startServer((req, res2) => {
       seen.push({ url: req.url, auth: req.headers.authorization || null, tag: req.headers['x-test-run'] });
@@ -735,7 +741,7 @@ describe('e2e-api', () => {
     assert.match(read(ts, 'e2e/api/api.e2e.test.ts'), /from 'vitest';[\s\S]*from '\.\/client';/);
     assert.equal(r1.openapi, 'openapi.yaml');
     validateAll(ts, r1);
-    await assertNoSelfFindings(ts, r1);
+    assertNoSelfFindings(ts, r1);
     for (const [lang, files, expected] of [
       ['python', PY_PROJECT, ['tests/e2e/api/conftest.py', 'tests/e2e/api/contract.py', 'tests/e2e/api/requirements-e2e.txt', 'tests/e2e/api/test_api_e2e.py']],
       ['java', {}, ['src/test/java/e2e/ApiE2ETest.java']],
@@ -745,7 +751,7 @@ describe('e2e-api', () => {
       const res = sc(dir, 'e2e-api', ['--write', '--lang', lang]);
       assert.deepEqual(paths(res).sort(), expected);
       validateAll(dir, res);
-      await assertNoSelfFindings(dir, res);
+      assertNoSelfFindings(dir, res);
     }
     const py = repo(PY_PROJECT);
     assert.match(sc(py, 'e2e-api', ['--pact', 'x'], { exit: 2 }).error.message, /TypeScript\/JavaScript only/);
@@ -776,7 +782,8 @@ const SAMPLE_SUITE = {
 describe('e2e-web', () => {
   test('TypeScript project: config, fixtures, page object, smoke, journeys, workflow; all valid', async () => {
     const dir = repo({ ...nodeProject(), 'package.json': JSON.stringify({ name: 'shop', private: true, scripts: { start: 'vite preview', test: 'node --test' } }) });
-    const res = sc(dir, 'e2e-web', ['--write', '--journeys', "sign up, search; checkout, wishlist", '--for', 'claude,codex']);
+    // "Sign up!" names the same spec file as "sign up": it is dropped, not silently merged into one file.
+    const res = sc(dir, 'e2e-web', ['--write', '--journeys', "sign up, Sign up!, search; checkout, wishlist", '--for', 'claude,codex']);
     assert.equal(res.lang, 'ts');
     assert.deepEqual(res.journeys, ['sign up', 'search', 'checkout']);
     for (const f of ['e2e/web/playwright.config.ts', 'e2e/web/fixtures.ts', 'e2e/web/pages/home.page.ts', 'e2e/web/tests/global.setup.ts', 'e2e/web/tests/smoke.spec.ts',
@@ -790,7 +797,7 @@ describe('e2e-web', () => {
     if (jobs) assert.deepEqual(jobs, ['report', 'test']);
     assert.match(read(dir, '.github/workflows/e2e-web.yml'), /merge-reports --reporter html,junit/);
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, { written: res.written.filter((w) => !/sign-up|search|checkout/.test(w.path)) });
+    assertNoSelfFindings(dir, { written: res.written.filter((w) => !/sign-up|search|checkout/.test(w.path)) });
     assert.ok(res.next_steps.some((s) => s.includes('npx playwright init-agents --loop=claude')));
     assert.ok(res.next_steps.some((s) => s.includes('codex mcp add playwright')));
     // The scaffold's own suite passes its hardening audit (no P1/P2 items).
@@ -821,6 +828,17 @@ describe('e2e-web', () => {
     assert.deepEqual(tree(dir), ['package-lock.json', 'package.json', 'playwright.config.ts', 'tests/login.spec.ts']);
   });
 
+  test('--audit reads the retries expression: 0 is fine, a CI-only count above 2 is unbounded', () => {
+    const rulesFor = (retries) => {
+      const config = `import { defineConfig } from '@playwright/test';\nexport default defineConfig({ retries: ${retries}, forbidOnly: !!process.env.CI, use: { baseURL: 'http://x', trace: 'retain-on-failure' }, reporter: [['junit']] });\n`;
+      const res = sc(repo({ ...SAMPLE_SUITE, 'playwright.config.ts': config, 'tests/login.spec.ts': "test('a @smoke', () => {});\n" }), 'e2e-web', ['--audit'], { exit: null });
+      return res.audit.items.map((i) => i.rule);
+    };
+    assert.deepEqual(rulesFor('0'), []);
+    assert.deepEqual(rulesFor('process.env.CI ? 5 : 0').sort(), ['retries-hide-flakes', 'unbounded-retries']);
+    assert.deepEqual(rulesFor('2'), ['retries-hide-flakes', 'retries-outside-ci']);
+  });
+
   test('the generated suite runs with Playwright (network and browsers permitting)', { timeout: 180_000 }, async (t) => {
     const browsers = process.env.PLAYWRIGHT_BROWSERS_PATH || '/opt/pw-browsers';
     if (process.env.ADC_SKIP_NETWORK_TESTS) return t.skip('ADC_SKIP_NETWORK_TESTS is set');
@@ -829,6 +847,9 @@ describe('e2e-web', () => {
     sc(dir, 'e2e-web', ['--write', '--journeys', 'sign up']);
     const web = path.join(dir, 'e2e/web');
     const npmCli = core.IS_WINDOWS ? 'npm.cmd' : 'npm';
+    // A blocked registry makes npm retry for minutes; one quick ping decides whether to try at all.
+    const ping = spawnSync(npmCli, ['ping', '--fetch-timeout=5000', '--fetch-retries=0'], { encoding: 'utf8', env: baseEnv(), timeout: 15_000, shell: core.IS_WINDOWS });
+    if (ping.status !== 0) return t.skip(`npm registry not reachable: ${(ping.stderr || ping.error || '').toString().split('\n')[0]}`);
     const install = spawnSync(npmCli, ['install', '--no-audit', '--no-fund', '@playwright/test@1.63.0'], { cwd: web, encoding: 'utf8', env: baseEnv(), timeout: 120_000, shell: core.IS_WINDOWS });
     if (install.status !== 0) return t.skip(`npm registry not reachable: ${(install.stderr || '').split('\n').slice(-3).join(' ')}`);
     const { server, url } = await startServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><html><head><title>Demo</title></head><body><main>Hello</main></body></html>'); });
@@ -882,7 +903,7 @@ describe('live', () => {
     assert.match(wf, /retention-days: 1/);
     assert.ok(!/npx playwright test/.test(wf), 'the workflow never runs the test runner directly');
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
   });
 
   test('synthetic probes: refused with TODO lines, generated with an answered checklist and a cost, merged into probes.json', async () => {
@@ -919,7 +940,7 @@ describe('live', () => {
     assert.match(synth, /assertWritesAllowed\(\);/);
     assert.match(synth, /finally \{/);
     validateAll(dir, forced);
-    await assertNoSelfFindings(dir, forced);
+    assertNoSelfFindings(dir, forced);
     // An answered checklist kept elsewhere is copied into the project when none exists there.
     const other = repo(nodeProject());
     fs.writeFileSync(path.join(other, 'answers.md'), answered);
@@ -947,10 +968,7 @@ describe('live', () => {
     assert.deepEqual(res.findings.map((f) => [f.id, f.file]), [['LIVE-GITIGNORE', 'tests/live/trace.har']]);
   });
 
-  test('the generated probe project runs under `adc.mjs live run`; the token never appears in the output', { timeout: 60_000 }, async (t) => {
-    let live = null;
-    try { live = await import('../../skills/agentic-developer-companion/scripts/lib/live.mjs'); } catch {}
-    if (!live || typeof live.liveRunCommand !== 'function') return t.skip('live.mjs is not available in this build');
+  test('the generated probe project runs under `adc.mjs live run`; the token never appears in the output', { timeout: 60_000 }, async () => {
     const token = ['tok', 'scaffold', String(Date.now())].join('-');
     const { server, url } = await startServer((req, res) => {
       if (req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401); return res.end(`denied ${req.headers.authorization || ''}`); }
@@ -1004,9 +1022,8 @@ describe('ci-gate', () => {
     assert.match(wf, /os: \["ubuntu-latest"\]/);
     assert.ok(!/needs: \[[^\]]*audit/.test(wf), 'the audit job is not part of Merge OK');
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
-    const M = await loadMarkers();
-    if (M && M.CI_GATE_HEADER) assert.match(wf, M.CI_GATE_HEADER);
+    assertNoSelfFindings(dir, res);
+    assert.match(wf, M.CI_GATE_HEADER);
   });
 
   test('stacks, OS matrix, vendored skill, agent jobs, quarantine registry, --test-cmd and the no-runner error', async () => {
@@ -1023,7 +1040,7 @@ describe('ci-gate', () => {
     assert.ok(!/coverage-root/.test(w1), 'no pytest-cov: no coverage job');
     assert.ok(r1.next_steps.some((s) => /no changed-line coverage producer/.test(s)));
     validateAll(py, r1);
-    await assertNoSelfFindings(py, r1);
+    assertNoSelfFindings(py, r1);
 
     const go = repo({ ...GO_PROJECT, '.github/skills/agentic-developer-companion/scripts/adc.mjs': '// vendored\n', '.github/workflows/old.yml': 'jobs:\n  a:\n    runs-on: windows-latest\n' });
     const r2 = sc(go, 'ci-gate', ['--write', '--for', 'claude,codex']);
@@ -1038,7 +1055,7 @@ describe('ci-gate', () => {
     assert.match(w2, /codex exec --json -s workspace-write/);
     assert.match(w2, /"Use \\\$agentic-developer-companion to verify/);
     checkYaml(path.join(go, '.github/workflows/ci-gate.yml'));
-    await assertNoSelfFindings(go, r2);
+    assertNoSelfFindings(go, r2);
 
     const node = repo(nodeProject({ extra: { 'tests/quarantine.json': JSON.stringify({ schema: 'adc-quarantine/1', tests: [] }) } }));
     sc(node, 'ci-gate', ['--write']);
@@ -1080,11 +1097,7 @@ describe('ci-gate', () => {
     assert.deepEqual(counts.projects['.'], { executed: 2, passed: 2, failed: 0, errors: 0, skipped: 1, flaky: 0 });
     assert.match(fs.readFileSync(path.join(out, 'output'), 'utf8'), /^executed=2$/m);
     assert.match(fs.readFileSync(path.join(out, 'summary.md'), 'utf8'), /\| 2 \| 2 \| 0 \| 0 \| 1 \| 0 \|/);
-    let clean = null;
-    try { clean = await import('../../skills/agentic-developer-companion/scripts/lib/clean-run.mjs'); } catch {}
-    if (clean && typeof clean.importBaseCounts === 'function') {
-      assert.equal(clean.importBaseCounts(path.join(out, 'counts.json'), '.').executed, 2, 'clean-run --base-counts imports the CI counts');
-    }
+    assert.equal(importBaseCounts(path.join(out, 'counts.json'), '.').executed, 2, 'clean-run --base-counts imports the CI counts');
     const glob = run(['counts', '--format', 'junit', '--report', 'reports/**/*.xml']);
     assert.equal(glob.status, 1, 'the failing report fails the gate');
     assert.match(glob.stdout, /::error::1 failed and 0 errored test/);
@@ -1145,7 +1158,7 @@ describe('flake', () => {
     assert.match(wf, /if: \$\{\{ needs\.registry\.outputs\.count != '0' \}\}/);
     assert.match(read(dir, '.adc/repro/flake/sum-handles-floats/diagnosis.md'), /flake-probe --tests "sum > handles floats" --times 20/);
     validateAll(dir, res);
-    await assertNoSelfFindings(dir, res);
+    assertNoSelfFindings(dir, res);
     // The registry holds the team's quarantine entries: a re-run, even with --force, never replaces it.
     const entry = { id: 'x', owner: '@team', issue: '#1', added: '2026-10-20', expires: '2026-11-10', reason: 'race' };
     fs.writeFileSync(path.join(dir, 'tests/quarantine.json'), JSON.stringify({ schema: 'adc-quarantine/1', max_days: 30, tests: [entry] }));

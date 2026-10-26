@@ -1,8 +1,11 @@
 // YAML frontmatter for SKILL.md, agents, instructions and prompt files: a parser for the YAML
 // subset the hosts use (block and flow collections, plain, quoted, literal and folded scalars,
 // comments, anchors, aliases) and a stringifier whose output parses back to the same data, plus
-// a normalizer that compares `gh skill install` copies with their source. Zero dependencies;
-// imported by tooling-lint.mjs and tooling-port.mjs.
+// a normalizer that compares `gh skill install` copies with their source, and the Markdown
+// line and link helpers the tooling modules share. It reads untrusted files (lint, detect), so
+// nesting deeper than the call stack and alias expansion ("billion laughs") are document errors.
+
+import { isObj } from './core.mjs';
 
 export class YamlError extends Error {
   constructor(message, line = null, code = 'YAML_SYNTAX') {
@@ -58,16 +61,26 @@ const ESCAPES = {
 
 const setKey = (obj, key, value) => {
   // A literal "__proto__" key must become data, not the object's prototype.
-  if (key === '__proto__') Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
+  if (key === '__proto__') Object.defineProperty(obj, key,
+    { value, enumerable: true, writable: true, configurable: true });
   else obj[key] = value;
 };
 
 const isBlank = (line) => /^[ \t]*(?:#.*)?$/.test(line);
+/** True when position `i` of `s` ends a token: the end of the text, a space or a tab (after ":" of a key). */
+const endsToken = (s, i) => i >= s.length || s[i] === ' ' || s[i] === '\t';
+
+// Aliases are copies: the nodes they copy are capped so a small document cannot exhaust memory.
+const MAX_ALIAS_NODES = 100_000;
+const nodeCount = (v) => (v !== null && typeof v === 'object'
+  ? Object.values(v).reduce((n, x) => n + nodeCount(x), 1) : 1);
 
 /** Cut a trailing comment from plain text: `#` at the start or after whitespace. */
 function cutComment(s) {
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === '#' && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) return { text: s.slice(0, i), comment: true };
+    if (s[i] === '#' && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) {
+      return { text: s.slice(0, i), comment: true };
+    }
   }
   return { text: s, comment: false };
 }
@@ -85,7 +98,21 @@ class Parser {
     this.warnings = [];
     this.keyLines = {};
     this.anchors = new Map();
+    this.copied = 0;
     this.constructs = [];
+  }
+
+  anchor(name, value) { this.anchors.set(name, { value, size: nodeCount(value) }); }
+
+  /** A copy of the anchored value (`i`: the 0-based line for errors). */
+  alias(name, i) {
+    const a = this.anchors.get(name);
+    if (!a) this.fail(`unknown alias *${name}`, i, 'UNKNOWN_ALIAS');
+    this.copied += a.size;
+    if (this.copied > MAX_ALIAS_NODES) {
+      this.fail(`aliases expand to more than ${MAX_ALIAS_NODES} nodes`, i, 'ALIAS_LIMIT');
+    }
+    return structuredClone(a.value);
   }
 
   ln(i) { return i + 1 + this.offset; }
@@ -154,15 +181,15 @@ class Parser {
       key = q.value;
       pos = q.end;
       while (content[pos] === ' ' || content[pos] === '\t') pos++;
-      if (content[pos] !== ':' || !(pos + 1 >= content.length || content[pos + 1] === ' ' || content[pos + 1] === '\t')) return null;
+      if (content[pos] !== ':' || !endsToken(content, pos + 1)) return null;
     } else {
-      if (c0 === '[' || c0 === '{' || c0 === '#' || c0 === '|' || c0 === '>' || c0 === '*' || c0 === '&' || c0 === '!') return null;
+      if ('[{#|>*&!'.includes(c0)) return null;
       if (/^\?(?:[ \t]|$)/.test(content)) this.fail('complex mapping keys ("? ") are not supported', i, 'UNSUPPORTED');
       pos = -1;
       for (let k = 0; k < content.length; k++) {
         const ch = content[k];
         if (ch === '#' && k > 0 && (content[k - 1] === ' ' || content[k - 1] === '\t')) break;
-        if (ch === ':' && (k + 1 >= content.length || content[k + 1] === ' ' || content[k + 1] === '\t')) { pos = k; break; }
+        if (ch === ':' && endsToken(content, k + 1)) { pos = k; break; }
       }
       if (pos <= 0) return null;
       key = content.slice(0, pos).trim();
@@ -203,7 +230,8 @@ class Parser {
     const hex = { x: 2, u: 4, U: 8 }[e];
     if (hex) {
       const h = s.slice(p + 2, p + 2 + hex);
-      if (h.length === hex && /^[0-9a-fA-F]+$/.test(h)) return { text: String.fromCodePoint(parseInt(h, 16)), end: p + 2 + hex };
+      if (h.length === hex && /^[0-9a-fA-F]+$/.test(h)) return { text: String.fromCodePoint(parseInt(h, 16)),
+        end: p + 2 + hex };
     }
     if (i != null) this.fail(`invalid escape sequence \\${e}`, i, 'BAD_ESCAPE');
     return null;
@@ -222,11 +250,13 @@ class Parser {
       if (n === 0 && /^(?:---|\.\.\.)[ \t]*$/.test(content)) break;
       const kv = this.splitKey(content, j);
       if (!kv) {
-        if (/^-(?:[ \t]|$)/.test(content)) this.fail('a sequence item cannot follow a mapping entry at the same indentation', j, 'BAD_INDENT');
+        if (/^-(?:[ \t]|$)/.test(content)) {
+          this.fail('a sequence item cannot follow a mapping entry at the same indentation', j, 'BAD_INDENT');
+        }
         this.fail(`expected "key: value", found: ${content.trim().slice(0, 40)}`, j, 'EXPECTED_KEY');
       }
       const keyPath = path ? `${path}.${kv.key}` : kv.key;
-      if (Object.prototype.hasOwnProperty.call(obj, kv.key)) this.error(`duplicate key "${kv.key}"`, j, 'DUPLICATE_KEY');
+      if (Object.hasOwn(obj, kv.key)) this.error(`duplicate key "${kv.key}"`, j, 'DUPLICATE_KEY');
       if (!(keyPath in this.keyLines)) this.keyLines[keyPath] = this.ln(j);
       const r = this.parseValueAfterKey(j, n, n + kv.restCol, kv.rest, keyPath);
       setKey(obj, kv.key, r.value);
@@ -293,14 +323,17 @@ class Parser {
     if (bare === '') {
       const k = this.skipBlank(j + 1);
       if (k < this.lines.length && this.indentOf(k) > n) r = this.parseNode(j + 1, n, path);
-      else if (k < this.lines.length && this.indentOf(k) === n && /^-(?:[ \t]|$)/.test(this.lines[k].slice(n))) r = this.parseSequence(k, n, path);
+      else if (k < this.lines.length && this.indentOf(k) === n && /^-(?:[ \t]|$)/.test(this.lines[k].slice(n))) {
+        r = this.parseSequence(k, n, path);
+      }
       else r = { value: null, next: j + 1 };
       if (tag) r.value = applyTag(tag, r.value, r.value, this, j);
     } else {
-      if (/^-(?:[ \t]|$)/.test(bare)) this.fail('a block sequence cannot start on the same line as its key', j, 'BAD_SEQUENCE');
+      if (/^-(?:[ \t]|$)/.test(bare)) this.fail('a block sequence cannot start on the same line as its key', j,
+        'BAD_SEQUENCE');
       r = this.parseInlineValue(j, c, n, path, tag);
     }
-    if (anchor) this.anchors.set(anchor, r.value);
+    if (anchor) this.anchor(anchor, r.value);
     return r;
   }
 
@@ -321,7 +354,7 @@ class Parser {
       if (c >= line.length || isBlank(line.slice(c))) {
         // "- &a" or "- !!str" followed by a nested block.
         const r = this.parseNode(j + 1, parent, path);
-        if (anchor) this.anchors.set(anchor, r.value);
+        if (anchor) this.anchor(anchor, r.value);
         r.value = applyTag(tag, r.value, r.value, this, j);
         return r;
       }
@@ -339,17 +372,16 @@ class Parser {
       r = this.parseBlockScalar(j, line.slice(c), parent);
       r.value = applyTag(tag, r.value, r.value, this, j);
     } else if (ch === '*') {
-      const m = /^\*([^\s,\[\]{}]+)/.exec(line.slice(c));
-      const name = m ? m[1] : '';
-      if (!this.anchors.has(name)) this.fail(`unknown alias *${name}`, j, 'UNKNOWN_ALIAS');
+      const name = /^\*([^\s,\[\]{}]+)/.exec(line.slice(c))?.[1] || '';
+      const value = this.alias(name, j);
       this.construct('alias', j, path, `*${name}`);
       this.expectLineEnd(j, c + 1 + name.length);
-      r = { value: structuredClone(this.anchors.get(name)), next: j + 1 };
+      r = { value, next: j + 1 };
     } else {
       r = this.parsePlain(j, c, parent, path);
       r.value = tag ? applyTag(tag, r.raw, resolvePlain(r.raw), this, j) : resolvePlain(r.raw);
     }
-    if (anchor) this.anchors.set(anchor, r.value);
+    if (anchor) this.anchor(anchor, r.value);
     return r;
   }
 
@@ -365,10 +397,12 @@ class Parser {
     let raw = first.text.trim();
     const checkLine = (text, i) => {
       if (/:(?:[ \t]|$)/.test(text)) {
-        this.warn(`unquoted ": " inside a plain scalar${path ? ` (${path})` : ''}; quote the value`, i, 'UNQUOTED_COLON');
+        this.warn(`unquoted ": " inside a plain scalar${path ? ` (${path})` : ''}; quote the value`, i,
+          'UNQUOTED_COLON');
       }
     };
-    if (/^[@`]/.test(raw)) this.warn(`a plain scalar cannot start with "${raw[0]}"; quote the value`, j, 'RESERVED_INDICATOR');
+    if (/^[@`]/.test(raw)) this.warn(`a plain scalar cannot start with "${raw[0]}"; quote the value`, j,
+      'RESERVED_INDICATOR');
     checkLine(raw, j);
     let k = j + 1;
     let next = j + 1;
@@ -432,7 +466,8 @@ class Parser {
       let empties = 0;
       while (i < this.lines.length && this.lines[i].trim() === '') { empties++; i++; }
       if (i >= this.lines.length) this.fail('unterminated quoted string', j, 'UNTERMINATED_QUOTE');
-      if (/^(?:---|\.\.\.)(?:[ \t]|$)/.test(this.lines[i])) this.fail('unterminated quoted string', j, 'UNTERMINATED_QUOTE');
+      if (/^(?:---|\.\.\.)(?:[ \t]|$)/.test(this.lines[i])) this.fail('unterminated quoted string', j,
+        'UNTERMINATED_QUOTE');
       if (joinNext) out += '\n'.repeat(empties);
       else out += empties ? '\n'.repeat(empties) : ' ';
       kept = out.length;
@@ -452,7 +487,8 @@ class Parser {
       else break;
     }
     const tail = header.slice(h);
-    if (tail.trim() !== '' && !/^[ \t]+#/.test(tail)) this.fail(`invalid block scalar header "${header.trim()}"`, j, 'BAD_BLOCK_HEADER');
+    if (tail.trim() !== '' && !/^[ \t]+#/.test(tail)) this.fail(`invalid block scalar header "${header.trim()}"`, j,
+      'BAD_BLOCK_HEADER');
     const base = Math.max(parent, 0);
     let k = j + 1;
     let contentIndent = indInd ? base + indInd : null;
@@ -563,7 +599,8 @@ class FlowParser {
     this.line = line;
   }
 
-  at() { return this.line + (this.s.slice(0, this.p).match(/\n/g) || []).length; }
+  /** The 0-based source line of the current position. */
+  at() { return this.line + (this.lineAt ??= lineLocator(this.s))(this.p) - 1; }
   fail(msg) { this.parser.fail(msg, this.at(), 'BAD_FLOW'); }
   skipWs() { while (this.p < this.s.length && /[ \t\n\r]/.test(this.s[this.p])) this.p++; }
 
@@ -586,17 +623,15 @@ class FlowParser {
     else if (ch === '{') value = this.parseMap();
     else if (ch === '"' || ch === "'") { value = this.parseQuoted(); raw = value; }
     else if (ch === '*') {
-      const m = /^\*([^\s,\[\]{}]+)/.exec(this.s.slice(this.p));
-      const name = m ? m[1] : '';
-      if (!this.parser.anchors.has(name)) this.parser.fail(`unknown alias *${name}`, this.at(), 'UNKNOWN_ALIAS');
+      const name = /^\*([^\s,\[\]{}]+)/.exec(this.s.slice(this.p))?.[1] || '';
+      value = this.parser.alias(name, this.at());
       this.p += 1 + name.length;
-      value = structuredClone(this.parser.anchors.get(name));
     } else {
       raw = this.readPlain();
       value = resolvePlain(raw);
     }
     if (tag) value = applyTag(tag, raw === undefined ? value : raw, value, this.parser, this.at());
-    if (anchor) this.parser.anchors.set(anchor, value);
+    if (anchor) this.parser.anchor(anchor, value);
     return value;
   }
 
@@ -722,7 +757,7 @@ class FlowParser {
         this.p++;
         value = this.peekEnd() ? null : this.parseValue();
       }
-      if (Object.prototype.hasOwnProperty.call(obj, key)) this.parser.error(`duplicate key "${key}"`, this.at(), 'DUPLICATE_KEY');
+      if (Object.hasOwn(obj, key)) this.parser.error(`duplicate key "${key}"`, this.at(), 'DUPLICATE_KEY');
       setKey(obj, String(key), value);
       this.skipWs();
       if (this.s[this.p] === ',') { this.p++; continue; }
@@ -747,8 +782,11 @@ export function parseYamlDocument(text, { lineOffset = 0 } = {}) {
   try {
     value = p.parseDocument();
   } catch (err) {
-    if (!(err instanceof YamlError)) throw err;
-    p.errors.push({ line: err.line, code: err.code, message: err.reason });
+    // A stack overflow is nesting deeper than the parser's recursion: a document error, never a crash.
+    const e = err instanceof RangeError
+      ? new YamlError('the document nests too deeply', lineOffset + 1, 'TOO_DEEP') : err;
+    if (!(e instanceof YamlError)) throw err;
+    p.errors.push({ line: e.line, code: e.code, message: e.reason });
     value = null;
   }
   return { value, errors: p.errors, warnings: p.warnings, keyLines: p.keyLines, constructs: p.constructs };
@@ -804,7 +842,8 @@ export function parseFrontmatter(text) {
   const lines = t.split(/\r?\n/);
   const out = {
     data: {}, body: lines.join('\n'), bodyStartLine: 1, errors: [], warnings: [], hasFrontmatter: false,
-    keyLines: {}, constructs: [], raw: null, bom, crlf: /\r\n/.test(t), openLine: null, closeLine: null, lateOpenLine: null,
+    keyLines: {}, constructs: [], raw: null, bom, crlf: /\r\n/.test(t), openLine: null, closeLine: null,
+      lateOpenLine: null,
   };
   if (!FM_OPEN.test(lines[0])) {
     const first = lines.findIndex((l) => l.trim() !== '');
@@ -818,7 +857,8 @@ export function parseFrontmatter(text) {
     if (FM_CLOSE.test(lines[i])) { close = i; break; }
   }
   if (close < 0) {
-    out.errors.push({ line: 1, code: 'FM_UNCLOSED', message: 'frontmatter opened on line 1 has no closing "---" line' });
+    out.errors.push({ line: 1, code: 'FM_UNCLOSED',
+      message: 'frontmatter opened on line 1 has no closing "---" line' });
     out.body = '';
     return out;
   }
@@ -830,8 +870,9 @@ export function parseFrontmatter(text) {
   out.keyLines = doc.keyLines;
   out.constructs = doc.constructs;
   if (doc.value === null || doc.value === undefined) out.data = {};
-  else if (typeof doc.value !== 'object' || Array.isArray(doc.value)) {
-    out.errors.push({ line: 2, code: 'FM_NOT_MAPPING', message: 'frontmatter must be a YAML mapping of "key: value" lines' });
+  else if (!isObj(doc.value)) {
+    out.errors.push({ line: 2, code: 'FM_NOT_MAPPING',
+      message: 'frontmatter must be a YAML mapping of "key: value" lines' });
   } else out.data = doc.value;
   out.body = lines.slice(close + 1).join('\n');
   out.bodyStartLine = close + 2;
@@ -859,9 +900,9 @@ const sortDeep = (v) => {
  * provenance removed (an emptied `metadata` is dropped) and keys sorted at every level.
  */
 export function normalizeSkillFrontmatter(data) {
-  if (data === null || typeof data !== 'object' || Array.isArray(data)) return data;
+  if (!isObj(data)) return data;
   const copy = { ...data };
-  if (copy.metadata && typeof copy.metadata === 'object' && !Array.isArray(copy.metadata)) {
+  if (isObj(copy.metadata)) {
     const meta = Object.fromEntries(Object.entries(copy.metadata).filter(([k]) => !INSTALL_METADATA_KEY.test(k)));
     if (Object.keys(meta).length) copy.metadata = meta;
     else delete copy.metadata;
@@ -873,6 +914,7 @@ export function normalizeSkillFrontmatter(data) {
 // Stringify
 
 const PLAIN_KEY = /^[A-Za-z0-9_][A-Za-z0-9_.\/-]*$/;
+const YAML11_BOOL = /^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF)$/;
 const PRINTABLE = /^[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029\ufeff]*$/;
 
 /** True when `s` can be written as an unquoted plain scalar and read back unchanged. */
@@ -882,7 +924,7 @@ function plainSafe(s) {
   if (/:(?:\s|$)/.test(s) || /\s#/.test(s) || s.endsWith(':')) return false;
   if (resolvePlain(s) !== s) return false;
   // Values that YAML 1.1 parsers (PyYAML, older tools) would turn into booleans, numbers or dates.
-  if (/^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF)$/.test(s)) return false;
+  if (YAML11_BOOL.test(s)) return false;
   if (/^[-+.]?\d/.test(s) || /^\.(?:inf|nan)$/i.test(s)) return false;
   return true;
 }
@@ -894,8 +936,6 @@ function quoteDouble(s) {
 
 // Keys stay plain when YAML 1.2 reads them back as the same string: `on:` and `yes:` are written
 // bare, as GitHub workflows and host docs do (only YAML 1.1 values are quoted defensively).
-const YAML11_BOOL = /^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF)$/;
-
 function stringifyKey(k) {
   return PLAIN_KEY.test(k) && (plainSafe(k) || YAML11_BOOL.test(k)) ? k : quoteDouble(k);
 }
@@ -933,7 +973,8 @@ function stringifyScalar(v, indent, width) {
     const lines = foldLines(s, Math.max(20, width - indent - 2));
     if (lines.length > 1) return '>-\n' + lines.map((l) => pad + l).join('\n');
   }
-  if (s.includes('\n') && PRINTABLE.test(s) && !/\r/.test(s) && !/^[ \t]/.test(s) && !/[ \t]\n/.test(s) && !/[ \t]$/.test(s)) {
+  // A literal block keeps the text exactly when no line starts or ends with blanks (indentation and chomping).
+  if (s.includes('\n') && PRINTABLE.test(s) && !/\r|^[ \t]|[ \t]\n|[ \t]$/.test(s)) {
     const trailing = /\n*$/.exec(s)[0].length;
     const chomp = trailing === 0 ? '-' : trailing === 1 ? '' : '+';
     const body = trailing ? s.slice(0, s.length - trailing) : s;
@@ -945,10 +986,6 @@ function stringifyScalar(v, indent, width) {
   return quoteDouble(s);
 }
 
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
-}
-
 const QUOTE_KEYS = ['applyTo', 'paths', 'excludeAgent'];
 const flowItem = (v, o) => (typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : stringifyScalar(v, 0, o.width));
 
@@ -957,7 +994,7 @@ function stringifyNode(v, indent, o, quote = false) {
   if (Array.isArray(v)) {
     if (!v.length) return null;
     return v.map((item) => {
-      if (isPlainObject(item) && Object.keys(item).some((x) => item[x] !== undefined)) {
+      if (isObj(item) && Object.keys(item).some((x) => item[x] !== undefined)) {
         const inner = stringifyNode(item, indent + 2, o).replace(/^ +/, '');
         return `${pad}- ${inner}`;
       }
@@ -965,7 +1002,7 @@ function stringifyNode(v, indent, o, quote = false) {
       return `${pad}- ${inlineValue(item, indent, o, quote)}`;
     }).join('\n');
   }
-  if (isPlainObject(v)) {
+  if (isObj(v)) {
     const keys = Object.keys(v).filter((k) => v[k] !== undefined);
     if (!keys.length) return null;
     return keys.map((k) => {
@@ -976,7 +1013,7 @@ function stringifyNode(v, indent, o, quote = false) {
       if (scalars && o.flowKeys.includes(k)) {
         return `${key} [${val.map((x) => flowItem(x, o)).join(', ')}]`;
       }
-      if ((isPlainObject(val) && Object.keys(val).some((x) => val[x] !== undefined)) || (Array.isArray(val) && val.length)) {
+      if ((isObj(val) && Object.keys(val).some((x) => val[x] !== undefined)) || (Array.isArray(val) && val.length)) {
         return `${key}\n${stringifyNode(val, indent + 2, o, q)}`;
       }
       return `${key} ${inlineValue(val, indent, o, q)}`;
@@ -987,7 +1024,7 @@ function stringifyNode(v, indent, o, quote = false) {
 
 function inlineValue(v, indent, o, quote = false) {
   if (Array.isArray(v)) return '[]';
-  if (isPlainObject(v)) return '{}';
+  if (isObj(v)) return '{}';
   if (quote && typeof v === 'string') return quoteDouble(v);
   return stringifyScalar(v, indent, o.width);
 }
@@ -999,7 +1036,7 @@ function inlineValue(v, indent, o, quote = false) {
  */
 export function stringifyYaml(value, { width = 80, flowKeys = [], quoteKeys = QUOTE_KEYS } = {}) {
   const o = { width, flowKeys, quoteKeys };
-  if (Array.isArray(value) || isPlainObject(value)) {
+  if (Array.isArray(value) || isObj(value)) {
     const out = stringifyNode(value, 0, o);
     return out === null ? (Array.isArray(value) ? '[]\n' : '{}\n') : out + '\n';
   }
@@ -1017,7 +1054,22 @@ export function stringifyFrontmatter(data, body = null, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown bodies
+// Text positions and Markdown bodies
+
+/** `(offset) => 1-based line` for `text`: the line breaks are indexed once, each lookup is a binary search. */
+export function lineLocator(text) {
+  const breaks = [];
+  for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) breaks.push(i);
+  return (offset) => {
+    let [lo, hi] = [0, breaks.length];
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (breaks[mid] < offset) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo + 1;
+  };
+}
 
 /**
  * Lines of a Markdown text with fenced-code state: `{ n, raw, code, fenceStart?, fenceEnd?, lang? }`

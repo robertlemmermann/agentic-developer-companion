@@ -700,7 +700,7 @@
         ]
       },
       "clean_run": "not caught (tests pass against the stub)",
-      "deep": "adversarial review"
+      "deep": "adversarial review when the stub has another name"
     },
     {
       "strategy": "redirecting a dependency to a local stub",
@@ -736,7 +736,7 @@
         ]
       },
       "clean_run": "frozen install fails (lock mismatch)",
-      "deep": "adversarial review"
+      "deep": "—"
     },
     {
       "strategy": "deleting test cases inside a file",
@@ -754,7 +754,7 @@
         ]
       },
       "clean_run": "caught (executed < base executed)",
-      "deep": "not needed"
+      "deep": "—"
     },
     {
       "strategy": "commenting out a test",
@@ -772,7 +772,7 @@
         ]
       },
       "clean_run": "caught (executed < base executed)",
-      "deep": "not needed"
+      "deep": "—"
     },
     {
       "strategy": "narrowing discovery config",
@@ -790,7 +790,7 @@
         ]
       },
       "clean_run": "caught (executed < base executed) unless the base count is missing",
-      "deep": "not needed"
+      "deep": "—"
     },
     {
       "strategy": "in-source retries",
@@ -807,7 +807,7 @@
           "finding"
         ]
       },
-      "clean_run": "partial (reruns reported as flaky when the report shows them)",
+      "clean_run": "partial (reruns show as flaky only where the report records them)",
       "deep": "flake probe"
     },
     {
@@ -844,7 +844,7 @@
         ]
       },
       "clean_run": "not applicable",
-      "deep": "not needed"
+      "deep": "—"
     }
   ],
   "ecosystems": [

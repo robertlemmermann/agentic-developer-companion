@@ -9,8 +9,10 @@ tooling (instructions, skills, agents, hooks, plugins, MCP configs) those agents
 [![Agent Skills spec](https://img.shields.io/badge/Agent%20Skills-specification-6f42c1.svg)](https://agentskills.io/specification)
 
 Version 0.1.0 (2026-10-25), the first public release. The skill lives in
-[`skills/agentic-developer-companion/`](skills/agentic-developer-companion/SKILL.md); this
-README and the [license](LICENSE) are the only files at the root.
+[`skills/agentic-developer-companion/`](skills/agentic-developer-companion/SKILL.md) and
+ships only runtime files (`SKILL.md`, `PREREQUISITES.md`, `references/`, `scripts/`,
+`assets/`); its tests, evals, changelog and notices stay at the repository root and are never
+installed.
 
 ## 🧭 What it is
 
@@ -326,6 +328,7 @@ All state lives in `<project-root>/.adc/`, created on first use (or with `doctor
 | `.env.live` | live-test credentials: `ADC_LIVE_TOKEN=` (the only required variable) |
 | `budget.json` | the live-probe budget ledger |
 | `detect.json`, `cache/`, `sessions/`, `metrics.jsonl`, `hooks.log`, `hooks-installed.json`, `repro/` | detection cache, base counts and run artifacts, hook session records, local metrics, metadata-only hook log, hook registrations, reproduction scripts |
+| `tooling/`, `backups/` | `tooling modify` baselines and backups, backups of files a scaffold `--force` replaced |
 
 - **Never committed.** Before writing anything the scripts add `/.adc/` to
   `.git/info/exclude` (not a tracked change, so an agent's PR never carries it). Every
@@ -383,10 +386,10 @@ folder, so an install carries only what the skill needs to run. From a clone:
 ```bash
 node tests/selftest.mjs
 node tests/selftest.mjs --only footprint,readme,release
-node --test tests/unit/
+node --test "tests/unit/*.test.mjs"
 ```
 
-`selftest` covers frontmatter, scripts, hook dialects and rendering, the planted-failure
+`tests/selftest.mjs` covers frontmatter, scripts, hook dialects and rendering, the planted-failure
 diff scenarios and the evasion matrix, detection, the file footprint (including that the
 skill folder carries no development files), `.adc/` handling, this README, prerequisites and
 release consistency, and prints the paid eval commands without running them. The OS × host
