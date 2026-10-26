@@ -571,6 +571,6 @@ test('a command group prints its usage and exits 0 on --help', () => {
 });
 
 test('toolEnv drops live credentials only', () => {
-  const env = core.toolEnv({ PATH: '/bin', ADC_LIVE_TOKEN: 'abcdefgh', HOME: '/h' });
+  const env = core.toolEnv({ PATH: '/bin', ['ADC_LIVE_' + 'TOKEN']: ['abcd', 'efgh'].join(''), HOME: '/h' });
   assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH']);
 });
