@@ -1,0 +1,266 @@
+{
+  "schema": "adc-prerequisites/1",
+  "doc": "PREREQUISITES.md",
+  "items": [
+    {
+      "id": "git", "category": "required", "group": "Core", "name": "Git on PATH", "minimum": "2.31",
+      "tools": ["git"], "check": { "cmd": "git", "args": ["--version"] },
+      "needed_for": "working-tree snapshots, temp worktrees, base resolution, every diff-scoped check, hook identity",
+      "without": "`adc.mjs` exits 3; QA modes cannot run; hooks emit `{}`"
+    },
+    {
+      "id": "node", "category": "required", "group": "Core", "name": "Node.js on PATH", "minimum": "24",
+      "tools": ["node"], "check": { "cmd": "node", "args": ["--version"] },
+      "needed_for": "every script, every hook, the evidence ledger, `doctor`",
+      "without": "guidance-only mode: the model follows the manual steps in `references/*.md` and says so in the ledger it writes by hand; hooks print `{}` (Copilot) or fail non-blocking (Claude, Codex)"
+    },
+    {
+      "id": "host", "category": "required", "group": "Core", "name": "A supported host with the skill installed in a directory it scans", "minimum": "see Host minimums",
+      "tools": [],
+      "needed_for": "invocation, discovery, hooks",
+      "without": "nothing loads; pasting `SKILL.md` into the conversation (guidance-only) is the last resort"
+    },
+    {
+      "id": "shell-permission", "category": "required", "group": "Core", "name": "Permission to run `node` and `git` through the host's shell tool", "minimum": null,
+      "tools": [],
+      "needed_for": "every script invocation (no `allowed-tools` is shipped)",
+      "without": "a denied call leaves the step `UNVERIFIED`; headless runs need explicit grants"
+    },
+    {
+      "id": "state-dir", "category": "required", "group": "Core", "name": "A writable, git-excluded state directory (`.adc/`)", "minimum": null,
+      "tools": [],
+      "needed_for": "state, evidence, hook records, live credentials and the budget ledger",
+      "without": "CLI commands exit 3 while `.adc/` is tracked by git; hooks keep emitting `{}`; relocate with `ADC_HOME` or `--state-dir`"
+    },
+    {
+      "id": "temp-dir", "category": "required", "group": "Core", "name": "A writable OS temp directory", "minimum": null,
+      "tools": [],
+      "needed_for": "clean-run and typecheck worktrees",
+      "without": "clean runs cannot start (`UNVERIFIED`)"
+    },
+    {
+      "id": "qa-repo", "category": "required", "group": "Core", "name": "For QA modes: a Git repository with a resolvable base and enough history", "minimum": null,
+      "tools": [],
+      "needed_for": "`verify`, `audit-tests`, `trace`, `clean-run`",
+      "without": "base chain `--base` > `origin/HEAD` > `main`/`master`/`init.defaultBranch` > `HEAD`; shallow clones get \"run `git fetch --unshallow`\" (exit 4)"
+    },
+
+    {
+      "id": "node-launcher", "category": "optional", "group": "Runtime and hooks", "name": "Node reachable by the host's hook launcher", "minimum": null,
+      "tools": [],
+      "needed_for": "hooks firing at all",
+      "fallback": "`setup hooks --node-path` renders the absolute Node path; `doctor` probes every launcher and reports a dead hook instead of hiding it"
+    },
+    {
+      "id": "hooks-registered", "category": "optional", "group": "Runtime and hooks", "name": "Hooks registered via `setup hooks`", "minimum": null,
+      "tools": [],
+      "needed_for": "session brief, post-edit warnings, observed runs, completion notice or gate",
+      "fallback": "every mode works without hooks; the ledger is the source of truth"
+    },
+    {
+      "id": "live-token", "category": "optional", "group": "Live tests", "name": "`ADC_LIVE_TOKEN` in `.adc/.env.live` or the environment", "minimum": null,
+      "tools": [],
+      "needed_for": "the `live` mode's probes",
+      "fallback": "live probes refuse to run (`UNVERIFIED: ADC_LIVE_TOKEN unset`); every other mode is unaffected"
+    },
+    {
+      "id": "budget-ledger", "category": "optional", "group": "Live tests", "name": "`.adc/budget.json` (budget ledger)", "minimum": null,
+      "tools": [],
+      "needed_for": "spend cap for live probes (2,500 credits per session and per day by default)",
+      "fallback": "materialized from the shipped template on first use; without registered hooks every run is its own session, so only the daily cap spans runs"
+    },
+    {
+      "id": "adc-debug", "category": "optional", "group": "Live tests", "name": "`ADC_DEBUG=1`", "minimum": null,
+      "tools": [],
+      "needed_for": "verbose `hooks.log` (metadata only, never payload bodies)",
+      "fallback": "terse logging"
+    },
+    {
+      "id": "gh", "category": "optional", "group": "Installation", "name": "GitHub CLI (`gh skill`, public preview)", "minimum": "2.90.0",
+      "tools": ["gh"], "check": { "cmd": "gh", "args": ["--version"] },
+      "needed_for": "primary install, pinning, updates",
+      "fallback": "`npx skills add ... --copy`; `copilot skill add <clone>/skills`; Codex `$skill-installer`; `git clone --depth 1` plus copy or junction"
+    },
+    {
+      "id": "npx-skills", "category": "optional", "group": "Installation", "name": "Vercel `skills` CLI (`npx skills`, Node 22.20+)", "minimum": null,
+      "tools": ["npx"],
+      "needed_for": "multi-host install without `gh`",
+      "fallback": "any other install path"
+    },
+    {
+      "id": "skill-installer", "category": "optional", "group": "Installation", "name": "Codex `$skill-installer`", "minimum": null,
+      "tools": [],
+      "needed_for": "install from inside Codex (runs a Python script; needs a network escalation in the sandbox)",
+      "fallback": "`gh skill install ... --agent codex`; clone and copy into `~/.agents/skills/`"
+    },
+    {
+      "id": "copilot-skill-add", "category": "optional", "group": "Installation", "name": "Copilot `copilot skill add <dir>` or `skillDirectories`", "minimum": null,
+      "tools": [],
+      "needed_for": "registering a raw clone",
+      "fallback": "copy the folder into `~/.copilot/skills/`"
+    },
+    {
+      "id": "network-install", "category": "optional", "group": "Installation", "name": "Network access to github.com at install and update time", "minimum": null,
+      "tools": [],
+      "needed_for": "all remote install paths",
+      "fallback": "vendor the skill into the work repo (pinned to tag + SHA) or copy it by hand; the cloud agent clones it in `copilot-setup-steps.yml`"
+    },
+    {
+      "id": "secret-scanner", "category": "optional", "group": "QA checks", "name": "gitleaks or trufflehog", "minimum": null,
+      "tools": ["gitleaks", "trufflehog"],
+      "needed_for": "CK-SECRETS, `ci-gate` secret step",
+      "fallback": "built-in secret regexes on the snapshot including untracked files (findings still FAIL; more false positives)"
+    },
+    {
+      "id": "diff-cover", "category": "optional", "group": "QA checks", "name": "diff-cover (Python)", "minimum": null,
+      "tools": ["diff-cover"],
+      "needed_for": "CK-COVERAGE, `ci-gate` changed-line gate",
+      "fallback": "built-in diff mapping for coverage XML/LCOV, Jest/Vitest JSON, go cover, coverlet; file-level results labeled approximate; coverage stays a soft check"
+    },
+    {
+      "id": "mutation-tools", "category": "optional", "group": "QA checks", "name": "StrykerJS, Stryker.NET, cargo-mutants, mutmut (POSIX only)", "minimum": null,
+      "tools": ["stryker", "dotnet-stryker", "cargo-mutants", "mutmut"],
+      "needed_for": "CK-MUTATION (`--deep`)",
+      "fallback": "skipped and recorded in the ledger; verdict unaffected"
+    },
+    {
+      "id": "flake-tools", "category": "optional", "group": "QA checks", "name": "pytest-randomly + pytest-repeat, jest-circus (`--randomize`), Go 1.17+ (`-shuffle`), cargo-nextest", "minimum": null,
+      "tools": ["cargo-nextest"],
+      "needed_for": "shuffled flake probes, retries off",
+      "fallback": "N sequential runs with `shuffle: false`; plain `cargo test` parser; `retries_disabled: unknown` recorded"
+    },
+    {
+      "id": "lint-detectors", "category": "optional", "group": "QA checks", "name": "Lint-side detectors (eslint-plugin-jest, Vitest `allowOnly`, pytest `-rs`, ESLint unused-directive reports, ruff `RUF100`, mypy `warn_unused_ignores`)", "minimum": null,
+      "tools": [],
+      "needed_for": "extra CK-SKIP / CK-SUPPRESS / CK-SWALLOW signals",
+      "fallback": "built-in anchored regexes on added lines with the base-tree ratchet"
+    },
+    {
+      "id": "registry-access", "category": "optional", "group": "QA checks", "name": "Package-registry access (`npm view`, `pip index versions`, `cargo info`, `go list -m`)", "minimum": null,
+      "tools": [],
+      "needed_for": "CK-DEPS existence of new packages",
+      "fallback": "offline-first: lockfile, then cached registry metadata; `--offline` is the default under Codex"
+    },
+    {
+      "id": "fresh-reviewer", "category": "optional", "group": "QA checks", "name": "A host fresh-context reviewer (Claude subagent, Copilot `/review` or a custom agent, `codex review`)", "minimum": null,
+      "tools": [],
+      "needed_for": "CK-REVIEW",
+      "fallback": "the model opens a new conversation with `references/review.md`; unconfirmed criticals never fail the verdict"
+    },
+    {
+      "id": "security-reviewer", "category": "optional", "group": "QA checks", "name": "Host security reviewers (`/security-review`, `claude-security`, Copilot code review)", "minimum": null,
+      "tools": [],
+      "needed_for": "FM-10 insecure code",
+      "fallback": "none: FM-10 stays uncovered and the ledger says so"
+    },
+    {
+      "id": "playwright", "category": "optional", "group": "Test engineering", "name": "Playwright (with browsers), Playwright MCP, `npx playwright init-agents`", "minimum": null,
+      "tools": [],
+      "needed_for": "`e2e web` scaffold and hardening",
+      "fallback": "templates rendered without the agents or MCP; browsers installed by the scaffold's documented step"
+    },
+    {
+      "id": "api-contract-tools", "category": "optional", "group": "Test engineering", "name": "Schemathesis, Pact", "minimum": null,
+      "tools": [],
+      "needed_for": "`e2e api` extras",
+      "fallback": "omitted when there is no OpenAPI document or no second service"
+    },
+    {
+      "id": "snapshot-libs", "category": "optional", "group": "Test engineering", "name": "Snapshot and approval libraries, HTTP mocks and fake timers", "minimum": null,
+      "tools": [],
+      "needed_for": "`regress` characterization, `flake` fixes",
+      "fallback": "runner-native snapshots or golden files; fix patterns are recommended, not installed"
+    },
+    {
+      "id": "github-actions", "category": "optional", "group": "Test engineering", "name": "GitHub Actions (`dorny/paths-filter`, a JUnit reporter action, `actions/setup-node` pinned to 24)", "minimum": null,
+      "tools": [],
+      "needed_for": "`ci-gate` and `live` templates",
+      "fallback": "GitHub Actions first; notes only for GitLab CI and Azure Pipelines"
+    },
+    {
+      "id": "audit-tools", "category": "optional", "group": "Test engineering", "name": "Dependency audit tools (`npm audit`, `pip-audit`, `cargo audit`, `dotnet list package --vulnerable`)", "minimum": null,
+      "tools": [],
+      "needed_for": "`ci-gate` audit step",
+      "fallback": "non-blocking by default; omitted for stacks without a tool"
+    },
+    {
+      "id": "external-validators", "category": "optional", "group": "Tooling development", "name": "External validators (`skills-ref validate`, `claude plugin validate`, `gh skill publish --dry-run`, `copilot skill list --json`, `codex exec --strict-config`, `waza`)", "minimum": null,
+      "tools": ["skills-ref", "waza"],
+      "needed_for": "merged into `tooling lint`",
+      "fallback": "the built-in Node validator always runs; external results are merged only when the tool is installed"
+    },
+    {
+      "id": "eval-runners", "category": "optional", "group": "Tooling development", "name": "`claude plugin eval`, promptfoo, Waza, a headless host CLI on PATH", "minimum": null,
+      "tools": ["promptfoo"],
+      "needed_for": "`tooling eval`, `tooling trigger-set`, the skill's own evals",
+      "fallback": "the trigger set is generated without a runner; evals are marked manual and paid"
+    },
+    {
+      "id": "host-diagnostics", "category": "optional", "group": "Tooling development", "name": "Claude `/skill-doctor`, `/doctor prompt-audit`, `claude --debug`; Copilot `/env`, `/skills info`", "minimum": null,
+      "tools": [],
+      "needed_for": "diagnostics referenced by `tooling optimize` and host notes",
+      "fallback": "`doctor` and `tooling cost` are the skill's own equivalents"
+    },
+    {
+      "id": "copilot-setup-steps", "category": "optional", "group": "At work", "name": "`.github/workflows/copilot-setup-steps.yml`", "minimum": null,
+      "tools": [],
+      "needed_for": "cloning the skill for the cloud agent outside the Bash-tool firewall",
+      "fallback": "vendor the skill into the repo"
+    },
+    {
+      "id": "codeowners", "category": "optional", "group": "At work", "name": "CODEOWNERS and branch protection on `.github/hooks/**` and vendored skill directories", "minimum": null,
+      "tools": [],
+      "needed_for": "containment for vendored installs",
+      "fallback": "none; a recommendation, not a mechanism"
+    },
+    {
+      "id": "pwsh", "category": "optional", "group": "Windows", "name": "PowerShell 7 (`pwsh`)", "minimum": "7.0",
+      "tools": ["pwsh"], "check": { "cmd": "pwsh", "args": ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"] },
+      "needed_for": "Copilot CLI and Codex hooks on Windows",
+      "fallback": "Windows PowerShell 5.1 (collapses exit codes and re-encodes stdout; harmless because decisions are ASCII JSON on exit 0)"
+    },
+    {
+      "id": "git-bash", "category": "optional", "group": "Windows", "name": "Git for Windows (Git Bash) for Claude Code", "minimum": null,
+      "tools": ["bash"],
+      "needed_for": "Claude Code's Bash tool on Windows",
+      "fallback": "Claude's PowerShell tool; `CLAUDE_CODE_GIT_BASH_PATH` when Git Bash is not auto-detected; exec-form hooks need no Git Bash"
+    },
+    {
+      "id": "longpaths", "category": "optional", "group": "Windows", "name": "`core.longpaths` for deep temp worktrees", "minimum": null,
+      "tools": [],
+      "needed_for": "clean-run worktrees with long paths",
+      "fallback": "a clear `UNVERIFIED` reason instead of a path-length failure"
+    },
+    {
+      "id": "wsl2", "category": "optional", "group": "Windows", "name": "WSL2", "minimum": null,
+      "tools": [],
+      "needed_for": "Claude shell-granting evals and mutmut",
+      "fallback": "run those on macOS or Linux; everything else is native"
+    },
+
+    {
+      "id": "copilot", "category": "host", "group": "Host minimums", "name": "Copilot CLI", "minimum": "1.0.88",
+      "tools": ["copilot"], "check": { "cmd": "copilot", "args": ["--version"] },
+      "needed_for": "skills, hooks, `copilot skill list --json` (namespaced skills, `copilot skill add`; `exec` hooks documented 1.0.97)",
+      "fallback": "another host, or guidance-only mode"
+    },
+    {
+      "id": "vscode", "category": "host", "group": "Host minimums", "name": "VS Code", "minimum": "1.109",
+      "tools": ["code"], "check": { "cmd": "code", "args": ["--version"] },
+      "needed_for": "skills (GA in 1.109), hooks (Preview; Session Target = Copilot)",
+      "fallback": "another host, or guidance-only mode"
+    },
+    {
+      "id": "claude", "category": "host", "group": "Host minimums", "name": "Claude Code", "minimum": "2.1.269",
+      "tools": ["claude"], "check": { "cmd": "claude", "args": ["--version"] },
+      "needed_for": "`claude plugin eval` (2.1.269+); hook `onFailure` (2.1.295+); direct `AGENTS.md` reading (2.1.277+)",
+      "fallback": "older versions run the skill and hooks; evals are marked manual"
+    },
+    {
+      "id": "codex", "category": "host", "group": "Host minimums", "name": "Codex", "minimum": "0.124.0",
+      "tools": ["codex"], "check": { "cmd": "codex", "args": ["--version"] },
+      "needed_for": "hooks (stable in 0.124.0), skills; `/presets` from 0.164.0",
+      "fallback": "older versions run the skill without hooks"
+    }
+  ]
+}

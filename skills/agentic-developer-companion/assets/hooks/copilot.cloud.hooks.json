@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "timeoutSec": 10,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run session-start --dialect copilot || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run session-start --dialect copilot 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "matcher": "edit|create|str_replace_editor|str_replace|apply_patch",
+        "timeoutSec": 10,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run post-edit --dialect copilot || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run post-edit --dialect copilot 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      },
+      {
+        "type": "command",
+        "matcher": "bash|powershell",
+        "timeoutSec": 10,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run post-shell --dialect copilot || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run post-shell --dialect copilot 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "timeoutSec": 10,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run stop --dialect copilot --level advise || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run stop --dialect copilot --level advise 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "matcher": "bash|powershell|edit|create|str_replace_editor|str_replace|apply_patch|view|grep|glob|rg",
+        "timeoutSec": 10,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run pre-guard --dialect copilot --level guard || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run pre-guard --dialect copilot --level guard 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "timeoutSec": 5,
+        "bash": "command -v node >/dev/null 2>&1 && node \"<SKILL>/scripts/adc.mjs\" hook-run session-end --dialect copilot || echo {}",
+        "powershell": "if (Get-Command node -ErrorAction SilentlyContinue) { $o = & node \"<SKILL>/scripts/adc.mjs\" hook-run session-end --dialect copilot 2>$null; if ($LASTEXITCODE -eq 0 -and $o) { $o } else { '{}' } } else { '{}' }; exit 0"
+      }
+    ]
+  }
+}

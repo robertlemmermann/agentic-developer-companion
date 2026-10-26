@@ -1,0 +1,1923 @@
+{
+  "description": "detect fixtures (plan §13 Detection row, §7.4): each case is materialized in a temp directory (object values are written as JSON files) and detected with `platform` (default linux) and a tool lookup where every tool exists unless `tools` says otherwise (cargo-nextest is absent by default). `expect` is a partial match: arrays must have the same length, objects only the listed keys; `*_re` keys are regexes, `*_include` keys are subsets; `is_test` / `not_test` / `project_for` exercise isTestFile and projectForFile.",
+  "cases": [
+    {
+      "name": "node-npm-jest",
+      "files": {
+        "package.json": {
+          "name": "app",
+          "scripts": {
+            "test": "jest"
+          },
+          "devDependencies": {
+            "jest": "^29.7.0"
+          }
+        },
+        "package-lock.json": {
+          "lockfileVersion": 3
+        },
+        "jest.config.js": "module.exports = {\r\n  testMatch: ['<rootDir>/src/**/*.test.js'],\r\n};\r\n",
+        "src/sum.js": "",
+        "src/sum.test.js": ""
+      },
+      "expect": {
+        "summary": "node(npm, jest)",
+        "projects": [
+          {
+            "root": ".",
+            "languages": [
+              "javascript"
+            ],
+            "managers": [
+              {
+                "name": "npm",
+                "lockfile": "package-lock.json",
+                "install": "npm ci",
+                "cwd": ".",
+                "frozen": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "jest",
+                "kind": "unit",
+                "cmd": "npx --no jest --ci",
+                "report": {
+                  "flag": "--json --outputFile=<f>",
+                  "format": "jest-json"
+                },
+                "retries_off": {
+                  "coverage": "partial"
+                },
+                "count_parser": "jest-json",
+                "source": "package.json scripts.test",
+                "config": "jest.config.js"
+              }
+            ],
+            "test_globs": [
+              "src/**/*.test.js"
+            ],
+            "test_script": "jest",
+            "coverage_names": [
+              "jest-coverage"
+            ]
+          }
+        ],
+        "is_test": [
+          "src/sum.test.js"
+        ],
+        "not_test": [
+          "src/sum.js",
+          "jest.config.js"
+        ]
+      }
+    },
+    {
+      "name": "node-pnpm-workspace-monorepo",
+      "files": {
+        "package.json": {
+          "name": "root",
+          "private": true,
+          "scripts": {
+            "test": "pnpm -r test",
+            "typecheck": "tsc -b"
+          },
+          "devDependencies": {
+            "typescript": "^5.6.0"
+          }
+        },
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n  - 'apps/*'\n  - '!**/fixtures/**'\n",
+        "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+        "packages/core/package.json": {
+          "name": "@x/core",
+          "scripts": {
+            "test": "vitest"
+          },
+          "devDependencies": {
+            "vitest": "^2.1.0"
+          }
+        },
+        "packages/core/vitest.config.ts": "import { defineConfig } from 'vitest/config';\nexport default defineConfig({ test: { include: ['src/**/*.spec.ts'] } });\n",
+        "packages/core/tsconfig.json": "{}",
+        "packages/core/src/a.spec.ts": "",
+        "packages/core/src/a.ts": "",
+        "apps/web/package.json": {
+          "name": "web",
+          "scripts": {
+            "test": "cross-env TZ=UTC jest --coverage",
+            "lint": "eslint ."
+          },
+          "devDependencies": {
+            "jest": "^29",
+            "cross-env": "^7"
+          }
+        },
+        "apps/web/__tests__/page.test.js": "",
+        "packages/docs/package.json": {
+          "name": "docs",
+          "scripts": {
+            "build": "astro build"
+          }
+        },
+        "packages/core/fixtures/pkg/package.json": {
+          "name": "fixture",
+          "scripts": {
+            "test": "mocha"
+          }
+        },
+        "tools/scratch/package.json": {
+          "name": "not-a-member",
+          "scripts": {
+            "test": "jest"
+          }
+        }
+      },
+      "expect": {
+        "summary": "node x2(pnpm, jest, vitest)",
+        "projects": [
+          {
+            "root": "apps/web",
+            "languages": [
+              "javascript"
+            ],
+            "workspace": {
+              "role": "member",
+              "root": "."
+            },
+            "managers": [
+              {
+                "name": "pnpm",
+                "lockfile": "pnpm-lock.yaml",
+                "install": "pnpm install --frozen-lockfile",
+                "cwd": ".",
+                "workspace": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "jest",
+                "cmd": "pnpm exec cross-env TZ=UTC jest --ci --coverage",
+                "env": {
+                  "TZ": "UTC"
+                }
+              }
+            ],
+            "lint_names": [
+              "eslint"
+            ]
+          },
+          {
+            "root": "packages/core",
+            "languages": [
+              "typescript"
+            ],
+            "managers": [
+              {
+                "name": "pnpm",
+                "cwd": "."
+              }
+            ],
+            "runners": [
+              {
+                "name": "vitest",
+                "cmd": "pnpm exec vitest run",
+                "report": {
+                  "flag": "--reporter=junit --outputFile=<f>",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "--retry=0",
+                  "coverage": "full"
+                },
+                "config": "packages/core/vitest.config.ts"
+              }
+            ],
+            "test_globs": [
+              "src/**/*.spec.ts"
+            ],
+            "typecheck_names": [
+              "tsc"
+            ],
+            "coverage_names": []
+          }
+        ],
+        "other_packages": [
+          {
+            "root": ".",
+            "reason_re": "^test script delegates"
+          },
+          {
+            "root": "packages/docs",
+            "reason": "no test runner"
+          }
+        ],
+        "top_typecheck": [
+          {
+            "name": "tsc",
+            "project": "packages/core"
+          },
+          {
+            "name": "tsc",
+            "cmd": "pnpm run typecheck",
+            "project": "."
+          }
+        ],
+        "is_test": [
+          "packages/core/src/a.spec.ts",
+          "apps/web/__tests__/page.test.js"
+        ],
+        "not_test": [
+          "packages/core/src/a.ts",
+          "tools/scratch/index.js"
+        ],
+        "project_for": {
+          "packages/core/src/a.ts": "packages/core",
+          "apps/web/x.js": "apps/web",
+          "README.md": null
+        }
+      }
+    },
+    {
+      "name": "node-yarn-berry-vitest-playwright",
+      "files": {
+        "package.json": {
+          "name": "b",
+          "packageManager": "yarn@4.5.0",
+          "scripts": {
+            "test": "vitest run --coverage",
+            "test:e2e": "playwright test"
+          },
+          "devDependencies": {
+            "vitest": "^2",
+            "@playwright/test": "^1.48"
+          }
+        },
+        ".yarnrc.yml": "nodeLinker: node-modules\n",
+        "yarn.lock": "__metadata:\n  version: 8\n",
+        "playwright.config.ts": "export default { testDir: './e2e', retries: process.env.CI ? 2 : 0 };\n",
+        "e2e/home.spec.ts": ""
+      },
+      "expect": {
+        "summary": "node(yarn, vitest, playwright)",
+        "projects": [
+          {
+            "root": ".",
+            "managers": [
+              {
+                "name": "yarn",
+                "lockfile": "yarn.lock",
+                "install": "yarn install --immutable",
+                "variant": "berry"
+              }
+            ],
+            "runners": [
+              {
+                "name": "vitest",
+                "cmd": "yarn vitest run --coverage"
+              },
+              {
+                "name": "playwright",
+                "kind": "e2e",
+                "cmd": "yarn playwright test",
+                "report": {
+                  "flag": "--reporter=junit",
+                  "env": {
+                    "PLAYWRIGHT_JUNIT_OUTPUT_NAME": "<f>"
+                  },
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "--retries=0",
+                  "coverage": "full"
+                },
+                "config": "playwright.config.ts"
+              }
+            ],
+            "test_globs_include": [
+              "e2e/**",
+              "**/*.{test,spec}.*"
+            ]
+          }
+        ],
+        "is_test": [
+          "e2e/home.spec.ts"
+        ]
+      }
+    },
+    {
+      "name": "node-yarn-classic-mocha",
+      "files": {
+        "package.json": {
+          "name": "c",
+          "scripts": {
+            "test": "mocha --reporter dot"
+          },
+          "devDependencies": {
+            "mocha": "^10"
+          }
+        },
+        "yarn.lock": "# yarn lockfile v1\n",
+        ".mocharc.json": {
+          "spec": "test/**/*.spec.js",
+          "timeout": 5000
+        },
+        "test/a.spec.js": ""
+      },
+      "expect": {
+        "summary": "node(yarn, mocha)",
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "yarn",
+                "install": "yarn install --frozen-lockfile"
+              }
+            ],
+            "runners": [
+              {
+                "name": "mocha",
+                "cmd": "yarn mocha",
+                "report": {
+                  "flag": "--reporter xunit --reporter-option output=<f>",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "--retries 0",
+                  "coverage": "full"
+                }
+              }
+            ],
+            "test_globs": [
+              "test/**/*.spec.js"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-bun",
+      "files": {
+        "package.json": {
+          "name": "d",
+          "scripts": {
+            "test": "bun test"
+          }
+        },
+        "bun.lock": "{}",
+        "src/x.test.ts": ""
+      },
+      "expect": {
+        "summary": "node(bun)",
+        "projects": [
+          {
+            "languages": [
+              "typescript"
+            ],
+            "managers": [
+              {
+                "name": "bun",
+                "lockfile": "bun.lock",
+                "install": "bun install --frozen-lockfile"
+              }
+            ],
+            "runners": [
+              {
+                "name": "bun",
+                "cmd": "bun test",
+                "report": {
+                  "flag": "--reporter=junit --reporter-outfile=<f>",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "--retry=0",
+                  "coverage": "full"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-test-runner",
+      "files": {
+        "package.json": {
+          "name": "e",
+          "type": "module",
+          "scripts": {
+            "test": "node --test 'test/**/*.test.mjs'"
+          }
+        },
+        "package-lock.json": {
+          "lockfileVersion": 3
+        },
+        "test/a.test.mjs": "",
+        "lib/a.mjs": ""
+      },
+      "expect": {
+        "summary": "node(npm, node-test)",
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "node-test",
+                "cmd": "node --test \"test/**/*.test.mjs\"",
+                "base_cmd": "node --test",
+                "paths": [
+                  "\"test/**/*.test.mjs\""
+                ],
+                "report": {
+                  "flag": "--test-reporter=junit --test-reporter-destination=<f>",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "coverage": "full"
+                },
+                "count_parser": "junit"
+              }
+            ],
+            "test_globs": [
+              "test/**/*.test.mjs"
+            ]
+          }
+        ],
+        "is_test": [
+          "test/a.test.mjs"
+        ],
+        "not_test": [
+          "lib/a.mjs"
+        ]
+      }
+    },
+    {
+      "name": "node-test-defaults-and-env-prefix",
+      "files": {
+        "package.json": {
+          "name": "f",
+          "scripts": {
+            "test": "NODE_OPTIONS=--experimental-vm-modules jest --watchAll"
+          },
+          "devDependencies": {
+            "jest": "29"
+          }
+        },
+        "package-lock.json": "{}"
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "jest",
+                "cmd": "NODE_OPTIONS=--experimental-vm-modules npx --no jest --ci",
+                "env": {
+                  "NODE_OPTIONS": "--experimental-vm-modules"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-env-prefix-windows",
+      "platform": "win32",
+      "files": {
+        "package.json": {
+          "name": "f",
+          "scripts": {
+            "test": "NODE_OPTIONS=--experimental-vm-modules jest"
+          },
+          "devDependencies": {
+            "jest": "29"
+          }
+        },
+        "package-lock.json": "{}"
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "jest",
+                "cmd": "set \"NODE_OPTIONS=--experimental-vm-modules\" && npx --no jest --ci"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-no-lockfile-react-scripts",
+      "files": {
+        "package.json": {
+          "name": "g",
+          "scripts": {
+            "test": "react-scripts test"
+          },
+          "dependencies": {
+            "react-scripts": "5"
+          }
+        },
+        "src/App.test.js": ""
+      },
+      "expect": {
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "npm",
+                "lockfile": null,
+                "install": "npm install --no-package-lock --no-audit --no-fund",
+                "frozen": false
+              }
+            ],
+            "runners": [
+              {
+                "name": "jest",
+                "cmd": "npx --no react-scripts test --ci --watchAll=false"
+              }
+            ],
+            "warnings_re": [
+              "no lockfile committed"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-unknown-test-script",
+      "files": {
+        "package.json": {
+          "name": "h",
+          "scripts": {
+            "test": "ava --verbose"
+          },
+          "devDependencies": {
+            "ava": "6"
+          }
+        },
+        "pnpm-lock.yaml": ""
+      },
+      "expect": {
+        "summary": "node(pnpm, npm-script)",
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "npm-script",
+                "kind": "wrapper",
+                "cmd": "pnpm test",
+                "report": {
+                  "format": "summary-text",
+                  "stdout": true
+                },
+                "count_parser": "summary-text",
+                "wraps": [
+                  "ava"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-npm-placeholder-no-runner",
+      "files": {
+        "package.json": {
+          "name": "i",
+          "scripts": {
+            "test": "echo \"Error: no test specified\" && exit 1"
+          }
+        },
+        "package-lock.json": "{}"
+      },
+      "expect": {
+        "summary": "node(npm)",
+        "projects": [
+          {
+            "root": ".",
+            "runners": []
+          }
+        ],
+        "next_steps_re": [
+          "No test runner was detected"
+        ]
+      }
+    },
+    {
+      "name": "python-uv",
+      "files": {
+        "pyproject.toml": "[project]\r\nname = \"svc\"\r\ndependencies = [\"httpx>=0.27\"]\r\n\r\n[dependency-groups]\r\ndev = [\r\n  \"pytest>=8\",\r\n  \"pytest-cov\",\r\n  \"mypy\",\r\n]\r\n\r\n[tool.pytest.ini_options]\r\ntestpaths = [\"tests\"]\r\naddopts = \"-ra\"\r\n\r\n[tool.mypy]\r\nstrict = true\r\n\r\n[tool.ruff]\r\nline-length = 100\r\n",
+        "uv.lock": "version = 1\n",
+        "tests/test_api.py": "",
+        "svc/api.py": ""
+      },
+      "expect": {
+        "summary": "python(uv, pytest)",
+        "projects": [
+          {
+            "root": ".",
+            "languages": [
+              "python"
+            ],
+            "managers": [
+              {
+                "name": "uv",
+                "lockfile": "uv.lock",
+                "install": "uv sync --locked",
+                "frozen": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "uv run --frozen pytest",
+                "report": {
+                  "flag": "--junit-xml=<f>",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "-p no:rerunfailures",
+                  "coverage": "full"
+                },
+                "source": "pyproject.toml [tool.pytest.ini_options]",
+                "addopts": "-ra"
+              }
+            ],
+            "test_globs": [
+              "test_*.py",
+              "*_test.py",
+              "conftest.py",
+              "tests/**"
+            ],
+            "typecheck": [
+              {
+                "name": "mypy",
+                "cmd": "uv run --frozen mypy ."
+              }
+            ],
+            "lint": [
+              {
+                "name": "ruff",
+                "cmd": "uv run --frozen ruff check ."
+              }
+            ],
+            "coverage_names": [
+              "pytest-cov"
+            ]
+          }
+        ],
+        "is_test": [
+          "tests/test_api.py",
+          "svc/test_util.py"
+        ],
+        "not_test": [
+          "svc/api.py"
+        ]
+      }
+    },
+    {
+      "name": "python-uv-workspace",
+      "files": {
+        "pyproject.toml": "[project]\nname = \"mono\"\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+        "uv.lock": "version = 1\n",
+        "packages/core/pyproject.toml": "[project]\nname = \"core\"\n[dependency-groups]\ntest = [\"pytest\", \"pytest-rerunfailures\", \"flaky\"]\n",
+        "packages/core/tests/test_core.py": ""
+      },
+      "expect": {
+        "other_packages": [
+          {
+            "root": ".",
+            "reason_re": "^workspace root without"
+          }
+        ],
+        "projects": [
+          {
+            "root": "packages/core",
+            "workspace": {
+              "role": "member",
+              "root": "."
+            },
+            "managers": [
+              {
+                "name": "uv",
+                "install": "uv sync --locked --all-packages",
+                "cwd": ".",
+                "workspace": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "uv run --frozen pytest",
+                "retries_off": {
+                  "mechanism": "--reruns=0 -p no:flaky",
+                  "coverage": "partial"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-poetry",
+      "files": {
+        "pyproject.toml": "[tool.poetry]\nname = \"p\"\nversion = \"0.1.0\"\n\n[tool.poetry.dependencies]\npython = \"^3.11\"\n\n[tool.poetry.group.dev.dependencies]\npytest = \"^8.0\"\npytest-rerunfailures = \"^14\"\n",
+        "poetry.lock": "# lock\n",
+        "tests/test_p.py": ""
+      },
+      "expect": {
+        "summary": "python(poetry, pytest)",
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "poetry",
+                "lockfile": "poetry.lock",
+                "install": "poetry install --no-interaction"
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "poetry run pytest",
+                "source": "pytest dependency",
+                "retries_off": {
+                  "mechanism": "--reruns=0",
+                  "coverage": "partial"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-pip-hashes-pytest-ini",
+      "files": {
+        "requirements.txt": "pytest==8.3.3 \\\n    --hash=sha256:not-a-real-digest\n",
+        "pytest.ini": "[pytest]\ntestpaths = tests\npython_files = check_*.py\n",
+        "tests/check_x.py": "",
+        "tests/helpers.py": ""
+      },
+      "expect": {
+        "summary": "python(pip, pytest)",
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "pip",
+                "lockfile": "requirements.txt",
+                "install": "python -m pip install --require-hashes -r requirements.txt",
+                "frozen": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "python -m pytest",
+                "source": "pytest.ini"
+              }
+            ],
+            "test_globs": [
+              "check_*.py",
+              "conftest.py",
+              "tests/**"
+            ]
+          }
+        ],
+        "is_test": [
+          "tests/check_x.py"
+        ]
+      }
+    },
+    {
+      "name": "python-pip-unittest-python3",
+      "tools": {
+        "python": false,
+        "python3": true
+      },
+      "files": {
+        "requirements.txt": "requests\n",
+        "tests/test_y.py": "",
+        "app.py": ""
+      },
+      "expect": {
+        "summary": "python(pip, unittest)",
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "pip",
+                "lockfile": null,
+                "install": null,
+                "frozen": false,
+                "install_hint": "python3 -m pip install -r requirements.txt"
+              }
+            ],
+            "runners": [
+              {
+                "name": "unittest",
+                "cmd": "python3 -m unittest discover -s tests",
+                "report": {
+                  "format": "summary-text",
+                  "stdout": true
+                },
+                "retries_off": {
+                  "coverage": "full"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-unittest-tests-package",
+      "files": {
+        "setup.py": "from setuptools import setup\nsetup()\n",
+        "tests/__init__.py": "",
+        "tests/test_z.py": ""
+      },
+      "expect": {
+        "summary": "python(unittest)",
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "unittest",
+                "cmd": "python -m unittest discover"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-setupcfg-tox",
+      "files": {
+        "setup.cfg": "[metadata]\nname = legacy\n\n[tool:pytest]\ntestpaths =\n    tests\n    integration\n\n[flake8]\nmax-line-length = 100\n",
+        "tox.ini": "[tox]\nenvlist = py311\n\n[testenv]\ndeps =\n    pytest\n    pytest-cov\ncommands = pytest\n",
+        "setup.py": "from setuptools import setup\nsetup()\n"
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "pytest",
+                "source": "setup.cfg [tool:pytest]"
+              }
+            ],
+            "test_globs_include": [
+              "tests/**",
+              "integration/**"
+            ],
+            "lint": [
+              {
+                "name": "flake8",
+                "cmd": "python -m flake8"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "go-module",
+      "files": {
+        "go.mod": "module example.com/svc\r\n\r\ngo 1.22\r\n",
+        "go.sum": "",
+        "main.go": "",
+        "main_test.go": "",
+        ".golangci.yml": "linters: {}\n",
+        "testdata/fixture/go.mod": "module fixture\n"
+      },
+      "expect": {
+        "summary": "go(go)",
+        "projects": [
+          {
+            "root": ".",
+            "languages": [
+              "go"
+            ],
+            "module": "example.com/svc",
+            "managers": [
+              {
+                "name": "go",
+                "lockfile": "go.sum",
+                "install": "go mod download",
+                "lock_check": "go mod tidy -diff"
+              }
+            ],
+            "runners": [
+              {
+                "name": "go",
+                "cmd": "go test ./...",
+                "report": {
+                  "flag": "-json",
+                  "format": "go-test-json",
+                  "stdout": true
+                },
+                "retries_off": {
+                  "mechanism": "-count=1",
+                  "coverage": "full"
+                }
+              }
+            ],
+            "test_globs": [
+              "**/*_test.go"
+            ],
+            "typecheck": [
+              {
+                "name": "go-vet",
+                "cmd": "go vet ./..."
+              }
+            ],
+            "lint": [
+              {
+                "name": "golangci-lint"
+              }
+            ],
+            "coverage_names": [
+              "go-cover"
+            ]
+          }
+        ],
+        "is_test": [
+          "main_test.go",
+          "pkg/x_test.go"
+        ],
+        "not_test": [
+          "main.go"
+        ]
+      }
+    },
+    {
+      "name": "go-multi-module-workspace",
+      "files": {
+        "go.work": "go 1.22\n\nuse (\n  ./services/a\n  ./services/b\n)\n",
+        "services/a/go.mod": "module a\n",
+        "services/a/a_test.go": "",
+        "services/b/go.mod": "module b\n"
+      },
+      "expect": {
+        "summary": "go x2(go)",
+        "projects": [
+          {
+            "root": "services/a",
+            "workspace": {
+              "kind": "go.work",
+              "role": "member",
+              "root": "."
+            }
+          },
+          {
+            "root": "services/b"
+          }
+        ],
+        "project_for": {
+          "services/a/x/y.go": "services/a",
+          "go.work": null
+        }
+      }
+    },
+    {
+      "name": "rust-cargo",
+      "files": {
+        "Cargo.toml": "[package]\nname = \"crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dev-dependencies]\nproptest = \"1\"\n",
+        "Cargo.lock": "",
+        "src/lib.rs": "",
+        "tests/it.rs": ""
+      },
+      "expect": {
+        "summary": "rust(cargo)",
+        "projects": [
+          {
+            "languages": [
+              "rust"
+            ],
+            "managers": [
+              {
+                "name": "cargo",
+                "lockfile": "Cargo.lock",
+                "install": "cargo fetch --locked"
+              }
+            ],
+            "runners": [
+              {
+                "name": "cargo",
+                "cmd": "cargo test --no-fail-fast",
+                "report": {
+                  "format": "cargo-text",
+                  "stdout": true
+                },
+                "retries_off": {
+                  "coverage": "unknown"
+                },
+                "count_parser": "cargo-text"
+              }
+            ],
+            "typecheck": [
+              {
+                "name": "cargo-check",
+                "cmd": "cargo check --all-targets"
+              }
+            ],
+            "test_globs": [
+              "tests/**"
+            ]
+          }
+        ],
+        "is_test": [
+          "tests/it.rs"
+        ],
+        "not_test": [
+          "src/lib.rs"
+        ]
+      }
+    },
+    {
+      "name": "rust-workspace-nextest",
+      "tools": {
+        "cargo-nextest": true
+      },
+      "files": {
+        "Cargo.toml": "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        "Cargo.lock": "",
+        "crates/a/Cargo.toml": "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        "crates/a/tests/t.rs": "",
+        ".config/nextest.toml": "[profile.default]\nretries = 2\n\n[profile.ci]\nfail-fast = false\n\n[profile.ci.junit]\npath = \"junit.xml\"\n",
+        "clippy.toml": ""
+      },
+      "expect": {
+        "summary": "rust(cargo, nextest)",
+        "projects": [
+          {
+            "root": ".",
+            "workspace": {
+              "kind": "cargo workspace",
+              "role": "root"
+            },
+            "runners": [
+              {
+                "name": "nextest",
+                "cmd": "cargo nextest run --workspace --no-fail-fast",
+                "report": {
+                  "flag": "--profile ci",
+                  "path": "target/nextest/ci/junit.xml",
+                  "format": "junit"
+                },
+                "retries_off": {
+                  "mechanism": "--retries 0",
+                  "coverage": "full"
+                },
+                "config": ".config/nextest.toml",
+                "available": true
+              },
+              {
+                "name": "cargo",
+                "cmd": "cargo test --workspace --no-fail-fast"
+              }
+            ],
+            "test_globs": [
+              "tests/**",
+              "**/tests/**"
+            ],
+            "lint": [
+              {
+                "name": "clippy",
+                "cmd": "cargo clippy --all-targets --workspace"
+              }
+            ]
+          }
+        ],
+        "is_test": [
+          "crates/a/tests/t.rs"
+        ]
+      }
+    },
+    {
+      "name": "rust-nextest-configured-not-installed",
+      "tools": {
+        "cargo-nextest": false
+      },
+      "files": {
+        "Cargo.toml": "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        ".config/nextest.toml": "[profile.default]\nslow-timeout = \"60s\"\n"
+      },
+      "expect": {
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "cargo",
+                "lockfile": null,
+                "install": "cargo fetch",
+                "frozen": false
+              }
+            ],
+            "runners": [
+              {
+                "name": "cargo"
+              },
+              {
+                "name": "nextest",
+                "available": false,
+                "report": {
+                  "nextestConfig": true,
+                  "format": "junit"
+                }
+              }
+            ],
+            "warnings_re": [
+              "not installed; using cargo test",
+              "no Cargo.lock"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "dotnet-sln-vstest",
+      "files": {
+        "App.sln": "Microsoft Visual Studio Solution File\n",
+        "src/App/App.csproj": "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n",
+        "tests/App.Tests/App.Tests.csproj": "<Project Sdk=\"Microsoft.NET.Sdk\">\r\n  <ItemGroup>\r\n    <PackageReference Include=\"Microsoft.NET.Test.Sdk\" Version=\"17.11.1\" />\r\n    <PackageReference Include=\"xunit\" Version=\"2.9.2\" />\r\n    <PackageReference Include=\"coverlet.collector\" Version=\"6.0.2\" />\r\n  </ItemGroup>\r\n</Project>\r\n",
+        "tests/App.Tests/packages.lock.json": "{}",
+        "tests/App.Tests/CalcTests.cs": "",
+        "src/App/Calc.cs": ""
+      },
+      "expect": {
+        "summary": "dotnet(nuget, dotnet)",
+        "projects": [
+          {
+            "root": ".",
+            "languages": [
+              "csharp"
+            ],
+            "managers": [
+              {
+                "name": "nuget",
+                "lockfile": "packages.lock.json",
+                "install": "dotnet restore App.sln --locked-mode",
+                "frozen": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "dotnet",
+                "cmd": "dotnet test App.sln",
+                "platform": "vstest",
+                "report": {
+                  "flag": "--logger trx --results-directory <d>",
+                  "dir": "<d>",
+                  "glob": "*.trx",
+                  "format": "trx"
+                },
+                "retries_off": {
+                  "coverage": "unknown"
+                }
+              }
+            ],
+            "test_globs": [
+              "tests/App.Tests/**",
+              "**/*Tests*/**"
+            ],
+            "typecheck": [
+              {
+                "name": "dotnet-build",
+                "cmd": "dotnet build App.sln --nologo"
+              }
+            ],
+            "coverage_names": [
+              "coverlet.collector"
+            ]
+          }
+        ],
+        "is_test": [
+          "tests/App.Tests/CalcTests.cs"
+        ],
+        "not_test": [
+          "src/App/Calc.cs"
+        ]
+      }
+    },
+    {
+      "name": "dotnet-mtp",
+      "files": {
+        "global.json": {
+          "sdk": {
+            "version": "10.0.100"
+          },
+          "test": {
+            "runner": "Microsoft.Testing.Platform"
+          }
+        },
+        "Lib.sln": "",
+        "tests/Lib.Tests/Lib.Tests.csproj": "<Project Sdk=\"MSTest.Sdk/3.6.1\"></Project>\n"
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "dotnet",
+                "platform": "mtp",
+                "cmd": "dotnet test --solution Lib.sln",
+                "report": {
+                  "flag": "--report-trx --results-directory <d>",
+                  "format": "trx"
+                },
+                "retries_off": {
+                  "coverage": "full"
+                }
+              }
+            ],
+            "managers": [
+              {
+                "install": "dotnet restore Lib.sln",
+                "frozen": false
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "jvm-maven-multimodule",
+      "files": {
+        "pom.xml": "<project>\n  <packaging>pom</packaging>\n  <modules>\n    <module>core</module>\n    <module>api</module>\n  </modules>\n</project>\n",
+        "mvnw": "",
+        "mvnw.cmd": "",
+        "core/pom.xml": "<project></project>\n",
+        "core/src/test/java/CoreTest.java": "",
+        "api/pom.xml": "<project></project>\n"
+      },
+      "expect": {
+        "summary": "jvm(maven)",
+        "projects": [
+          {
+            "root": ".",
+            "languages": [
+              "java"
+            ],
+            "managers": [
+              {
+                "name": "maven",
+                "install": null,
+                "offline_flag": "-o"
+              }
+            ],
+            "runners": [
+              {
+                "name": "maven",
+                "cmd": "./mvnw -B test",
+                "report": {
+                  "dir": "target/surefire-reports",
+                  "glob": "TEST-*.xml",
+                  "format": "junit",
+                  "dirs": [
+                    "core/target/surefire-reports",
+                    "api/target/surefire-reports"
+                  ]
+                },
+                "retries_off": {
+                  "mechanism": "-Dsurefire.rerunFailingTestsCount=0",
+                  "coverage": "full"
+                }
+              }
+            ],
+            "test_globs": [
+              "src/test/**",
+              "**/src/test/**"
+            ],
+            "typecheck": [
+              {
+                "name": "maven-compile",
+                "cmd": "./mvnw -B -q test-compile"
+              }
+            ]
+          }
+        ],
+        "is_test": [
+          "core/src/test/java/CoreTest.java"
+        ],
+        "not_test": [
+          "core/src/main/java/Core.java"
+        ]
+      }
+    },
+    {
+      "name": "jvm-maven-windows-wrapper",
+      "platform": "win32",
+      "files": {
+        "pom.xml": "<project></project>\n",
+        "mvnw.cmd": "",
+        "src/test/java/ATest.java": ""
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "maven",
+                "cmd": "mvnw.cmd -B test"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "jvm-gradle-kotlin-test-retry",
+      "files": {
+        "settings.gradle.kts": "rootProject.name = \"g\"\ninclude(\"app\", \":lib:util\")\n",
+        "build.gradle.kts": "plugins { kotlin(\"jvm\") version \"2.0.0\" apply false }\n",
+        "app/build.gradle.kts": "plugins {\n  id(\"org.gradle.test-retry\") version \"1.6.0\"\n}\ntasks.test { useJUnitPlatform() }\n",
+        "gradlew": "",
+        "gradlew.bat": "",
+        "gradle.properties": "org.gradle.caching=true\n",
+        "app/src/test/kotlin/AppTest.kt": ""
+      },
+      "expect": {
+        "summary": "jvm(gradle)",
+        "projects": [
+          {
+            "languages_include": [
+              "kotlin"
+            ],
+            "runners": [
+              {
+                "name": "gradle",
+                "cmd": "./gradlew test --no-build-cache",
+                "retries_off": {
+                  "coverage": "partial"
+                },
+                "report": {
+                  "dir": "build/test-results/test",
+                  "format": "junit",
+                  "dirs": [
+                    "app/build/test-results/test",
+                    "lib/util/build/test-results/test"
+                  ]
+                }
+              }
+            ],
+            "typecheck": [
+              {
+                "name": "gradle-compile",
+                "cmd": "./gradlew testClasses"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ruby-rspec",
+      "files": {
+        "Gemfile": "source 'https://rubygems.org'\ngem 'rspec', '~> 3.13'\ngem \"rspec-retry\"\ngem 'rubocop', require: false\ngem 'simplecov'\n",
+        "Gemfile.lock": "",
+        ".rspec": "--require spec_helper\n",
+        "spec/calc_spec.rb": "",
+        "lib/calc.rb": ""
+      },
+      "expect": {
+        "summary": "ruby(bundler, rspec)",
+        "projects": [
+          {
+            "languages": [
+              "ruby"
+            ],
+            "managers": [
+              {
+                "name": "bundler",
+                "lockfile": "Gemfile.lock",
+                "install": "bundle config set --local frozen true && bundle install",
+                "frozen": true
+              }
+            ],
+            "runners": [
+              {
+                "name": "rspec",
+                "cmd": "bundle exec rspec",
+                "report": {
+                  "flag": "--format json --out <f> --format progress",
+                  "format": "rspec-json"
+                },
+                "retries_off": {
+                  "coverage": "partial"
+                }
+              }
+            ],
+            "lint": [
+              {
+                "name": "rubocop",
+                "cmd": "bundle exec rubocop"
+              }
+            ],
+            "test_globs": [
+              "spec/**"
+            ],
+            "coverage_names": [
+              "simplecov"
+            ]
+          }
+        ],
+        "is_test": [
+          "spec/calc_spec.rb"
+        ],
+        "not_test": [
+          "lib/calc.rb"
+        ]
+      }
+    },
+    {
+      "name": "ruby-rails-minitest",
+      "files": {
+        "Gemfile": "gem 'rails', '~> 7.2'\n",
+        "Gemfile.lock": "",
+        "bin/rails": "",
+        "test/models/user_test.rb": ""
+      },
+      "expect": {
+        "summary": "ruby(bundler, minitest)",
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "minitest",
+                "cmd": "bundle exec rails test",
+                "report": {
+                  "format": "summary-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "makefile-test-target",
+      "files": {
+        "Makefile": ".PHONY: test lint\r\nBIN := ./bin\r\n\r\ntest: build\r\n\t@go test ./...\r\n\r\ntest-integration:\r\n\t./scripts/it.sh\r\n\r\nlint:\r\n\techo lint\r\n",
+        "docs/Makefile": "html:\n\tsphinx-build . _build\n"
+      },
+      "expect": {
+        "summary": "make(test)",
+        "projects": [
+          {
+            "root": ".",
+            "runners": [
+              {
+                "name": "make",
+                "kind": "wrapper",
+                "cmd": "make test",
+                "target": "test",
+                "targets": [
+                  "test",
+                  "test-integration"
+                ],
+                "wraps": [
+                  "go"
+                ],
+                "report": {
+                  "format": "summary-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "justfile-with-cargo",
+      "files": {
+        "justfile": "set shell := [\"bash\", \"-c\"]\n\ntest *args:\n    cargo nextest run {{args}}\n\nfmt:\n    cargo fmt\n",
+        "Cargo.toml": "[package]\nname = \"j\"\n",
+        "Cargo.lock": ""
+      },
+      "expect": {
+        "summary": "rust(cargo) · just(test)",
+        "projects": [
+          {
+            "ecosystems": [
+              "rust",
+              "just"
+            ],
+            "runners": [
+              {
+                "name": "cargo"
+              },
+              {
+                "name": "just",
+                "cmd": "just test",
+                "wraps": [
+                  "nextest"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ci-learned-script",
+      "files": {
+        ".github/workflows/test.yml": "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Unit tests\n        run: ./scripts/run_tests.sh --fast\n",
+        "scripts/run_tests.sh": ""
+      },
+      "expect": {
+        "summary": "ci(ci)",
+        "ci": {
+          "system": "github-actions",
+          "files": [
+            ".github/workflows/test.yml"
+          ],
+          "test_commands": [
+            "./scripts/run_tests.sh --fast"
+          ]
+        },
+        "projects": [
+          {
+            "root": ".",
+            "runners": [
+              {
+                "name": "ci",
+                "kind": "wrapper",
+                "cmd": "./scripts/run_tests.sh --fast",
+                "portable": false,
+                "source": "ci: .github/workflows/test.yml:8",
+                "report": {
+                  "format": "summary-text"
+                }
+              }
+            ],
+            "ci_test_commands": [
+              "./scripts/run_tests.sh --fast"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ci-learned-pytest-gitlab",
+      "files": {
+        ".gitlab-ci.yml": "stages: [test]\n\nunit:\n  stage: test\n  image: python:3.12\n  before_script:\n    - pip install -r requirements.txt pytest\n  script:\n    - pytest -q --junitxml=report.xml tests\n",
+        "requirements.txt": "requests\n",
+        "tests/test_a.py": "",
+        "app.py": ""
+      },
+      "expect": {
+        "summary": "python(pip, pytest)",
+        "ci": {
+          "system": "gitlab-ci",
+          "test_commands": [
+            "pytest -q --junitxml=report.xml tests"
+          ]
+        },
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "python -m pytest",
+                "source": "ci: .gitlab-ci.yml:9"
+              }
+            ],
+            "ci_test_commands": [
+              "pytest -q --junitxml=report.xml tests"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ci-azure-working-directory",
+      "files": {
+        "azure-pipelines.yml": "trigger:\n- main\npool:\n  vmImage: ubuntu-latest\nsteps:\n- script: npm ci\n  workingDirectory: web\n- script: |\n    npm test -- --coverage\n  workingDirectory: web\n  displayName: test\n- task: DotNetCoreCLI@2\n  inputs:\n    command: test\n    projects: '**/*Tests.csproj'\n",
+        "web/package.json": {
+          "name": "web",
+          "scripts": {
+            "test": "vitest run"
+          },
+          "devDependencies": {
+            "vitest": "2"
+          }
+        },
+        "web/package-lock.json": "{}"
+      },
+      "expect": {
+        "ci": {
+          "system": "azure-pipelines",
+          "test_commands": [
+            "npm test -- --coverage",
+            "dotnet test **/*Tests.csproj"
+          ]
+        },
+        "projects": [
+          {
+            "root": ".",
+            "runners": [
+              {
+                "name": "dotnet",
+                "cmd": "dotnet test \"**/*Tests.csproj\""
+              }
+            ]
+          },
+          {
+            "root": "web",
+            "runners": [
+              {
+                "name": "vitest",
+                "cmd": "npx --no vitest run"
+              }
+            ],
+            "ci_test_commands": [
+              "npm test -- --coverage"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "mixed-root-node-python",
+      "files": {
+        "package.json": {
+          "name": "m",
+          "scripts": {
+            "test": "vitest"
+          },
+          "devDependencies": {
+            "vitest": "2"
+          }
+        },
+        "package-lock.json": "{}",
+        "pyproject.toml": "[project]\nname = \"m\"\n[project.optional-dependencies]\ntest = [\"pytest\"]\n",
+        "tests/test_x.py": "",
+        "src/x.test.ts": ""
+      },
+      "expect": {
+        "summary": "node(npm, vitest) · python(pytest)",
+        "projects": [
+          {
+            "root": ".",
+            "ecosystems": [
+              "node",
+              "python"
+            ],
+            "languages": [
+              "typescript",
+              "python"
+            ],
+            "runners": [
+              {
+                "name": "vitest",
+                "ecosystem": "node"
+              },
+              {
+                "name": "pytest",
+                "ecosystem": "python"
+              }
+            ]
+          }
+        ],
+        "is_test": [
+          "tests/test_x.py",
+          "src/x.test.ts"
+        ]
+      }
+    },
+    {
+      "name": "node-mocha-positional-specs-no-lockfile",
+      "files": {
+        "package.json": {
+          "name": "m",
+          "scripts": {
+            "test": "mocha --require test/support/env --check-leaks test/ test/acceptance/"
+          },
+          "devDependencies": {
+            "mocha": "10"
+          }
+        }
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "mocha",
+                "cmd": "npx --no mocha --require test/support/env --check-leaks test/ test/acceptance/",
+                "specs": [
+                  "test/",
+                  "test/acceptance/"
+                ]
+              }
+            ],
+            "test_globs": [
+              "test/**",
+              "test/acceptance/**"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "node-runner-bin-script-and-yarn-berry-lock-header",
+      "files": {
+        "package.json": {
+          "name": "j",
+          "scripts": {
+            "test": "yarn lint && yarn jest",
+            "lint": "eslint .",
+            "jest": "node ./packages/jest-cli/bin/jest.js"
+          }
+        },
+        "yarn.lock": "# This file is generated by running \"yarn install\" inside your project.\n\n__metadata:\n  version: 8\n"
+      },
+      "expect": {
+        "summary": "node(yarn, jest)",
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "yarn",
+                "install": "yarn install --immutable",
+                "variant": "berry"
+              }
+            ],
+            "runners": [
+              {
+                "name": "jest",
+                "cmd": "node ./packages/jest-cli/bin/jest.js --ci",
+                "source": "package.json scripts.test -> scripts.jest"
+              }
+            ],
+            "lint": [
+              {
+                "name": "eslint",
+                "cmd": "yarn run lint"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ci-other-repo-checkout-and-circleci-home-dir",
+      "files": {
+        ".github/workflows/downstream.yml": "on: push\njobs:\n  d:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: other/app\n          path: app\n      - run: npm test\n        working-directory: app\n",
+        ".circleci/config.yml": "version: 2.1\njobs:\n  build:\n    working_directory: ~/repo\n    docker:\n      - image: cimg/go:1.22\n    steps:\n      - checkout\n      - run:\n          name: Test\n          command: go test -race ./...\n",
+        "go.mod": "module x\n"
+      },
+      "expect": {
+        "summary": "go(go)",
+        "ci": {
+          "system": "circleci",
+          "systems": [
+            "circleci",
+            "github-actions"
+          ],
+          "test_commands": [
+            "go test -race ./...",
+            "npm test"
+          ],
+          "steps": [
+            {
+              "cmd": "go test -race ./...",
+              "cwd": ".",
+              "project": "."
+            },
+            {
+              "cmd": "npm test",
+              "cwd": "app",
+              "project": null
+            }
+          ]
+        },
+        "projects": [
+          {
+            "root": ".",
+            "runners": [
+              {
+                "name": "go"
+              }
+            ],
+            "ci_test_commands": [
+              "go test -race ./..."
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-repo",
+      "files": {
+        "README.md": "# nothing\n"
+      },
+      "expect": {
+        "summary": "no projects detected",
+        "projects": [],
+        "next_steps_re": [
+          "clean-run --runner"
+        ]
+      }
+    },
+    {
+      "name": "jvm-wrappers-match-the-platform-gradle-cache-always-bypassed",
+      "platform": "win32",
+      "files": {
+        "settings.gradle": "rootProject.name = 'w'\n",
+        "build.gradle": "dependencies { testImplementation 'junit:junit:4.13' }\n",
+        "gradlew": "#!/bin/sh\n",
+        "src/test/java/ATest.java": "class ATest {}\n"
+      },
+      "tools": {
+        "gradle": true
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "gradle",
+                "cmd": "gradle test --no-build-cache",
+                "available": true
+              }
+            ],
+            "typecheck": [
+              {
+                "name": "gradle-compile",
+                "cmd": "gradle testClasses"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "jvm-maven-cmd-wrapper-only-on-posix",
+      "files": {
+        "pom.xml": "<project><artifactId>a</artifactId></project>\n",
+        "mvnw.cmd": "@echo off\n",
+        "src/test/java/ATest.java": "class ATest {}\n"
+      },
+      "tools": {
+        "mvn": false
+      },
+      "expect": {
+        "projects": [
+          {
+            "runners": [
+              {
+                "name": "maven",
+                "cmd": "mvn -B test",
+                "available": false
+              }
+            ],
+            "warnings_re": [
+              "mvn is not on PATH \\(and no wrapper\\)"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "python-uv-toml-without-lockfile",
+      "files": {
+        "pyproject.toml": "[project]\nname = \"u\"\ndependencies = [\"pytest>=8\"]\n",
+        "uv.toml": "native-tls = true\n",
+        "tests/test_u.py": "def test_u():\n    assert True\n"
+      },
+      "expect": {
+        "projects": [
+          {
+            "managers": [
+              {
+                "name": "uv",
+                "lockfile": null,
+                "install": null,
+                "frozen": false,
+                "install_hint": "uv sync"
+              }
+            ],
+            "runners": [
+              {
+                "name": "pytest",
+                "cmd": "uv run pytest",
+                "source": "pytest dependency"
+              }
+            ],
+            "warnings_re": [
+              "pyproject.toml: no lockfile with hashes"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

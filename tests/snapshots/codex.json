@@ -1,0 +1,376 @@
+{
+  "user-advise": {
+    "target_file": "/home/dev/.codex/hooks.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [],
+    "config": {
+      "description": "agentic-developer-companion hooks",
+      "hooks": {
+        "SessionStart": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-guard": {
+    "target_file": "/home/dev/.codex/hooks.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [],
+    "config": {
+      "description": "agentic-developer-companion hooks",
+      "hooks": {
+        "SessionStart": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex --level guard",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex --level guard",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PreToolUse": [
+          {
+            "matcher": "Bash|apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run pre-guard --dialect codex --level guard",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run pre-guard --dialect codex --level guard",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level guard",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level guard",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "project-advise": {
+    "target_file": "<REPO>/.codex/hooks.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "node",
+    "warnings": [
+      ".codex/hooks.json names this machine's skill path (/opt/skills/agentic-developer-companion); keep it uncommitted, since colleagues' copies live elsewhere"
+    ],
+    "config": {
+      "description": "agentic-developer-companion hooks",
+      "hooks": {
+        "SessionStart": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "node \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-advise-node-path": {
+    "target_file": "/home/dev/.codex/hooks.json",
+    "skill_path": "/opt/skills/agentic-developer-companion",
+    "node": "/opt/node js/bin/node",
+    "warnings": [
+      "the Node path needs quoting (/opt/node js/bin/node); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+    ],
+    "config": {
+      "description": "agentic-developer-companion hooks",
+      "hooks": {
+        "SessionStart": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "& \"/opt/node js/bin/node\" \"/opt/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "user-advise-windows": {
+    "target_file": "/home/dev/.codex/hooks.json",
+    "skill_path": "C:/Users/Dev User/.copilot/skills/agentic-developer-companion",
+    "node": "C:/Program Files/nodejs/node.exe",
+    "warnings": [
+      "the Node path needs quoting (C:/Program Files/nodejs/node.exe); Codex commandWindows is rendered for a PowerShell launcher (`& \"<node>\"`), which cmd.exe cannot run"
+    ],
+    "config": {
+      "description": "agentic-developer-companion hooks",
+      "hooks": {
+        "SessionStart": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "commandWindows": "& \"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-start --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "PostToolUse": [
+          {
+            "matcher": "apply_patch|Write|Edit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "commandWindows": "& \"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+                "timeout": 10
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "commandWindows": "& \"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "Stop": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "commandWindows": "& \"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+                "timeout": 10
+              }
+            ]
+          }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "\"C:/Program Files/nodejs/node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "commandWindows": "& \"C:\\Program Files\\nodejs\\node.exe\" \"C:/Users/Dev User/.copilot/skills/agentic-developer-companion/scripts/adc.mjs\" hook-run session-end --dialect codex",
+                "timeout": 1
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

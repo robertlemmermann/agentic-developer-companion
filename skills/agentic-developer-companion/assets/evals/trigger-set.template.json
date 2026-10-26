@@ -1,0 +1,36 @@
+{
+  "schema": "adc-trigger-set/1",
+  "skill": "{{skill_name}}",
+  "runs": 3,
+  "query_threshold": 0.5,
+  "suite_threshold": 0.8,
+  "guidance": [
+    "Replace every TODO query before running: tooling trigger-set refuses a set that still contains TODO.",
+    "8-10 should_trigger queries with varied phrasing: direct asks, indirect asks, the user's own words, realistic detail (paths, tools, error text).",
+    "8-10 should_trigger=false near misses: requests that share keywords or context with {{skill_name}} but belong to another skill or to plain coding.",
+    "Each query runs 3 times; a query passes when more than half of its runs behave as labeled; the suite score is the share of passing queries (accept at 0.8).",
+    "The split (60% train, 40% validation) is assigned by tooling trigger-set; tune the description on train only, check validation, stop after 5 revisions and add 5-10 fresh queries."
+  ],
+  "queries": [
+    { "id": "pos-01", "should_trigger": true, "query": "TODO: a direct request that names the task {{skill_name}} handles" },
+    { "id": "pos-02", "should_trigger": true, "query": "TODO: the same need phrased indirectly, without the obvious keywords" },
+    { "id": "pos-03", "should_trigger": true, "query": "TODO: a request with concrete detail (a file path, a tool name, an error message)" },
+    { "id": "pos-04", "should_trigger": true, "query": "TODO: a short, casual request in the user's own words" },
+    { "id": "pos-05", "should_trigger": true, "query": "TODO: a request embedded in a longer description of the situation" },
+    { "id": "pos-06", "should_trigger": true, "query": "TODO: a request that mentions a second, related goal" },
+    { "id": "pos-07", "should_trigger": true, "query": "TODO: a request from a different role (reviewer, lead, newcomer)" },
+    { "id": "pos-08", "should_trigger": true, "query": "TODO: a request that uses a synonym for the main task" },
+    { "id": "pos-09", "should_trigger": true, "query": "TODO: a follow-up style request (\"now do the same for ...\")" },
+    { "id": "pos-10", "should_trigger": true, "query": "TODO: an edge case the skill must still handle" },
+    { "id": "neg-01", "should_trigger": false, "query": "TODO: a near miss that shares keywords but asks for plain coding" },
+    { "id": "neg-02", "should_trigger": false, "query": "TODO: a near miss that belongs to another skill in the same repository" },
+    { "id": "neg-03", "should_trigger": false, "query": "TODO: a near miss about the same files but a different task" },
+    { "id": "neg-04", "should_trigger": false, "query": "TODO: a general question about the topic (explanation only)" },
+    { "id": "neg-05", "should_trigger": false, "query": "TODO: a request the skill description explicitly excludes" },
+    { "id": "neg-06", "should_trigger": false, "query": "TODO: a one-step request the agent answers without any skill" },
+    { "id": "neg-07", "should_trigger": false, "query": "TODO: a near miss with the same tool or framework names" },
+    { "id": "neg-08", "should_trigger": false, "query": "TODO: a near miss phrased like a positive query" },
+    { "id": "neg-09", "should_trigger": false, "query": "TODO: an unrelated request from the same project" },
+    { "id": "neg-10", "should_trigger": false, "query": "TODO: a request for a neighbouring workflow the skill does not cover" }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+ "version": "3.13.6",
+ "examples": [
+  {
+   "id": "./spec/calc_spec.rb[1:1]",
+   "description": "adds",
+   "full_description": "Calc adds",
+   "status": "passed",
+   "file_path": "./spec/calc_spec.rb",
+   "line_number": 3,
+   "run_time": 0.000499893,
+   "pending_message": null
+  },
+  {
+   "id": "./spec/calc_spec.rb[1:2]",
+   "description": "adds wrong",
+   "full_description": "Calc adds wrong",
+   "status": "failed",
+   "file_path": "./spec/calc_spec.rb",
+   "line_number": 6,
+   "run_time": 0.008856796,
+   "pending_message": null,
+   "exception": {
+    "class": "RSpec::Expectations::ExpectationNotMetError",
+    "message": "\nexpected: 5\n     got: 4\n\n(compared using ==)\n",
+    "backtrace": [
+     "./spec/calc_spec.rb:7:in `block (2 levels) in <top (required)>'"
+    ]
+   }
+  },
+  {
+   "id": "./spec/calc_spec.rb[1:3]",
+   "description": "is pending",
+   "full_description": "Calc is pending",
+   "status": "pending",
+   "file_path": "./spec/calc_spec.rb",
+   "line_number": 9,
+   "run_time": 0.00017382,
+   "pending_message": "not yet"
+  },
+  {
+   "id": "./spec/calc_spec.rb[1:4]",
+   "description": "is skipped",
+   "full_description": "Calc is skipped",
+   "status": "pending",
+   "file_path": "./spec/calc_spec.rb",
+   "line_number": 13,
+   "run_time": 0.000007115,
+   "pending_message": "Temporarily skipped with xit"
+  },
+  {
+   "id": "./spec/calc_spec.rb[1:5]",
+   "description": "raises",
+   "full_description": "Calc raises",
+   "status": "failed",
+   "file_path": "./spec/calc_spec.rb",
+   "line_number": 15,
+   "run_time": 0.000073543,
+   "pending_message": null,
+   "exception": {
+    "class": "NoMethodError",
+    "message": "undefined method `subtract' for an instance of Calc",
+    "backtrace": [
+     "./spec/calc_spec.rb:16:in `block (2 levels) in <top (required)>'"
+    ]
+   }
+  }
+ ],
+ "summary": {
+  "duration": 0.011485989,
+  "example_count": 5,
+  "failure_count": 2,
+  "pending_count": 2,
+  "errors_outside_of_examples_count": 0
+ },
+ "summary_line": "5 examples, 2 failures, 2 pending"
+}

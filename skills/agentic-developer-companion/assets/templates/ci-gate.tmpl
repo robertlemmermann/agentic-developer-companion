@@ -1,0 +1,830 @@
+# ci-gate (plan §10.5): a GitHub Actions merge gate behind one always-present aggregate job ("Merge OK"):
+# path filtering, the full suite with retries off, reports and counts, changed-line coverage (reported,
+# enforced on request), the diff-scope ratchet, a secret scan and an informational dependency audit; plus
+# .github/adc/gate.mjs, the dependency-free helper the workflows call. Commands land in YAML block scalars.
+# The ci-gate header lets a later `verify` report edits to the workflows as findings, not CK-CI failures.
+# JSON data fragments: `runners` (`ci` flags with the report dir <d>, `tail`, `report` [<d>/junit.xml],
+# `format` [junit], `only`/`skip` for @quarantine tests, `coverage` with `<cmd>` and `requires`), `audits`
+# and `agents` (the optional agent-verify jobs). Attributes: see scripts/lib/scaffold.mjs (renderFiles).
+
+@@@ file: .github/workflows/ci-gate.yml unless=gate-script-only @@@
+{{header}}
+# Merge gate. In branch protection or a ruleset, require ONLY the "Merge OK" check: jobs skipped
+# by the path filter then never leave a required check "Expected". OS matrix: {{os_list}}.
+# Repository variables: ADC_COVERAGE_ENFORCE=true enforces changed-line coverage ({{threshold}}%,
+# ADC_COVERAGE_MIN overrides it). Edit freely: a later `verify` reports weakening edits as findings.
+name: ci-gate
+
+on:
+  pull_request:
+  push:
+    branches: [{{default_branch}}]
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      executed:
+        value: ${{ jobs.merge-ok.outputs.executed }}
+      passed:
+        value: ${{ jobs.merge-ok.outputs.passed }}
+      failed:
+        value: ${{ jobs.merge-ok.outputs.failed }}
+      skipped:
+        value: ${{ jobs.merge-ok.outputs.skipped }}
+      flaky:
+        value: ${{ jobs.merge-ok.outputs.flaky }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!LICENSE*'
+
+{{test_jobs}}
+
+  ratchet:
+    name: Suppression and skip ratchet (diff-scope)
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+{{get_adc}}
+      - name: diff-scope against the base branch (fail-severity findings fail the gate)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if node "$ADC" diff-scope --base "origin/$BASE_REF" --json > "$RUNNER_TEMP/adc-diff-scope.json"; then code=0; else code=$?; fi
+          node .github/adc/gate.mjs ratchet --report "$RUNNER_TEMP/adc-diff-scope.json" --exit "$code"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: adc-diff-scope
+          path: ${{ runner.temp }}/adc-diff-scope.json
+          retention-days: 14
+
+  secrets:
+    name: Secret scan (gitleaks)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (checksum verified)
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan the commits of this change (.gitleaks-baseline.json holds accepted findings)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          range="${BASE_SHA:-$BEFORE}"
+          args=(git --redact --exit-code 1 --report-format json --report-path "$RUNNER_TEMP/gitleaks.json")
+          if [ -f .gitleaks-baseline.json ]; then args+=(--baseline-path .gitleaks-baseline.json); fi
+          if [ -n "$range" ] && [ "$range" != "0000000000000000000000000000000000000000" ]; then args+=("--log-opts=$range..HEAD"); fi
+          gitleaks "${args[@]}" .
+{{quarantine_job}}
+
+  audit:
+    name: Dependency audit (informational; not part of Merge OK)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+{{audit_steps}}
+{{agent_jobs}}
+
+  merge-ok:
+    name: Merge OK
+    if: ${{ always() }}
+    needs: [{{needs_list}}]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+{{merge_outputs}}
+    steps:
+      - name: Every gate job passed (a job skipped by the path filter counts as passed)
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          CHANGES: ${{ needs.changes.result }}
+        run: |
+          echo "job results: $RESULTS"
+          if [ "$CHANGES" != "success" ]; then echo "::error::change detection did not succeed ($CHANGES)"; exit 1; fi
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a gate job ended with: $r"; exit 1 ;;
+            esac
+          done
+
+@@@ file: fragment/test-job part=fragment name=test-job @@@
+  test-{{slug}}:
+    name: Test {{project_label}} (${{ matrix.os }})
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [{{os_matrix}}]
+    permissions:
+      contents: read
+      checks: write
+    outputs:
+      executed: ${{ steps.counts.outputs.executed }}
+      passed: ${{ steps.counts.outputs.passed }}
+      failed: ${{ steps.counts.outputs.failed }}
+      skipped: ${{ steps.counts.outputs.skipped }}
+      flaky: ${{ steps.counts.outputs.flaky }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{project_root}}
+    steps:
+      - uses: actions/checkout@v7
+{{setup}}
+{{get_adc}}
+      - name: Install (frozen)
+        run: |
+          {{install_cmd}}
+      - name: Full suite, retries off ({{runner_name}})
+        run: |
+          mkdir -p reports
+          {{test_cmd}}{{test_env}}
+      - name: Count the results (no tests, failures or too many flaky tests fail the gate)
+        id: counts
+        if: ${{ !cancelled() }}
+        run: |
+          node "$GITHUB_WORKSPACE/.github/adc/gate.mjs" counts --format {{report_format}} --report '{{report_path}}' --project '{{project_root}}' --max-flaky {{max_flaky}} --out "$RUNNER_TEMP/adc-counts-{{slug}}.json"
+{{publish}}
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: test-reports-{{slug}}-${{ matrix.os }}
+          path: |
+            {{report_upload}}
+            ${{ runner.temp }}/adc-counts-{{slug}}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+@@@ file: fragment/publish-junit part=fragment name=publish-junit @@@
+      - name: Publish the test report
+        uses: dorny/test-reporter@v3
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          name: Tests {{project_label}} (${{ matrix.os }})
+          path: {{report_upload}}
+          reporter: {{publisher}}
+
+@@@ file: fragment/coverage-job part=fragment name=coverage-job @@@
+  coverage-{{slug}}:
+    name: Changed-line coverage {{project_label}}
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{project_root}}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+{{setup}}
+      - name: Install (frozen)
+        run: |
+          {{install_cmd}}
+      - name: Suite with coverage
+        run: |
+          mkdir -p coverage reports
+          {{coverage_cmd}}
+      - name: Changed-line coverage with diff-cover (reported; enforced when ADC_COVERAGE_ENFORCE is true)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          ENFORCE: ${{ vars.ADC_COVERAGE_ENFORCE }}
+          MIN: ${{ vars.ADC_COVERAGE_MIN }}
+        run: |
+          args=({{coverage_report}} --compare-branch="origin/$BASE_REF" --format "markdown:$RUNNER_TEMP/diff-cover.md")
+          if [ "$ENFORCE" = "true" ]; then args+=("--fail-under=${MIN:-{{threshold}}}"); fi
+          if pipx run --spec 'diff-cover>=9' diff-cover "${args[@]}"; then status=0; else status=$?; fi
+          if [ -f "$RUNNER_TEMP/diff-cover.md" ]; then cat "$RUNNER_TEMP/diff-cover.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$status" != "0" ] && [ "$ENFORCE" != "true" ]; then echo "::warning::diff-cover exited $status (not enforced yet)"; fi
+          if [ "$ENFORCE" = "true" ]; then exit "$status"; fi
+
+@@@ file: fragment/coverage-job-adc part=fragment name=coverage-job-adc @@@
+  coverage-{{slug}}:
+    name: Changed-line coverage {{project_label}}
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{project_root}}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+{{setup}}
+{{get_adc}}
+      - name: Install (frozen)
+        run: |
+          {{install_cmd}}
+      - name: Suite with coverage
+        run: |
+          mkdir -p coverage reports
+          {{coverage_cmd}}
+      - name: Changed-line coverage with adc coverage-delta (reported; enforced when ADC_COVERAGE_ENFORCE is true)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          ENFORCE: ${{ vars.ADC_COVERAGE_ENFORCE }}
+          MIN: ${{ vars.ADC_COVERAGE_MIN }}
+        run: |
+          args=(coverage-delta --base "origin/$BASE_REF" --report {{coverage_report}} --json)
+          if [ "$ENFORCE" = "true" ]; then args+=(--fail-under "${MIN:-{{threshold}}}"); fi
+          if node "$ADC" "${args[@]}" > "$RUNNER_TEMP/coverage-delta.json"; then status=0; else status=$?; fi
+          node "$GITHUB_WORKSPACE/.github/adc/gate.mjs" coverage --report "$RUNNER_TEMP/coverage-delta.json"
+          if [ "$status" != "0" ] && [ "$ENFORCE" != "true" ]; then echo "::warning::coverage-delta exited $status (not enforced yet)"; fi
+          if [ "$ENFORCE" = "true" ]; then exit "$status"; fi
+
+@@@ file: fragment/e2e-job part=fragment name=e2e-job @@@
+  e2e-{{slug}}:
+    name: E2E {{project_label}} (Playwright)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{project_root}}
+    steps:
+      - uses: actions/checkout@v7
+{{setup}}
+{{get_adc}}
+      - name: Install (frozen)
+        run: |
+          {{install_cmd}}
+      - name: Install browsers (not cached, as Playwright recommends)
+        run: |
+          npx playwright install --with-deps
+      - name: Playwright; a test that passes only on retry fails the run
+        env:
+          PLAYWRIGHT_JUNIT_OUTPUT_NAME: reports/e2e-junit.xml
+        run: |
+          {{e2e_cmd}} --fail-on-flaky-tests --reporter=list,junit,html
+      - name: Count the results
+        if: ${{ !cancelled() }}
+        run: |
+          node "$GITHUB_WORKSPACE/.github/adc/gate.mjs" counts --format junit --report reports/e2e-junit.xml --project '{{project_root}}' --max-flaky {{max_flaky}}
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report-{{slug}}
+          path: |
+            {{project_dir}}playwright-report/
+            {{project_dir}}reports/e2e-junit.xml
+          retention-days: 14
+
+@@@ file: fragment/audit-step part=fragment name=audit-step @@@
+{{setup}}
+      - name: {{audit_name}}
+        working-directory: {{project_root}}
+        run: |
+          {{audit_cmd}}
+
+@@@ file: fragment/audit-none part=fragment name=audit-none @@@
+      - name: No dependency audit tool is known for the detected stacks
+        run: |
+          echo "add an audit step for this stack (references/ci-gate.md)"
+
+@@@ file: fragment/quarantine-job part=fragment name=quarantine-job @@@
+
+  quarantine:
+    name: Quarantine registry (owners, issues, expiry)
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Every quarantined test has an owner, an issue and an unexpired date
+        run: |
+          node .github/adc/gate.mjs quarantine --registry {{registry}}
+
+@@@ file: fragment/get-adc-pinned part=fragment name=get-adc-pinned @@@
+      - name: Get the {{skill_name}} skill (pinned; use a commit SHA for ADC_REF to pin harder)
+        shell: bash
+        env:
+          ADC_REF: {{adc_ref}}
+        run: |
+          git init --quiet "$RUNNER_TEMP/adc"
+          git -C "$RUNNER_TEMP/adc" fetch --quiet --depth 1 {{adc_repo}} "$ADC_REF"
+          git -C "$RUNNER_TEMP/adc" checkout --quiet FETCH_HEAD
+          echo "ADC=$RUNNER_TEMP/adc/skills/{{skill_name}}/scripts/adc.mjs" >> "$GITHUB_ENV"
+
+@@@ file: fragment/get-adc-vendored part=fragment name=get-adc-vendored @@@
+      - name: Use the vendored {{skill_name}} skill
+        shell: bash
+        run: |
+          echo "ADC=$GITHUB_WORKSPACE/{{skill_rel}}/scripts/adc.mjs" >> "$GITHUB_ENV"
+
+@@@ file: fragment/setup-node part=fragment name=setup-node @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+@@@ file: fragment/setup-node-cache part=fragment name=setup-node-cache @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: {{node_cache}}
+          cache-dependency-path: {{lockfile}}
+
+@@@ file: fragment/setup-pnpm part=fragment name=setup-pnpm @@@
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: {{lockfile}}
+
+@@@ file: fragment/setup-yarn part=fragment name=setup-yarn @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Enable Corepack (Yarn from packageManager)
+        run: |
+          corepack enable
+
+@@@ file: fragment/setup-bun part=fragment name=setup-bun @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+
+@@@ file: fragment/setup-python part=fragment name=setup-python @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v7
+        with:
+          {{python_version}}
+{{python_tool}}
+
+@@@ file: fragment/python-tool-uv part=fragment name=python-tool-uv @@@
+      - uses: astral-sh/setup-uv@v7
+
+@@@ file: fragment/python-tool-poetry part=fragment name=python-tool-poetry @@@
+      - name: Install Poetry
+        run: |
+          pipx install poetry
+
+@@@ file: fragment/setup-go part=fragment name=setup-go @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: {{project_dir}}go.mod
+
+@@@ file: fragment/setup-rust part=fragment name=setup-rust @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Rust toolchain (rust-toolchain.toml when present, else stable)
+        run: |
+          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then rustup toolchain install; else rustup toolchain install stable --profile minimal; fi
+
+@@@ file: fragment/setup-dotnet part=fragment name=setup-dotnet @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-dotnet@v6
+        with:
+          {{dotnet_version}}
+
+@@@ file: fragment/setup-java part=fragment name=setup-java @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          {{java_cache}}
+
+@@@ file: fragment/setup-ruby part=fragment name=setup-ruby @@@
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+          working-directory: {{project_root}}
+
+@@@ file: fragment/agent-job part=fragment name=agent-job @@@
+
+  agent-verify-{{agent}}:
+    name: Agent verify ({{agent_label}}; informational, costs {{agent_cost}})
+    if: ${{ github.event_name == 'pull_request' && contains(format(',{0},', vars.ADC_AGENT_AUTHORS || 'Copilot,copilot-swe-agent[bot]'), format(',{0},', github.event.pull_request.user.login)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+{{get_adc}}
+      - name: Install the skill at user scope (outside the checkout) and {{agent_label}}
+        run: |
+          mkdir -p "$HOME/{{agent_home}}"
+          cp -R "$(dirname "$(dirname "$ADC")")" "$HOME/{{agent_home}}/{{skill_name}}"
+          npm install -g {{agent_package}}
+{{agent_verify}}
+      - name: Post the evidence ledger on the PR
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          node "$ADC" evidence render --md --out "$RUNNER_TEMP/ledger.md" --json > "$RUNNER_TEMP/render.json"
+          head -c 60000 "$RUNNER_TEMP/ledger.md" > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+@@@ file: fragment/agent-verify-copilot part=fragment name=agent-verify-copilot @@@
+      - name: Verify the change (headless)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          copilot -p "Use the {{skill_name}} skill to verify origin/$BASE_REF and write the evidence ledger." --trust-folder --no-ask-user --allow-tool 'shell(node:*)' --allow-tool 'shell(git:*)' --output-format json > "$RUNNER_TEMP/agent-output.json"
+
+@@@ file: fragment/agent-verify-claude part=fragment name=agent-verify-claude @@@
+      - name: Verify the change (headless)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          claude -p "/{{skill_name}} verify origin/$BASE_REF --yes" --allowedTools "Bash,Read,Glob,Grep" --output-format json > "$RUNNER_TEMP/agent-output.json"
+
+@@@ file: fragment/agent-verify-codex part=fragment name=agent-verify-codex @@@
+      - name: Verify the change (headless, workspace-write sandbox)
+        env:
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          codex exec --json -s workspace-write -o "$RUNNER_TEMP/agent-last-message.txt" "Use \$agentic-developer-companion to verify origin/$BASE_REF and write the evidence ledger." > "$RUNNER_TEMP/agent-output.jsonl"
+
+@@@ file: data/agents.json part=fragment name=agents @@@
+{
+  "copilot": {"label": "Copilot CLI", "cost": "premium requests", "home": ".copilot/skills", "package": "@github/copilot"},
+  "claude": {"label": "Claude Code", "cost": "API usage", "home": ".claude/skills", "package": "@anthropic-ai/claude-code"},
+  "codex": {"label": "Codex CLI", "cost": "API usage", "home": ".agents/skills", "package": "@openai/codex"}
+}
+
+@@@ file: data/runners.json part=fragment name=runners @@@
+{
+  "node-test": {"ci": "--test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=<d>/junit.xml", "only": "--test-name-pattern=@quarantine", "skip": "--test-skip-pattern=@quarantine", "coverage": {"cmd": "<cmd> --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info", "report": "coverage/lcov.info"}},
+  "vitest": {"ci": "--retry=0 --reporter=default --reporter=junit --outputFile.junit=<d>/junit.xml", "only": "-t '@quarantine'", "skip": "-t '^(?!.*@quarantine)'", "coverage": {"cmd": "<cmd> --coverage.enabled --coverage.reporter=lcov", "report": "coverage/lcov.info", "requires": ["@vitest/coverage-v8", "@vitest/coverage-istanbul"]}},
+  "jest": {"ci": "--json --outputFile=<d>/jest.json", "report": "<d>/jest.json", "format": "jest-json", "only": "-t '@quarantine'", "skip": "-t '^(?!.*@quarantine)'", "coverage": {"cmd": "<cmd> --coverage --coverageReporters=lcov", "report": "coverage/lcov.info"}},
+  "mocha": {"ci": "--retries 0 --reporter xunit --reporter-option output=<d>/junit.xml", "only": "--grep @quarantine", "skip": "--grep @quarantine --invert"},
+  "bun": {"ci": "--reporter=junit --reporter-outfile=<d>/junit.xml"},
+  "pytest": {"ci": "-p no:rerunfailures --junit-xml=<d>/junit.xml", "only": "-m quarantine", "skip": "-m \"not quarantine\"", "coverage": {"cmd": "<cmd> --cov --cov-report=xml:coverage.xml", "report": "coverage.xml", "requires": ["pytest-cov"]}},
+  "go": {"ci": "-count=1 -json", "tail": " > <d>/go-test.jsonl", "report": "<d>/go-test.jsonl", "format": "go-test-json", "only": "-run 'Quarantine'", "skip": "-skip 'Quarantine'", "coverage": {"cmd": "go test ./... -count=1 -coverprofile=coverage.out", "report": "coverage.out", "tool": "adc"}},
+  "cargo": {"cmd": "cargo test --no-fail-fast", "tail": " 2>&1 | tee <d>/cargo-test.txt", "report": "<d>/cargo-test.txt", "format": "cargo-text", "only": "-- --ignored"},
+  "nextest": {"cmd": "cargo test --no-fail-fast", "tail": " 2>&1 | tee <d>/cargo-test.txt", "report": "<d>/cargo-test.txt", "format": "cargo-text", "only": "-- --ignored"},
+  "dotnet": {"ci": "--logger \"trx;LogFileName=results.trx\" --results-directory <d>", "report": "<d>/**/*.trx", "format": "trx", "only": "--filter \"Category=quarantine\"", "skip": "--filter \"Category!=quarantine\""},
+  "maven": {"ci": "-Dsurefire.rerunFailingTestsCount=0", "report": "target/surefire-reports/TEST-*.xml", "only": "-Dgroups=quarantine", "skip": "-DexcludedGroups=quarantine"},
+  "gradle": {"report": "build/test-results/test/TEST-*.xml"},
+  "rspec": {"ci": "--format progress --format json --out <d>/rspec.json", "report": "<d>/rspec.json", "format": "rspec-json", "only": "--tag quarantine", "skip": "--tag ~quarantine"},
+  "playwright": {"ci": "--reporter=list,junit", "env": {"PLAYWRIGHT_JUNIT_OUTPUT_NAME": "<d>/junit.xml"}, "only": "--grep @quarantine", "skip": "--grep-invert @quarantine"}
+}
+
+@@@ file: data/audits.json part=fragment name=audits @@@
+{
+  "node": "npm audit --audit-level=high",
+  "node:pnpm": "pnpm audit --audit-level=high",
+  "node:yarn": "yarn npm audit --severity high",
+  "python": "pipx run pip-audit",
+  "python:uv": "uv export --format requirements-txt --no-hashes > audit-requirements.txt && pipx run pip-audit -r audit-requirements.txt",
+  "rust": "cargo install cargo-audit --locked && cargo audit",
+  "go": "go run golang.org/x/vuln/cmd/govulncheck@latest ./...",
+  "dotnet": "dotnet list package --vulnerable --include-transitive",
+  "ruby": "gem install bundler-audit && bundle-audit check --update"
+}
+
+@@@ file: next/ci-gate part=fragment name=next @@@
+branch protection or ruleset: require ONLY the "Merge OK" check (jobs skipped by the path filter then never leave a required check "Expected")
+changed-line coverage is reported first; set the repository variable ADC_COVERAGE_ENFORCE=true to enforce {{threshold}}% (ADC_COVERAGE_MIN overrides the threshold)
+the ratchet runs adc.mjs diff-scope against the base: fail-severity findings fail the gate, other findings become annotations
+gitleaks: commit a .gitleaks-baseline.json (gitleaks git --report-path .gitleaks-baseline.json) when the history has accepted findings
+the dependency audit job is informational (not part of Merge OK); read its output on every PR
+the adc-counts-*.json artifacts feed `clean-run --base-counts <file>`; the executed/passed/failed/skipped/flaky job outputs are also workflow_call outputs
+
+@@@ file: next/ci-gate-pinned part=fragment name=next when=pinned @@@
+CI fetches {{skill_name}} v{{version}} (ADC_REF); pin a commit SHA there, or vendor the skill into .github/skills/{{skill_name}}
+
+@@@ file: next/ci-gate-agents part=fragment name=next when=agents @@@
+agent verify job(s) for {{agent_hosts}}: add the secret(s) the job names; they run only on PRs by authors in the ADC_AGENT_AUTHORS variable (default Copilot), are informational and cost money
+
+@@@ file: next/ci-gate-registry part=fragment name=next when=registry @@@
+quarantined tests ({{registry}}) are excluded from the gate and checked for owner, issue and expiry
+
+@@@ file: .github/adc/gate.mjs @@@
+// {{header_js}}
+// CI helper for the generated workflows: test counts, the diff-scope ratchet verdict, coverage
+// summaries and the quarantine registry check. Node 24+, no dependencies; report parsing comes
+// from the companion skill (ADC=<skill>/scripts/adc.mjs, fetched or vendored by the workflow).
+//
+//   node .github/adc/gate.mjs counts --format <junit|jest-json|go-test-json|cargo-text|trx|rspec-json|summary>
+//        --report <file or glob> [--project <dir>] [--out <counts.json>] [--max-flaky <n>]
+//   node .github/adc/gate.mjs ratchet --report <diff-scope.json> --exit <code>
+//   node .github/adc/gate.mjs coverage --report <coverage-delta.json>
+//   node .github/adc/gate.mjs quarantine --registry <tests/quarantine.json> [--today YYYY-MM-DD]
+// Exit codes: 0 pass, 1 the gate fails, 2 usage. Writes the step summary and step outputs.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+
+const KEYS = ['executed', 'passed', 'failed', 'errors', 'skipped', 'flaky'];
+
+function summary(markdown) {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (file) fs.appendFileSync(file, markdown + '\n');
+  else process.stdout.write(markdown + '\n');
+}
+
+function setOutputs(pairs) {
+  const file = process.env.GITHUB_OUTPUT;
+  const text = Object.entries(pairs).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  if (file) fs.appendFileSync(file, text);
+}
+
+function escapeData(value, property = false) {
+  let s = String(value ?? '').replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  if (property) s = s.replace(/:/g, '%3A').replace(/,/g, '%2C');
+  return s;
+}
+
+function annotate(level, message, where = {}) {
+  const props = [
+    where.file ? `file=${escapeData(where.file, true)}` : null,
+    where.line ? `line=${Number(where.line)}` : null,
+    where.title ? `title=${escapeData(where.title, true)}` : null,
+  ].filter(Boolean).join(',');
+  process.stdout.write(`::${level}${props ? ` ${props}` : ''}::${escapeData(message)}\n`);
+}
+
+function fail(message, where) {
+  annotate('error', message, where);
+  process.exitCode = 1;
+}
+
+const cell = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').slice(0, 200);
+
+function globRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') {
+      const slash = glob[i + 2] === '/';
+      re += slash ? '(?:.*/)?' : '.*';
+      i += slash ? 2 : 1;
+    } else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^$()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/** Files matching a path that may contain * and ** (either separator). */
+export function expand(pattern) {
+  const norm = String(pattern).replace(/\\/g, '/');
+  if (!/[*?]/.test(norm)) return fs.existsSync(norm) && fs.statSync(norm).isFile() ? [norm] : [];
+  const parts = norm.split('/');
+  const fixed = [];
+  while (parts.length && !/[*?]/.test(parts[0])) fixed.push(parts.shift());
+  const base = fixed.join('/') || '.';
+  const re = globRegExp(parts.join('/'));
+  const out = [];
+  const walk = (dir, rel) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), r);
+      else if (e.isFile() && re.test(r)) out.push(base === '.' ? r : `${base}/${r}`);
+    }
+  };
+  walk(base, '');
+  return out.sort();
+}
+
+async function loadReports() {
+  const adc = process.env.ADC;
+  if (!adc) throw new Error('ADC is not set: the workflow step that provides the companion skill must run first');
+  return import(pathToFileURL(path.join(path.dirname(adc), 'lib', 'reports.mjs')).href);
+}
+
+async function counts(o) {
+  const maxFlaky = o['max-flaky'] == null ? 0 : Number(o['max-flaky']);
+  if (!o.format || !o.report || !Number.isInteger(maxFlaky) || maxFlaky < 0) return usage('counts needs --format, --report and a non-negative integer --max-flaky');
+  const files = expand(o.report);
+  if (!files.length) return fail(`no test report matches ${o.report}: the suite produced none (did it run?)`);
+  const reports = await loadReports();
+  const total = Object.fromEntries(KEYS.map((k) => [k, 0]));
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    let r = null;
+    try {
+      if (o.format === 'summary') {
+        const s = reports.parseSummaryText(text);
+        if (s) r = { executed: (s.passed || 0) + (s.failed || 0), passed: s.passed || 0, failed: s.failed || 0, errors: 0, skipped: s.skipped || 0, flaky: 0 };
+      } else r = reports.parseReport(o.format, text);
+    } catch (err) {
+      fail(`${file}: ${err.message}`);
+      continue;
+    }
+    if (!r || !Number.isFinite(Number(r.executed))) {
+      fail(`${file}: no ${o.format} results could be read`);
+      continue;
+    }
+    for (const k of KEYS) total[k] += Number(r[k]) || 0;
+  }
+  const project = o.project || '.';
+  if (o.out) {
+    const doc = { schema: 'adc-counts/1', source: 'ci-gate', format: o.format, commit: process.env.GITHUB_SHA || null, project, ...total, projects: { [project]: total } };
+    fs.writeFileSync(o.out, JSON.stringify(doc, null, 2) + '\n');
+  }
+  setOutputs(total);
+  summary(`### Tests: ${cell(project)}\n\n| executed | passed | failed | errors | skipped | flaky |\n|---:|---:|---:|---:|---:|---:|\n| ${KEYS.map((k) => total[k]).join(' | ')} |\n\n${files.length} report file(s), format ${o.format}.`);
+  if (total.executed === 0) fail('no test was executed: an empty run is not a pass');
+  if (total.failed + total.errors > 0) fail(`${total.failed} failed and ${total.errors} errored test(s)`);
+  if (total.flaky > maxFlaky) fail(`${total.flaky} flaky test(s), ${maxFlaky} allowed: a test that passes only on a retry is a flake (see the flake policy)`);
+}
+
+function ratchet(o) {
+  const code = Number(o.exit);
+  if (!o.report || !Number.isInteger(code)) return usage('ratchet needs --report and --exit');
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(o.report, 'utf8'));
+  } catch (err) {
+    return fail(`diff-scope produced no readable JSON (exit ${code}): ${err.message}`);
+  }
+  if (doc && doc.error) return fail(`diff-scope could not run: ${doc.error.code}: ${doc.error.message}`);
+  const findings = Array.isArray(doc.findings) ? doc.findings : [];
+  const hard = findings.filter((f) => f.severity === 'fail');
+  const soft = findings.filter((f) => f.severity === 'finding');
+  for (const f of hard) annotate('error', `${f.id}: ${f.message}`, { file: f.file, line: f.line, title: f.id });
+  for (const f of soft) annotate('warning', `${f.id}: ${f.message}`, { file: f.file, line: f.line, title: f.id });
+  const rows = [...hard, ...soft].slice(0, 60).map((f) => `| ${f.severity} | ${f.id} | ${cell(f.file)}${f.line ? `:${f.line}` : ''} | ${cell(f.message)} |`);
+  summary(`### diff-scope ratchet\n\n${hard.length} fail, ${soft.length} finding(s) against ${cell(doc.base && doc.base.ref)}.\n${rows.length ? `\n| severity | check | where | finding |\n|---|---|---|---|\n${rows.join('\n')}\n` : ''}`);
+  if (![0, 1].includes(code)) fail(`diff-scope exited ${code}: the change could not be verified`);
+  if (hard.length) fail(`${hard.length} fail-severity finding(s): tests, skips, suppressions or CI were weakened`);
+}
+
+function coverage(o) {
+  if (!o.report) return usage('coverage needs --report');
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(o.report, 'utf8'));
+  } catch (err) {
+    return annotate('warning', `no coverage-delta result: ${err.message}`);
+  }
+  const pct = doc.pct == null ? 'n/a' : `${Number(doc.pct).toFixed(1)}%`;
+  const rows = (doc.uncovered || []).slice(0, 40).map((u) => `| ${cell(u.file)} | ${cell((u.lines || []).slice(0, 30).join(', '))} |`);
+  summary(`### Changed-line coverage\n\n${pct} of ${doc.changed_lines ?? 0} changed line(s) covered (${cell(doc.tool)}, precision ${cell(doc.precision)}).\n${rows.length ? `\n| file | uncovered lines |\n|---|---|\n${rows.join('\n')}\n` : ''}`);
+}
+
+function quarantine(o) {
+  if (!o.registry) return usage('quarantine needs --registry');
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(o.registry, 'utf8'));
+  } catch (err) {
+    return fail(`${o.registry} is missing or not JSON: ${err.message}`);
+  }
+  const today = o.today || new Date().toISOString().slice(0, 10);
+  const maxDays = Number.isInteger(doc.max_days) ? doc.max_days : 30;
+  const tests = Array.isArray(doc.tests) ? doc.tests : null;
+  if (!tests) return fail(`${o.registry}: "tests" must be an array`);
+  const problems = [];
+  const day = (s) => Date.parse(`${s}T00:00:00Z`);
+  tests.forEach((t, i) => {
+    const where = `tests[${i}]${t && t.id ? ` (${t.id})` : ''}`;
+    for (const k of ['id', 'owner', 'issue', 'expires']) {
+      if (!t || typeof t[k] !== 'string' || !t[k].trim()) problems.push(`${where}: "${k}" is required`);
+    }
+    if (!t || typeof t.expires !== 'string') return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(t.expires) || Number.isNaN(day(t.expires))) problems.push(`${where}: "expires" must be YYYY-MM-DD`);
+    else if (t.expires < today) problems.push(`${where}: the quarantine expired on ${t.expires}; fix the test or delete it`);
+    else if (typeof t.added === 'string' && !Number.isNaN(day(t.added)) && (day(t.expires) - day(t.added)) / 86_400_000 > maxDays) problems.push(`${where}: quarantined for more than ${maxDays} days`);
+  });
+  setOutputs({ count: tests.length });
+  const rows = tests.slice(0, 100).map((t) => `| ${cell(t && t.id)} | ${cell(t && t.owner)} | ${cell(t && t.issue)} | ${cell(t && t.expires)} |`);
+  summary(`### Quarantine\n\n${tests.length} quarantined test(s), ${problems.length} problem(s).\n${rows.length ? `\n| test | owner | issue | expires |\n|---|---|---|---|\n${rows.join('\n')}\n` : ''}`);
+  for (const p of problems) fail(p, { file: o.registry });
+}
+
+function usage(message) {
+  process.stderr.write(`gate.mjs: ${message}\n`);
+  process.exitCode = 2;
+}
+
+const COMMANDS = {
+  counts: [counts, { format: { type: 'string' }, report: { type: 'string' }, project: { type: 'string' }, out: { type: 'string' }, 'max-flaky': { type: 'string' } }],
+  ratchet: [ratchet, { report: { type: 'string' }, exit: { type: 'string' } }],
+  coverage: [coverage, { report: { type: 'string' } }],
+  quarantine: [quarantine, { registry: { type: 'string' }, today: { type: 'string' } }],
+};
+
+async function main(argv) {
+  const [name, ...rest] = argv;
+  const entry = COMMANDS[name];
+  if (!entry) return usage(`unknown command "${name ?? ''}" (expected ${Object.keys(COMMANDS).join(', ')})`);
+  let values;
+  try {
+    ({ values } = parseArgs({ args: rest, options: entry[1], strict: true, allowPositionals: false }));
+  } catch (err) {
+    return usage(err.message);
+  }
+  return entry[0](values);
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main(process.argv.slice(2)).catch((err) => {
+    fail(`gate.mjs: ${err && err.message ? err.message : err}`);
+  });
+}

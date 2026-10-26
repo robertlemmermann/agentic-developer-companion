@@ -1,0 +1,384 @@
+# Tooling scaffolds (§11.1), rendered by scripts/lib/tooling.mjs; a section without host= serves every host.
+# {{frontmatter}} and the hook, MCP and plugin configs are rendered in code (configs from the model shared
+# with `tooling port`), so YAML quoting stays valid and scaffolds and ports produce the same shapes.
+@@@ file: AGENTS.md kind=instructions @@@
+# {{project_name}}
+
+<!-- Canonical agent instructions: GitHub Copilot and Codex read this file, Claude Code reads it
+through the import line at the top of CLAUDE.md. Keep it short (well under 200 lines): one rule
+per line, commands and conventions over prose, no secrets, tokens or internal hostnames. -->
+
+## Commands
+
+- Install dependencies: `{{install_cmd}}`
+- Run the full test suite: `{{test_cmd}}`
+- Lint: `{{lint_cmd}}`
+- Type-check: `{{typecheck_cmd}}`
+
+These commands work in bash, PowerShell and cmd. Prefer the project's own scripts over ad-hoc
+shell pipelines.
+
+## Conventions
+
+- (One verifiable rule per line, for example "Use 2-space indentation in TypeScript files".)
+
+## Testing rules
+
+- Run the full test suite before reporting work as done, and report the command and its exit code.
+- Never delete, skip or weaken a test, assertion or CI step to make a check pass; report the failure.
+
+## Boundaries
+
+- Ask before changing CI workflows, lockfiles, dependency versions or files under `.github/`.
+- Never commit secrets, tokens, internal hostnames or personal paths.
+@@@ file: CLAUDE.md kind=instructions host=claude @@@
+@AGENTS.md
+
+<!-- Claude Code-only notes. Shared rules live in AGENTS.md (imported above), so Copilot and
+Codex see the same rules. Do not add a CLAUDE.local.md in this repository: it stops Claude
+Code from reading AGENTS.md unless the project-instructions setting reads both. -->
+
+## Claude Code
+
+- (Claude Code-specific notes only, for example which subagents to delegate to.)
+@@@ file: .github/copilot-instructions.md kind=instructions host=copilot @@@
+# Copilot notes for {{project_name}}
+
+<!-- Repository-wide Copilot instructions (cloud agent, code review, VS Code). Copilot also
+reads AGENTS.md, so keep this file to Copilot-only notes and under two pages. -->
+
+- Run `{{test_cmd}}` before opening or updating a pull request.
+- In code review, flag deleted or skipped tests, weakened assertions, new lint or type
+  suppressions, edits to CI workflows and new dependencies.
+@@@ file: .github/instructions/{{topic}}.instructions.md kind=instructions host=copilot @@@
+{{frontmatter}}
+
+# {{topic_title}}
+
+<!-- Copilot adds this file when files matching applyTo are in play. Add
+excludeAgent: "code-review" or "cloud-agent" to the frontmatter to hide it from one agent. -->
+
+Applies to {{apply_to_md}}.
+
+- (One rule per line for these files only.)
+@@@ file: .claude/rules/{{topic}}.md kind=instructions host=claude @@@
+{{frontmatter}}
+
+# {{topic_title}}
+
+<!-- Claude Code loads this rule when files matching paths are in play; Copilot CLI reads
+.claude/rules too. -->
+
+Applies to {{apply_to_md}}.
+
+- (One rule per line for these files only.)
+@@@ file: {{skill_dir}}/SKILL.md kind=skill @@@
+{{frontmatter}}
+
+# {{name}}
+
+{{summary}}
+
+## When to use
+
+- (The requests and situations that should trigger this skill, in the user's words.)
+
+## Steps
+
+1. (First step: what to read or run, with the exact command.)
+2. (Next step. Prefer scripts in `scripts/` for anything deterministic.)
+3. (How to report the result.)
+
+## Gotchas
+
+- (The mistakes an agent makes without this skill. This is the highest-signal section.)
+
+## References
+
+- [Details](references/details.md): read when (the situation that needs the detail).
+@@@ file: {{skill_dir}}/references/details.md kind=skill @@@
+# {{name}}: details
+
+Load-on-demand detail for the {{name}} skill. SKILL.md links here; keep references one level
+deep, add a table of contents once this file grows past 100 lines, and use forward slashes in
+every path.
+
+## (Topic)
+
+- (Detail that only some invocations need.)
+@@@ file: {{agent_path}} kind=agent host=copilot|claude @@@
+{{frontmatter}}
+
+You are {{name}}. {{summary}}
+
+## Inputs
+
+- {{agent_input}} and the files it names. Read only what the task needs.
+
+## Output contract
+
+Return exactly:
+
+1. A one-line verdict.
+2. A list of findings, each with `file:line` and a one-sentence explanation.
+3. The commands you ran and their exit codes.
+
+## Rules
+
+- Use only the tools in your tool list. Do not edit files unless the request asks for it.
+- Say "unknown" instead of guessing.
+@@@ file: {{skill_dir}}/SKILL.md kind=agent host=codex @@@
+{{frontmatter}}
+
+# {{name}}
+
+Codex has no custom agent files, so this role is a skill: invoke it with `${{name}}`.
+{{summary}}
+
+## Output contract
+
+Return exactly:
+
+1. A one-line verdict.
+2. A list of findings, each with `file:line` and a one-sentence explanation.
+3. The commands you ran and their exit codes.
+
+## Rules
+
+- Do not edit files unless the request asks for it.
+- Say "unknown" instead of guessing.
+@@@ file: .github/prompts/{{name}}.prompt.md kind=prompt host=copilot @@@
+{{prompt_frontmatter}}
+
+{{summary}}
+
+- (The task, step by step. Prompt files run only in the VS Code Local harness and Visual
+  Studio; the skill in {{prompt_skill_dir}} is the portable equivalent and the one to keep.)
+@@@ file: {{skill_dir}}/SKILL.md kind=prompt @@@
+{{frontmatter}}
+
+# {{name}}
+
+{{summary}}
+
+This skill runs only when the user invokes it by name; the words after the name are its input.
+
+## Steps
+
+1. (What to do with the user's input.)
+2. (How to report the result.)
+@@@ file: {{hooks_dir}}/{{name}}.mjs kind=hooks @@@
+// {{name}}: a hook handler for GitHub Copilot, Claude Code and OpenAI Codex.
+// Generated by {{generated_by}} (tooling scaffold hooks). Zero dependencies.
+//
+// Contract on every host: read one JSON payload on stdin, print exactly one JSON object on
+// stdout, exit 0. Any error, bad input or a slow run prints {} (no decision): it fails open.
+//   node {{script_path}} --dialect copilot|claude|codex --event <event name>
+// Test it with: node --test {{test_path}}
+
+import { pathToFileURL } from 'node:url';
+
+// Stay well under the host timeout (the generated configs allow 10 seconds).
+const TIME_LIMIT_MS = 5000;
+const TEST_FILE = /(^|[/\\])(tests?|__tests__|spec)[/\\]|[._-](test|spec)\.[^/\\]+$|(^|[/\\])test_[^/\\]+\.py$/i;
+
+/** Tool name, arguments and touched paths from a Copilot, Claude Code or Codex payload. */
+export function normalize(payload, dialect) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  let args = p.toolArgs ?? p.tool_input ?? {};
+  // Copilot camelCase payloads carry toolArgs as a JSON string.
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = { raw: args }; }
+  }
+  const paths = [];
+  for (const key of ['path', 'file_path', 'filePath', 'notebook_path']) {
+    if (args && typeof args[key] === 'string') paths.push(args[key]);
+  }
+  // Codex apply_patch sends the patch text; collect the files it names.
+  const patch = [args?.command, args?.input, args?.patch].find((v) => typeof v === 'string') || '';
+  for (const m of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) paths.push(m[1].trim());
+  return {
+    dialect,
+    toolName: String(p.toolName ?? p.tool_name ?? ''),
+    args,
+    paths,
+    event: p.hook_event_name ?? p.hookEventName ?? null,
+    stopHookActive: p.stop_hook_active === true,
+  };
+}
+
+/** The check itself. Return null (no decision) or { context } / { deny } / { block }. */
+export function decide(norm, event) {
+  if (String(event).toLowerCase() === 'posttooluse') {
+    const tests = norm.paths.filter((f) => TEST_FILE.test(f));
+    if (tests.length) {
+      return { context: `Test file edited: ${tests.join(', ')}. Keep its assertions at least as strong as before and run the full suite before reporting success.` };
+    }
+  }
+  return null;
+}
+
+const PASCAL = { pretooluse: 'PreToolUse', posttooluse: 'PostToolUse', sessionstart: 'SessionStart', stop: 'Stop', agentstop: 'Stop', userpromptsubmit: 'UserPromptSubmit' };
+
+/** Shape a decision in the host's output dialect. Codex rejects unknown fields. */
+export function format(dialect, event, decision) {
+  if (!decision) return {};
+  const lower = String(event).toLowerCase();
+  if (dialect === 'copilot') {
+    if (decision.deny && lower === 'pretooluse') return { permissionDecision: 'deny', permissionDecisionReason: decision.deny };
+    if (decision.block && (lower === 'agentstop' || lower === 'subagentstop')) return { decision: 'block', reason: decision.block };
+    if (decision.context && ['posttooluse', 'sessionstart', 'subagentstart'].includes(lower)) return { additionalContext: decision.context };
+    return {};
+  }
+  const name = PASCAL[lower] || String(event);
+  if (decision.deny && name === 'PreToolUse') {
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.deny } };
+  }
+  if (decision.block && name === 'Stop') return { decision: 'block', reason: decision.block };
+  if (decision.context && ['PostToolUse', 'SessionStart', 'UserPromptSubmit'].includes(name)) {
+    return { hookSpecificOutput: { hookEventName: name, additionalContext: decision.context } };
+  }
+  return {};
+}
+
+let emitted = false;
+
+/** Print exactly one JSON object and exit 0 once it is flushed (pipes are asynchronous on some OSes). */
+function emit(obj) {
+  if (emitted) return;
+  emitted = true;
+  // ASCII-only JSON: Windows PowerShell re-encodes stdout with the console code page.
+  const text = JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+  process.exitCode = 0;
+  process.stdout.write(text + '\n', () => process.exit(0));
+}
+
+function arg(name, fallback) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+}
+
+/** Decide for one raw stdin payload; any error is "no decision". */
+export function handle(raw, dialect, eventArg) {
+  try {
+    const payload = String(raw || '').trim() ? JSON.parse(raw) : {};
+    const norm = normalize(payload, dialect);
+    const event = eventArg || norm.event || '';
+    // Never block a stop the host already continued once (loop protection).
+    if (norm.stopHookActive) return {};
+    return format(dialect, event, decide(norm, event));
+  } catch {
+    return {};
+  }
+}
+
+export function main() {
+  // stdin is read asynchronously so the time limit also covers a host that never closes it.
+  const timer = setTimeout(() => emit({}), TIME_LIMIT_MS);
+  let raw = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { raw += chunk; });
+  process.stdin.on('error', () => { clearTimeout(timer); emit({}); });
+  process.stdin.on('end', () => { clearTimeout(timer); emit(handle(raw, arg('dialect', 'claude'), arg('event', null))); });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+@@@ file: {{hooks_dir}}/{{name}}.test.mjs kind=hooks @@@
+// Tests for {{name}}: every fixture case runs through the handler as a subprocess, the way
+// the hosts run it. Run with: node --test {{test_path}}
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const handler = path.join(here, '{{name}}.mjs');
+const cases = JSON.parse(readFileSync(path.join(here, 'fixtures', '{{name}}.json'), 'utf8'));
+
+for (const c of cases) {
+  test(c.name, () => {
+    const input = typeof c.payload === 'string' ? c.payload : JSON.stringify(c.payload);
+    const res = spawnSync(process.execPath, [handler, '--dialect', c.dialect, '--event', c.event], { input, encoding: 'utf8', timeout: 10000 });
+    assert.equal(res.status, 0, res.stderr);
+    const lines = res.stdout.trim().split(/\r?\n/);
+    assert.equal(lines.length, 1, 'exactly one line of output');
+    assert.match(lines[0], /^[\x20-\x7e]*$/, 'ASCII-only output');
+    const out = JSON.parse(lines[0]);
+    if (c.expect === null) assert.deepEqual(out, {});
+    else for (const key of c.expect) assert.notEqual(key.split('.').reduce((o, k) => (o == null ? o : o[k]), out), undefined, `missing ${key}`);
+  });
+}
+@@@ file: {{hooks_dir}}/fixtures/{{name}}.json kind=hooks @@@
+[
+  {
+    "name": "copilot postToolUse on a test file adds context",
+    "dialect": "copilot", "event": "postToolUse",
+    "payload": { "sessionId": "s1", "toolName": "edit", "toolArgs": "{\"path\":\"src/app.test.ts\"}", "toolResult": { "resultType": "success" } },
+    "expect": ["additionalContext"]
+  },
+  {
+    "name": "copilot postToolUse on a source file makes no decision",
+    "dialect": "copilot", "event": "postToolUse",
+    "payload": { "sessionId": "s1", "toolName": "edit", "toolArgs": "{\"path\":\"src/app.ts\"}" },
+    "expect": null
+  },
+  {
+    "name": "claude PostToolUse on a test file adds context",
+    "dialect": "claude", "event": "PostToolUse",
+    "payload": { "session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": { "file_path": "/repo/tests/test_app.py" }, "tool_response": {} },
+    "expect": ["hookSpecificOutput.additionalContext"]
+  },
+  {
+    "name": "codex PostToolUse apply_patch on a spec file adds context",
+    "dialect": "codex", "event": "PostToolUse",
+    "payload": { "session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "apply_patch", "tool_input": { "command": "*** Begin Patch\n*** Update File: lib/app.spec.js\n@@\n-a\n+b\n*** End Patch" } },
+    "expect": ["hookSpecificOutput.additionalContext"]
+  },
+  {
+    "name": "malformed input fails open",
+    "dialect": "claude", "event": "PostToolUse", "payload": "not-json", "expect": null
+  },
+  {
+    "name": "empty input fails open",
+    "dialect": "copilot", "event": "postToolUse", "payload": "", "expect": null
+  },
+  {
+    "name": "stop_hook_active never blocks again",
+    "dialect": "claude", "event": "Stop", "payload": { "hook_event_name": "Stop", "stop_hook_active": true }, "expect": null
+  }
+]
+@@@ file: README.md kind=plugin @@@
+# {{name}}
+
+{{description}}
+
+## Contents
+
+{{contents}}
+
+## Install
+
+{{install}}
+
+## Develop
+
+- Check the manifests, layout and validators: `node <adc.mjs> tooling plugin check {{plugin_dir}}`
+- List the local test commands per host: `node <adc.mjs> tooling plugin test {{plugin_dir}}`
+- Prepare a release (versions, tags, pinned SHAs, SHA256SUMS): `node <adc.mjs> tooling plugin release {{plugin_dir}} --version X.Y.Z`
+
+Hooks and MCP servers reference files through `${PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_ROOT}` and keep
+state under `${PLUGIN_DATA}` / `${CLAUDE_PLUGIN_DATA}`, because the install directory changes on
+every version.
+@@@ file: CHANGELOG.md kind=plugin @@@
+# Changelog
+
+All notable changes to {{name}} are documented here. Versions follow Semantic Versioning; the
+version in every plugin manifest and marketplace entry matches the release tag.
+
+## [{{version}}] - {{date}}
+
+### Added
+
+- First version of the {{name}} plugin.

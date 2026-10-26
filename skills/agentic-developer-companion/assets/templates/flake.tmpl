@@ -1,0 +1,164 @@
+# flake (plan §10.4): the quarantine policy and registry (mode=keep), the weekly quarantine workflow and,
+# with --test, a diagnosis report in the state dir. The shared .github/adc/gate.mjs comes from ci-gate.tmpl.
+# Attributes: see scripts/lib/scaffold.mjs (renderFiles).
+
+@@@ file: flaky-test-policy.md @@@
+# Flaky-test policy
+
+Scaffolded by {{generated_by}} on {{date}}. Owner of this policy: TODO (the team that owns the merge gate).
+
+A test is **flaky** when it both passes and fails on the same code. A flaky test is a bug in the
+test or in the product; a retry that turns it green hides the bug. Quarantine is a stopgap with an
+owner and an expiry date, never a fix.
+
+## 1. Detect
+
+- Repeat the suspect tests with shuffling and recorded seeds where the runner supports it:
+  `node <skill>/scripts/adc.mjs flake-probe --tests "<id>" --times 20 --json` (pytest-randomly +
+  pytest-repeat, `go test -count=10 -shuffle=on`, `jest --randomize`, `cargo nextest run --retries 0`,
+  a `dotnet test` loop; otherwise N sequential runs, recorded as `shuffle: false`).
+- Compare pass/fail across runs; keep the failing seeds, they reproduce the order.
+- Detected runner: **{{runner_name}}**; e2e runner: **{{e2e_runner}}**.
+
+## 2. Classify (one class per incident)
+
+| Class | Typical signal | Fix pattern |
+|---|---|---|
+| Order dependence | fails only in some orders or seeds; passes alone | isolate state per test, reset globals, deterministic seeds |
+| Time and timezone | fails near midnight, at DST changes, in another TZ | fake timers (`jest.useFakeTimers`, `vi.useFakeTimers`, Playwright `page.clock`, freezegun, time-machine) |
+| Network | timeouts, DNS errors, third-party 5xx | mock at the boundary (MSW 3 `onUnhandledFrame: 'error'`, nock `disableNetConnect`, respx, VCR.py / pytest-recording `--block-network`, WireMock) |
+| Concurrency | races between parallel workers or async steps | wait on conditions, never sleep; one resource per worker |
+| Resource leaks | later tests fail; open handles | explicit cleanup in fixtures; `--detectOpenHandles`; pytest-timeout |
+| Test-data collisions | unique-constraint errors, shared accounts | unique data per test or worker; factories instead of shared fixtures |
+| Environment | Windows paths, line endings, locale, CPU speed | `path.join`, normalize EOL, pin locale and TZ, no timing thresholds |
+
+## 3. Quarantine (stopgap)
+
+1. Tag the test `@quarantine` (name or tag). With {{runner_name}}: `{{quarantine_only}}` selects
+   quarantined tests and `{{quarantine_skip}}` excludes them.
+2. Add an entry to `{{registry}}`: `id`, `owner`, `issue`, `added`, `expires` (at most 30 days
+   later), `reason`.
+3. The merge gate excludes quarantined tests (`scaffold ci-gate` adds the exclusion and a registry
+   check when `{{registry}}` exists). The weekly `quarantine` workflow runs them with retries off
+   and fails on expired or incomplete entries.
+4. Weekly review: fix the test, extend once with a written reason, or delete it.
+
+## 4. Retries
+
+- Allowed only for e2e tests and only with a flaky report, so a retried pass is visible and fails
+  the run: Playwright `failOnFlakyTests` / `--fail-on-flaky-tests`, Surefire `Flakes:` with
+  `rerunFailingTestsCount`, Vitest `retry` with the flaky outcome in JUnit. Never for unit tests.
+- CI fails when more than {{max_flaky}} flaky test(s) are reported (`ci-gate --max-flaky`).
+- `gh run rerun --failed` hides flakes: a green re-run is not evidence.
+- In-source retries (Jest retry counts, the pytest flaky marker, Playwright describe-level retries)
+  are findings in `verify` (CK-RETRY): retries belong in the CI configuration, with a flaky report.
+
+## 5. Evidence
+
+Every quarantine and every fix carries the flake-probe evidence (command, runs, seeds, failures)
+in the PR description, and the fix is verified by a second probe with zero failures.
+
+@@@ file: .github/workflows/quarantine.yml scope=repo @@@
+{{header}}
+# Weekly review of quarantined tests (not part of the merge gate): every registry entry needs an
+# owner, an issue and an unexpired date, and the quarantined tests run with retries off so fixed
+# tests can leave the quarantine. Edit freely: a later `verify` reports weakening edits as findings.
+name: quarantine
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  pull_request:
+    paths:
+      - {{registry}}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    name: Quarantine registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.check.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Owners, issues and expiry dates
+        id: check
+        run: |
+          node .github/adc/gate.mjs quarantine --registry {{registry}}
+
+  quarantined-tests:
+    name: Quarantined tests, retries off
+    needs: registry
+    if: ${{ needs.registry.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{project_root}}
+    steps:
+      - uses: actions/checkout@v7
+{{setup}}
+      - name: Install (frozen)
+        run: |
+          {{install_cmd}}
+      - name: Run only the quarantined tests ({{runner_name}})
+        run: |
+          {{quarantine_run}}
+
+@@@ file: quarantine.json mode=keep @@@
+{
+  "schema": "adc-quarantine/1",
+  "max_flaky": {{max_flaky}},
+  "max_days": 30,
+  "policy": "{{policy}}",
+  "tests": []
+}
+
+@@@ file: repro/flake/{{slug}}/diagnosis.md scope=state when=diagnosis @@@
+# Flake diagnosis: {{test_id}}
+
+Created {{date}} by {{generated_by}}. This report lives in the state dir and is never committed;
+copy its conclusions into the PR description.
+
+## 1. Evidence runs
+
+    {{flake_probe}}
+
+- Runs, failures, shuffle on/off, seeds: TODO
+- Failing seeds or orders (reproduce with the runner's seed option): TODO
+- Failure messages (trimmed, secrets redacted): TODO
+
+## 2. Classification
+
+- Class (order dependence, time, network, concurrency, resource leak, test-data collision, environment): TODO
+- Why (the evidence that points to it): TODO
+
+## 3. Fix
+
+- Pattern (fake timers, boundary mock, isolation, deterministic seed, condition wait, unique data, cleanup): TODO
+- Change (files and the one-line reason): TODO
+
+## 4. Verification
+
+- Re-run of the probe above after the fix, 0 failures in N runs: TODO
+
+## 5. Quarantine (only if the fix cannot land now)
+
+- Entry in {{registry}} with owner, issue and expiry (at most 30 days): TODO
+
+@@@ file: next/flake-diagnosis part=fragment name=next when=diagnosis @@@
+diagnosis report: {{state_rel}}/repro/flake/{{slug}}/diagnosis.md (evidence runs, class, fix, verification)
+
+@@@ file: next/flake part=fragment name=next @@@
+detect: {{flake_probe}}   (shuffled where the runner supports it; seeds recorded)
+quarantine a test: tag it @quarantine (selected by {{quarantine_only}}), add {id, owner, issue, added, expires, reason} to {{registry}}, and exclude it from the merge gate ({{quarantine_skip}})
+scaffold ci-gate after this (or re-run it with --force): it excludes quarantined tests and checks the registry when the registry exists
+never use `gh run rerun --failed` to get green: it hides flakes

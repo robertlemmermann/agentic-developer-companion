@@ -1,0 +1,78 @@
+{
+  "description": "agentic-developer-companion hooks",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run session-start --dialect codex",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run session-start --dialect codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run post-edit --dialect codex",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run post-shell --dialect codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run pre-guard --dialect codex --level guard",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run pre-guard --dialect codex --level guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run stop --dialect codex --level advise",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<SKILL>/scripts/adc.mjs\" hook-run session-end --dialect codex",
+            "commandWindows": "node \"<SKILL>/scripts/adc.mjs\" hook-run session-end --dialect codex",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

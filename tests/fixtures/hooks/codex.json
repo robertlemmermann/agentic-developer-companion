@@ -1,0 +1,530 @@
+[
+  {
+    "name": "SessionStart: hookSpecificOutput only",
+    "event": "session-start",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "SessionStart",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "source": "startup"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.hookEventName": "SessionStart"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse apply_patch (command key): focus marker with patch line numbers",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Add File: tests/a.test.js\n+import { add } from '../src/add.js';\n+it.only('adds', () => {})\n*** End Patch\n"
+      },
+      "tool_use_id": "c1",
+      "tool_response": "Success. Updated the following files:\nA tests/a.test.js"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.hookEventName": "PostToolUse"
+      },
+      "match": {
+        "hookSpecificOutput.additionalContext": "skip/focus marker \\(\\S+\\) at line 2"
+      },
+      "session": {
+        "edits.count": 1
+      }
+    }
+  },
+  {
+    "name": "PostToolUse apply_patch (patch key): update + delete of a test",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "patch": "*** Begin Patch\n*** Update File: src/a.js\n@@ -1,2 +1,2 @@\n const a = 1;\n-try { x() } catch (e) { log(e) }\n+try { x() } catch (e) {}\n*** Delete File: tests/old.test.js\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "match": {
+        "hookSpecificOutput.additionalContext": "src/a\\.js: adds an exception-swallowing pattern \\(\\S+\\) at line 2[\\s\\S]*tests/old\\.test\\.js \\(test file\\): deleted"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse apply_patch as a plain string tool_input",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": "*** Begin Patch\n*** Update File: src/b.ts\n+// @ts-expect-error\n+const n: number = \"x\";\n*** End Patch\n"
+    },
+    "expect": {
+      "match": {
+        "hookSpecificOutput.additionalContext": "src/b\\.ts: adds a lint/type suppression"
+      }
+    }
+  },
+  {
+    "name": "PostToolUse Bash argv form: cargo summary",
+    "event": "post-shell",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": [
+          "bash",
+          "-lc",
+          "cargo test"
+        ]
+      },
+      "tool_response": "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured"
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.cmd_head": "cargo test",
+        "observed_runs.0.counts.passed": 3
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Bash git push --force: deny",
+    "event": "pre-guard",
+    "dialect_arg": "codex",
+    "level": "guard",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "git push --force"
+      },
+      "tool_use_id": "c2"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny",
+        "hookSpecificOutput.hookEventName": "PreToolUse"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Bash reading .adc/.env.live: deny (Codex reads files through Bash)",
+    "event": "pre-guard",
+    "dialect_arg": "codex",
+    "level": "guard",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": [
+          "bash",
+          "-lc",
+          "sed -n '1,5p' .adc/.env.live"
+        ]
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse apply_patch touching .adc/: deny",
+    "event": "pre-guard",
+    "dialect_arg": "codex",
+    "level": "guard",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Update File: .adc/evidence/20261025T000000Z-x.json\n-  \"verdict\": \"FAIL\"\n+  \"verdict\": \"PASS\"\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "deny"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse apply_patch deleting a test: ask",
+    "event": "pre-guard",
+    "dialect_arg": "codex",
+    "level": "guard",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Delete File: tests/math.test.js\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "values": {
+        "hookSpecificOutput.permissionDecision": "ask"
+      }
+    }
+  },
+  {
+    "name": "PreToolUse Bash npm test: no decision",
+    "event": "pre-guard",
+    "dialect_arg": "codex",
+    "level": "guard",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "npm test"
+      }
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "Stop (advise): systemMessage only (Codex rejects unknown fields)",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Update File: src/a.js\n+x\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cx-1",
+          "turn_id": "t-1",
+          "transcript_path": null,
+          "cwd": "<REPO>",
+          "hook_event_name": "Stop",
+          "model": "gpt-5-codex",
+          "permission_mode": "default",
+          "stop_hook_active": false,
+          "last_assistant_message": "All tests pass."
+        },
+        "expect": {
+          "keys": [
+            "systemMessage"
+          ],
+          "match": {
+            "systemMessage": "newer than the verification evidence[\\s\\S]*All tests pass"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "Stop (gate): decision block",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "level": "gate",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Update File: src/a.js\n+x\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cx-1",
+          "turn_id": "t-1",
+          "transcript_path": null,
+          "cwd": "<REPO>",
+          "hook_event_name": "Stop",
+          "model": "gpt-5-codex",
+          "permission_mode": "default",
+          "stop_hook_active": false
+        },
+        "expect": {
+          "keys": [
+            "decision",
+            "reason"
+          ],
+          "values": {
+            "decision": "block"
+          }
+        }
+      },
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "cx-1",
+          "turn_id": "t-1",
+          "transcript_path": null,
+          "cwd": "<REPO>",
+          "hook_event_name": "Stop",
+          "model": "gpt-5-codex",
+          "permission_mode": "default",
+          "stop_hook_active": true
+        },
+        "expect": {
+          "equals": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "SessionEnd: {}",
+    "event": "session-end",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "SessionEnd",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "reason": "other"
+    },
+    "expect": {
+      "equals": {}
+    }
+  },
+  {
+    "name": "no cwd: identity from the process cwd",
+    "event": "session-start",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "cx-1",
+      "hook_event_name": "SessionStart",
+      "model": "gpt-5-codex",
+      "permission_mode": "bypassPermissions",
+      "source": "resume"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ]
+    }
+  },
+  {
+    "name": "--dialect auto with turn_id resolves to codex",
+    "event": "post-edit",
+    "dialect_arg": "auto",
+    "payload": {
+      "session_id": "cx-1",
+      "turn_id": "t-1",
+      "transcript_path": null,
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5-codex",
+      "permission_mode": "default",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Add File: tests/c.test.js\n+it.skip(\"c\")\n*** End Patch\n"
+      }
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "match": {
+        "hookSpecificOutput.additionalContext": "skip/focus"
+      }
+    }
+  },
+  {
+    "name": "measured: apply_patch tool_input.command with relative paths; tool_response is a string",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "m-cx-1",
+      "turn_id": "m-turn-1",
+      "transcript_path": "/home/dev/.codex/sessions/2026/10/25/rollout-m-cx-1.jsonl",
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5.5",
+      "permission_mode": "bypassPermissions",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Add File: tests/c.test.js\n+const test = require('node:test');\n+test.only('c', () => {});\n*** End Patch\n"
+      },
+      "tool_response": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nA tests/c.test.js\n",
+      "tool_use_id": "call_1"
+    },
+    "expect": {
+      "keys": [
+        "hookSpecificOutput"
+      ],
+      "match": {
+        "hookSpecificOutput.additionalContext": "tests/c\\.test\\.js \\(test file\\): adds a skip/focus marker \\(\\S+\\) at line 2"
+      }
+    }
+  },
+  {
+    "name": "measured: Bash (exec_command) tool_input.command; tool_response is the plain output",
+    "event": "post-shell",
+    "dialect_arg": "codex",
+    "payload": {
+      "session_id": "m-cx-1",
+      "turn_id": "m-turn-1",
+      "transcript_path": "/home/dev/.codex/sessions/2026/10/25/rollout-m-cx-1.jsonl",
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5.5",
+      "permission_mode": "bypassPermissions",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "node --test tests/ 2>&1 | tail -8"
+      },
+      "tool_response": "# tests 1\n# suites 0\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n",
+      "tool_use_id": "call_3"
+    },
+    "expect": {
+      "equals": {},
+      "session": {
+        "observed_runs.0.exit": null,
+        "observed_runs.0.counts.failed": 1
+      }
+    }
+  },
+  {
+    "name": "measured: Stop with turn_id and last_assistant_message (gate)",
+    "event": "post-edit",
+    "dialect_arg": "codex",
+    "level": "gate",
+    "payload": {
+      "session_id": "m-cx-1",
+      "turn_id": "m-turn-1",
+      "transcript_path": "/home/dev/.codex/sessions/2026/10/25/rollout-m-cx-1.jsonl",
+      "cwd": "<REPO>",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-5.5",
+      "permission_mode": "bypassPermissions",
+      "tool_name": "apply_patch",
+      "tool_input": {
+        "command": "*** Begin Patch\n*** Update File: src/a.js\n@@\n-export const a = 1;\n+export const a = 2;\n*** End Patch\n"
+      },
+      "tool_response": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess.\n"
+    },
+    "expect": {
+      "equals": {}
+    },
+    "then": [
+      {
+        "event": "stop",
+        "payload": {
+          "session_id": "m-cx-1",
+          "turn_id": "m-turn-1",
+          "transcript_path": "/home/dev/.codex/sessions/2026/10/25/rollout-m-cx-1.jsonl",
+          "cwd": "<REPO>",
+          "hook_event_name": "Stop",
+          "model": "gpt-5.5",
+          "permission_mode": "bypassPermissions",
+          "stop_hook_active": false,
+          "last_assistant_message": "All tests pass."
+        },
+        "expect": {
+          "keys": [
+            "decision",
+            "reason"
+          ],
+          "match": {
+            "reason": "All tests pass"
+          }
+        }
+      }
+    ]
+  }
+]

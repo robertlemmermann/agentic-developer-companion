@@ -1,0 +1,527 @@
+# live (plan §10.3): a plain probe project for the companion's trusted runner (`adc.mjs live run`), which
+# owns credentials, the budget and redaction; probes get ADC_LIVE_TOKEN, ADC_LIVE_BASE_URL, ADC_LIVE_TENANT,
+# ADC_TEST_RUN_ID, ADC_PROBE_ID and ADC_PROBE_RESULT from its environment only. lang=ts (Playwright API
+# testing) | js (node:test + fetch) | python (pytest + httpx); when=synthetic only once the live safety
+# checklist has no TODO line. Attributes: see scripts/lib/scaffold.mjs (renderFiles).
+
+@@@ file: package.json lang=ts @@@
+{
+  "name": "{{package_name}}",
+  "private": true,
+  "type": "module",
+  "description": "Live probes, run by `node <skill>/scripts/adc.mjs live run`. Scaffolded by {{generated_by}}.",
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.0.0"
+  }
+}
+
+@@@ file: playwright.config.ts lang=ts @@@
+// Live probes (Playwright API testing, no browser needed). Run them through the companion's
+// trusted runner, which loads ADC_LIVE_TOKEN, enforces the budget and redacts the token:
+//   node <skill>/scripts/adc.mjs live run --json
+// This project holds no credential or budget logic of its own.
+import { defineConfig } from '@playwright/test';
+
+const token = process.env.ADC_LIVE_TOKEN;
+const tenant = process.env.ADC_LIVE_TENANT;
+
+export default defineConfig({
+  testDir: './probes',
+  outputDir: './test-results',
+  fullyParallel: false,
+  workers: 1,
+  retries: 0,
+  forbidOnly: true,
+  timeout: 60_000,
+  reporter: [['list'], ['junit', { outputFile: 'test-results/junit.xml' }]],
+  use: {
+    baseURL: process.env.ADC_LIVE_BASE_URL || '{{base_url}}',
+    // Authenticated probes: traces, HAR files and failure reports record request headers, so
+    // nothing that could hold the token is recorded (the choice is in live-checklist.md).
+    trace: 'off',
+    screenshot: 'off',
+    video: 'off',
+    extraHTTPHeaders: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(tenant ? { 'X-Tenant': tenant } : {}),
+      'X-Test-Run': process.env.ADC_TEST_RUN_ID || 'manual',
+    },
+  },
+});
+
+@@@ file: probes/support/result.ts lang=ts @@@
+// Tells the trusted runner the HTTP outcome through ADC_PROBE_RESULT: the status (401/403 become
+// AUTH_REJECTED in the ledger) and the response headers (the runner reads only the configured
+// cost header). Never write request headers or bodies here.
+import fs from 'node:fs';
+import type { APIResponse } from '@playwright/test';
+
+export function recordResult(res: APIResponse): void {
+  const file = process.env.ADC_PROBE_RESULT;
+  if (!file) return;
+  fs.writeFileSync(file, JSON.stringify({ status: res.status(), headers: res.headers() }));
+}
+
+/** Kill switch, checked before every write: LIVE_TESTS_ENABLED set to anything but "true" refuses. */
+export function assertWritesAllowed(): void {
+  const flag = process.env.LIVE_TESTS_ENABLED;
+  if (flag !== undefined && flag !== 'true') throw new Error(`writes refused: LIVE_TESTS_ENABLED=${flag} (the kill switch is on)`);
+}
+
+@@@ file: probes/readonly/health.spec.ts lang=ts @@@
+import { test, expect } from '@playwright/test';
+import { recordResult } from '../support/result';
+
+// Read-only probe (cost 1): the service answers its health endpoint, {{health_path}}.
+test('the health endpoint reports pass or warn', { tag: '@readonly' }, async ({ request }) => {
+  const res = await request.get('{{health_path}}');
+  recordResult(res);
+  expect(res.status(), `GET {{health_path}} answered ${res.status()}`).toBeLessThan(400);
+  if (/json/.test(res.headers()['content-type'] || '')) {
+    const body = await res.json();
+    // application/health+json: status is pass | warn | fail; other formats name it differently.
+    if (body && typeof body === 'object' && 'status' in body) {
+      expect(['pass', 'warn', 'ok', 'up', 'healthy']).toContain(String(body.status).toLowerCase());
+    }
+  }
+});
+
+@@@ file: probes/synthetic/create-and-cleanup.spec.ts lang=ts when=synthetic @@@
+import { test, expect } from '@playwright/test';
+import { assertWritesAllowed, recordResult } from '../support/result';
+
+// Synthetic (write) probe, allowed by live-checklist.md. Estimated cost: {{synthetic_cost}} credits.
+// - the kill switch is checked before every write
+// - every record carries a unique test marker and an idempotency key
+// - cleanup always runs (afterEach), also when the probe fails
+// ADAPT: RESOURCE and the payload to the dedicated test tenant's API.
+const RESOURCE = '/api/test-records';
+const marker = `adc-live-${process.env.ADC_TEST_RUN_ID || 'manual'}-${Date.now()}`;
+const created: string[] = [];
+
+test.afterEach(async ({ request }) => {
+  for (const id of created.splice(0)) {
+    const res = await request.delete(`${RESOURCE}/${encodeURIComponent(id)}`);
+    expect(res.status(), `cleanup of ${id}`).toBeLessThan(500);
+  }
+});
+
+test('create, read and delete a marked test record', { tag: '@synthetic' }, async ({ request }) => {
+  assertWritesAllowed();
+  const res = await request.post(RESOURCE, {
+    headers: { 'Idempotency-Key': marker },
+    data: { name: marker, test_marker: marker },
+  });
+  recordResult(res);
+  expect(res.status(), `POST ${RESOURCE} answered ${res.status()}`).toBeLessThan(300);
+  const body = await res.json();
+  created.push(String(body.id));
+  const read = await request.get(`${RESOURCE}/${encodeURIComponent(String(body.id))}`);
+  expect(read.status()).toBe(200);
+});
+
+@@@ file: probes/support/client.mjs lang=js @@@
+// HTTP client for live probes: base URL, bearer token, tenant and test-run tag come from the
+// environment the trusted runner (adc.mjs live run) provides. No credential or budget logic here.
+import fs from 'node:fs';
+
+export const BASE_URL = (process.env.ADC_LIVE_BASE_URL || '{{base_url}}').replace(/\/+$/, '');
+
+/** One request; resolves to { status, headers, text, json } and reports the outcome to the runner. */
+export async function request(method, urlPath, options = {}) {
+  const headers = { accept: 'application/json', 'x-test-run': process.env.ADC_TEST_RUN_ID || 'manual', ...options.headers };
+  if (process.env.ADC_LIVE_TOKEN) headers.authorization = `Bearer ${process.env.ADC_LIVE_TOKEN}`;
+  if (process.env.ADC_LIVE_TENANT) headers['x-tenant'] = process.env.ADC_LIVE_TENANT;
+  if (options.body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(`${BASE_URL}${urlPath}`, {
+    method,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await res.text();
+  recordResult(res);
+  // JSON when the server says so (a malformed JSON body fails the probe); anything else stays text.
+  const json = /\bjson\b/i.test(res.headers.get('content-type') || '') && text ? JSON.parse(text) : null;
+  return { status: res.status, headers: res.headers, text, json };
+}
+
+/**
+ * Tell the runner the HTTP status (401/403 become AUTH_REJECTED) and the response headers (it
+ * reads only the configured cost header) through ADC_PROBE_RESULT. Never request data.
+ */
+export function recordResult(res) {
+  const file = process.env.ADC_PROBE_RESULT;
+  if (!file) return;
+  fs.writeFileSync(file, JSON.stringify({ status: res.status, headers: Object.fromEntries(res.headers) }));
+}
+
+/** Kill switch, checked before every write: LIVE_TESTS_ENABLED set to anything but "true" refuses. */
+export function assertWritesAllowed() {
+  const flag = process.env.LIVE_TESTS_ENABLED;
+  if (flag !== undefined && flag !== 'true') throw new Error(`writes refused: LIVE_TESTS_ENABLED=${flag} (the kill switch is on)`);
+}
+
+@@@ file: probes/readonly/health.test.mjs lang=js @@@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { request } from '../support/client.mjs';
+
+// Read-only probe (cost 1): the service answers its health endpoint, {{health_path}}.
+test('the health endpoint reports pass or warn', async () => {
+  const res = await request('GET', '{{health_path}}');
+  assert.ok(res.status < 400, `GET {{health_path}} answered ${res.status}`);
+  if (res.json && typeof res.json === 'object' && 'status' in res.json) {
+    // application/health+json: status is pass | warn | fail; other formats name it differently.
+    assert.ok(['pass', 'warn', 'ok', 'up', 'healthy'].includes(String(res.json.status).toLowerCase()), `health status: ${res.json.status}`);
+  }
+});
+
+@@@ file: probes/synthetic/create-and-cleanup.test.mjs lang=js when=synthetic @@@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { assertWritesAllowed, request } from '../support/client.mjs';
+
+// Synthetic (write) probe, allowed by live-checklist.md. Estimated cost: {{synthetic_cost}} credits.
+// - the kill switch is checked before every write
+// - every record carries a unique test marker and an idempotency key
+// - cleanup always runs (finally), also when the probe fails
+// ADAPT: RESOURCE and the payload to the dedicated test tenant's API.
+const RESOURCE = '/api/test-records';
+
+test('create, read and delete a marked test record', async () => {
+  const marker = `adc-live-${process.env.ADC_TEST_RUN_ID || 'manual'}-${Date.now()}`;
+  assertWritesAllowed();
+  const res = await request('POST', RESOURCE, { body: { name: marker, test_marker: marker }, headers: { 'idempotency-key': marker } });
+  assert.ok(res.status < 300, `POST ${RESOURCE} answered ${res.status}`);
+  const id = String(res.json && res.json.id);
+  try {
+    const read = await request('GET', `${RESOURCE}/${encodeURIComponent(id)}`);
+    assert.equal(read.status, 200);
+  } finally {
+    const del = await request('DELETE', `${RESOURCE}/${encodeURIComponent(id)}`);
+    assert.ok(del.status < 500, `cleanup of ${id} answered ${del.status}`);
+  }
+});
+
+@@@ file: requirements-live.txt lang=python @@@
+# Live probe dependencies.
+pytest>=8
+httpx>=0.27
+
+@@@ file: probes/conftest.py lang=python @@@
+"""Fixtures for live probes: base URL, bearer token, tenant and test-run tag come from the
+environment the trusted runner (adc.mjs live run) provides. No credential or budget logic here."""
+
+import json
+import os
+
+import httpx
+import pytest
+
+
+def record_result(response):
+    """Tell the runner the HTTP status (401/403 become AUTH_REJECTED) and the response headers
+    (it reads only the configured cost header) through ADC_PROBE_RESULT. Never request data."""
+    path = os.environ.get("ADC_PROBE_RESULT")
+    if path:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"status": response.status_code, "headers": dict(response.headers)}, fh)
+
+
+def assert_writes_allowed():
+    """Kill switch, checked before every write: LIVE_TESTS_ENABLED set to anything but "true" refuses."""
+    flag = os.environ.get("LIVE_TESTS_ENABLED")
+    if flag is not None and flag != "true":
+        raise RuntimeError(f"writes refused: LIVE_TESTS_ENABLED={flag} (the kill switch is on)")
+
+
+@pytest.fixture(scope="session")
+def client():
+    headers = {"accept": "application/json", "x-test-run": os.environ.get("ADC_TEST_RUN_ID", "manual")}
+    token = os.environ.get("ADC_LIVE_TOKEN")
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    tenant = os.environ.get("ADC_LIVE_TENANT")
+    if tenant:
+        headers["x-tenant"] = tenant
+    base_url = (os.environ.get("ADC_LIVE_BASE_URL") or "{{base_url}}").rstrip("/")
+    with httpx.Client(base_url=base_url, headers=headers, timeout=30.0, event_hooks={"response": [record_result]}) as c:
+        yield c
+
+@@@ file: probes/readonly/test_health.py lang=python @@@
+"""Read-only probe (cost 1): the service answers its health endpoint, {{health_path}}."""
+
+
+def test_health_endpoint_reports_pass_or_warn(client):
+    res = client.get("{{health_path}}")
+    assert res.status_code < 400, f"GET {{health_path}} answered {res.status_code}"
+    if "json" in res.headers.get("content-type", ""):
+        body = res.json()
+        # application/health+json: status is pass | warn | fail; other formats name it differently.
+        if isinstance(body, dict) and "status" in body:
+            assert str(body["status"]).lower() in ("pass", "warn", "ok", "up", "healthy"), f"health status: {body['status']}"
+
+@@@ file: probes/synthetic/test_create_and_cleanup.py lang=python when=synthetic @@@
+"""Synthetic (write) probe, allowed by live-checklist.md. Estimated cost: {{synthetic_cost}} credits.
+
+- the kill switch is checked before every write
+- every record carries a unique test marker and an idempotency key
+- cleanup always runs (finally), also when the probe fails
+ADAPT: RESOURCE and the payload to the dedicated test tenant's API.
+"""
+
+import os
+import time
+
+from conftest import assert_writes_allowed
+
+RESOURCE = "/api/test-records"
+
+
+def test_create_read_and_delete_a_marked_record(client):
+    marker = f"adc-live-{os.environ.get('ADC_TEST_RUN_ID', 'manual')}-{int(time.time() * 1000)}"
+    assert_writes_allowed()
+    res = client.post(RESOURCE, json={"name": marker, "test_marker": marker}, headers={"idempotency-key": marker})
+    assert res.status_code < 300, f"POST {RESOURCE} answered {res.status_code}"
+    record_id = str(res.json()["id"])
+    try:
+        read = client.get(f"{RESOURCE}/{record_id}")
+        assert read.status_code == 200
+    finally:
+        deleted = client.delete(f"{RESOURCE}/{record_id}")
+        assert deleted.status_code < 500, f"cleanup of {record_id} answered {deleted.status_code}"
+
+@@@ file: runbook.md @@@
+# Live probes: runbook
+
+Scaffolded by {{generated_by}} on {{date}}. The probes in `probes/` run only through the companion's
+trusted runner, which loads the token, checks the budget before every probe and redacts the token
+from everything it keeps:
+
+    node <skill>/scripts/adc.mjs live run --dry-run --json   # what would run, caps, gating
+    node <skill>/scripts/adc.mjs live run --json             # run; CK-LIVE checks go to the ledger
+
+## Credentials
+
+- The token lives in `.adc/.env.live` (`ADC_LIVE_TOKEN=`, optional `ADC_LIVE_BASE_URL=`,
+  `ADC_LIVE_TENANT=`), git-ignored and owner-only. Fill it in your own editor; an agent never
+  opens, prints or searches that file and never dumps the environment.
+- CI reads `ADC_LIVE_TOKEN` from an environment-scoped secret (environment `live`), never from a file.
+- The token belongs to a dedicated test account or tenant with least privilege, has an expiry and
+  is rotated on schedule. A rejected token fails closed (`AUTH_REJECTED` in the ledger).
+
+## Spend and kill switch
+
+- Budget: `.adc/budget.json`, 2,500 credits per session and per UTC day by default; `--credits n`
+  lowers it for one run; only a person at a terminal can raise it (`--credits-override`).
+- Without registered hooks every run is its own session, so only the daily cap spans runs.
+- Kill switch: `LIVE_TESTS_ENABLED` set to anything but `true` stops every run; synthetic probes
+  also check it before every write. In CI it is the repository variable `LIVE_TESTS_ENABLED`.
+
+## Where it runs
+
+- Developer machines and CI. The Copilot cloud agent's firewall and Codex's no-network sandbox
+  block live probes unless an admin allow-lists the host, so do not run them inside an agent session.
+- The scheduled workflow (`.github/workflows/live-probes.yml`) runs on the default branch only;
+  GitHub disables schedules after 60 days without activity in public repositories.
+
+## When a probe fails
+
+| Reason | Meaning | Action |
+|---|---|---|
+| `PROBE_FAILED` | an assertion or HTTP error | read the redacted log in `.adc/cache/live/<run>/`; fix the service or the probe, never the check |
+| `AUTH_REJECTED` | 401/403 | the token expired or lacks a permission; rotate it |
+| `BUDGET_EXHAUSTED` | a cap would be passed | stop; only a person may raise a cap |
+| `SYNTHETIC_GATED` | `live-checklist.md` has TODO lines | finish the checklist with the owner |
+| `KILL_SWITCH` | `LIVE_TESTS_ENABLED` is not `true` | nothing ran, by policy |
+
+## Adding a probe
+
+1. Read-only first: a GET journey with no side effects, cost 1.
+2. Add the file under `probes/readonly/` and an entry to `probes.json` (`id`, `kind`, `cmd` valid in
+   sh and cmd.exe, `cwd`, `cost`, `timeout_s`, optional `cost_header` + `cost_header_kind`).
+3. Write probes go under `probes/synthetic/`, only after the checklist covers them, with an
+   estimated `cost`, a unique test marker, an idempotency key and guaranteed cleanup.
+
+@@@ file: fragment/checklist part=fragment name=checklist @@@
+# Live safety checklist
+
+Answer every item with the owner of the target environment, then replace each TODO with the answer.
+The companion generates and runs write-capable (synthetic) probes only while no line of this file
+contains TODO.
+
+## Environment and tenant
+
+- Target environment (production or staging) and its owner: TODO
+- Dedicated test tenant or account used by the probes: TODO
+
+## Read-only first
+
+- Read-only probes in scope (health, readiness, key GET journeys, auth smoke): TODO
+
+## Writes
+
+- Idempotency keys on every write: TODO
+- Unique test marker on every created record (probes use `adc-live-<run id>-<time>`): TODO
+- Guaranteed cleanup, and what happens to records a crashed probe leaves behind: TODO
+- Data retention rules for test records: TODO
+- Rate limits and backoff: TODO
+- Feature flags that isolate test traffic: TODO
+- Kill switch: `LIVE_TESTS_ENABLED` (CI: repository or environment variable), checked before every write: TODO
+- Blast radius, in one sentence (the worst a broken probe can do): TODO
+- Estimated credits per synthetic run: {{synthetic_cost}}
+
+## Secrets
+
+- Token source: `.adc/.env.live` on developer machines, an environment secret in CI; never in the repository: TODO
+- Least privilege, expiry date and rotation schedule of the token: TODO
+
+## Observability
+
+- Requests are tagged `X-Test-Run: <run id>`; JUnit and the runner's summary are kept.
+- Traces, HAR files and failure reports record request headers: these probes run with
+  `trace: 'off'`, record no HAR, and `test-results/`, `playwright-report/`, `blob-report/` and
+  `*.har` are git-ignored (verified with `git check-ignore` by the scaffold). The scheduled
+  workflow uploads only the runner's redacted result, kept for 1 day.
+
+## Cadence and alerting
+
+- Schedule (cron, UTC) and who is alerted when a run fails: TODO
+- Thresholds that count as an incident: TODO
+
+@@@ file: .github/workflows/live-probes.yml scope=repo @@@
+{{header}}
+# Scheduled live probes, executed by the companion's trusted runner (never the test runner
+# directly). Kill switch: repository variable LIVE_TESTS_ENABLED must be 'true'. Secrets:
+# ADC_LIVE_TOKEN in the protected environment "live"{{synthetic_env_note}}.
+name: live-probes
+
+on:
+  schedule:
+    - cron: '{{cron}}'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-probes
+  cancel-in-progress: false
+
+jobs:
+  readonly:
+    if: ${{ vars.LIVE_TESTS_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: live
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+{{probe_setup}}
+{{get_adc}}
+      - name: Read-only probes
+        env:
+          ADC_LIVE_TOKEN: ${{ secrets.ADC_LIVE_TOKEN }}
+          ADC_LIVE_BASE_URL: ${{ vars.ADC_LIVE_BASE_URL }}
+          ADC_LIVE_TENANT: ${{ vars.ADC_LIVE_TENANT }}
+          ADC_LIVE_BUDGET: ${{ vars.ADC_LIVE_BUDGET }}
+          LIVE_TESTS_ENABLED: ${{ vars.LIVE_TESTS_ENABLED }}
+        run: |
+          node "$ADC" live run --probes 'readonly/*' --json > "$RUNNER_TEMP/live-readonly.json"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: live-readonly
+          path: ${{ runner.temp }}/live-readonly.json
+          retention-days: 1
+{{synthetic_job}}
+
+@@@ file: fragment/synthetic-job part=fragment name=synthetic-job @@@
+
+  synthetic:
+    needs: [readonly]
+    if: ${{ vars.LIVE_TESTS_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment approve every write run.
+    environment: live-write
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+{{probe_setup}}
+{{get_adc}}
+      - name: Synthetic (write) probes
+        env:
+          ADC_LIVE_TOKEN: ${{ secrets.ADC_LIVE_TOKEN }}
+          ADC_LIVE_BASE_URL: ${{ vars.ADC_LIVE_BASE_URL }}
+          ADC_LIVE_TENANT: ${{ vars.ADC_LIVE_TENANT }}
+          ADC_LIVE_BUDGET: ${{ vars.ADC_LIVE_BUDGET }}
+          LIVE_TESTS_ENABLED: ${{ vars.LIVE_TESTS_ENABLED }}
+        run: |
+          node "$ADC" live run --probes 'synthetic/*' --json > "$RUNNER_TEMP/live-synthetic.json"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: live-synthetic
+          path: ${{ runner.temp }}/live-synthetic.json
+          retention-days: 1
+
+@@@ file: fragment/probe-setup part=fragment name=probe-setup lang=ts @@@
+      - name: Install the probe project (API probes need no browsers)
+        working-directory: {{out}}
+        run: |
+          npm ci
+
+@@@ file: fragment/probe-setup part=fragment name=probe-setup lang=js @@@
+      - name: The probe project needs nothing installed (node:test + fetch)
+        run: |
+          node --version
+
+@@@ file: fragment/probe-setup part=fragment name=probe-setup lang=python @@@
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install the probe project
+        run: |
+          python -m pip install -r {{out}}/requirements-live.txt
+
+@@@ file: .gitignore mode=lines @@@
+# Traces, HAR files and reports record request headers: they never reach git.
+test-results/
+playwright-report/
+blob-report/
+*.har
+node_modules/
+.pytest_cache/
+
+@@@ file: next/live-gated part=fragment name=next when=no-synthetic @@@
+synthetic (write) probes were NOT generated: {{gate_reason}}. Answer every checklist item with the user, record the answers, then re-run with --checklist {{checklist}} --write
+
+@@@ file: next/live-ts part=fragment name=next lang=ts @@@
+cd {{out}} && npm install   (creates package-lock.json: commit it; the workflow runs npm ci; API probes need no browsers)
+
+@@@ file: next/live-js part=fragment name=next lang=js @@@
+{{out}} needs nothing installed: node:test + fetch (Node 24)
+
+@@@ file: next/live-python part=fragment name=next lang=python @@@
+python -m pip install -r {{out}}/requirements-live.txt
+
+@@@ file: next/live part=fragment name=next @@@
+ask the user to put the token into .adc/.env.live in their own editor (ADC_LIVE_TOKEN=..., optional ADC_LIVE_BASE_URL); never open that file yourself
+node <skill>/scripts/adc.mjs live run --dry-run --json, then live run --json (budget: 2,500 credits per session and per day)
+CI: environment "live" with secret ADC_LIVE_TOKEN; repository variables LIVE_TESTS_ENABLED=true (kill switch), ADC_LIVE_BASE_URL, optional ADC_LIVE_BUDGET (ci class, max 10,000)
+
+@@@ file: next/live-pinned part=fragment name=next when=pinned @@@
+the workflow fetches {{skill_name}} v{{version}} at run time; pin a commit SHA in ADC_REF, or vendor the skill into .github/skills/ (references/install.md)

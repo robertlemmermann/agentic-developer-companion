@@ -1,0 +1,34 @@
+{
+  "schema": "adc-trigger-set/1",
+  "skill": "agentic-developer-companion",
+  "runs": 3,
+  "query_threshold": 0.5,
+  "suite_threshold": 0.8,
+  "guidance": [
+    "The skill's own trigger set: 10 should-trigger queries across both jobs (QA of agent-made changes, agentic tooling) and 10 near misses that share keywords with them.",
+    "Release gate: suite_threshold in Claude Code and Copilot. Scoring and tuning (train split only, at most 5 revisions, then 5-10 fresh queries instead of edits): skills/agentic-developer-companion/references/tooling-eval.md §2.",
+    "Free check from the repository root: node skills/agentic-developer-companion/scripts/adc.mjs tooling trigger-set skills/agentic-developer-companion --set evals/trigger-set.json --json (validates the set, prints the paid commands). Paid run: add --host claude|copilot|codex --run."
+  ],
+  "queries": [
+    { "id": "pos-01", "should_trigger": true, "query": "Copilot says it fixed the date parsing bug and that all tests pass. Can you check that this is actually true before I merge the branch?" },
+    { "id": "pos-02", "should_trigger": true, "query": "verify the uncommitted changes Claude made in this repo against origin/main and give me a verdict with the evidence for each claim" },
+    { "id": "pos-03", "should_trigger": true, "query": "Codex touched jest.config.js and three test files while fixing the build. Did it delete, skip or narrow any tests to get green?" },
+    { "id": "pos-04", "should_trigger": true, "query": "Audit the tests added in this PR: do the assertions check real behavior, or do they just mock everything and assert the mocks were called?" },
+    { "id": "pos-05", "should_trigger": true, "query": "We need a regression test for issue #482 (CSV export drops the last row) that fails on main and passes with the fix, with proof of both." },
+    { "id": "pos-06", "should_trigger": true, "query": "Set up a Playwright end-to-end suite for our Next.js storefront: login and checkout journeys, smoke tags, traces only on failure, JUnit output for CI." },
+    { "id": "pos-07", "should_trigger": true, "query": "tests/api/test_orders.py::test_refund fails about one run in ten on CI. Find out whether it is order-dependent or timing-related and quarantine it the right way." },
+    { "id": "pos-08", "should_trigger": true, "query": "Add a GitHub Actions gate to this repo that runs the whole suite with retries off and fails the PR when coverage of the changed lines is below 80%." },
+    { "id": "pos-09", "should_trigger": true, "query": "Lint our .github/copilot-instructions.md, AGENTS.md and every skill under .github/skills against what Copilot, Claude Code and Codex actually support." },
+    { "id": "pos-10", "should_trigger": true, "query": "Port the Claude Code subagent in .claude/agents/reviewer.md to a Copilot custom agent and a Codex equivalent, and list which fields get lost." },
+    { "id": "neg-01", "should_trigger": false, "query": "Add a --verbose flag to the argument parser in src/cli.ts and print the resolved config when it is set." },
+    { "id": "neg-02", "should_trigger": false, "query": "Refactor the OrderService class into smaller functions without changing its public API." },
+    { "id": "neg-03", "should_trigger": false, "query": "Explain the difference between unit tests and integration tests in two short paragraphs." },
+    { "id": "neg-04", "should_trigger": false, "query": "Fix the TypeScript error \"Property 'id' does not exist on type 'User'\" in src/models/user.ts." },
+    { "id": "neg-05", "should_trigger": false, "query": "Write a conventional commit message for the staged changes." },
+    { "id": "neg-06", "should_trigger": false, "query": "Bump lodash to the latest version in package.json and regenerate package-lock.json." },
+    { "id": "neg-07", "should_trigger": false, "query": "Generate a multi-stage Dockerfile for this FastAPI service with a slim runtime image." },
+    { "id": "neg-08", "should_trigger": false, "query": "Summarize what changed between v2.3.0 and v2.4.0 so I can paste it into the release notes." },
+    { "id": "neg-09", "should_trigger": false, "query": "Convert the callback-based readConfig function in lib/config.js to async/await." },
+    { "id": "neg-10", "should_trigger": false, "query": "How do I install the GitHub Copilot CLI on my Windows laptop and sign in?" }
+  ]
+}
